@@ -1,0 +1,47 @@
+{
+  "name": "fusion-starter",
+  "private": true,
+  "type": "module",
+  "pkg": {
+    "scripts": [
+      "dist/server/**/*.js"
+    ]
+  },
+  "scripts": {
+    "dev": "tsx watch server/node-build.ts",
+    "build": "vite build --config vite.config.server.ts",
+    "start": "node dist/server/node-build.mjs",
+    "test": "vitest --run",
+    "format.fix": "prettier --write .",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "@types/nodemailer": "^7.0.4",
+    "axios": "^1.7.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.11",
+    "pg": "^8.11.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.2.1",
+    "@types/swagger-jsdoc": "^6.0.4",
+    "@types/swagger-ui-express": "^4.1.6",
+    "cors": "^2.8.5",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "serverless-http": "^3.2.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.2",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@10.14.0+sha512.ad27a79641b49c3e481a16a805baa71817a04bbe06a38d17e60e2eaee83f6a146c6a688125f5792e48dd5ba30e7da52a5cda4c3992b9ccf333f9ce223af84748"
+}

@@ -66,12 +66,13 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS next_billing_date TIMESTAMP`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS trial_used_days INTEGER DEFAULT 0`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMP`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS is_manual_subscription BOOLEAN DEFAULT FALSE`);
 
     // Create transactions table
     await query(`
       CREATE TABLE IF NOT EXISTS transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID REFERENCES businesses(id),
+        business_id VARCHAR(255) REFERENCES businesses(id),
         plan_id UUID REFERENCES pricing_plans(id),
         amount DECIMAL(12, 2) NOT NULL,
         currency VARCHAR(3) DEFAULT 'NGN',
@@ -110,7 +111,7 @@ export async function initializeDatabase() {
     // Create businesses table
     await query(`
       CREATE TABLE IF NOT EXISTS businesses (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id VARCHAR(255) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         email VARCHAR(255) NOT NULL UNIQUE,
         industry VARCHAR(255),
@@ -124,7 +125,7 @@ export async function initializeDatabase() {
     await query(`
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         email VARCHAR(255) NOT NULL,
         password_hash VARCHAR(255),
         name VARCHAR(255) NOT NULL,
@@ -147,7 +148,7 @@ export async function initializeDatabase() {
     await query(`
       CREATE TABLE IF NOT EXISTS tasks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         created_by UUID NOT NULL REFERENCES users(id),
         title VARCHAR(255) NOT NULL,
         description TEXT,
@@ -245,7 +246,7 @@ export async function initializeDatabase() {
     await query(`
       CREATE TABLE IF NOT EXISTS epics (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
         status VARCHAR(50) DEFAULT 'active',
@@ -268,7 +269,7 @@ export async function initializeDatabase() {
     await query(`
       CREATE TABLE IF NOT EXISTS activity_logs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id),
         task_id UUID REFERENCES tasks(id),
         user_id UUID NOT NULL REFERENCES users(id),
         action VARCHAR(50) NOT NULL,
@@ -283,7 +284,7 @@ export async function initializeDatabase() {
     await query(`
       CREATE TABLE IF NOT EXISTS ideas (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         title VARCHAR(255) NOT NULL,
         description TEXT NOT NULL,
@@ -324,6 +325,39 @@ export async function initializeDatabase() {
         PRIMARY KEY (role_id, permission_id)
       )
     `);
+
+    // Create payment_cards table
+    await query(`
+      CREATE TABLE IF NOT EXISTS payment_cards (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        token_id VARCHAR(255) NOT NULL,
+        last4 VARCHAR(4),
+        card_type VARCHAR(50),
+        exp_month VARCHAR(2),
+        exp_year VARCHAR(4),
+        is_active BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create squad_webhooks table
+    await query(`
+      CREATE TABLE IF NOT EXISTS squad_webhooks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(255),
+        payload JSONB,
+        status VARCHAR(50) DEFAULT 'processed',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add provider column to squad_webhooks
+    await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'squad'`);
+
+    // Add transaction_type to transactions table
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_type VARCHAR(50) DEFAULT 'subscription'`); // subscription, card_validation
 
     // Add role_id to platform_admins
     await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS role_id UUID REFERENCES admin_roles(id) ON DELETE SET NULL`);
@@ -377,6 +411,23 @@ export async function initializeDatabase() {
       `UPDATE platform_admins SET role_id = $1 WHERE email = 'admin@quantigrate.com' AND role_id IS NULL`,
       [superAdminRoleId]
     );
+
+    // Create system_settings table
+    await query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(255) PRIMARY KEY,
+        value TEXT,
+        description TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Insert default card verification amount if not exists
+    await query(`
+      INSERT INTO system_settings (key, value, description)
+      VALUES ('card_verification_amount', '100', 'Amount charged for card verification in Naira')
+      ON CONFLICT (key) DO NOTHING
+    `);
 
     console.log("Database tables initialized successfully");
   } catch (error) {

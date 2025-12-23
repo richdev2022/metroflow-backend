@@ -1,11 +1,125 @@
 import express from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { query } from "../db";
-import { initiatePayment, verifyPayment } from "../services/squad";
+import { initiatePayment, verifyPayment, cancelRecurring } from "../services/squad";
+import { processSubscriptionRenewals } from "../services/subscription";
 import crypto from "crypto";
 import axios from "axios";
+import * as XLSX from "xlsx";
 
 const router = express.Router();
+
+const sendCSV = (res: any, data: any[], filename: string) => {
+    const ws = XLSX.utils.json_to_sheet(data);
+    const csv = XLSX.utils.sheet_to_csv(ws);
+    res.header('Content-Type', 'text/csv');
+    res.header('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+};
+
+const parsePan = (pan: string) => {
+    let last4 = null;
+    let expMonth = null;
+    let expYear = null;
+    let cardType = null;
+    
+    if (pan && pan.includes('|')) {
+        const parts = pan.split('|');
+        const cardPart = parts[0];
+        const expPart = parts[1]; 
+        
+        last4 = cardPart.slice(-4);
+        if (expPart && expPart.length === 4) {
+            expMonth = expPart.substring(0, 2);
+            expYear = "20" + expPart.substring(2);
+        }
+    } else if (pan) {
+        last4 = pan.slice(-4);
+    }
+    
+    return { last4, expMonth, expYear, cardType };
+};
+
+/**
+ * @swagger
+ * /subscription/transactions/export:
+ *   get:
+ *     summary: Export transactions to CSV
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date (YYYY-MM-DD)
+ *     responses:
+ *       200:
+ *         description: CSV file
+ *         content:
+ *           text/csv:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get("/transactions/export", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+        const { startDate, endDate } = req.query;
+        let queryStr = `
+            SELECT t.reference, t.amount, t.currency, t.status, t.created_at, p.name as plan_name 
+            FROM transactions t
+            LEFT JOIN pricing_plans p ON t.plan_id = p.id
+            WHERE t.business_id = $1
+        `;
+        const params: any[] = [businessId];
+        let paramCount = 2;
+
+        if (startDate) {
+            queryStr += ` AND t.created_at >= $${paramCount}`;
+            params.push(startDate);
+            paramCount++;
+        }
+        if (endDate) {
+            queryStr += ` AND t.created_at <= $${paramCount}`;
+            params.push(endDate);
+            paramCount++;
+        }
+
+        queryStr += ` ORDER BY t.created_at DESC`;
+
+        const result = await query(queryStr, params);
+        
+        const data = result.rows.map(row => ({
+            Reference: row.reference,
+            Amount: row.amount,
+            Currency: row.currency,
+            Status: row.status,
+            Plan: row.plan_name || 'N/A',
+            Date: new Date(row.created_at).toLocaleString()
+        }));
+
+        sendCSV(res, data, `transactions_${businessId}_${Date.now()}.csv`);
+    } catch (error) {
+        console.error("Export transactions error:", error);
+        res.status(500).json({ success: false, error: "Failed to export transactions" });
+    }
+});
 
 /**
  * @swagger
@@ -41,6 +155,9 @@ const router = express.Router();
  *                       type: string
  *                     plan_name:
  *                       type: string
+ *                     next_due_subscription_date:
+ *                       type: string
+ *                       format: date-time
  *       500:
  *         description: Server error
  */
@@ -52,7 +169,7 @@ router.get("/current", authenticateToken, async (req, res) => {
     if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
     const businessResult = await query(`
-      SELECT b.id, b.name, b.subscription_status, b.trial_ends_at, 
+      SELECT b.id, b.name, b.subscription_status, b.trial_ends_at, b.next_billing_date,
              p.id as plan_id, p.name as plan_name, p.price as plan_price, 
              p.max_team_members, p.features
       FROM businesses b
@@ -70,17 +187,76 @@ router.get("/current", authenticateToken, async (req, res) => {
     const usageResult = await query(`SELECT COUNT(*) FROM users WHERE business_id = $1`, [businessId]);
     const teamCount = parseInt(usageResult.rows[0].count);
 
+    // Determine next due subscription date logic:
+    // "Next due subscription date is a count of month from the date which user's successfully subscribe and card was charge"
+    // This maps to 'next_billing_date' in DB which we update on successful charge.
+    
     res.json({ 
       success: true, 
       subscription: {
         ...subscription,
-        team_usage: teamCount
+        team_usage: teamCount,
+        next_due_subscription_date: subscription.next_billing_date
       } 
     });
   } catch (error) {
     console.error("Get subscription error:", error);
     res.status(500).json({ success: false, error: "Failed to fetch subscription" });
   }
+});
+
+/**
+ * @swagger
+ * /subscription/cards:
+ *   get:
+ *     summary: Get all payment cards
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of payment cards
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 cards:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       last4:
+ *                         type: string
+ *                       card_type:
+ *                         type: string
+ *                       exp_month:
+ *                         type: string
+ *                       exp_year:
+ *                         type: string
+ *                       is_active:
+ *                         type: boolean
+ *       500:
+ *         description: Server error
+ */
+// Get all cards
+router.get("/cards", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+        const cardsResult = await query(`SELECT * FROM payment_cards WHERE business_id = $1 ORDER BY created_at DESC`, [businessId]);
+        
+        res.json({ success: true, cards: cardsResult.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Failed to fetch cards" });
+    }
 });
 
 // Get public pricing plans
@@ -127,6 +303,182 @@ router.get("/plans", async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to fetch plans" });
   }
+});
+
+// Add Card Initiate
+/**
+ * @swagger
+ * /subscription/cards/initiate:
+ *   post:
+ *     summary: Initiate adding a new card
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Card addition initiated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 checkout_url:
+ *                   type: string
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.post("/cards/initiate", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        const userId = authReq.user?.userId;
+        if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+        const userRes = await query('SELECT email FROM users WHERE id = $1', [userId]);
+        const userEmail = userRes.rows[0]?.email;
+        if (!userEmail) return res.status(401).json({ success: false, error: "User email not found" });
+
+        // Get current plan_id
+        const businessRes = await query('SELECT plan_id FROM businesses WHERE id = $1', [businessId]);
+        const planId = businessRes.rows[0]?.plan_id;
+
+        // Initiate a small charge (e.g., 100 NGN) to tokenize
+        // Fetch verification amount from settings
+        const settingsRes = await query(`SELECT value FROM system_settings WHERE key = 'card_verification_amount'`);
+        const settingsAmount = settingsRes.rows.length > 0 ? parseInt(settingsRes.rows[0].value) : 100;
+        const amount = isNaN(settingsAmount) ? 100 : settingsAmount;
+        
+        const currency = 'NGN';
+        const reference = `CARD_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+        
+        // Create transaction
+        await query(
+            `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, transaction_type)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 'card_validation')`,
+            [businessId, planId, amount, currency, reference]
+        );
+
+        const origin = req.get('origin') || req.get('referer') || 'http://localhost:3000';
+        const baseUrl = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+        const callbackUrl = `${baseUrl}/payment/callback`;
+
+        const squadResponse = await initiatePayment({
+            amount: amount * 100, // Kobo
+            email: userEmail,
+            reference: reference,
+            callbackUrl: callbackUrl,
+            currency: currency,
+            isRecurring: true
+        });
+
+        if (squadResponse && squadResponse.status === 200 && squadResponse.data?.checkout_url) {
+            res.json({ success: true, checkout_url: squadResponse.data.checkout_url });
+        } else {
+            res.status(500).json({ success: false, error: "Failed to initiate card validation" });
+        }
+    } catch (error) {
+        console.error("Initiate card add error:", error);
+        res.status(500).json({ success: false, error: "Failed to initiate card addition" });
+    }
+});
+
+// Delete Card
+/**
+ * @swagger
+ * /subscription/cards/{id}:
+ *   delete:
+ *     summary: Remove a payment card
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Card removed
+ *       404:
+ *         description: Card not found
+ *       500:
+ *         description: Server error
+ */
+router.delete("/cards/:id", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        const cardId = req.params.id;
+        
+        // Get card
+        const cardRes = await query(`SELECT * FROM payment_cards WHERE id = $1 AND business_id = $2`, [cardId, businessId]);
+        if (cardRes.rows.length === 0) return res.status(404).json({ success: false, error: "Card not found" });
+        const card = cardRes.rows[0];
+       
+        // Delete from DB
+        await query(`DELETE FROM payment_cards WHERE id = $1`, [cardId]);
+        
+        if (card.is_active) {
+            await query(`UPDATE businesses SET card_token = NULL WHERE id = $1`, [businessId]);
+        }
+
+        res.json({ success: true, message: "Card removed" });
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Failed to remove card" });
+    }
+});
+
+// Set Active Card
+/**
+ * @swagger
+ * /subscription/cards/{id}/active:
+ *   put:
+ *     summary: Set a card as active for subscription
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Card set as active
+ *       404:
+ *         description: Card not found
+ *       500:
+ *         description: Server error
+ */
+router.put("/cards/:id/active", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        const cardId = req.params.id;
+        
+        const cardRes = await query(`SELECT * FROM payment_cards WHERE id = $1 AND business_id = $2`, [cardId, businessId]);
+        if (cardRes.rows.length === 0) return res.status(404).json({ success: false, error: "Card not found" });
+        const card = cardRes.rows[0];
+
+        await query(`BEGIN`);
+        await query(`UPDATE payment_cards SET is_active = false WHERE business_id = $1`, [businessId]);
+        await query(`UPDATE payment_cards SET is_active = true WHERE id = $1`, [cardId]);
+        await query(`UPDATE businesses SET card_token = $1 WHERE id = $2`, [card.token_id, businessId]);
+        await query(`COMMIT`);
+
+        res.json({ success: true, message: "Card set as active" });
+    } catch (error) {
+        await query(`ROLLBACK`);
+        res.status(500).json({ success: false, error: "Failed to update active card" });
+    }
 });
 
 // Initiate Payment
@@ -233,7 +585,7 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
     // Call Squad API
     // Callback URL: The frontend page that handles the verify
     // Using referer or origin to build callback URL
-    const origin = req.get('origin') || req.get('referer') || 'http://localhost:5000';
+    const origin = req.get('origin') || req.get('referer') || 'http://localhost:3000';
     // Clean trailing slash
     const baseUrl = origin.endsWith('/') ? origin.slice(0, -1) : origin;
     const callbackUrl = `${baseUrl}/payment/callback`;
@@ -263,6 +615,33 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
 });
 
 // Verify Payment
+/**
+ * @swagger
+ * /subscription/verify-payment:
+ *   post:
+ *     summary: Verify a payment (Subscription or Card Addition)
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - reference
+ *             properties:
+ *               reference:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Payment verified
+ *       404:
+ *         description: Transaction not found
+ *       500:
+ *         description: Server error
+ */
 router.post("/verify-payment", authenticateToken, async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
@@ -287,6 +666,67 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
     const verifyResponse = await verifyPayment(reference);
 
     if (verifyResponse.success && verifyResponse.data?.transaction_status === 'success') {
+        // Extract Card Information
+        const paymentInfo = verifyResponse.data.payment_information || {};
+        const cardDetails = verifyResponse.data.card_details || {}; 
+        const tokenId = paymentInfo.token_id || verifyResponse.data.token_id || cardDetails.token_id;
+        
+        let last4 = null;
+        let cardType = null;
+        let expMonth = null;
+        let expYear = null;
+        
+        if (paymentInfo.pan) {
+             const parsed = parsePan(paymentInfo.pan);
+             last4 = parsed.last4;
+             expMonth = parsed.expMonth;
+             expYear = parsed.expYear;
+             cardType = paymentInfo.card_type || paymentInfo.type;
+        } else if (cardDetails.pan) {
+             const parsed = parsePan(cardDetails.pan);
+             last4 = parsed.last4;
+             expMonth = parsed.expMonth;
+             expYear = parsed.expYear;
+             cardType = cardDetails.type;
+        }
+
+        // Store card if token available
+        if (tokenId) {
+             // If we are storing a new token, should we make it active?
+             // Usually yes if it's the one just used.
+             await query(`UPDATE payment_cards SET is_active = false WHERE business_id = $1`, [businessId]);
+             
+             // Check if already exists
+             const tokenCheck = await query(`SELECT id FROM payment_cards WHERE token_id = $1`, [tokenId]);
+             if (tokenCheck.rows.length === 0) {
+                 await query(`
+                    INSERT INTO payment_cards (business_id, token_id, last4, card_type, exp_month, exp_year, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, true)
+                 `, [businessId, tokenId, last4, cardType, expMonth, expYear]);
+             } else {
+                 await query(`UPDATE payment_cards SET is_active = true WHERE token_id = $1`, [tokenId]);
+             }
+        }
+
+        // Handle 'card_validation' type
+        if (transaction.transaction_type === 'card_validation') {
+             // SYNC FIX: Update businesses table with the new card token since we made it active in payment_cards
+             if (tokenId) {
+                 await query(`UPDATE businesses SET card_token = $1 WHERE id = $2`, [tokenId, businessId]);
+             }
+
+             await query(
+                `UPDATE transactions SET status = 'success', gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [JSON.stringify(verifyResponse.data), transaction.id]
+             );
+             
+             if (tokenId) {
+                 return res.json({ success: true, message: "Card added successfully" });
+             } else {
+                 return res.json({ success: true, message: "Transaction successful but card token not received. Check if recurring payment is enabled and supported." });
+             }
+        }
+
         // Update transaction status
         await query(
           `UPDATE transactions SET status = 'success', gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
@@ -295,10 +735,6 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
 
         // Log the full response for debugging
         console.log("Verify Payment Response:", JSON.stringify(verifyResponse, null, 2));
-
-        const tokenId = verifyResponse.data?.card_details?.token_id 
-                     || verifyResponse.data?.token_id
-                     || verifyResponse.data?.payment_information?.token_id;
 
         // Calculate next billing date (1 month from now)
         const nextBillingDate = new Date();
@@ -462,36 +898,13 @@ router.post("/cancel", authenticateToken, async (req, res) => {
             return res.status(400).json({ success: false, error: "No active recurring subscription found" });
         }
 
-        // Call Squad to cancel recurring if possible (optional but good practice)
-        // Squad API requires auth_code which is our token
-        /*
+        // Call Squad to cancel recurring
         try {
             await cancelRecurring(business.card_token);
         } catch (err) {
-            console.warn("Failed to cancel recurring on Squad side, but proceeding locally", err);
+            console.warn("Squad cancel recurring warning:", err);
+            // Continue locally
         }
-        */
-       // Actually, we should probably just remove the token locally so we stop charging.
-       // Calling Squad cancel endpoint is good if Squad manages the schedule.
-       // But here we are managing the schedule (or planning to).
-       // However, Squad's recurring payment might be managed by them if we passed `is_recurring`.
-       // Squad docs say: "This allows you charge a card without collecting the card information each time."
-       // It doesn't explicitly say Squad auto-charges. It says "Charge Authorization on Card... This allows you charge a card...".
-       // And "To tokenize a card... is_recurring:true".
-       // So we (the merchant) are responsible for calling `charge_card`.
-       // Thus, "cancelling" just means deleting the token locally so we don't charge anymore.
-       // But Squad also has a `cancel/recurring` endpoint which "allows you to cancel a card which was previously tokenised."
-       // So we should call it.
-
-       // Import cancelRecurring if not imported
-       const { cancelRecurring } = require("../services/squad");
-       
-       try {
-           await cancelRecurring(business.card_token);
-       } catch (err) {
-           console.warn("Squad cancel recurring warning:", err);
-           // Continue locally
-       }
 
        // Update DB
        await query(
@@ -539,102 +952,7 @@ router.post("/cron/process-renewals", async (req, res) => {
     }
 
     try {
-        // Find subscriptions due for renewal
-        // Status active, next_billing_date <= NOW, has card_token
-        const dueSubscriptions = await query(`
-            SELECT b.id as business_id, b.card_token, b.plan_id, p.price, p.currency
-            FROM businesses b
-            JOIN pricing_plans p ON b.plan_id = p.id
-            WHERE b.subscription_status = 'active' 
-            AND b.next_billing_date <= CURRENT_TIMESTAMP
-            AND b.card_token IS NOT NULL
-        `);
-
-        const results = {
-            processed: 0,
-            success: 0,
-            failed: 0,
-            errors: [] as any[]
-        };
-
-        const { chargeCard } = require("../services/squad");
-
-        for (const sub of dueSubscriptions.rows) {
-            results.processed++;
-            try {
-                // Calculate amount (convert to Minor units if needed, e.g. Kobo)
-                // Assuming price is in Major (NGN) and Squad needs Minor (Kobo)
-                // If currency is USD, we need to convert?
-                // For recurring, we likely charge in NGN if that's what Squad supports primarily or whatever the token was created for.
-                // Assuming price is consistent with original transaction currency.
-                
-                let amount = parseFloat(sub.price);
-                
-                // If the plan is in USD but we are charging a Nigerian card via Squad, we might need conversion.
-                // But typically the recurring token is tied to the currency of the initial transaction.
-                // Let's assume we charge the NGN equivalent or the stored amount.
-                // Ideally we should have stored the 'recurring_amount' and 'recurring_currency' in businesses table.
-                // But we'll use plan price. If plan is USD, we convert to NGN dynamically?
-                // This is risky if rate changes.
-                // For now, let's assume we charge NGN equivalent at current rate if plan is USD.
-                
-                if (sub.currency === 'USD') {
-                     try {
-                        const rateRes = await axios.get('https://api.exchangerate-api.com/v4/latest/USD');
-                        if (rateRes.data && rateRes.data.rates && rateRes.data.rates.NGN) {
-                            amount = amount * rateRes.data.rates.NGN;
-                        }
-                     } catch (e) {
-                         console.error("Rate fetch failed for recurring", e);
-                         // Fallback? Skip?
-                         results.failed++;
-                         results.errors.push({ businessId: sub.business_id, error: "Rate fetch failed" });
-                         continue;
-                     }
-                }
-
-                const amountInMinor = Math.round(amount * 100);
-
-                const chargeRes = await chargeCard(amountInMinor, sub.card_token);
-                
-                if (chargeRes && chargeRes.success) {
-                    // Update next billing date
-                    const nextDate = new Date();
-                    nextDate.setMonth(nextDate.getMonth() + 1);
-                    
-                    await query(`
-                        UPDATE businesses 
-                        SET next_billing_date = $1, updated_at = CURRENT_TIMESTAMP 
-                        WHERE id = $2
-                    `, [nextDate, sub.business_id]);
-
-                    // Log transaction
-                    await query(`
-                        INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response)
-                        VALUES ($1, $2, $3, $4, $5, 'success', $6)
-                    `, [
-                        sub.business_id, 
-                        sub.plan_id, 
-                        amount, 
-                        'NGN', // Assuming we charged in NGN
-                        `REC_${Date.now()}_${sub.business_id.substring(0,4)}`,
-                        JSON.stringify(chargeRes)
-                    ]);
-
-                    results.success++;
-                } else {
-                    throw new Error("Charge failed");
-                }
-
-            } catch (err: any) {
-                console.error(`Recurring charge failed for business ${sub.business_id}`, err);
-                results.failed++;
-                results.errors.push({ businessId: sub.business_id, error: err.message });
-                
-                // Optional: Retry logic or mark as 'past_due'
-            }
-        }
-
+        const results = await processSubscriptionRenewals();
         res.json({ success: true, results });
 
     } catch (error) {
@@ -808,6 +1126,62 @@ router.get("/transactions", authenticateToken, async (req, res) => {
     } catch (error: any) {
         console.error("Fetch transactions error:", error);
         res.status(500).json({ success: false, error: "Failed to fetch transactions" });
+    }
+});
+
+// Export Transactions (User)
+/**
+ * @swagger
+ * /subscription/transactions/export:
+ *   get:
+ *     summary: Export transactions to CSV
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.get("/transactions/export", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        const { startDate, endDate, status } = req.query;
+
+        let queryStr = `
+            SELECT t.reference, t.amount, t.currency, t.status, t.transaction_type, t.created_at, p.name as plan_name
+            FROM transactions t
+            LEFT JOIN pricing_plans p ON t.plan_id = p.id
+            WHERE t.business_id = $1
+        `;
+        const params: any[] = [businessId];
+        let paramCount = 2;
+
+        if (startDate) {
+            queryStr += ` AND t.created_at >= $${paramCount}`;
+            params.push(startDate);
+            paramCount++;
+        }
+        if (endDate) {
+            queryStr += ` AND t.created_at <= $${paramCount}`;
+            params.push(endDate);
+            paramCount++;
+        }
+        if (status) {
+            queryStr += ` AND t.status = $${paramCount}`;
+            params.push(status);
+            paramCount++;
+        }
+
+        queryStr += ` ORDER BY t.created_at DESC`;
+        const result = await query(queryStr, params);
+
+        const ws = XLSX.utils.json_to_sheet(result.rows);
+        const csv = XLSX.utils.sheet_to_csv(ws);
+        res.header('Content-Type', 'text/csv');
+        res.header('Content-Disposition', `attachment; filename="transactions_${Date.now()}.csv"`);
+        res.send(csv);
+
+    } catch (error) {
+        console.error("Export transactions error:", error);
+        res.status(500).json({ success: false, error: "Failed to export transactions" });
     }
 });
 

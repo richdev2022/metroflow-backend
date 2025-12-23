@@ -86,3 +86,80 @@ export const checkTeamLimit = async (
     res.status(500).json({ success: false, error: "Failed to check plan limits" });
   }
 };
+
+export const checkSubscriptionStatus = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const businessId = req.user?.businessId;
+    // Skip if no businessId (e.g. platform admin or pre-auth)
+    if (!businessId) return next();
+
+    // Skip checks for subscription related endpoints to allow upgrade
+    if (req.originalUrl.startsWith('/api/subscription')) {
+        return next();
+    }
+
+    const businessResult = await query(
+      `SELECT b.subscription_status, b.trial_ends_at, p.price, p.trial_days
+       FROM businesses b
+       LEFT JOIN pricing_plans p ON b.plan_id = p.id
+       WHERE b.id = $1`,
+      [businessId]
+    );
+
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Business not found" });
+    }
+
+    const business = businessResult.rows[0];
+    const now = new Date();
+    const trialEndsAt = business.trial_ends_at ? new Date(business.trial_ends_at) : null;
+    const isFreePlan = parseFloat(business.price) === 0;
+
+    // Check if subscription is explicitly inactive/cancelled
+    if (business.subscription_status === 'inactive' || business.subscription_status === 'cancelled') {
+         // Allow if trial is still valid? 
+         // Usually inactive means manually cancelled or payment failed.
+         // If it's a free plan, 'inactive' might mean trial expired.
+         
+         // If trial date exists and is in future, maybe allow? 
+         // But prompt says "After expiration for Free Plan".
+         
+         if (isFreePlan && trialEndsAt && trialEndsAt < now) {
+             return res.status(403).json({
+                 success: false,
+                 error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
+             });
+         }
+         
+         // For paid plans that are inactive/cancelled
+         if (!isFreePlan && business.subscription_status !== 'active') {
+             // Maybe they have a grace period or trial?
+             // Simplification: if not active and trial expired (or no trial), block.
+             if (!trialEndsAt || trialEndsAt < now) {
+                return res.status(403).json({
+                    success: false,
+                    error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
+                });
+             }
+         }
+    }
+    
+    // Check if Active but Trial Expired (specifically for Free Plan which might stay 'active' until we check dates)
+    if (isFreePlan && trialEndsAt && trialEndsAt < now) {
+        return res.status(403).json({
+            success: false,
+            error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
+        });
+    }
+
+    next();
+  } catch (error) {
+    console.error("Check subscription status error:", error);
+    // Fail open or closed? Let's fail open to avoid blocking users on DB errors, but log it.
+    next();
+  }
+};

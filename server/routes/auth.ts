@@ -18,6 +18,7 @@ import {
 } from "../services/auth";
 import { sendEmail, generateBusinessRegistrationEmailHtml } from "../services/email";
 import { logActivity } from "../services/activity";
+import { generateBusinessId } from "../utils/idGenerator";
 
 export const registerBusiness: RequestHandler = async (req, res) => {
 /**
@@ -113,18 +114,26 @@ export const registerBusiness: RequestHandler = async (req, res) => {
 
     if (planResult.rows.length > 0) {
       planId = planResult.rows[0].id;
-      const trialDays = planResult.rows[0].trial_days || 7;
+      // Ensure trial days is at least 7 for free plan
+      const trialDays = planResult.rows[0].trial_days && planResult.rows[0].trial_days > 0 ? planResult.rows[0].trial_days : 7;
       const date = new Date();
       date.setDate(date.getDate() + trialDays);
       trialEndsAt = date;
+    } else {
+        // Fallback if no free plan found in DB (should be seeded)
+        // We might want to create one or just use default 7 days
+        const date = new Date();
+        date.setDate(date.getDate() + 7);
+        trialEndsAt = date;
     }
 
     // Create business
+    const businessId = generateBusinessId(input.businessName);
     const businessResult = await query(
-      `INSERT INTO businesses (name, email, industry, plan_id, trial_ends_at)
-        VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id, name, email, created_at as "createdAt"`,
-      [input.businessName, input.businessEmail, input.businessIndustry || null, planId, trialEndsAt],
+      [businessId, input.businessName, input.businessEmail, input.businessIndustry || null, planId, trialEndsAt],
     );
 
     const business = businessResult.rows[0];

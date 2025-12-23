@@ -51,9 +51,11 @@ import { getActivityLogs } from "./routes/activity";
 import { getIdeas, createIdea, updateIdeaStatus } from "./routes/ideas";
 import adminRouter from "./routes/admin";
 import subscriptionRouter from "./routes/subscription";
+import webhookRouter from "./routes/webhook";
 import dashboardRouter from "./routes/dashboard";
 import { initializeDatabase, query } from "./db";
-import { authenticateToken, checkTeamLimit } from "./middleware/auth";
+import { authenticateToken, checkTeamLimit, checkSubscriptionStatus } from "./middleware/auth";
+import { processSubscriptionRenewals } from "./services/subscription";
 import * as cron from "node-cron";
 
 export async function createServer() {
@@ -106,6 +108,9 @@ export async function createServer() {
         console.log(`Sending trial expiration warning to ${b.email}`);
         // await sendEmail(...)
       });
+
+      // Process subscription renewals
+      await processSubscriptionRenewals();
 
     } catch (error) {
       console.error("Cron job error:", error);
@@ -181,55 +186,56 @@ export async function createServer() {
   app.post("/api/auth/reset-password", resetPassword);
 
   // Tasks API routes
-  app.get("/api/tasks", authenticateToken, getTasks);
-  app.post("/api/tasks", authenticateToken, createTask);
-  app.post("/api/tasks/bulk", authenticateToken, bulkCreateTasks);
-  app.put("/api/tasks/bulk-update", authenticateToken, bulkUpdateTasks);
-  app.put("/api/tasks/:id", authenticateToken, updateTask);
-  app.delete("/api/tasks/:id", authenticateToken, deleteTask);
-  app.delete("/api/tasks", authenticateToken, bulkDeleteTasks);
+  app.get("/api/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
+  app.post("/api/tasks", authenticateToken, checkSubscriptionStatus, createTask);
+  app.post("/api/tasks/bulk", authenticateToken, checkSubscriptionStatus, bulkCreateTasks);
+  app.put("/api/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, bulkUpdateTasks);
+  app.put("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, updateTask);
+  app.delete("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, deleteTask);
+  app.delete("/api/tasks", authenticateToken, checkSubscriptionStatus, bulkDeleteTasks);
 
   // Team API routes
-  app.get("/api/team/ranking", authenticateToken, getTeamRanking);
-  app.get("/api/team/ranking/top", authenticateToken, getTopTeamRanking);
-  app.get("/api/team", authenticateToken, getTeamMembers);
-  app.get("/api/team/:id", authenticateToken, getTeamMemberById);
-  app.post("/api/team/invite", authenticateToken, checkTeamLimit, inviteTeamMember);
+  app.get("/api/team/ranking", authenticateToken, checkSubscriptionStatus, getTeamRanking);
+  app.get("/api/team/ranking/top", authenticateToken, checkSubscriptionStatus, getTopTeamRanking);
+  app.get("/api/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
+  app.get("/api/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
+  app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkTeamLimit, inviteTeamMember);
   app.get("/api/team/verify-invite-token/:token", verifyInviteToken);
   app.post("/api/team/accept-invite/:token", acceptInvite);
   app.put(
     "/api/team/:id/status",
     authenticateToken,
+    checkSubscriptionStatus,
     updateTeamMemberStatus,
   );
-  app.put("/api/team/:id/role", authenticateToken, updateTeamMemberRole);
-  app.delete("/api/team/:id", authenticateToken, deleteTeamMember);
+  app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, updateTeamMemberRole);
+  app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, deleteTeamMember);
 
   // Comments API routes
-  app.get("/api/comments/epic/:epicName", authenticateToken, getComments);
-  app.get("/api/comments/:taskId", authenticateToken, getComments);
-  app.post("/api/comments", authenticateToken, createComment);
-  app.delete("/api/comments/:commentId", authenticateToken, deleteComment);
-  app.post("/api/comments/:commentId/reaction", authenticateToken, toggleReaction);
+  app.get("/api/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
+  app.get("/api/comments/:taskId", authenticateToken, checkSubscriptionStatus, getComments);
+  app.post("/api/comments", authenticateToken, checkSubscriptionStatus, createComment);
+  app.delete("/api/comments/:commentId", authenticateToken, checkSubscriptionStatus, deleteComment);
+  app.post("/api/comments/:commentId/reaction", authenticateToken, checkSubscriptionStatus, toggleReaction);
 
   // Epics API routes
-  app.get("/api/epics", authenticateToken, getEpics);
-  app.post("/api/epics", authenticateToken, createEpic);
-  app.post("/api/epics/backfill", authenticateToken, backfillEpics);
-  app.post("/api/epics/:epicId/tasks", authenticateToken, linkTasksToEpic);
+  app.get("/api/epics", authenticateToken, checkSubscriptionStatus, getEpics);
+  app.post("/api/epics", authenticateToken, checkSubscriptionStatus, createEpic);
+  app.post("/api/epics/backfill", authenticateToken, checkSubscriptionStatus, backfillEpics);
+  app.post("/api/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, linkTasksToEpic);
 
   // Task assignments API routes
-  app.post("/api/assignments", authenticateToken, assignTasks);
-  app.get("/api/assignments/:taskId", authenticateToken, getAssignments);
-  app.delete("/api/assignments/:assignmentId", authenticateToken, removeAssignment);
+  app.post("/api/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
+  app.get("/api/assignments/:taskId", authenticateToken, checkSubscriptionStatus, getAssignments);
+  app.delete("/api/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
 
   // Activity logs API routes
-  app.get("/api/activity-logs", authenticateToken, getActivityLogs);
+  app.get("/api/activity-logs", authenticateToken, checkSubscriptionStatus, getActivityLogs);
 
   // Ideas API routes
-  app.get("/api/ideas", authenticateToken, getIdeas);
-  app.post("/api/ideas", authenticateToken, createIdea);
-  app.put("/api/ideas/:id/status", authenticateToken, updateIdeaStatus);
+  app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, getIdeas);
+  app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, createIdea);
+  app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, updateIdeaStatus);
 
   // Admin API routes
   app.use("/api/admin", adminRouter);
@@ -239,6 +245,9 @@ export async function createServer() {
 
   // Subscription API routes
   app.use("/api/subscription", subscriptionRouter);
+
+  // Webhook API routes
+  app.use("/api/webhook", webhookRouter);
 
   return app;
 }

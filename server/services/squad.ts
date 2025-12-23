@@ -52,7 +52,8 @@ export const initiatePayment = async (input: InitiatePaymentInput) => {
         initiate_type: "inline",
         transaction_ref: input.reference,
         callback_url: input.callbackUrl,
-        is_recurring: input.isRecurring || false
+        is_recurring: input.isRecurring || false,
+        payment_channels: ['card']
       },
       {
         headers: {
@@ -104,29 +105,28 @@ export const chargeCard = async (amount: number, tokenId: string, transactionRef
   }
 };
 
-export const cancelRecurring = async (authCode: string) => {
-    const apiKey = process.env.SQUAD_SECRET_KEY;
-    if (!apiKey) throw new Error("SQUAD_SECRET_KEY is missing");
+export const cancelRecurring = async (tokenId: string) => {
+  const apiKey = process.env.SQUAD_SECRET_KEY;
+  if (!apiKey) throw new Error("SQUAD_SECRET_KEY is missing");
 
-    // Note: The API expects 'auth_code' as an array.
-    try {
-        const response = await axios.patch(
-            `${BASE_URL}/transaction/cancel/recurring`,
-            {
-                auth_code: [authCode]
-            },
-            {
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json',
-                },
-            }
-        );
-        return response.data;
-    } catch (error: any) {
-        console.error('Squad cancel recurring error:', error.response?.data || error.message);
-        throw error;
-    }
+  try {
+    const response = await axios.patch(
+      `${BASE_URL}/transaction/cancel/recurring`,
+      {
+        auth_code: [tokenId]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+    return response.data;
+  } catch (error: any) {
+    console.error('Squad cancel recurring error:', error.response?.data || error.message);
+    throw error;
+  }
 };
 
 export const verifyPayment = async (reference: string): Promise<VerifyPaymentResponse> => {

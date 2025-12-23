@@ -5,6 +5,9 @@ import { query } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
 import { sendEmail } from "../services/email";
 
+import * as XLSX from "xlsx";
+import { generateBusinessId } from "../utils/idGenerator";
+
 const router = express.Router();
 
 // Admin Login
@@ -68,6 +71,36 @@ router.post("/auth/forgot-password", async (req, res) => {
 });
 
 // Dashboard Stats
+/**
+ * @swagger
+ * /admin/dashboard/stats:
+ *   get:
+ *     summary: Get dashboard statistics
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Dashboard statistics
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 stats:
+ *                   type: object
+ *                   properties:
+ *                     totalBusinesses:
+ *                       type: integer
+ *                     totalUsers:
+ *                       type: integer
+ *                     activeBusinesses:
+ *                       type: integer
+ *                     totalRevenue:
+ *                       type: integer
+ */
 router.get("/dashboard/stats", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
   try {
     const businessesCount = await query(`SELECT COUNT(*) FROM businesses`);
@@ -169,19 +202,83 @@ router.get("/dashboard/charts", authenticateAdmin, requirePermission('view_dashb
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: planId
+ *         schema:
+ *           type: string
  *     responses:
  *       200:
  *         description: List of businesses
  */
 router.get("/businesses", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
   try {
-    const result = await query(`
+    const { page = 1, limit = 10, search, status, planId } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+
+    let queryStr = `
       SELECT b.*, p.name as plan_name 
       FROM businesses b
       LEFT JOIN pricing_plans p ON b.plan_id = p.id
-      ORDER BY b.created_at DESC
-    `);
-    res.json({ success: true, businesses: result.rows });
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+    let paramCount = 1;
+
+    if (search) {
+      queryStr += ` AND (b.name ILIKE $${paramCount} OR b.email ILIKE $${paramCount})`;
+      params.push(`%${search}%`);
+      paramCount++;
+    }
+
+    if (status) {
+      queryStr += ` AND b.subscription_status = $${paramCount}`;
+      params.push(status);
+      paramCount++;
+    }
+
+    if (planId) {
+      queryStr += ` AND b.plan_id = $${paramCount}`;
+      params.push(planId);
+      paramCount++;
+    }
+
+    // Count query
+    const countQuery = `SELECT COUNT(*) FROM (${queryStr}) as count_table`;
+    const countRes = await query(countQuery, params);
+    const total = parseInt(countRes.rows[0].count);
+
+    queryStr += ` ORDER BY b.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+    params.push(limit, offset);
+
+    const result = await query(queryStr, params);
+
+    res.json({
+      success: true,
+      businesses: result.rows,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit))
+      }
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to fetch businesses" });
   }
@@ -250,21 +347,83 @@ router.get("/businesses/:id/team", authenticateAdmin, requirePermission('manage_
  *         name: page
  *         schema:
  *           type: integer
+ *         description: Page number
  *       - in: query
  *         name: perPage
  *         schema:
  *           type: integer
+ *         description: Items per page
  *       - in: query
  *         name: status
  *         schema:
  *           type: string
+ *         description: Filter by transaction status
  *       - in: query
  *         name: businessId
  *         schema:
  *           type: string
+ *         description: Filter by business ID
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Filter by start date (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Filter by end date (YYYY-MM-DD)
+ *       - in: query
+ *         name: reference
+ *         schema:
+ *           type: string
+ *         description: Search by transaction reference
  *     responses:
  *       200:
- *         description: List of transactions
+ *         description: List of transactions with pagination
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 transactions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       amount:
+ *                         type: number
+ *                       currency:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                       reference:
+ *                         type: string
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
+ *                       business_name:
+ *                         type: string
+ *                       plan_name:
+ *                         type: string
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                     page:
+ *                       type: integer
+ *                     perPage:
+ *                       type: integer
+ *                     totalPages:
+ *                       type: integer
  */
 router.get("/transactions", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
     try {
@@ -959,6 +1118,508 @@ router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to delete admin" });
   }
+});
+
+// System Settings
+/**
+ * @swagger
+ * /admin/settings/card-verification-amount:
+ *   get:
+ *     summary: Get card verification amount
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Card verification amount
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 amount:
+ *                   type: integer
+ */
+router.get("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+    try {
+        const result = await query(`SELECT value FROM system_settings WHERE key = 'card_verification_amount'`);
+        const amount = result.rows.length > 0 ? parseInt(result.rows[0].value) : 100;
+        res.json({ success: true, amount });
+    } catch (error) {
+        console.error("Error fetching card verification amount:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch settings" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/settings/card-verification-amount:
+ *   put:
+ *     summary: Update card verification amount
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - amount
+ *             properties:
+ *               amount:
+ *                 type: integer
+ *     responses:
+ *       200:
+ *         description: Settings updated
+ */
+router.put("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        if (!amount || isNaN(amount) || amount < 50) {
+            return res.status(400).json({ success: false, error: "Invalid amount. Minimum is 50." });
+        }
+        
+        await query(
+            `INSERT INTO system_settings (key, value, description) 
+             VALUES ('card_verification_amount', $1, 'Amount charged for card verification in Naira')
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+            [amount.toString()]
+        );
+        
+        res.json({ success: true, message: "Card verification amount updated" });
+    } catch (error) {
+        console.error("Error updating card verification amount:", error);
+        res.status(500).json({ success: false, error: "Failed to update settings" });
+    }
+});
+
+// Helper for CSV download
+const sendCSV = (res: any, data: any[], filename: string) => {
+    const ws = XLSX.utils.json_to_sheet(data);
+    const csv = XLSX.utils.sheet_to_csv(ws);
+    res.header('Content-Type', 'text/csv');
+    res.header('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+};
+
+// Webhook Notifications
+/**
+ * @swagger
+ * /admin/webhooks:
+ *   get:
+ *     summary: Get webhook notifications
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: provider
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Webhook notifications
+ */
+router.get("/webhooks", authenticateAdmin, async (req, res) => {
+    try {
+        const { page = 1, limit = 10, provider, status, startDate, endDate, search } = req.query;
+        const offset = (Number(page) - 1) * Number(limit);
+        
+        let queryStr = `SELECT * FROM squad_webhooks WHERE 1=1`;
+        const params: any[] = [];
+        let paramCount = 1;
+
+        if (provider) {
+            queryStr += ` AND provider = $${paramCount}`;
+            params.push(provider);
+            paramCount++;
+        }
+
+        if (status) {
+            queryStr += ` AND status = $${paramCount}`;
+            params.push(status);
+            paramCount++;
+        }
+
+        if (startDate) {
+            queryStr += ` AND created_at >= $${paramCount}`;
+            params.push(startDate);
+            paramCount++;
+        }
+
+        if (endDate) {
+            queryStr += ` AND created_at <= $${paramCount}`;
+            params.push(endDate);
+            paramCount++;
+        }
+
+        if (search) {
+            queryStr += ` AND payload::text ILIKE $${paramCount}`;
+            params.push(`%${search}%`);
+            paramCount++;
+        }
+
+        const countQuery = `SELECT COUNT(*) FROM (${queryStr}) as count_table`;
+        const countRes = await query(countQuery, params);
+        const total = parseInt(countRes.rows[0].count);
+
+        queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+        params.push(limit, offset);
+
+        const result = await query(queryStr, params);
+
+        res.json({
+            success: true,
+            webhooks: result.rows,
+            pagination: {
+                total,
+                page: Number(page),
+                limit: Number(limit),
+                pages: Math.ceil(total / Number(limit))
+            }
+        });
+    } catch (error) {
+        console.error("Get webhooks error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch webhooks" });
+    }
+});
+
+// Export Transactions (Admin)
+/**
+ * @swagger
+ * /admin/reports/transactions/export:
+ *   get:
+ *     summary: Export transactions to CSV
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date (YYYY-MM-DD)
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *         description: Transaction status
+ */
+router.get("/reports/transactions/export", authenticateAdmin, async (req, res) => {
+    try {
+        const { startDate, endDate, status } = req.query;
+        let queryStr = `
+            SELECT t.*, b.name as business_name, b.email as business_email, p.name as plan_name
+            FROM transactions t
+            LEFT JOIN businesses b ON t.business_id = b.id
+            LEFT JOIN pricing_plans p ON t.plan_id = p.id
+            WHERE 1=1
+        `;
+        const params: any[] = [];
+        let paramCount = 1;
+
+        if (startDate) {
+            queryStr += ` AND t.created_at >= $${paramCount}`;
+            params.push(startDate);
+            paramCount++;
+        }
+        if (endDate) {
+            queryStr += ` AND t.created_at <= $${paramCount}`;
+            params.push(endDate);
+            paramCount++;
+        }
+        if (status) {
+            queryStr += ` AND t.status = $${paramCount}`;
+            params.push(status);
+            paramCount++;
+        }
+
+        queryStr += ` ORDER BY t.created_at DESC`;
+        const result = await query(queryStr, params);
+
+        sendCSV(res, result.rows, `transactions_admin_${Date.now()}.csv`);
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Failed to export transactions" });
+    }
+});
+
+// Export Business Users (Admin)
+/**
+ * @swagger
+ * /admin/reports/businesses/export:
+ *   get:
+ *     summary: Export businesses to CSV
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date (YYYY-MM-DD)
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *         description: Subscription status
+ */
+router.get("/reports/businesses/export", authenticateAdmin, async (req, res) => {
+    try {
+        const { startDate, endDate, status } = req.query;
+        let queryStr = `
+            SELECT b.*, p.name as plan_name
+            FROM businesses b
+            LEFT JOIN pricing_plans p ON b.plan_id = p.id
+            WHERE 1=1
+        `;
+        const params: any[] = [];
+        let paramCount = 1;
+
+        if (startDate) {
+            queryStr += ` AND b.created_at >= $${paramCount}`;
+            params.push(startDate);
+            paramCount++;
+        }
+        if (endDate) {
+            queryStr += ` AND b.created_at <= $${paramCount}`;
+            params.push(endDate);
+            paramCount++;
+        }
+        if (status) {
+            queryStr += ` AND b.subscription_status = $${paramCount}`;
+            params.push(status);
+            paramCount++;
+        }
+
+        queryStr += ` ORDER BY b.created_at DESC`;
+        const result = await query(queryStr, params);
+
+        sendCSV(res, result.rows, `businesses_admin_${Date.now()}.csv`);
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Failed to export businesses" });
+    }
+});
+
+// Migration: Recreate Business IDs
+/**
+ * @swagger
+ * /admin/migrate-business-ids:
+ *   post:
+ *     summary: Recreate all business IDs to updated format
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/migrate-business-ids", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        // 1. Fetch all businesses
+        const businesses = await query(`SELECT id, name FROM businesses`);
+        
+        // 2. Prepare tables for Cascade Update
+        const tables = ['users', 'tasks', 'transactions', 'epics', 'activity_logs', 'ideas', 'payment_cards'];
+        
+        for (const table of tables) {
+            // Drop existing FK and Add with ON UPDATE CASCADE
+            try {
+                // Drop by standard name guess
+                await query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${table}_business_id_fkey`);
+                // Re-add
+                await query(`ALTER TABLE ${table} ADD CONSTRAINT ${table}_business_id_fkey FOREIGN KEY (business_id) REFERENCES businesses(id) ON DELETE CASCADE ON UPDATE CASCADE`);
+            } catch (err) {
+                console.log(`Failed to update constraint for ${table}:`, err);
+            }
+        }
+
+        let updatedCount = 0;
+        const errors = [];
+
+        // 3. Update IDs
+        for (const business of businesses.rows) {
+            const oldId = business.id;
+            const newId = generateBusinessId(business.name);
+            
+            if (oldId !== newId) {
+                try {
+                    // Check if newId exists
+                    const check = await query(`SELECT id FROM businesses WHERE id = $1`, [newId]);
+                    if (check.rows.length > 0) {
+                        console.log(`ID collision for ${business.name}: ${newId}`);
+                        continue;
+                    }
+
+                    await query(`UPDATE businesses SET id = $1 WHERE id = $2`, [newId, oldId]);
+                    updatedCount++;
+                } catch (err: any) {
+                    errors.push({ id: oldId, name: business.name, error: err.message });
+                }
+            }
+        }
+
+        res.json({ success: true, message: `Updated ${updatedCount} businesses`, errors });
+    } catch (error) {
+        console.error("Migration error:", error);
+        res.status(500).json({ success: false, error: "Failed to migrate business IDs" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/subscription/manual-upgrade:
+ *   post:
+ *     summary: Manually upgrade a business plan (No expiry)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - businessId
+ *               - planId
+ *             properties:
+ *               businessId:
+ *                 type: string
+ *               planId:
+ *                 type: string
+ */
+router.post("/subscription/manual-upgrade", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+    try {
+        const { businessId, planId } = req.body;
+
+        if (!businessId || !planId) {
+            return res.status(400).json({ success: false, error: "Business ID and Plan ID are required" });
+        }
+
+        // Verify plan exists
+        const planCheck = await query(`SELECT id, name FROM pricing_plans WHERE id = $1`, [planId]);
+        if (planCheck.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Plan not found" });
+        }
+
+        // Update business
+        // Set next_billing_date to NULL (Never expires)
+        // Set is_manual_subscription to TRUE
+        await query(
+            `UPDATE businesses 
+             SET plan_id = $1, 
+                 subscription_status = 'active', 
+                 next_billing_date = NULL, 
+                 is_manual_subscription = TRUE,
+                 updated_at = NOW() 
+             WHERE id = $2`,
+            [planId, businessId]
+        );
+
+        res.json({ success: true, message: `Business upgraded to ${planCheck.rows[0].name} (Manual)` });
+    } catch (error) {
+        console.error("Manual upgrade error:", error);
+        res.status(500).json({ success: false, error: "Failed to upgrade business" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/subscription/manual-upgrade/revoke:
+ *   post:
+ *     summary: Revoke manual upgrade and revert to Free/Inactive
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - businessId
+ *             properties:
+ *               businessId:
+ *                 type: string
+ */
+router.post("/subscription/manual-upgrade/revoke", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+    try {
+        const { businessId } = req.body;
+
+        if (!businessId) {
+            return res.status(400).json({ success: false, error: "Business ID is required" });
+        }
+
+        // Find Free Plan
+        const freePlan = await query(`SELECT id FROM pricing_plans WHERE price = 0 LIMIT 1`);
+        let targetPlanId = null;
+        let status = 'inactive';
+
+        if (freePlan.rows.length > 0) {
+            targetPlanId = freePlan.rows[0].id;
+            status = 'active';
+        }
+
+        // Revert business
+        await query(
+            `UPDATE businesses 
+             SET plan_id = $1, 
+                 subscription_status = $2, 
+                 next_billing_date = NOW(), 
+                 is_manual_subscription = FALSE,
+                 updated_at = NOW() 
+             WHERE id = $3`,
+            [targetPlanId, status, businessId]
+        );
+
+        res.json({ success: true, message: "Manual upgrade revoked" });
+    } catch (error) {
+        console.error("Revoke upgrade error:", error);
+        res.status(500).json({ success: false, error: "Failed to revoke upgrade" });
+    }
 });
 
 export default router;

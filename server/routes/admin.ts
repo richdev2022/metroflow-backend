@@ -3,7 +3,7 @@ import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission } from "../middleware/adminAuth";
 import { query } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
-import { sendEmail } from "../services/email";
+import { sendEmail, generateAdminInviteEmailHtml } from "../services/email";
 
 import * as XLSX from "xlsx";
 import { generateBusinessId } from "../utils/idGenerator";
@@ -1042,11 +1042,15 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
     );
 
     // Send email
+    const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:5173';
+    const loginLink = `${baseUrl}/admin/login`;
+    const emailHtml = generateAdminInviteEmailHtml(name, email, tempPassword, loginLink);
+
     const emailSent = await sendEmail(
       email,
       name,
       "Admin Access Invitation",
-      `You have been invited as an admin. Your temporary password is: ${tempPassword}\nPlease login and change it immediately.`
+      emailHtml
     );
 
     if (!emailSent) {

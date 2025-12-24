@@ -64,6 +64,74 @@ export function generateInviteEmailHtml(
   `;
 }
 
+export function generateAdminInviteEmailHtml(
+  adminName: string,
+  adminEmail: string,
+  tempPassword: string,
+  loginLink: string
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Admin Access Invitation</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${adminName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            You have been invited to join the <strong>MetroFlow</strong> platform as an Administrator.
+          </p>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <p style="color: #6b7280; font-size: 14px; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;">Your Login Credentials</p>
+            
+            <div style="margin-bottom: 16px;">
+              <span style="color: #4b5563; font-size: 14px;">Email:</span><br/>
+              <strong style="color: #111827; font-size: 16px;">${adminEmail}</strong>
+            </div>
+            
+            <div>
+              <span style="color: #4b5563; font-size: 14px;">Temporary Password:</span><br/>
+              <code style="background-color: #e0e7ff; color: #4338ca; padding: 4px 8px; border-radius: 4px; font-family: monospace; font-size: 18px; font-weight: 600; letter-spacing: 1px;">${tempPassword}</code>
+            </div>
+          </div>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            Please click the button below to log in. You will be required to change your password upon your first login.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${loginLink}"
+               style="background-color: #2563eb; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">
+              Login to Admin Dashboard
+            </a>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 32px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            If the button above doesn't work, copy and paste this link into your browser:<br/>
+            <a href="${loginLink}" style="color: #2563eb; text-decoration: none; word-break: break-all;">${loginLink}</a>
+          </p>
+          
+          <div style="text-align: center; margin-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 export function generateBusinessRegistrationEmailHtml(
   userName: string,
   businessName: string,

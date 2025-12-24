@@ -169,6 +169,14 @@ export async function createServer() {
   });
 
   // Example API routes
+  app.get("/", (_req, res) => {
+    res.json({ 
+      message: "MetroFlow Backend API is running", 
+      docs: "/api-docs",
+      status: "active" 
+    });
+  });
+
   app.get("/api/ping", (_req, res) => {
     const ping = process.env.PING_MESSAGE ?? "ping";
     res.json({ message: ping });

@@ -1,17 +1,14 @@
-import serverless from 'serverless-http';
-import { createServer } from '../../server/index';
+import serverless from "serverless-http";
+import { createServer } from "../../server/index";
 
-let app: any;
+// We need to initialize the app outside of the handler to reuse it
+// if possible, but createServer is async.
+let api;
 
-export const handler = async (event: any, context: any) => {
-  if (!app) {
-    app = await createServer();
+export const handler = async (event, context) => {
+  if (!api) {
+    const app = await createServer();
+    api = serverless(app);
   }
-  const serverlessHandler = serverless(app, {
-    request: (req: any, event: any, context: any) => {
-      req.netlifyEvent = event;
-      req.netlifyContext = context;
-    }
-  });
-  return serverlessHandler(event, context);
+  return api(event, context);
 };

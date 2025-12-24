@@ -1053,7 +1053,7 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
       baseUrl = 'http://localhost:5173';
     }
 
-    const loginLink = `${baseUrl}/admin/login`;
+    const loginLink = baseUrl.includes('/login') ? baseUrl : `${baseUrl}/login`;
     const emailHtml = generateAdminInviteEmailHtml(name, email, tempPassword, loginLink);
 
     const emailSent = await sendEmail(

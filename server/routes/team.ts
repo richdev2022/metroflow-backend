@@ -305,15 +305,24 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
     const member = result.rows[0];
 
     // Send invitation email
-    const inviteLink = `http://${req.get('host')}/accept-invite/${inviteToken}`;
+    const baseUrl = process.env.APP_BASE_URL || `http://${req.get('host')}`;
+    const inviteLink = `${baseUrl}/accept-invite/${inviteToken}`;
     const emailHtml = generateInviteEmailHtml(input.name, inviteLink);
 
-    await sendEmail(
+    const emailSent = await sendEmail(
       input.email,
       input.name,
       "You're Invited to MetricFlow",
       emailHtml,
     );
+
+    if (!emailSent) {
+      console.error("Failed to send invite email to", input.email);
+      return res.status(500).json({
+        success: false,
+        error: "User created but failed to send invitation email. Please try again.",
+      });
+    }
 
     // Log team member invitation activity
     await logActivity({

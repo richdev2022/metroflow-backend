@@ -331,7 +331,8 @@ export const verifyOTP: RequestHandler = async (req, res) => {
     const business = businessResult.rows[0];
 
     // Send welcome email
-    const loginLink = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/login` : 'http://localhost:8080/login';
+    const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+    const loginLink = baseUrl ? `${baseUrl}/login` : 'http://localhost:8080/login';
     const welcomeEmailHtml = generateBusinessRegistrationEmailHtml(
       user.name,
       business.name,

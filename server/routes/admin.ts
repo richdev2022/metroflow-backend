@@ -1042,11 +1042,17 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
     );
 
     // Send email
-    await sendEmail(
+    const emailSent = await sendEmail(
       email,
+      name,
       "Admin Access Invitation",
       `You have been invited as an admin. Your temporary password is: ${tempPassword}\nPlease login and change it immediately.`
     );
+
+    if (!emailSent) {
+      console.error("Failed to send admin invite email to", email);
+      return res.status(500).json({ success: false, error: "Admin created but failed to send invitation email" });
+    }
 
     res.json({ success: true });
   } catch (error) {

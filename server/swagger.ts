@@ -1,4 +1,6 @@
 import swaggerJsdoc from "swagger-jsdoc";
+// @ts-ignore
+import swaggerDocument from "./swagger-output.json";
 
 const options: swaggerJsdoc.Options = {
   definition: {
@@ -71,7 +73,28 @@ const options: swaggerJsdoc.Options = {
       },
     ],
   },
-  apis: ["./server/routes/*.ts", "./server/index.ts"],
+  // In production/bundled env, we don't scan files. We use the imported JSON.
+  apis: process.env.NODE_ENV === 'production' ? [] : ["./server/routes/*.ts", "./server/index.ts"],
 };
 
-export const specs = swaggerJsdoc(options);
+let specs: object = swaggerJsdoc(options);
+
+// Merge with pre-generated docs if available (crucial for production)
+if (swaggerDocument) {
+  specs = {
+    ...specs,
+    paths: {
+      ...(specs as any).paths,
+      ...swaggerDocument.paths
+    },
+    components: {
+      ...(specs as any).components,
+      schemas: {
+        ...(specs as any).components?.schemas,
+        ...swaggerDocument.components?.schemas
+      }
+    }
+  };
+}
+
+export { specs };

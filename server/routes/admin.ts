@@ -947,11 +947,40 @@ router.delete("/roles/:id", authenticateAdmin, requirePermission('manage_roles')
  *     responses:
  *       200:
  *         description: List of admin users
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 admins:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       name:
+ *                         type: string
+ *                       email:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                       role_name:
+ *                         type: string
+ *                       role_id:
+ *                         type: string
+ *                         format: uuid
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
  */
 router.get("/users", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
   try {
     const result = await query(`
-      SELECT a.id, a.name, a.email, a.created_at, r.name as role_name, r.id as role_id
+      SELECT a.id, a.name, a.email, a.status, a.created_at, r.name as role_name, r.id as role_id
       FROM platform_admins a
       LEFT JOIN admin_roles r ON a.role_id = r.id
       ORDER BY a.created_at DESC
@@ -1008,7 +1037,7 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
     const hashed = hashPassword(tempPassword);
 
     await query(
-      `INSERT INTO platform_admins (name, email, password_hash, role_id) VALUES ($1, $2, $3, $4)`,
+      `INSERT INTO platform_admins (name, email, password_hash, role_id, status) VALUES ($1, $2, $3, $4, 'pending_invite')`,
       [name, email, hashed, roleId]
     );
 
@@ -1076,6 +1105,60 @@ router.put("/users/:id", authenticateAdmin, requirePermission('manage_admins'), 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to update admin" });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/users/{id}/status:
+ *   put:
+ *     summary: Update an admin user's status
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [active, inactive, pending_invite]
+ *     responses:
+ *       200:
+ *         description: Admin status updated
+ */
+router.put("/users/:id/status", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    // Validate status
+    if (!['active', 'inactive', 'pending_invite'].includes(status)) {
+        return res.status(400).json({ success: false, error: "Invalid status" });
+    }
+
+    // Protect root super admin
+    const targetUser = await query(`SELECT email FROM platform_admins WHERE id = $1`, [id]);
+    if (targetUser.rows.length > 0 && targetUser.rows[0].email === 'admin@quantigrate.com') {
+        return res.status(403).json({ success: false, error: "Cannot modify root Super Admin status" });
+    }
+
+    await query(`UPDATE platform_admins SET status = $1 WHERE id = $2`, [status, id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Failed to update admin status" });
   }
 });
 

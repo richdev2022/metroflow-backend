@@ -38,6 +38,11 @@ export async function loginAdmin(email: string, password: string) {
   }
 
   const admin = result.rows[0];
+
+  if (admin.status === 'inactive') {
+    throw new Error("Account is inactive");
+  }
+
   const isValid = verifyPassword(password, admin.password_hash);
 
   if (!isValid) {

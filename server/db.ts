@@ -3,7 +3,7 @@ import { hashPassword } from "./services/auth";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
+  ssl: process.env.DISABLE_SSL === 'true' ? false : {
     rejectUnauthorized: false,
   },
 });
@@ -30,10 +30,14 @@ export async function initializeDatabase() {
         email VARCHAR(255) NOT NULL UNIQUE,
         password_hash VARCHAR(255) NOT NULL,
         name VARCHAR(255) NOT NULL,
+        status VARCHAR(50) DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Add status column if not exists (migration)
+    await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'`);
 
     // Create pricing_plans table
     await query(`

@@ -1,13 +1,14 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import { fileURLToPath } from 'url';
+// import { fileURLToPath } from 'url';
 import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import { specs } from "./swagger";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// const __filename = fileURLToPath(import.meta.url);
+// const __dirname = path.dirname(__filename);
+
 
 import { handleDemo } from "./routes/demo";
 import {
@@ -126,7 +127,9 @@ export async function createServer() {
   app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
 
   // Serve static files
-  app.use(express.static(path.join(__dirname, "../public")));
+  // app.use(express.static(path.join(__dirname, "../public")));
+  app.use(express.static(path.join(process.cwd(), "public")));
+
 
   // Fix for potential body parsing issues in serverless environment
   app.use((req, res, next) => {

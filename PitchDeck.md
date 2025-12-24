@@ -12,13 +12,16 @@ Modern teams face significant challenges in coordination and productivity:
 
 ## 3. The Solution
 Metroflow provides an all-in-one solution that integrates:
+*   **API-First Architecture:** A robust, scalable API backend ensuring flexibility and third-party integrations.
+*   **Launch-Ready Frontends:** Fully integrated web and mobile applications ready for immediate deployment.
 *   **Smart Task Management:** Intuitive creation, assignment, and tracking of tasks and epics.
 *   **Team Gamification:** A unique "Team Ranking" system that motivates members by visualizing contributions and performance.
 *   **Idea Management:** A dedicated pipeline to capture, discuss, and promote ideas into projects.
 *   **Seamless Collaboration:** Built-in commenting, reactions, and activity logs to keep everyone aligned.
 
 ## 4. Key Features
-*   **Task & Epic Management:** Organize work into manageable tasks and group them into larger strategic Epics. Support for bulk operations for efficiency.
+*   **Complete System:** Production-ready API with fully integrated, user-friendly frontends (Web & Mobile).
+*   **Task & Epic Management:** Organize work into manageable tasks and group into larger strategic Epics.
 *   **Team Performance Tracking:** Real-time leaderboards and ranking based on task completion and engagement.
 *   **Idea Hub:** A space to propose new concepts, gather feedback via reactions, and track their status.
 *   **Role-Based Access Control:** Secure management of team members, roles, and permissions.
@@ -41,6 +44,7 @@ The global project management software market is projected to reach substantial 
 | **Pricing** | Affordable | Expensive | Freemium | Expensive |
 
 **Why We Win:**
+*   **Launch Readiness:** Unlike concept-stage competitors, Metroflow is a fully integrated, live-ready system (API + Web Frontend).
 *   **Engagement First:** Our gamification features keep teams motivated.
 *   **Innovation Focus:** We treat "Ideas" as first-class citizens, not just tasks.
 *   **Simplicity:** Powerful features without the steep learning curve.
@@ -48,8 +52,8 @@ The global project management software market is projected to reach substantial 
 ## 7. Revenue Model
 Metroflow operates on a SaaS (Software as a Service) model with tiered pricing plans:
 *   **Free Trial:** 7-day full access to test the waters.
-*   **Starter Plan ($29/mo):** Perfect for small teams (up to 20 members). Includes advanced analytics and email support.
-*   **Pro Plan ($99/mo):** For growing businesses. Unlimited team members, all features, and priority support.
+*   **Starter Plan ($20/mo):** Perfect for small teams (up to 20 members). Includes advanced analytics and email support.
+*   **Pro Plan ($60/mo):** For growing businesses. Unlimited team members, all features, and priority support.
 
 *Pricing is optimized for global competitiveness while offering localized payment options (e.g., NGN support).*
 

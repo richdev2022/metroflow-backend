@@ -1042,7 +1042,17 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
     );
 
     // Send email
-    const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:5173';
+    let baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+
+    // If no env var, try to infer from request origin (useful for dev/ngrok)
+    if (!baseUrl && req.get('origin')) {
+      baseUrl = req.get('origin');
+    }
+
+    if (!baseUrl) {
+      baseUrl = 'http://localhost:5173';
+    }
+
     const loginLink = `${baseUrl}/admin/login`;
     const emailHtml = generateAdminInviteEmailHtml(name, email, tempPassword, loginLink);
 

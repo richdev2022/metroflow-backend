@@ -163,3 +163,46 @@ export const checkSubscriptionStatus = async (
     next();
   }
 };
+
+export const checkFeaturePermission = (requiredPermission: string) => {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const businessId = req.user?.businessId;
+      if (!businessId) {
+         // If no business context (maybe individual user or admin?), decide policy.
+         // Assuming this middleware is used for business-scoped features.
+         return res.status(401).json({ success: false, error: "Unauthorized" });
+      }
+
+      // Get plan permissions
+      const result = await query(
+        `SELECT p.permissions 
+         FROM businesses b
+         JOIN pricing_plans p ON b.plan_id = p.id
+         WHERE b.id = $1`,
+        [businessId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Business plan not found" });
+      }
+
+      const permissions = result.rows[0].permissions || [];
+      
+      // Check if permissions includes the required one
+      // The permissions column is JSONB, pg driver parses it to array if it's a JSON array
+      if (Array.isArray(permissions) && permissions.includes(requiredPermission)) {
+        return next();
+      }
+
+      return res.status(403).json({ 
+        success: false, 
+        error: "Kindly upgrade your plan to enjoy this feature." 
+      });
+
+    } catch (error) {
+      console.error("Check feature permission error:", error);
+      res.status(500).json({ success: false, error: "Failed to verify feature access" });
+    }
+  };
+};

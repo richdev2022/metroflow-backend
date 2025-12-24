@@ -1,9 +1,10 @@
 import express from "express";
 import { loginAdmin } from "../services/admin-auth";
-import { authenticateAdmin, requirePermission } from "../middleware/adminAuth";
+import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
 import { sendEmail, generateAdminInviteEmailHtml } from "../services/email";
+import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 
 import * as XLSX from "xlsx";
 import { generateBusinessId } from "../utils/idGenerator";
@@ -550,6 +551,23 @@ router.put("/businesses/:id/status", authenticateAdmin, requirePermission('manag
   }
 });
 
+// Plan Features (Permissions)
+/**
+ * @swagger
+ * /admin/features:
+ *   get:
+ *     summary: Get all available plan features/permissions
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of available features
+ */
+router.get("/features", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+  res.json({ success: true, features: AVAILABLE_PERMISSIONS });
+});
+
 // Pricing Plans
 /**
  * @swagger
@@ -602,6 +620,10 @@ router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), asy
  *                 type: array
  *                 items:
  *                   type: string
+ *               permissions:
+ *                 type: array
+ *                 items:
+ *                   type: string
  *               max_team_members:
  *                 type: integer
  *               trial_days:
@@ -612,10 +634,10 @@ router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), asy
  */
 router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
   try {
-    const { name, description, price, currency, features, max_team_members, trial_days } = req.body;
+    const { name, description, price, currency, features, permissions, max_team_members, trial_days } = req.body;
     await query(
-      `INSERT INTO pricing_plans (name, description, price, currency, features, max_team_members, trial_days) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [name, description, price, currency || 'USD', JSON.stringify(features), max_team_members || 5, trial_days || 0]
+      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [name, description, price, currency || 'USD', JSON.stringify(features), JSON.stringify(permissions || []), max_team_members || 5, trial_days || 0]
     );
     res.json({ success: true });
   } catch (error) {
@@ -657,6 +679,10 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
  *                 type: array
  *                 items:
  *                   type: string
+ *               permissions:
+ *                 type: array
+ *                 items:
+ *                   type: string
  *               max_team_members:
  *                 type: integer
  *               trial_days:
@@ -672,13 +698,13 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
 router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, price, is_active, features, max_team_members, trial_days } = req.body;
+    const { name, description, price, is_active, features, permissions, max_team_members, trial_days } = req.body;
     
     // Build dynamic update query
     // For simplicity, updating all fields
     await query(
-      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, max_team_members=$6, trial_days=$7, updated_at=CURRENT_TIMESTAMP WHERE id=$8`,
-      [name, description, price, is_active, JSON.stringify(features), max_team_members, trial_days, id]
+      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, updated_at=CURRENT_TIMESTAMP WHERE id=$9`,
+      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, id]
     );
     res.json({ success: true });
   } catch (error) {
@@ -1204,6 +1230,7 @@ router.put("/users/:id/status", authenticateAdmin, requirePermission('manage_adm
 router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
   try {
     const { id } = req.params;
+    const adminReq = req as AuthenticatedAdminRequest;
     
     // Protect root super admin
     const targetUser = await query(`SELECT email FROM platform_admins WHERE id = $1`, [id]);
@@ -1212,7 +1239,7 @@ router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'
     }
 
     // Prevent deleting self
-    if (req.admin?.adminId === id) {
+    if (adminReq.admin?.adminId === id) {
         return res.status(400).json({ success: false, error: "Cannot delete yourself" });
     }
 

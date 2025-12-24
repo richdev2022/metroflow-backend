@@ -55,7 +55,7 @@ import subscriptionRouter from "./routes/subscription";
 import webhookRouter from "./routes/webhook";
 import dashboardRouter from "./routes/dashboard";
 import { initializeDatabase, query } from "./db";
-import { authenticateToken, checkTeamLimit, checkSubscriptionStatus } from "./middleware/auth";
+import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
 import * as cron from "node-cron";
 
@@ -205,29 +205,30 @@ export async function createServer() {
 
   // Tasks API routes
   app.get("/api/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
-  app.post("/api/tasks", authenticateToken, checkSubscriptionStatus, createTask);
-  app.post("/api/tasks/bulk", authenticateToken, checkSubscriptionStatus, bulkCreateTasks);
-  app.put("/api/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, bulkUpdateTasks);
-  app.put("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, updateTask);
-  app.delete("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, deleteTask);
-  app.delete("/api/tasks", authenticateToken, checkSubscriptionStatus, bulkDeleteTasks);
+  app.post("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
+  app.post("/api/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
+  app.put("/api/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkUpdateTasks);
+  app.put("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), updateTask);
+  app.delete("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
+  app.delete("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
 
   // Team API routes
-  app.get("/api/team/ranking", authenticateToken, checkSubscriptionStatus, getTeamRanking);
-  app.get("/api/team/ranking/top", authenticateToken, checkSubscriptionStatus, getTopTeamRanking);
+  app.get("/api/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
+  app.get("/api/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
   app.get("/api/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
   app.get("/api/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
-  app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkTeamLimit, inviteTeamMember);
+  app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
   app.get("/api/team/verify-invite-token/:token", verifyInviteToken);
   app.post("/api/team/accept-invite/:token", acceptInvite);
   app.put(
     "/api/team/:id/status",
     authenticateToken,
     checkSubscriptionStatus,
+    checkFeaturePermission('manage_team'),
     updateTeamMemberStatus,
   );
-  app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, updateTeamMemberRole);
-  app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, deleteTeamMember);
+  app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
+  app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
 
   // Comments API routes
   app.get("/api/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
@@ -238,9 +239,9 @@ export async function createServer() {
 
   // Epics API routes
   app.get("/api/epics", authenticateToken, checkSubscriptionStatus, getEpics);
-  app.post("/api/epics", authenticateToken, checkSubscriptionStatus, createEpic);
-  app.post("/api/epics/backfill", authenticateToken, checkSubscriptionStatus, backfillEpics);
-  app.post("/api/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, linkTasksToEpic);
+  app.post("/api/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), createEpic);
+  app.post("/api/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), backfillEpics);
+  app.post("/api/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), linkTasksToEpic);
 
   // Task assignments API routes
   app.post("/api/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
@@ -248,12 +249,12 @@ export async function createServer() {
   app.delete("/api/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
 
   // Activity logs API routes
-  app.get("/api/activity-logs", authenticateToken, checkSubscriptionStatus, getActivityLogs);
+  app.get("/api/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), getActivityLogs);
 
   // Ideas API routes
-  app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, getIdeas);
-  app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, createIdea);
-  app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, updateIdeaStatus);
+  app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
+  app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
+  app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
 
   // Admin API routes
   app.use("/api/admin", adminRouter);

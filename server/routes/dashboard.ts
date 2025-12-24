@@ -1,5 +1,5 @@
 import express from "express";
-import { authenticateToken, AuthenticatedRequest, checkSubscriptionStatus } from "../middleware/auth";
+import { authenticateToken, AuthenticatedRequest, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
 import { query } from "../db";
 
 const router = express.Router();
@@ -42,7 +42,7 @@ const router = express.Router();
  *       500:
  *         description: Server error
  */
-router.get("/metrics", authenticateToken, checkSubscriptionStatus, async (req, res) => {
+router.get("/metrics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_dashboard'), async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const businessId = authReq.user?.businessId;

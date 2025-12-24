@@ -1,5 +1,5 @@
 import express from "express";
-import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateToken, AuthenticatedRequest, checkFeaturePermission } from "../middleware/auth";
 import { query } from "../db";
 import { initiatePayment, verifyPayment, cancelRecurring } from "../services/squad";
 import { processSubscriptionRenewals } from "../services/subscription";
@@ -74,7 +74,7 @@ const parsePan = (pan: string) => {
  *       500:
  *         description: Server error
  */
-router.get("/transactions/export", authenticateToken, async (req, res) => {
+router.get("/transactions/export", authenticateToken, checkFeaturePermission('export_data'), async (req, res) => {
     try {
         const authReq = req as AuthenticatedRequest;
         const businessId = authReq.user?.businessId;

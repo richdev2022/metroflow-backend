@@ -49,6 +49,12 @@ export async function loginAdmin(email: string, password: string) {
     throw new Error("Invalid credentials");
   }
 
+  // Auto-activate if pending invite
+  if (admin.status === 'pending_invite') {
+    await query(`UPDATE platform_admins SET status = 'active' WHERE id = $1`, [admin.id]);
+    admin.status = 'active';
+  }
+
   const token = generateAdminToken(admin.id);
 
   return {

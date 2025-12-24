@@ -106,7 +106,7 @@ export function generateAdminInviteEmailHtml(
           </div>
 
           <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
-            Please click the button below to log in. You will be required to change your password upon your first login.
+            Please click the button below to log in. You can decide to reset your password.
           </p>
 
           <div style="text-align: center; margin-bottom: 32px;">

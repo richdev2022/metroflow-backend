@@ -85,6 +85,7 @@ Creates a new pricing plan with specific feature permissions enabled.
   "description": "For growing teams",
   "price": 29.99,
   "currency": "USD",
+  "duration": "monthly",
   "max_team_members": 10,
   "trial_days": 14,
   "features": [
@@ -99,7 +100,7 @@ Creates a new pricing plan with specific feature permissions enabled.
   ]
 }
 ```
-*Note: `features` is for display purposes (marketing text), while `permissions` controls actual system access.*
+*Note: `features` is for display purposes (marketing text), while `permissions` controls actual system access. `duration` can be `monthly` or `yearly` (defaults to `monthly`).*
 
 #### Response (Success 200)
 ```json
@@ -120,6 +121,7 @@ Updates an existing pricing plan.
 {
   "name": "Pro Plan Updated",
   "price": 35.00,
+  "duration": "yearly",
   "permissions": [
     "view_dashboard",
     "manage_tasks",

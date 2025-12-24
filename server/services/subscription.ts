@@ -9,7 +9,7 @@ export const processSubscriptionRenewals = async () => {
     // Find subscriptions due for renewal
     // We check for active or past_due statuses that are due
     const dueSubscriptions = await query(`
-        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, p.name as plan_name, p.price, p.currency
+        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, p.name as plan_name, p.price, p.currency, p.duration
         FROM businesses b
         JOIN pricing_plans p ON b.plan_id = p.id
         WHERE b.subscription_status IN ('active', 'past_due') 
@@ -41,7 +41,11 @@ export const processSubscriptionRenewals = async () => {
                 
                 // If price is 0, we can just update the date without charging.
                  const nextDate = new Date();
-                 nextDate.setMonth(nextDate.getMonth() + 1);
+                 if (sub.duration === 'yearly') {
+                    nextDate.setFullYear(nextDate.getFullYear() + 1);
+                 } else {
+                    nextDate.setMonth(nextDate.getMonth() + 1);
+                 }
                  await query(`
                     UPDATE businesses 
                     SET next_billing_date = $1, subscription_status = 'active', updated_at = CURRENT_TIMESTAMP 
@@ -94,7 +98,11 @@ export const processSubscriptionRenewals = async () => {
             if (chargeRes && chargeRes.success) {
                 // Update next billing date (1 month from now)
                 const nextDate = new Date();
-                nextDate.setMonth(nextDate.getMonth() + 1);
+                if (sub.duration === 'yearly') {
+                    nextDate.setFullYear(nextDate.getFullYear() + 1);
+                } else {
+                    nextDate.setMonth(nextDate.getMonth() + 1);
+                }
                 
                 await query(`
                     UPDATE businesses 

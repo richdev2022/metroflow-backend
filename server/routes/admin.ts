@@ -628,16 +628,19 @@ router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), asy
  *                 type: integer
  *               trial_days:
  *                 type: integer
+ *               duration:
+ *                 type: string
+ *                 enum: [monthly, yearly]
  *     responses:
  *       200:
  *         description: Plan created
  */
 router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
   try {
-    const { name, description, price, currency, features, permissions, max_team_members, trial_days } = req.body;
+    const { name, description, price, currency, features, permissions, max_team_members, trial_days, duration } = req.body;
     await query(
-      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [name, description, price, currency || 'USD', JSON.stringify(features), JSON.stringify(permissions || []), max_team_members || 5, trial_days || 0]
+      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days, duration) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [name, description, price, currency || 'USD', JSON.stringify(features), JSON.stringify(permissions || []), max_team_members || 5, trial_days || 0, duration || 'monthly']
     );
     res.json({ success: true });
   } catch (error) {
@@ -687,6 +690,9 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
  *                 type: integer
  *               trial_days:
  *                 type: integer
+ *               duration:
+ *                 type: string
+ *                 enum: [monthly, yearly]
  *     responses:
  *       200:
  *         description: Plan updated
@@ -698,13 +704,13 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
 router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, price, is_active, features, permissions, max_team_members, trial_days } = req.body;
+    const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration } = req.body;
     
     // Build dynamic update query
     // For simplicity, updating all fields
     await query(
-      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, updated_at=CURRENT_TIMESTAMP WHERE id=$9`,
-      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, id]
+      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, duration=$9, updated_at=CURRENT_TIMESTAMP WHERE id=$10`,
+      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, duration || 'monthly', id]
     );
     res.json({ success: true });
   } catch (error) {

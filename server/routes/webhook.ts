@@ -110,8 +110,16 @@ router.post("/", async (req, res) => {
                 
                 // If this was a subscription payment (not just card validation), update subscription
                 if (transaction.transaction_type === 'subscription') {
+                     // Fetch Plan Duration
+                     const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+                     const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
+
                      const nextBillingDate = new Date();
-                     nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                     if (planDuration === 'yearly') {
+                         nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+                     } else {
+                         nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                     }
                      
                      await query(
                       `UPDATE businesses 

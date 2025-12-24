@@ -290,6 +290,8 @@ router.get("/plans", async (req, res) => {
  *                         type: number
  *                       currency:
  *                         type: string
+ *                       duration:
+ *                         type: string
  *                       features:
  *                         type: array
  *                         items:
@@ -736,9 +738,17 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
         // Log the full response for debugging
         console.log("Verify Payment Response:", JSON.stringify(verifyResponse, null, 2));
 
-        // Calculate next billing date (1 month from now)
+        // Fetch Plan Duration
+        const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+        const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
+
+        // Calculate next billing date
         const nextBillingDate = new Date();
-        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+        if (planDuration === 'yearly') {
+            nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+        } else {
+            nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+        }
 
         // Update Business Subscription
         // Store token if available

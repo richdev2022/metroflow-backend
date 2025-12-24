@@ -51,6 +51,7 @@ export async function initializeDatabase() {
         max_team_members INTEGER DEFAULT 5,
         trial_days INTEGER DEFAULT 7,
         is_active BOOLEAN DEFAULT TRUE,
+        duration VARCHAR(20) DEFAULT 'monthly',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
@@ -60,6 +61,7 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_team_members INTEGER DEFAULT 5`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_days INTEGER DEFAULT 7`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS duration VARCHAR(20) DEFAULT 'monthly'`);
 
     // Add plan_id and subscription_status to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS plan_id UUID REFERENCES pricing_plans(id)`);

@@ -134,7 +134,7 @@ export async function createServer() {
     preflightContinue: false,
     optionsSuccessStatus: 204
   }));
-  app.options('*', cors()); // Enable pre-flight across-the-board
+  // app.options('*', cors()); // Enable pre-flight across-the-board
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 

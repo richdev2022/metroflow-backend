@@ -1,0 +1,161 @@
+server/index.ts:  app.use(cors({
+server/index.ts:  app.use(express.json());
+server/index.ts:  app.use(express.urlencoded({ extended: true }));
+server/index.ts:  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, {
+server/index.ts:  // app.use(express.static(path.join(__dirname, "../public")));
+server/index.ts:  app.use(express.static(path.join(process.cwd(), "public")));
+server/index.ts:  app.use("/uploads", express.static(uploadDir));
+server/index.ts:  app.use((req, res, next) => {
+server/index.ts:  app.get("/", (_req, res) => {
+server/index.ts:  app.get("/api/ping", (_req, res) => {
+server/index.ts:  app.get("/api/demo", handleDemo);
+server/index.ts:  app.post("/api/auth/register", registerBusiness);
+server/index.ts:  app.post("/api/auth/verify-otp", verifyOTP);
+server/index.ts:  app.post("/api/auth/login", login);
+server/index.ts:  app.post("/api/auth/resend-otp", resendOTP);
+server/index.ts:  app.post("/api/auth/forgot-password", forgotPassword);
+server/index.ts:  app.post("/api/auth/verify-reset-otp", verifyResetOTP);
+server/index.ts:  app.post("/api/auth/reset-password", resetPassword);
+server/index.ts:  app.get("/api/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
+server/index.ts:  app.post("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
+server/index.ts:  app.post("/api/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
+server/index.ts:  app.put("/api/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkUpdateTasks);
+server/index.ts:  app.put("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), updateTask);
+server/index.ts:  app.delete("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
+server/index.ts:  app.delete("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
+server/index.ts:  app.get("/api/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
+server/index.ts:  app.get("/api/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
+server/index.ts:  app.get("/api/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
+server/index.ts:  app.get("/api/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
+server/index.ts:  app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
+server/index.ts:  app.get("/api/team/verify-invite-token/:token", verifyInviteToken);
+server/index.ts:  app.post("/api/team/accept-invite/:token", acceptInvite);
+server/index.ts:  app.put(
+server/index.ts:  app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
+server/index.ts:  app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
+server/index.ts:  app.get("/api/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
+server/index.ts:  app.get("/api/comments/:taskId", authenticateToken, checkSubscriptionStatus, getComments);
+server/index.ts:  app.post("/api/comments", authenticateToken, checkSubscriptionStatus, createComment);
+server/index.ts:  app.delete("/api/comments/:commentId", authenticateToken, checkSubscriptionStatus, deleteComment);
+server/index.ts:  app.post("/api/comments/:commentId/reaction", authenticateToken, checkSubscriptionStatus, toggleReaction);
+server/index.ts:  app.get("/api/epics", authenticateToken, checkSubscriptionStatus, getEpics);
+server/index.ts:  app.post("/api/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), createEpic);
+server/index.ts:  app.post("/api/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), backfillEpics);
+server/index.ts:  app.post("/api/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), linkTasksToEpic);
+server/index.ts:  app.post("/api/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
+server/index.ts:  app.get("/api/assignments/:taskId", authenticateToken, checkSubscriptionStatus, getAssignments);
+server/index.ts:  app.delete("/api/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
+server/index.ts:  app.get("/api/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), getActivityLogs);
+server/index.ts:  app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
+server/index.ts:  app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
+server/index.ts:  app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
+server/index.ts:  app.use("/api/fees", feesRouter);
+server/index.ts:  app.use("/api/admin/fees", adminFeesRouter);
+server/index.ts:  app.use("/api/admin", adminRouter);
+server/index.ts:  app.use("/api/dashboard", dashboardRouter);
+server/index.ts:  app.use("/api/subscription", subscriptionRouter);
+server/index.ts:  app.use("/api/webhook", webhookRouter);
+server/index.ts:  app.use("/api/transfers", transferRouter);
+server/index.ts:  app.use("/api/payroll", payrollRouter);
+server/index.ts:  app.use("/api/settings", settingsRouter);
+server/index.ts:  app.use("/api/kyc", kycRouter);
+server/index.ts:  app.use("/api/wallet", walletRouter);
+server/index.ts:  app.get("/wallet/verify", (req, res) => {
+server/routes/admin.ts:router.post("/auth/login", async (req, res) => {
+server/routes/admin.ts:router.post("/auth/forgot-password", async (req, res) => {
+server/routes/admin.ts:router.get("/dashboard/stats", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/dashboard/charts", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/wallet", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/revenue", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/wallet/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/revenue/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/kyc", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.post("/kyc/business/:id/approve", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.post("/kyc/business/:id/reject", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.get("/businesses", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.get("/businesses/:id/team", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.get("/transactions", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/transactions/pending-settlement", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.post("/transactions/settle", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.put("/businesses/:id/status", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.get("/features", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.get("/permissions", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+server/routes/admin.ts:router.get("/roles", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+server/routes/admin.ts:router.post("/roles", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+server/routes/admin.ts:router.put("/roles/:id", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+server/routes/admin.ts:router.delete("/roles/:id", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+server/routes/admin.ts:router.get("/users", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+server/routes/admin.ts:router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+server/routes/admin.ts:router.put("/users/:id", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+server/routes/admin.ts:router.put("/users/:id/status", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+server/routes/admin.ts:router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+server/routes/admin.ts:router.get("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+server/routes/admin.ts:router.put("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+server/routes/admin.ts:router.get("/webhooks", authenticateAdmin, async (req, res) => {
+server/routes/admin.ts:router.get("/reports/transactions/export", authenticateAdmin, async (req, res) => {
+server/routes/admin.ts:router.get("/reports/businesses/export", authenticateAdmin, async (req, res) => {
+server/routes/admin.ts:router.post("/migrate-business-ids", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.post("/subscription/manual-upgrade", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.post("/subscription/manual-upgrade/revoke", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+server/routes/admin.ts:router.get("/transfers", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+server/routes/admin.ts:router.get("/kyc/pending", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.put("/kyc/user/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin.ts:router.put("/kyc/business/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+server/routes/admin_fees.ts:router.get("/", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
+server/routes/admin_fees.ts:router.post("/", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
+server/routes/admin_fees.ts:router.put("/:id", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
+server/routes/admin_fees.ts:router.delete("/:id", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
+server/routes/dashboard.ts:router.get("/metrics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_dashboard'), async (req, res) => {
+server/routes/fees.ts:router.get("/", authenticateToken, async (req, res) => {
+server/routes/kyc.ts:router.get("/status", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/kyc.ts:router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/kyc.ts:router.post("/verify-otp", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/kyc.ts:router.post("/business", authenticateToken, upload.single('proof_of_address'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/payroll.ts:router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.put("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.put("/otp-preference", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/settings.ts:router.get("/otp-preference", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/subscription.ts:router.get("/transactions/export", authenticateToken, checkFeaturePermission('export_data'), async (req, res) => {
+server/routes/subscription.ts:router.get("/transactions", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.get("/current", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.get("/cards", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.get("/plans", async (req, res) => {
+server/routes/subscription.ts:router.post("/cards/initiate", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.delete("/cards/:id", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.put("/cards/:id/active", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.post("/initiate-payment", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.post("/verify-payment", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.post("/downgrade", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.post("/cancel", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.post("/cron/process-renewals", async (req, res) => {
+server/routes/subscription.ts:router.get("/transactions", authenticateToken, async (req, res) => {
+server/routes/subscription.ts:router.get("/transactions/export", authenticateToken, async (req, res) => {
+server/routes/transfer.ts:router.post("/account-lookup", authenticateToken, async (req, res) => {
+server/routes/transfer.ts:router.post("/bulk", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/transfer.ts:router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/transfer.ts:router.post("/:id/retry", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.get("/banks", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/transfers.ts:router.post("/lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+server/routes/wallet.ts:router.post("/create-virtual-account", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/wallet.ts:router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/wallet.ts:router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/wallet.ts:router.post("/business/create", authenticateToken, async (req: AuthenticatedRequest, res) => {
+server/routes/wallet.ts:router.get("/verify", async (req, res) => {
+server/routes/webhook.ts:router.post("/", async (req, res) => {

@@ -126,7 +126,15 @@ export async function createServer() {
   });
 
   // Middleware
-  app.use(cors());
+  app.use(cors({
+    origin: true, // Allow all origins by reflecting the request origin
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers', 'Access-Control-Request-Method', 'Access-Control-Request-Headers'],
+    preflightContinue: false,
+    optionsSuccessStatus: 204
+  }));
+  app.options('*', cors()); // Enable pre-flight across-the-board
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 

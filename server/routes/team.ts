@@ -193,7 +193,30 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
  *                 data:
  *                   type: array
  *                   items:
- *                     $ref: '#/components/schemas/User'
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                       name:
+ *                         type: string
+ *                       email:
+ *                         type: string
+ *                       role:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                       kyc_status:
+ *                         type: string
+ *                       salary:
+ *                         type: number
+ *                       salary_currency:
+ *                         type: string
+ *                       bank_code:
+ *                         type: string
+ *                       account_number:
+ *                         type: string
+ *                       account_name:
+ *                         type: string
  *       500:
  *         description: Server error
  */
@@ -208,7 +231,7 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
 
     const result = await query(
       `SELECT
-        id, name, email, role, status
+        id, name, email, role, status, kyc_status, salary_currency, bank_code, account_number, account_name
        FROM users
        WHERE business_id = $1 AND status IN ('active', 'invited')
        ORDER BY created_at DESC`,

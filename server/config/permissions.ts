@@ -39,4 +39,9 @@ export const AVAILABLE_PERMISSIONS = [
     name: "View Ranking",
     description: "Access to view team ranking and leaderboards",
   },
+  {
+    id: "manage_finance",
+    name: "Manage Finance",
+    description: "Access to transfers and payout features",
+  },
 ];

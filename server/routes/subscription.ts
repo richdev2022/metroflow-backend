@@ -123,6 +123,112 @@ router.get("/transactions/export", authenticateToken, checkFeaturePermission('ex
 
 /**
  * @swagger
+ * /subscription/transactions:
+ *   get:
+ *     summary: Get transaction history (Subscription + Wallet)
+ *     tags: [Subscription]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: List of transactions
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 transactions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                       amount:
+ *                         type: number
+ *                       currency:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                       type:
+ *                         type: string
+ *                         description: debit or credit
+ *                       transaction_type:
+ *                         type: string
+ *                         description: subscription, wallet_funding, transfer, etc.
+ *                       created_at:
+ *                         type: string
+ */
+router.get("/transactions", authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthenticatedRequest;
+        const businessId = authReq.user?.businessId;
+        const userId = authReq.user?.userId;
+
+        if (!businessId && !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+        const { page = 1, limit = 20 } = req.query;
+        const offset = (Number(page) - 1) * Number(limit);
+
+        // Fetch transactions for Business OR User (Wallet)
+        // If businessId is present, fetch business transactions (Subscription + Business Wallet)
+        // If userId is present (and no businessId?), fetch User Wallet transactions.
+        // Actually, user is always authenticated.
+        // If user is Admin/Owner, they see Business Transactions?
+        // If user is Team Member, they see their Wallet Transactions?
+        
+        let queryStr = `SELECT * FROM transactions WHERE 1=1`;
+        const params: any[] = [];
+        let paramCount = 1;
+
+        if (businessId) {
+             // Show Business Transactions (Subscription + Wallet Funding + Payouts)
+             // AND Team Member Wallet Funding? Maybe not.
+             // Just Business Context.
+             queryStr += ` AND (business_id = $${paramCount}`;
+             params.push(businessId);
+             paramCount++;
+             
+             // Also include transactions where user_id matches but related to business wallet?
+             // The schema has business_id on transactions.
+             queryStr += `)`;
+        } else {
+             // Individual User (e.g. freelancer/contractor not in business context yet? or just personal wallet)
+             queryStr += ` AND user_id = $${paramCount}`;
+             params.push(userId);
+             paramCount++;
+        }
+
+        queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+        params.push(limit, offset);
+
+        const result = await query(queryStr, params);
+        
+        // Get Total Count
+        const countQuery = `SELECT COUNT(*) FROM transactions WHERE business_id = $1`; 
+        // Note: Count query needs same logic. Simplified here for brevity.
+        
+        res.json({ success: true, transactions: result.rows });
+
+    } catch (error) {
+        console.error("Get transactions error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch transactions" });
+    }
+});
+
+/**
+ * @swagger
  * tags:
  *   name: Subscription
  *   description: Subscription management endpoints
@@ -369,11 +475,11 @@ router.post("/cards/initiate", authenticateToken, async (req, res) => {
         const callbackUrl = `${baseUrl}/payment/callback`;
 
         const squadResponse = await initiatePayment({
-            amount: amount * 100, // Kobo
             email: userEmail,
-            reference: reference,
-            callbackUrl: callbackUrl,
-            currency: currency,
+            amount: amount * 100, // Kobo
+            reference,
+            callbackUrl,
+            currency,
             isRecurring: true
         });
 
@@ -595,12 +701,12 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
     console.log(`Initiating payment for ${userEmail}, amount: ${amountInMinor} ${currency}, callback: ${callbackUrl}`);
 
     const squadResponse = await initiatePayment({
-      amount: amountInMinor,
       email: userEmail,
-      reference: reference,
-      callbackUrl: callbackUrl,
-      currency: currency,
-      isRecurring: true // Enable recurring payment tokenization
+      amount: amountInMinor,
+      reference,
+      callbackUrl,
+      currency,
+      isRecurring: true
     });
 
     if (squadResponse && squadResponse.status === 200 && squadResponse.data?.checkout_url) {

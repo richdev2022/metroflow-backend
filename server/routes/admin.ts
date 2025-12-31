@@ -1,9 +1,10 @@
 import express from "express";
 import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
-import { query } from "../db";
+import { query, pool } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
 import { sendEmail, generateAdminInviteEmailHtml } from "../services/email";
+import { verifyPayment } from "../services/squad";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 
 import * as XLSX from "xlsx";
@@ -192,6 +193,432 @@ router.get("/dashboard/charts", authenticateAdmin, requirePermission('view_dashb
     console.error("Failed to fetch charts data:", error);
     res.status(500).json({ success: false, error: "Failed to fetch charts data" });
   }
+});
+
+// Admin Wallet
+/**
+ * @swagger
+ * /admin/wallet:
+ *   get:
+ *     summary: Get Main Operational Wallet
+ *     description: Retrieve the details of the main operational wallet (funding credits, transfers).
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Main Wallet details retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 wallet:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                     balance:
+ *                       type: string
+ *                       example: "50000.00"
+ *                     currency:
+ *                       type: string
+ *                       example: "NGN"
+ *                     status:
+ *                       type: string
+ *                       example: "active"
+ *                     created_at:
+ *                       type: string
+ *                       format: date-time
+ */
+router.get("/wallet", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+  try {
+    // Find or Create Platform Wallet
+    // We assume Platform Wallet has business_id = NULL and user_id = NULL
+    
+    let wallet = await query(`SELECT * FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+    
+    if (wallet.rows.length === 0) {
+      // Create it
+      const newWallet = await query(
+        `INSERT INTO wallets (status, currency, balance) VALUES ('active', 'NGN', 0) RETURNING *`
+      );
+      wallet = newWallet;
+    }
+
+    res.json({ success: true, wallet: wallet.rows[0] });
+
+  } catch (error) {
+    console.error("Get Admin Wallet Error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch admin wallet" });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/revenue:
+ *   get:
+ *     summary: Get Platform Revenue Wallet Balance
+ *     description: Retrieve the balance of the platform's revenue wallet (fees & subscriptions).
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Revenue Wallet details retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 wallet:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                     balance:
+ *                       type: string
+ *                       example: "15000.00"
+ *                     currency:
+ *                       type: string
+ *                       example: "NGN"
+ *                 wallets:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       balance:
+ *                         type: string
+ *                       currency:
+ *                         type: string
+ */
+router.get("/revenue", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+  try {
+    const walletsRes = await query(`SELECT * FROM platform_wallet`);
+    let wallets = walletsRes.rows;
+    
+    // Ensure NGN wallet exists (Default)
+    let ngnWallet = wallets.find(w => w.currency === 'NGN');
+    if (!ngnWallet) {
+       const newWallet = await query(
+         `INSERT INTO platform_wallet (balance, currency) VALUES (0, 'NGN') RETURNING *`
+       );
+       ngnWallet = newWallet.rows[0];
+       wallets.push(ngnWallet);
+    }
+
+    // Return NGN wallet as primary 'wallet' for backward compatibility, and full list in 'wallets'
+    res.json({ success: true, wallet: ngnWallet, wallets: wallets });
+
+  } catch (error) {
+    console.error("Get Revenue Wallet Error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch revenue wallet" });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/wallet/history:
+ *   get:
+ *     summary: Get Main Operational Wallet History
+ *     description: Retrieve the transaction history of the main operational wallet (funding/transfers).
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Transaction history retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 transactions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       amount:
+ *                         type: string
+ *                         example: "50.00"
+ *                       type:
+ *                         type: string
+ *                         example: "credit"
+ *                       description:
+ *                         type: string
+ *                         example: "Transfer Fee"
+ *                       reference:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                         example: "success"
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
+ */
+router.get("/wallet/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+  try {
+    const walletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+    if (walletRes.rows.length === 0) {
+        return res.json({ success: true, transactions: [] });
+    }
+    const walletId = walletRes.rows[0].id;
+
+    const transactions = await query(
+        `SELECT * FROM transactions 
+         WHERE wallet_id = $1 
+         AND transaction_type NOT IN ('fee', 'subscription')
+         ORDER BY created_at DESC`,
+        [walletId]
+    );
+
+    res.json({ success: true, transactions: transactions.rows });
+
+  } catch (error) {
+    console.error("Get Admin Wallet History Error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch history" });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/revenue/history:
+ *   get:
+ *     summary: Get Platform Revenue History (Fees & Subscriptions)
+ *     description: Retrieve all revenue-generating transactions (fees and subscriptions).
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Revenue history retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 transactions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       amount:
+ *                         type: string
+ *                         example: "50.00"
+ *                       type:
+ *                         type: string
+ *                         example: "credit"
+ *                       description:
+ *                         type: string
+ *                         example: "Subscription Renewal"
+ *                       status:
+ *                         type: string
+ *                         example: "success"
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
+ */
+router.get("/revenue/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+  try {
+    const transactions = await query(
+        `SELECT * FROM transactions 
+         WHERE status = 'success' 
+         AND transaction_type IN ('subscription', 'fee') 
+         ORDER BY created_at DESC`
+    );
+
+    // Transform to ensure they look like credits (Revenue)
+    const history = transactions.rows.map(txn => ({
+        ...txn,
+        type: 'credit' 
+    }));
+
+    res.json({ success: true, transactions: history });
+
+  } catch (error) {
+    console.error("Get Admin Revenue History Error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch revenue history" });
+  }
+});
+
+// KYC Management
+/**
+ * @swagger
+ * /admin/kyc:
+ *   get:
+ *     summary: Get All KYC Details
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of KYC records
+ */
+router.get("/kyc", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+  try {
+    // Fetch Users with KYC
+    const users = await query(`
+        SELECT id, name, email, bvn, nin, kyc_status, kyc_data, created_at, 'user' as type 
+        FROM users 
+        WHERE kyc_status IS NOT NULL AND kyc_status != 'none'
+    `);
+
+    // Fetch Businesses with KYC
+    const businesses = await query(`
+        SELECT id, name, email, cac_number, proof_of_address_url, kyc_status, kyc_rejection_reason,
+               address_country, address_state, address_city, address_street, address_house_number,
+               created_at, 'business' as type 
+        FROM businesses 
+        WHERE kyc_status IS NOT NULL AND kyc_status != 'none'
+    `);
+
+    res.json({ 
+        success: true, 
+        kyc_records: [...users.rows, ...businesses.rows].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()) 
+    });
+
+  } catch (error) {
+    console.error("Get Admin KYC Error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch KYC records" });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/kyc/business/{id}/approve:
+ *   post:
+ *     summary: Approve Business KYC
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Business Verified
+ */
+router.post("/kyc/business/:id/approve", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        // Update Status
+        await query(
+            `UPDATE businesses SET kyc_status = 'verified', kyc_rejection_reason = NULL WHERE id = $1`,
+            [id]
+        );
+
+        // Fetch Email
+        const busRes = await query(`SELECT email, name FROM businesses WHERE id = $1`, [id]);
+        if (busRes.rows.length > 0) {
+            const { email, name } = busRes.rows[0];
+            
+            // Send Email
+            await sendEmail(email, name, "KYC Approved", `
+                <h3>KYC Approved</h3>
+                <p>Congratulations, your business verification for <strong>${name}</strong> has been approved.</p>
+                <p>You can now proceed to create your Business Wallet.</p>
+            `);
+        }
+
+        res.json({ success: true, message: "Business KYC Approved" });
+
+    } catch (error) {
+        console.error("Approve KYC Error:", error);
+        res.status(500).json({ success: false, error: "Failed to approve KYC" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/kyc/business/{id}/reject:
+ *   post:
+ *     summary: Reject Business KYC
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - reason
+ *             properties:
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Business Rejected
+ */
+router.post("/kyc/business/:id/reject", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { reason } = req.body;
+
+        if (!reason) {
+            return res.status(400).json({ success: false, error: "Rejection reason is required" });
+        }
+        
+        // Update Status
+        await query(
+            `UPDATE businesses SET kyc_status = 'rejected', kyc_rejection_reason = $1 WHERE id = $2`,
+            [reason, id]
+        );
+
+        // Fetch Email
+        const busRes = await query(`SELECT email, name FROM businesses WHERE id = $1`, [id]);
+        if (busRes.rows.length > 0) {
+            const { email, name } = busRes.rows[0];
+            
+            // Send Email
+            await sendEmail(email, name, "KYC Rejected", `
+                <h3>KYC Update</h3>
+                <p>Your business verification for <strong>${name}</strong> has been rejected.</p>
+                <p><strong>Reason:</strong> ${reason}</p>
+                <p>Please update your information and resubmit.</p>
+            `);
+        }
+
+        res.json({ success: true, message: "Business KYC Rejected" });
+
+    } catch (error) {
+        console.error("Reject KYC Error:", error);
+        res.status(500).json({ success: false, error: "Failed to reject KYC" });
+    }
 });
 
 // Businesses Management
@@ -508,6 +935,341 @@ router.get("/transactions", authenticateAdmin, requirePermission('view_dashboard
     } catch (error) {
         console.error("Admin transactions error:", error);
         res.status(500).json({ success: false, error: "Failed to fetch transactions" });
+    }
+});
+
+// Pending Settlements
+/**
+ * @swagger
+ * /admin/transactions/pending-settlement:
+ *   get:
+ *     summary: Get transactions requiring settlement
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [all, pending, settled]
+ *           default: pending
+ *         description: Filter by settlement status
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *     responses:
+ *       200:
+ *         description: List of transactions with settlement info
+ */
+router.get("/transactions/pending-settlement", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+    try {
+        const page = parseInt(req.query.page as string) || 1;
+        const limit = parseInt(req.query.limit as string) || 50;
+        const offset = (page - 1) * limit;
+
+        const search = req.query.search as string;
+        const status = (req.query.status as string)?.toLowerCase() || 'pending';
+        const startDate = req.query.startDate as string;
+        const endDate = req.query.endDate as string;
+
+        const params: any[] = []; 
+        let paramIndex = 1; 
+
+        let whereClause = `WHERE 1=1`;
+
+        // Status Filter
+        if (status === 'pending') {
+            whereClause += ` AND s.status = 'pending'`;
+        } else if (status === 'settled') {
+            whereClause += ` AND s.status = 'settled'`;
+        }
+        // If status === 'all', we don't add a status filter
+
+        // Search Filter
+        if (search) {
+            whereClause += ` AND (t.reference ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex} OR b.name ILIKE $${paramIndex})`;
+            params.push(`%${search}%`);
+            paramIndex++;
+        }
+
+        // Date Range Filter
+        if (startDate) {
+            whereClause += ` AND s.created_at >= $${paramIndex}`;
+            params.push(startDate);
+            paramIndex++;
+        }
+
+        if (endDate) {
+            const endDateTime = new Date(endDate);
+            endDateTime.setHours(23, 59, 59, 999);
+            whereClause += ` AND s.created_at <= $${paramIndex}`;
+            params.push(endDateTime.toISOString());
+            paramIndex++;
+        }
+
+        // Count Query
+        const countQueryText = `
+            SELECT COUNT(*) 
+            FROM settlements s
+            JOIN transactions t ON s.transaction_id = t.id
+            LEFT JOIN users u ON t.user_id = u.id 
+            LEFT JOIN businesses b ON t.business_id = b.id 
+            ${whereClause}
+        `;
+        
+        const countRes = await query(countQueryText, params);
+        const total = parseInt(countRes.rows[0].count);
+
+        // Data Query
+        const queryText = `
+            SELECT 
+                t.*, 
+                s.status as settlement_status,
+                s.id as settlement_id,
+                s.created_at as settlement_date,
+                u.email as user_email, 
+                u.name as user_name,
+                b.name as business_name 
+            FROM settlements s
+            JOIN transactions t ON s.transaction_id = t.id
+            LEFT JOIN users u ON t.user_id = u.id 
+            LEFT JOIN businesses b ON t.business_id = b.id 
+            ${whereClause}
+            ORDER BY s.created_at DESC
+            LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+        `;
+
+        params.push(limit, offset);
+
+        const result = await query(queryText, params);
+
+        res.json({
+            success: true,
+            transactions: result.rows,
+            pagination: {
+                total,
+                page,
+                limit,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+
+    } catch (error) {
+        console.error("Get Pending Settlements Error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch pending settlements" });
+    }
+});
+
+// Manual Settlement
+/**
+ * @swagger
+ * /admin/transactions/settle:
+ *   post:
+ *     summary: Manually settle a transaction
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - reference
+ *             properties:
+ *               reference:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Transaction settled
+ */
+router.post("/transactions/settle", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { reference, force } = req.body;
+        
+        if (!reference) {
+            client.release();
+            return res.status(400).json({ success: false, error: "Reference is required" });
+        }
+
+        // 1. Fetch Transaction
+        const txRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
+        if (txRes.rows.length === 0) {
+            client.release();
+            return res.status(404).json({ success: false, error: "Transaction not found" });
+        }
+        const transaction = txRes.rows[0];
+
+        // 2. Check/Create Settlement Record
+        let settlementRes = await query(`SELECT * FROM settlements WHERE transaction_id = $1`, [transaction.id]);
+        let settlement = settlementRes.rows[0];
+
+        if (!settlement) {
+             // Create default pending settlement
+             const sRes = await query(`
+                INSERT INTO settlements (transaction_id, business_id, user_id, amount, status)
+                VALUES ($1, $2, $3, $4, 'pending')
+                RETURNING *
+             `, [transaction.id, transaction.business_id, transaction.user_id, transaction.amount]);
+             settlement = sRes.rows[0];
+        }
+
+        if (settlement.status === 'settled' && !force) {
+             client.release();
+             return res.status(400).json({ success: false, error: "Transaction already settled. Use force to override." });
+        }
+
+        // 3. Resolve Wallet ID if missing
+        let userWalletId = transaction.wallet_id;
+        if (!userWalletId && transaction.user_id) {
+             const wRes = await query(`SELECT id FROM wallets WHERE user_id = $1`, [transaction.user_id]);
+             if (wRes.rows.length > 0) {
+                  userWalletId = wRes.rows[0].id;
+             }
+        }
+        
+        if (!userWalletId) {
+             client.release();
+             return res.status(400).json({ success: false, error: "User wallet not found for this transaction" });
+        }
+
+        // 4. Atomic Settlement Execution
+        await client.query('BEGIN');
+
+        // Check Platform Wallet
+        const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+        let platformWalletId;
+        if (platformWalletRes.rows.length === 0) {
+             const newWallet = await client.query(`INSERT INTO wallets (status, currency) VALUES ('active', 'NGN') RETURNING id`);
+             platformWalletId = newWallet.rows[0].id;
+        } else {
+             platformWalletId = platformWalletRes.rows[0].id;
+        }
+
+        // Check if Platform was already debited for this specific transaction
+        const platTxCheck = await client.query(
+            `SELECT id FROM transactions WHERE reference = $1 AND wallet_id = $2 AND type = 'debit'`,
+            [`${reference}-PLATFORM`, platformWalletId]
+        );
+        const platformDebited = platTxCheck.rows.length > 0;
+
+        let creditUser = false;
+        let debitPlatform = false;
+        let settlementNote = "Manual Settlement";
+
+        if (platformDebited) {
+             // Platform already debited. Likely partial failure where User wasn't credited.
+             // We MUST credit user to fix the state.
+             creditUser = true;
+             settlementNote += " (Fix: User Credit Only)";
+             
+             // Safety check: If transaction was success, maybe user WAS credited?
+             // But if admin is running this, we assume they verified user wasn't credited.
+             // If 'force' is not used, we warn if it looks suspicious.
+             if (transaction.status === 'success' && !force) {
+                  await client.query('ROLLBACK');
+                  client.release();
+                  return res.status(400).json({ success: false, error: "Transaction marked success & Platform debited. Potentially already settled. Use 'force' to credit user anyway." });
+             }
+        } else {
+             // Platform NOT debited.
+             debitPlatform = true;
+             
+             if (transaction.status === 'success') {
+                  // Transaction is success, but Platform not debited.
+                  // This implies User was credited (normal flow) but Platform debit failed or wasn't done.
+                  // So we only debit platform.
+                  creditUser = false;
+                  settlementNote += " (Fix: Platform Debit Only)";
+                  
+                  if (force) {
+                       creditUser = true; // Force credit user too
+                       settlementNote += " + Force Credit";
+                  }
+             } else {
+                  // Transaction is pending/failed. Full settlement needed.
+                  creditUser = true;
+                  settlementNote += " (Full)";
+             }
+        }
+
+        // Execute Actions
+        if (creditUser) {
+             const creditRes = await client.query(
+                `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
+                [transaction.amount, userWalletId]
+             );
+             if (creditRes.rowCount === 0) {
+                  throw new Error(`User wallet ${userWalletId} update failed (row count 0)`);
+             }
+        }
+
+        if (debitPlatform) {
+             await client.query(
+                `UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE id = $2`,
+                [transaction.amount, platformWalletId]
+             );
+             
+             await client.query(
+                `INSERT INTO transactions 
+                (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                VALUES ($1, 'NGN', 'success', $2, 'debit', $3, 'wallet_funding', $4, 'debit')`,
+                [transaction.amount, `${reference}-PLATFORM`, `Platform Wallet Debit for ${reference}`, platformWalletId]
+            );
+        }
+
+        // Update Transaction Status
+        await client.query(
+            `UPDATE transactions SET status = 'success', description = description || $1, updated_at = NOW() WHERE id = $2`,
+            [` - ${settlementNote}`, transaction.id]
+        );
+
+        // Update Settlement Status
+        await client.query(
+            `UPDATE settlements SET status = 'settled', updated_at = NOW() WHERE id = $1`,
+            [settlement.id]
+        );
+
+        await client.query('COMMIT');
+        client.release();
+
+        res.json({ 
+            success: true, 
+            message: "Transaction settled successfully",
+            details: settlementNote
+        });
+
+    } catch (error: any) {
+        if (client) {
+            await client.query('ROLLBACK');
+            client.release();
+        }
+        console.error("Manual Settlement Error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to settle transaction" });
     }
 });
 
@@ -1757,5 +2519,304 @@ router.post("/subscription/manual-upgrade/revoke", authenticateAdmin, requirePer
         res.status(500).json({ success: false, error: "Failed to revoke upgrade" });
     }
 });
+
+/**
+ * @swagger
+ * /admin/transfers:
+ *   get:
+ *     summary: Get all transfers (queue)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: businessId
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *         description: Search by reference, recipient name/account, business name/email
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Filter by start date (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Filter by end date (YYYY-MM-DD)
+ *     responses:
+ *       200:
+ *         description: List of transfers
+ */
+router.get("/transfers", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+    try {
+        const page = parseInt(req.query.page as string) || 1;
+        const limit = parseInt(req.query.limit as string) || 50;
+        const offset = (page - 1) * limit;
+
+        const status = req.query.status as string;
+        const businessId = req.query.businessId as string;
+        const search = req.query.search as string;
+        const startDate = req.query.startDate as string;
+        const endDate = req.query.endDate as string;
+
+        let queryText = `
+            SELECT t.*, b.name as business_name, b.email as business_email
+            FROM transfer_queue t
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE 1=1
+        `;
+        const queryParams: any[] = [];
+        let paramIndex = 1;
+
+        if (businessId) {
+            queryText += ` AND t.business_id = $${paramIndex}`;
+            queryParams.push(businessId);
+            paramIndex++;
+        }
+
+        if (status) {
+            queryText += ` AND t.status = $${paramIndex}`;
+            queryParams.push(status);
+            paramIndex++;
+        }
+
+        if (search) {
+            queryText += ` AND (t.reference ILIKE $${paramIndex} OR t.recipient_account ILIKE $${paramIndex} OR t.recipient_name ILIKE $${paramIndex} OR b.name ILIKE $${paramIndex} OR b.email ILIKE $${paramIndex})`;
+            queryParams.push(`%${search}%`);
+            paramIndex++;
+        }
+
+        if (startDate) {
+            queryText += ` AND t.created_at >= $${paramIndex}`;
+            queryParams.push(startDate);
+            paramIndex++;
+        }
+
+        if (endDate) {
+            const endDateTime = new Date(endDate);
+            endDateTime.setHours(23, 59, 59, 999);
+            queryText += ` AND t.created_at <= $${paramIndex}`;
+            queryParams.push(endDateTime.toISOString());
+            paramIndex++;
+        }
+
+        // Count
+        const whereClause = queryText.substring(queryText.indexOf("WHERE"));
+        const countQuery = `SELECT COUNT(*) FROM transfer_queue t LEFT JOIN businesses b ON t.business_id = b.id ${whereClause}`;
+        const countRes = await query(countQuery, queryParams);
+        const total = parseInt(countRes.rows[0].count);
+
+        queryText += ` ORDER BY t.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        queryParams.push(limit, offset);
+
+        const result = await query(queryText, queryParams);
+
+        res.json({
+            success: true,
+            transfers: result.rows,
+            pagination: {
+                total,
+                page,
+                limit,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+
+    } catch (error) {
+        console.error("Admin transfers error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch transfers" });
+    }
+});
+
+// KYC Management
+/**
+ * @swagger
+ * /admin/kyc/pending:
+ *   get:
+ *     summary: Get pending KYC requests
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Pending KYC requests
+ */
+router.get("/kyc/pending", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const pendingUsers = await query(`
+            SELECT id, name, email, business_id, kyc_status, kyc_data, bvn, nin, phone_number, created_at 
+            FROM users 
+            WHERE kyc_status IN ('pending_review', 'pending_otp') 
+            ORDER BY created_at ASC
+        `);
+
+        const pendingBusinesses = await query(`
+            SELECT id, name, email, kyc_status, proof_of_address_url, created_at 
+            FROM businesses 
+            WHERE kyc_status = 'pending_review' 
+            ORDER BY created_at ASC
+        `);
+
+        res.json({
+            success: true,
+            users: pendingUsers.rows,
+            businesses: pendingBusinesses.rows
+        });
+    } catch (error) {
+        console.error("Admin KYC pending error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch pending KYC" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/kyc/user/{id}:
+ *   put:
+ *     summary: Update User KYC status
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [verified, rejected]
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Status updated
+ */
+router.put("/kyc/user/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, reason } = req.body;
+
+        if (!['verified', 'rejected'].includes(status)) {
+            return res.status(400).json({ success: false, error: "Invalid status" });
+        }
+
+        await query(
+            `UPDATE users SET kyc_status = $1, otp_hash = NULL WHERE id = $2`,
+            [status, id]
+        );
+
+        // If verified, ensure wallet exists
+        if (status === 'verified') {
+             // We can dynamically import or just replicate logic since this is admin route
+             // Ideally we call a service. For now, lazy create on next login or just here.
+             await query(
+                `INSERT INTO wallets (user_id, balance, currency, status) 
+                 VALUES ($1, 0.00, 'NGN', 'active') 
+                 ON CONFLICT (user_id) DO NOTHING`,
+                [id]
+             );
+        }
+
+        // Send email notification (TODO)
+
+        res.json({ success: true, message: `User KYC ${status}` });
+    } catch (error) {
+        console.error("Admin user KYC error:", error);
+        res.status(500).json({ success: false, error: "Failed to update user KYC" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/kyc/business/{id}:
+ *   put:
+ *     summary: Update Business KYC status
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [verified, rejected]
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Status updated
+ */
+router.put("/kyc/business/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, reason } = req.body;
+
+        if (!['verified', 'rejected'].includes(status)) {
+            return res.status(400).json({ success: false, error: "Invalid status" });
+        }
+
+        await query(
+            `UPDATE businesses SET kyc_status = $1 WHERE id = $2`,
+            [status, id]
+        );
+        
+        // If verified, ensure wallet exists
+        if (status === 'verified') {
+             await query(
+                `INSERT INTO wallets (business_id, balance, currency, status) 
+                 VALUES ($1, 0.00, 'NGN', 'active') 
+                 ON CONFLICT (business_id) DO NOTHING`,
+                [id]
+             );
+        }
+
+        res.json({ success: true, message: `Business KYC ${status}` });
+    } catch (error) {
+        console.error("Admin business KYC error:", error);
+        res.status(500).json({ success: false, error: "Failed to update business KYC" });
+    }
+});
+
+
 
 export default router;

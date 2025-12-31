@@ -1,8 +1,129 @@
 import axios from "axios";
 import nodemailer from "nodemailer";
-import { sendEmail } from "./email-sender";
 
-export { sendEmail };
+// Configure Nodemailer Transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || "smtp.gmail.com",
+  port: parseInt(process.env.SMTP_PORT || "587"),
+  secure: process.env.SMTP_SECURE === "true", // true for 465, false for other ports
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_URL = process.env.BREVO_BASE_URL || "https://api.brevo.com/v3/smtp/email";
+
+async function sendEmailViaBrevo(payload: any) {
+    try {
+        const response = await axios.post(
+            `${BREVO_URL}/v3/smtp/email`,
+            {
+                sender: payload.sender,
+                to: payload.to,
+                subject: payload.subject,
+                htmlContent: payload.htmlContent,
+                replyTo: payload.replyTo
+            },
+            {
+                headers: {
+                    'api-key': BREVO_API_KEY,
+                    'Content-Type': 'application/json',
+                    'accept': 'application/json'
+                },
+                timeout: parseInt(process.env.BREVO_TIMEOUT_SECONDS || '30') * 1000
+            }
+        );
+        console.log("Email sent via Brevo:", response.data?.messageId);
+        return response.data;
+    } catch (error: any) {
+        console.error("Brevo Email Error:", error.response?.data || error.message);
+        throw error;
+    }
+}
+
+export async function sendEmail(
+  to: string | EmailPayload | { email: string; name?: string }[],
+  nameOrSubject?: string,
+  subjectOrHtml?: string,
+  htmlContent?: string
+) {
+  try {
+    let recipientEmail = "";
+    let recipientName = "";
+    let subject = "";
+    let html = "";
+
+    // Handle overload: sendEmail(to: string, name: string, subject: string, html: string)
+    if (typeof to === "string") {
+      recipientEmail = to;
+      recipientName = nameOrSubject || "";
+      subject = subjectOrHtml || "";
+      html = htmlContent || "";
+    } else if (Array.isArray(to)) {
+      const recipients = (to as { email: string; name?: string }[]).map(r => r.email).join(",");
+      recipientEmail = recipients;
+      recipientName = nameOrSubject || "";
+      subject = subjectOrHtml || "";
+      html = htmlContent || "";
+    }
+
+    // Prepare payload for Brevo/Nodemailer
+    let payload: any = {};
+    
+    if (typeof to === 'object' && !Array.isArray(to)) {
+        // It's the object payload style
+        payload = to;
+    } else {
+        // Construct payload from arguments
+        payload = {
+            sender: {
+                name: process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'MetroFlow',
+                email: process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_FROM_ADDRESS || 'no-reply@metroflow.com'
+            },
+            to: [{ email: recipientEmail, name: recipientName }],
+            subject: subject,
+            htmlContent: html
+        };
+    }
+
+    // Try Brevo first if API Key is present
+    if (BREVO_API_KEY) {
+        return await sendEmailViaBrevo(payload);
+    }
+
+    // Fallback to Nodemailer
+    if (typeof to === 'object' && !Array.isArray(to)) {
+        // It's the object payload style
+        const info = await transporter.sendMail({
+            from: `"${payload.sender.name}" <${payload.sender.email}>`,
+            to: payload.to.map((r: any) => r.email).join(", "),
+            subject: payload.subject,
+            html: payload.htmlContent,
+            replyTo: payload.replyTo?.email
+        });
+        console.log("Email sent:", info.messageId);
+        return info;
+    }
+    
+    // 4-arg style (or array converted to string)
+    if (recipientEmail) {
+        const info = await transporter.sendMail({
+            from: `"${process.env.EMAIL_FROM_NAME || 'MetroFlow'}" <${process.env.EMAIL_FROM_ADDRESS || 'no-reply@metroflow.com'}>`,
+            to: `"${recipientName}" <${recipientEmail}>`,
+            subject: subject,
+            html: html,
+        });
+        console.log("Email sent:", info.messageId);
+        return info;
+    }
+
+  } catch (error) {
+    console.error("Error sending email:", error);
+    // Don't throw to avoid breaking the flow, just log
+  }
+}
 
 interface EmailPayload {
   to: Array<{
@@ -366,6 +487,165 @@ export async function sendMentionNotification(
   }
 }
 
+export async function sendTransferFailureNotification(
+  adminEmails: string[],
+  businessName: string,
+  reference: string,
+  recipientName: string,
+  amount: number,
+  currency: string,
+  failureReason: string
+) {
+  const subject = `Transfer Failed - ${reference}`;
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  const htmlContent = `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fef2f2; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #ef4444;">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Transfer Failed</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            A transfer for <strong>${businessName}</strong> could not be completed.
+          </p>
+
+          <div style="background-color: #fff5f5; border: 1px solid #fecaca; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <div style="margin-bottom: 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #fee2e2; padding-bottom: 8px;">
+              <span style="color: #7f1d1d; font-weight: 600;">Reference</span>
+              <span style="color: #374151; font-family: monospace;">${reference}</span>
+            </div>
+            <div style="margin-bottom: 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #fee2e2; padding-bottom: 8px;">
+              <span style="color: #7f1d1d; font-weight: 600;">Recipient</span>
+              <span style="color: #374151;">${recipientName}</span>
+            </div>
+            <div style="margin-bottom: 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #fee2e2; padding-bottom: 8px;">
+              <span style="color: #7f1d1d; font-weight: 600;">Amount</span>
+              <span style="color: #374151;">${currency} ${amount}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: #7f1d1d; font-weight: 600;">Reason</span>
+              <span style="color: #ef4444; font-weight: 500;">${failureReason}</span>
+            </div>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center;">
+            Please check your dashboard to retry the transaction or investigate the issue.
+          </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+
+  for (const email of adminEmails) {
+    await sendEmail({
+      to: [{ email }],
+      subject,
+      htmlContent,
+      sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+      replyTo: { email: "support@metroflow.com" },
+    });
+  }
+}
+
+export async function sendPayrollAdjustmentNotification(
+  emails: string[],
+  recipientName: string,
+  type: string,
+  amount: number,
+  currency: string,
+  reason: string,
+  businessName: string
+) {
+  const subject = `Payroll Adjustment Notification - ${businessName}`;
+  const adjustmentType = type.charAt(0).toUpperCase() + type.slice(1);
+  const isBonus = type.toLowerCase() === 'bonus';
+  const color = isBonus ? '#10b981' : '#ef4444'; // Green for bonus, Red for deduction
+
+  const htmlContent = `
+    <html>
+      <body style="font-family: 'Segoe UI', Arial, sans-serif; padding: 20px; background-color: #f9fafb;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <h2 style="color: #111827;">Payroll Adjustment Notice</h2>
+          <p>This is to inform you that a <strong>${adjustmentType}</strong> has been applied to the upcoming payroll for <strong>${recipientName}</strong>.</p>
+          
+          <div style="background-color: ${isBonus ? '#ecfdf5' : '#fef2f2'}; border-left: 4px solid ${color}; padding: 15px; margin: 20px 0;">
+            <p style="margin: 5px 0;"><strong>Type:</strong> <span style="color: ${color}; font-weight: bold;">${adjustmentType}</span></p>
+            <p style="margin: 5px 0;"><strong>Amount:</strong> ${currency} ${amount}</p>
+            <p style="margin: 5px 0;"><strong>Reason:</strong> ${reason}</p>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px;">This adjustment will be reflected in the next salary processing.</p>
+        </div>
+      </body>
+    </html>
+  `;
+
+  for (const email of emails) {
+    await sendEmail({
+      to: [{ email }],
+      subject,
+      htmlContent,
+      sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+      replyTo: { email: "support@metroflow.com" },
+    });
+  }
+}
+
+export function generateOtpEmailHtml(
+  otpCode: string,
+  purpose: string = "Transaction Verification"
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">${purpose}</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px; text-align: center;">
+            Use the One-Time Password (OTP) below to complete your request.
+          </p>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px; text-align: center;">
+            <span style="color: #6b7280; font-size: 14px; margin-bottom: 8px; display: block; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;">Your OTP Code</span>
+            <code style="color: #2563eb; font-size: 32px; font-weight: 700; letter-spacing: 4px; display: block;">${otpCode}</code>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-bottom: 8px;">
+            This code is valid for <strong>10 minutes</strong>.
+          </p>
+          <p style="color: #ef4444; font-size: 14px; text-align: center; margin-bottom: 32px; font-weight: 500;">
+            Do not share this code with anyone.
+          </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 export function generateTaskActivityEmailHtml(
   actionType: string,
   taskTitle: string,
@@ -415,6 +695,59 @@ export function generateTaskActivityEmailHtml(
           <p style="color: #999; font-size: 12px; margin-top: 20px;">
             You received this email because you are assigned to this task or are an admin.
           </p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export function generateKYCOtpEmailHtml(
+  userName: string,
+  otp: string,
+  expiresInMinutes: number = 10
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">KYC Verification</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${userName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            To complete your identity verification, please use the One-Time Password (OTP) below.
+          </p>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; margin-bottom: 24px; text-align: center;">
+            <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px 0; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;">Your Verification Code</p>
+            
+            <div style="font-family: monospace; font-size: 36px; font-weight: 700; letter-spacing: 8px; color: #2563eb;">
+              ${otp}
+            </div>
+          </div>
+
+          <p style="color: #374151; font-size: 14px; line-height: 1.6; margin-bottom: 8px; text-align: center;">
+            This code is valid for <strong>${expiresInMinutes} minutes</strong>.
+          </p>
+          
+          <p style="color: #6b7280; font-size: 14px; line-height: 1.6; margin-bottom: 32px; text-align: center;">
+            Do not share this code with anyone. MetroFlow support will never ask for this code.
+          </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
         </div>
       </body>
     </html>

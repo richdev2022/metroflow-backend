@@ -1,24 +1,53 @@
 import { Pool } from "pg";
 import { hashPassword } from "./services/auth";
 
-const pool = new Pool({
+console.log("Initializing DB Pool...");
+
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DISABLE_SSL === 'true' ? false : {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000, // 10 seconds
+  idleTimeoutMillis: 30000,       // 30 seconds
+  max: 20                         // Max clients in pool
 });
+
+// Retry logic for transient errors (like DNS/Connection timeouts)
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1s
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function query(text: string, params?: unknown[]) {
   const start = Date.now();
-  try {
-    const res = await pool.query(text, params);
-    const duration = Date.now() - start;
-    console.log("Executed query", { text, duration, rows: res.rowCount });
-    return res;
-  } catch (error) {
-    console.error("Database error:", error);
-    throw error;
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const res = await pool.query(text, params);
+      const duration = Date.now() - start;
+      // Only log slow queries or mutations to reduce noise
+      if (duration > 1000 || !text.trim().toLowerCase().startsWith('select')) {
+         console.log("Executed query", { text: text.substring(0, 50) + '...', duration, rows: res.rowCount });
+      }
+      return res;
+    } catch (error: any) {
+      lastError = error;
+      const isTransient = error.code === 'ENOTFOUND' || 
+                          error.code === 'ETIMEDOUT' || 
+                          error.code === 'ECONNRESET' || 
+                          error.message.includes('timeout');
+      
+      if (isTransient && attempt < MAX_RETRIES) {
+        console.warn(`Database query failed (Attempt ${attempt}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY}ms... Error: ${error.message}`);
+        await sleep(RETRY_DELAY);
+        continue;
+      }
+      
+      console.error("Database error:", error);
+      throw error;
+    }
   }
+  throw lastError;
 }
 
 export async function initializeDatabase() {
@@ -75,6 +104,10 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMP`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS is_manual_subscription BOOLEAN DEFAULT FALSE`);
 
+    // Add payroll configuration columns to businesses
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS salary_interval VARCHAR(20) DEFAULT 'monthly'`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS salary_custom_date TIMESTAMP`);
+
     // Create transactions table
     await query(`
       CREATE TABLE IF NOT EXISTS transactions (
@@ -86,6 +119,21 @@ export async function initializeDatabase() {
         reference VARCHAR(255) UNIQUE NOT NULL,
         status VARCHAR(50) DEFAULT 'pending', -- pending, success, failed
         gateway_response JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create settlements table
+    await query(`
+      CREATE TABLE IF NOT EXISTS settlements (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        transaction_id UUID REFERENCES transactions(id),
+        business_id VARCHAR(255) REFERENCES businesses(id),
+        user_id UUID REFERENCES users(id),
+        amount DECIMAL(12, 2) NOT NULL,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        status VARCHAR(50) DEFAULT 'pending', -- pending, settled, failed
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
@@ -128,6 +176,18 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Add KYC columns to businesses
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(50) DEFAULT 'pending'`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_rejection_reason TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS proof_of_address_url TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_country VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_state VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_city VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_street VARCHAR(255)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_house_number VARCHAR(50)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS cac_number VARCHAR(50)`);
+
     // Create users table (replaces old developers table concept)
     await query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -150,6 +210,20 @@ export async function initializeDatabase() {
         UNIQUE(business_id, email)
       )
     `);
+    
+    // Add columns to users if they don't exist
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_amount DECIMAL(15, 2) DEFAULT 0`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_currency VARCHAR(3) DEFAULT 'NGN'`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS contract_start_date TIMESTAMP`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(50) DEFAULT 'pending'`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
+
+    // Add bank details and salary columns to users
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_code VARCHAR(10)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_number VARCHAR(20)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_amount DECIMAL(12, 2) DEFAULT 0`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_currency VARCHAR(3) DEFAULT 'NGN'`);
 
     // Create tasks table with new fields
     await query(`
@@ -287,6 +361,68 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Create wallets table
+    await query(`
+      CREATE TABLE IF NOT EXISTS wallets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) REFERENCES businesses(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        balance DECIMAL(15, 2) DEFAULT 0.00,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        status VARCHAR(50) DEFAULT 'active', -- active, frozen
+        virtual_account_number VARCHAR(20),
+        bank_code VARCHAR(10),
+        account_name VARCHAR(255),
+        customer_identifier VARCHAR(255),
+        beneficiary_account VARCHAR(20),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(business_id),
+        UNIQUE(user_id)
+      )
+    `);
+
+    // Add columns if table exists (for existing deployments)
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS virtual_account_number VARCHAR(20)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS bank_code VARCHAR(10)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS customer_identifier VARCHAR(255)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS beneficiary_account VARCHAR(20)`);
+    
+    // Add wallet_id to transactions
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS direction VARCHAR(10) DEFAULT 'credit'`); // credit, debit
+
+
+    // Add KYC columns to users
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bvn VARCHAR(20)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nin VARCHAR(20)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(20) DEFAULT 'none'`); // none, pending_otp, verified, rejected
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bvn_status VARCHAR(20) DEFAULT 'pending'`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nin_status VARCHAR(20) DEFAULT 'pending'`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_data JSONB`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_hash VARCHAR(255)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_type VARCHAR(20)`);
+
+    // Add KYC columns to businesses
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(20) DEFAULT 'none'`); // none, pending, verified, rejected
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS proof_of_address TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS proof_of_address_url TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_rejection_reason TEXT`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_country VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_state VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_city VARCHAR(100)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_street VARCHAR(255)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address_house_number VARCHAR(50)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'NGN'`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS temp_phone VARCHAR(20)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS temp_email VARCHAR(255)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_code VARCHAR(6)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP`);
+
     // Create ideas table
     await query(`
       CREATE TABLE IF NOT EXISTS ideas (
@@ -360,6 +496,28 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Create transfer_queue table
+    await query(`
+      CREATE TABLE IF NOT EXISTS transfer_queue (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) REFERENCES businesses(id),
+        reference VARCHAR(255) UNIQUE NOT NULL,
+        recipient_account VARCHAR(50) NOT NULL,
+        recipient_bank VARCHAR(10) NOT NULL,
+        recipient_name VARCHAR(255),
+        amount DECIMAL(12, 2) NOT NULL,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        remark TEXT,
+        status VARCHAR(50) DEFAULT 'pending', -- pending, success, failed, processing
+        failure_reason TEXT,
+        source_type VARCHAR(50), -- sprint, task, salary
+        source_id VARCHAR(255),
+        meta_data JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Add provider column to squad_webhooks
     await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'squad'`);
 
@@ -368,6 +526,36 @@ export async function initializeDatabase() {
 
     // Add role_id to platform_admins
     await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS role_id UUID REFERENCES admin_roles(id) ON DELETE SET NULL`);
+
+    // Add currency to businesses
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'NGN'`);
+
+    // Add currency to tasks
+    await query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'NGN'`);
+
+    // Create payroll_adjustments table
+    await query(`
+      CREATE TABLE IF NOT EXISTS payroll_adjustments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL, -- bonus, deduction
+        amount DECIMAL(12, 2) NOT NULL,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        reason TEXT,
+        status VARCHAR(50) DEFAULT 'pending', -- pending, processed, cancelled
+        transfer_id UUID REFERENCES transfer_queue(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        processed_at TIMESTAMP
+      )
+    `);
+
+    // Ensure currency column exists in payroll_adjustments (for migration if table existed)
+    await query(`ALTER TABLE payroll_adjustments ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'NGN'`);
+
+    // Add wallet_id to transfer_queue
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id)`);
 
     // Seed Admin Permissions
     const permissions = [
@@ -435,6 +623,11 @@ export async function initializeDatabase() {
       VALUES ('card_verification_amount', '100', 'Amount charged for card verification in Naira')
       ON CONFLICT (key) DO NOTHING
     `);
+
+    // Add missing columns to transactions table
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type VARCHAR(50)`);
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT`);
 
     console.log("Database tables initialized successfully");
   } catch (error) {

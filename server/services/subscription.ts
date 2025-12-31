@@ -1,6 +1,7 @@
 import { query } from "../db";
 import { chargeCard } from "./squad";
 import { sendEmail } from "./email";
+import { creditPlatformWallet } from "./fees";
 import axios from "axios";
 
 export const processSubscriptionRenewals = async () => {
@@ -122,6 +123,9 @@ export const processSubscriptionRenewals = async () => {
                     `REC_${Date.now()}_${sub.business_id.substring(0,4)}`,
                     JSON.stringify(chargeRes)
                 ]);
+
+                // Credit Platform Revenue Wallet
+                await creditPlatformWallet(amount, 'NGN');
 
                 results.success++;
             } else {

@@ -94,6 +94,167 @@
         }
       }
     },
+    "/admin/fees": {
+      "get": {
+        "summary": "List all fee configurations",
+        "tags": [
+          "Admin Fees"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of fees"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a fee configuration",
+        "tags": [
+          "Admin Fees"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "fee_type",
+                  "config_type",
+                  "config"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "fee_type": {
+                    "type": "string",
+                    "enum": [
+                      "funding_card",
+                      "funding_account",
+                      "transfer",
+                      "otp",
+                      "stamp_duty"
+                    ]
+                  },
+                  "config_type": {
+                    "type": "string",
+                    "enum": [
+                      "percentage_cap",
+                      "flat",
+                      "flat_conditional",
+                      "range"
+                    ]
+                  },
+                  "config": {
+                    "type": "object"
+                  },
+                  "currency": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fee created"
+          }
+        }
+      }
+    },
+    "/admin/fees/{id}": {
+      "put": {
+        "summary": "Update a fee configuration",
+        "tags": [
+          "Admin Fees"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "fee_type": {
+                    "type": "string"
+                  },
+                  "config_type": {
+                    "type": "string"
+                  },
+                  "config": {
+                    "type": "object"
+                  },
+                  "currency": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fee updated"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a fee configuration",
+        "tags": [
+          "Admin Fees"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Fee deleted"
+          }
+        }
+      }
+    },
     "/admin/auth/forgot-password": {
       "post": {
         "summary": "Admin forgot password",
@@ -187,6 +348,353 @@
         "responses": {
           "200": {
             "description": "Chart data"
+          }
+        }
+      }
+    },
+    "/admin/wallet": {
+      "get": {
+        "summary": "Get Main Operational Wallet",
+        "description": "Retrieve the details of the main operational wallet (funding credits, transfers).",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Main Wallet details retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "wallet": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "balance": {
+                          "type": "string",
+                          "example": "50000.00"
+                        },
+                        "currency": {
+                          "type": "string",
+                          "example": "NGN"
+                        },
+                        "status": {
+                          "type": "string",
+                          "example": "active"
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/revenue": {
+      "get": {
+        "summary": "Get Platform Revenue Wallet Balance",
+        "description": "Retrieve the balance of the platform's revenue wallet (fees & subscriptions).",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revenue Wallet details retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "wallet": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "balance": {
+                          "type": "string",
+                          "example": "15000.00"
+                        },
+                        "currency": {
+                          "type": "string",
+                          "example": "NGN"
+                        }
+                      }
+                    },
+                    "wallets": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "balance": {
+                            "type": "string"
+                          },
+                          "currency": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/wallet/history": {
+      "get": {
+        "summary": "Get Main Operational Wallet History",
+        "description": "Retrieve the transaction history of the main operational wallet (funding/transfers).",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction history retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "transactions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "amount": {
+                            "type": "string",
+                            "example": "50.00"
+                          },
+                          "type": {
+                            "type": "string",
+                            "example": "credit"
+                          },
+                          "description": {
+                            "type": "string",
+                            "example": "Transfer Fee"
+                          },
+                          "reference": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "example": "success"
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/revenue/history": {
+      "get": {
+        "summary": "Get Platform Revenue History (Fees & Subscriptions)",
+        "description": "Retrieve all revenue-generating transactions (fees and subscriptions).",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revenue history retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "transactions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "amount": {
+                            "type": "string",
+                            "example": "50.00"
+                          },
+                          "type": {
+                            "type": "string",
+                            "example": "credit"
+                          },
+                          "description": {
+                            "type": "string",
+                            "example": "Subscription Renewal"
+                          },
+                          "status": {
+                            "type": "string",
+                            "example": "success"
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/kyc": {
+      "get": {
+        "summary": "Get All KYC Details",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of KYC records"
+          }
+        }
+      }
+    },
+    "/admin/kyc/business/{id}/approve": {
+      "post": {
+        "summary": "Approve Business KYC",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Business Verified"
+          }
+        }
+      }
+    },
+    "/admin/kyc/business/{id}/reject": {
+      "post": {
+        "summary": "Reject Business KYC",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Business Rejected"
           }
         }
       }
@@ -440,6 +948,115 @@
         }
       }
     },
+    "/admin/transactions/pending-settlement": {
+      "get": {
+        "summary": "Get transactions requiring settlement",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "pending",
+                "settled"
+              ],
+              "default": "pending"
+            },
+            "description": "Filter by settlement status"
+          },
+          {
+            "in": "query",
+            "name": "startDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "in": "query",
+            "name": "endDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transactions with settlement info"
+          }
+        }
+      }
+    },
+    "/admin/transactions/settle": {
+      "post": {
+        "summary": "Manually settle a transaction",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reference"
+                ],
+                "properties": {
+                  "reference": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transaction settled"
+          }
+        }
+      }
+    },
     "/admin/businesses/{id}/status": {
       "put": {
         "summary": "Update business status",
@@ -482,6 +1099,24 @@
         "responses": {
           "200": {
             "description": "Status updated"
+          }
+        }
+      }
+    },
+    "/admin/features": {
+      "get": {
+        "summary": "Get all available plan features/permissions",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of available features"
           }
         }
       }
@@ -542,11 +1177,24 @@
                       "type": "string"
                     }
                   },
+                  "permissions": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
                   "max_team_members": {
                     "type": "integer"
                   },
                   "trial_days": {
                     "type": "integer"
+                  },
+                  "duration": {
+                    "type": "string",
+                    "enum": [
+                      "monthly",
+                      "yearly"
+                    ]
                   }
                 }
               }
@@ -607,11 +1255,24 @@
                       "type": "string"
                     }
                   },
+                  "permissions": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
                   "max_team_members": {
                     "type": "integer"
                   },
                   "trial_days": {
                     "type": "integer"
+                  },
+                  "duration": {
+                    "type": "string",
+                    "enum": [
+                      "monthly",
+                      "yearly"
+                    ]
                   }
                 }
               }
@@ -1354,6 +2015,204 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/admin/transfers": {
+      "get": {
+        "summary": "Get all transfers (queue)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "businessId",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search by reference, recipient name/account, business name/email"
+          },
+          {
+            "in": "query",
+            "name": "startDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by start date (YYYY-MM-DD)"
+          },
+          {
+            "in": "query",
+            "name": "endDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by end date (YYYY-MM-DD)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transfers"
+          }
+        }
+      }
+    },
+    "/admin/kyc/pending": {
+      "get": {
+        "summary": "Get pending KYC requests",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending KYC requests"
+          }
+        }
+      }
+    },
+    "/admin/kyc/user/{id}": {
+      "put": {
+        "summary": "Update User KYC status",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "verified",
+                      "rejected"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Status updated"
+          }
+        }
+      }
+    },
+    "/admin/kyc/business/{id}": {
+      "put": {
+        "summary": "Update Business KYC status",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "verified",
+                      "rejected"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Status updated"
           }
         }
       }
@@ -2400,6 +3259,24 @@
         }
       }
     },
+    "/fees": {
+      "get": {
+        "summary": "View applicable fees",
+        "tags": [
+          "Fees"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of fees"
+          }
+        }
+      }
+    },
     "/ideas": {
       "get": {
         "summary": "Get all ideas",
@@ -2573,6 +3450,751 @@
         }
       }
     },
+    "/kyc/status": {
+      "get": {
+        "summary": "Get KYC status for current user and business",
+        "tags": [
+          "KYC"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KYC status details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "type": "object",
+                      "properties": {
+                        "bvnStatus": {
+                          "type": "string",
+                          "enum": [
+                            "pending",
+                            "pending_otp",
+                            "pending_review",
+                            "verified",
+                            "failed"
+                          ]
+                        },
+                        "ninStatus": {
+                          "type": "string",
+                          "enum": [
+                            "pending",
+                            "pending_otp",
+                            "pending_review",
+                            "verified",
+                            "failed"
+                          ]
+                        },
+                        "rejection_reason": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "business": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "pending",
+                            "pending_review",
+                            "verified",
+                            "failed"
+                          ]
+                        },
+                        "rejection_reason": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kyc/initiate": {
+      "post": {
+        "summary": "Initiate KYC verification (BVN or NIN)",
+        "tags": [
+          "KYC"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "bvn",
+                      "nin"
+                    ]
+                  },
+                  "number": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification initiated, OTP sent if applicable"
+          }
+        }
+      }
+    },
+    "/kyc/verify-otp": {
+      "post": {
+        "summary": "Verify OTP to complete KYC",
+        "tags": [
+          "KYC"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "otp": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "KYC completed successfully"
+          }
+        }
+      }
+    },
+    "/kyc/business": {
+      "post": {
+        "summary": "Submit Business KYC (Address, Proof of Address)",
+        "tags": [
+          "KYC"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "proof_of_address": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "country": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "type": "string"
+                  },
+                  "city": {
+                    "type": "string"
+                  },
+                  "street": {
+                    "type": "string"
+                  },
+                  "house_number": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Business KYC submitted"
+          }
+        }
+      }
+    },
+    "/payroll/adjustments": {
+      "post": {
+        "summary": "Add a payroll adjustment (bonus or deduction)",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId",
+                  "type",
+                  "amount",
+                  "reason"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "bonus",
+                      "deduction"
+                    ]
+                  },
+                  "amount": {
+                    "type": "number"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "enum": [
+                      "USD",
+                      "NGN"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Adjustment added"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get pending payroll adjustments",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "userId",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of adjustments"
+          }
+        }
+      }
+    },
+    "/payroll/adjustments/{id}": {
+      "delete": {
+        "summary": "Delete/Cancel a pending adjustment",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Adjustment deleted"
+          }
+        }
+      }
+    },
+    "/payroll/summary": {
+      "get": {
+        "summary": "Get payroll summary for all team members",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search by name or email"
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by user role"
+          },
+          {
+            "in": "query",
+            "name": "startDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter adjustments start date (YYYY-MM-DD)"
+          },
+          {
+            "in": "query",
+            "name": "endDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter adjustments end date (YYYY-MM-DD)"
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "Page number"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            },
+            "description": "Items per page"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of team members with payroll calculations"
+          }
+        }
+      }
+    },
+    "/payroll/user/{id}": {
+      "put": {
+        "summary": "Update user payroll details",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "salary": {
+                    "type": "number"
+                  },
+                  "salary_currency": {
+                    "type": "string"
+                  },
+                  "bank_account_number": {
+                    "type": "string"
+                  },
+                  "bank_code": {
+                    "type": "string"
+                  },
+                  "account_name": {
+                    "type": "string"
+                  },
+                  "contract_start_date": {
+                    "type": "string",
+                    "format": "date"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "User payroll details updated"
+          }
+        }
+      }
+    },
+    "/payroll/config": {
+      "get": {
+        "summary": "Get payroll configuration (salary interval)",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current payroll configuration"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update payroll configuration",
+        "tags": [
+          "Payroll"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "salary_interval"
+                ],
+                "properties": {
+                  "salary_interval": {
+                    "type": "string",
+                    "enum": [
+                      "daily",
+                      "weekly",
+                      "monthly",
+                      "yearly",
+                      "custom"
+                    ]
+                  },
+                  "salary_custom_date": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Required if interval is custom"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Configuration updated"
+          }
+        }
+      }
+    },
+    "/settings": {
+      "get": {
+        "summary": "Get business settings",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Business settings details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "settings": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "email": {
+                          "type": "string"
+                        },
+                        "phone_number": {
+                          "type": "string"
+                        },
+                        "industry": {
+                          "type": "string"
+                        },
+                        "logo_url": {
+                          "type": "string"
+                        },
+                        "currency": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update business settings (e.g., currency)",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "currency": {
+                    "type": "string",
+                    "enum": [
+                      "USD",
+                      "NGN"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "industry": {
+                    "type": "string"
+                  },
+                  "logo_url": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settings updated"
+          }
+        }
+      }
+    },
+    "/settings/update-contact/request-otp": {
+      "post": {
+        "summary": "Request OTP to update business email or phone number",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "type",
+                  "value"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "email",
+                      "phone"
+                    ]
+                  },
+                  "value": {
+                    "type": "string",
+                    "description": "New email address or phone number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP sent successfully"
+          },
+          "400": {
+            "description": "Invalid input"
+          }
+        }
+      }
+    },
+    "/settings/update-contact/verify-otp": {
+      "post": {
+        "summary": "Verify OTP and update business email or phone number",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "otp"
+                ],
+                "properties": {
+                  "otp": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Contact updated successfully"
+          },
+          "400": {
+            "description": "Invalid OTP or expired"
+          }
+        }
+      }
+    },
+    "/settings/otp-preference": {
+      "put": {
+        "summary": "Update transaction OTP preference",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "preference"
+                ],
+                "properties": {
+                  "preference": {
+                    "type": "string",
+                    "enum": [
+                      "email",
+                      "sms",
+                      "both"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Preference updated"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get transaction OTP preference",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current preference"
+          }
+        }
+      }
+    },
     "/subscription/transactions/export": {
       "get": {
         "summary": "Export transactions to CSV",
@@ -2612,6 +4234,161 @@
                 "schema": {
                   "type": "string",
                   "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/subscription/transactions": {
+      "get": {
+        "summary": "Get subscription transaction history",
+        "tags": [
+          "Subscription"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Page number"
+          },
+          {
+            "in": "query",
+            "name": "perPage",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Items per page"
+          },
+          {
+            "in": "query",
+            "name": "startDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by start date"
+          },
+          {
+            "in": "query",
+            "name": "endDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by end date"
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by status"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transactions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "transactions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "amount": {
+                            "type": "number"
+                          },
+                          "currency": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "debit or credit"
+                          },
+                          "transaction_type": {
+                            "type": "string",
+                            "description": "subscription, wallet_funding, transfer, etc."
+                          },
+                          "created_at": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "amount": {
+                            "type": "number"
+                          },
+                          "currency": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string"
+                          },
+                          "reference": {
+                            "type": "string"
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "total": {
+                          "type": "integer"
+                        },
+                        "page": {
+                          "type": "integer"
+                        },
+                        "perPage": {
+                          "type": "integer"
+                        },
+                        "totalPages": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -2768,6 +4545,9 @@
                             "type": "number"
                           },
                           "currency": {
+                            "type": "string"
+                          },
+                          "duration": {
                             "type": "string"
                           },
                           "features": {
@@ -3110,130 +4890,6 @@
           },
           "401": {
             "description": "Unauthorized"
-          }
-        }
-      }
-    },
-    "/subscription/transactions": {
-      "get": {
-        "summary": "Get subscription transaction history",
-        "tags": [
-          "Subscription"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "in": "query",
-            "name": "page",
-            "schema": {
-              "type": "integer"
-            },
-            "description": "Page number"
-          },
-          {
-            "in": "query",
-            "name": "perPage",
-            "schema": {
-              "type": "integer"
-            },
-            "description": "Items per page"
-          },
-          {
-            "in": "query",
-            "name": "startDate",
-            "schema": {
-              "type": "string",
-              "format": "date"
-            },
-            "description": "Filter by start date"
-          },
-          {
-            "in": "query",
-            "name": "endDate",
-            "schema": {
-              "type": "string",
-              "format": "date"
-            },
-            "description": "Filter by end date"
-          },
-          {
-            "in": "query",
-            "name": "status",
-            "schema": {
-              "type": "string"
-            },
-            "description": "Filter by status"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of transactions",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean"
-                    },
-                    "data": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "id": {
-                            "type": "string"
-                          },
-                          "amount": {
-                            "type": "number"
-                          },
-                          "currency": {
-                            "type": "string"
-                          },
-                          "status": {
-                            "type": "string"
-                          },
-                          "reference": {
-                            "type": "string"
-                          },
-                          "created_at": {
-                            "type": "string",
-                            "format": "date-time"
-                          }
-                        }
-                      }
-                    },
-                    "pagination": {
-                      "type": "object",
-                      "properties": {
-                        "total": {
-                          "type": "integer"
-                        },
-                        "page": {
-                          "type": "integer"
-                        },
-                        "perPage": {
-                          "type": "integer"
-                        },
-                        "totalPages": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "500": {
-            "description": "Server error"
           }
         }
       }
@@ -3730,7 +5386,42 @@
                     "data": {
                       "type": "array",
                       "items": {
-                        "$ref": "#/components/schemas/User"
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "email": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string"
+                          },
+                          "kyc_status": {
+                            "type": "string"
+                          },
+                          "salary": {
+                            "type": "number"
+                          },
+                          "salary_currency": {
+                            "type": "string"
+                          },
+                          "bank_code": {
+                            "type": "string"
+                          },
+                          "account_number": {
+                            "type": "string"
+                          },
+                          "account_name": {
+                            "type": "string"
+                          }
+                        }
                       }
                     }
                   }
@@ -4108,9 +5799,655 @@
           }
         }
       }
+    },
+    "/api/transfers/account-lookup": {
+      "post": {
+        "summary": "Lookup account details",
+        "tags": [
+          "Transfers"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "bank_code",
+                  "account_number"
+                ],
+                "properties": {
+                  "bank_code": {
+                    "type": "string"
+                  },
+                  "account_number": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account details"
+          },
+          "400": {
+            "description": "Bad request"
+          }
+        }
+      }
+    },
+    "/api/transfers/bulk": {
+      "post": {
+        "summary": "Initiate bulk transfer",
+        "tags": [
+          "Transfers"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "transfers"
+                ],
+                "properties": {
+                  "transfers": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "recipient_account",
+                        "recipient_bank",
+                        "recipient_name",
+                        "amount"
+                      ],
+                      "properties": {
+                        "recipient_account": {
+                          "type": "string"
+                        },
+                        "recipient_bank": {
+                          "type": "string"
+                        },
+                        "recipient_name": {
+                          "type": "string"
+                        },
+                        "amount": {
+                          "type": "number"
+                        },
+                        "remark": {
+                          "type": "string"
+                        },
+                        "source_type": {
+                          "type": "string"
+                        },
+                        "source_id": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transfers queued"
+          }
+        }
+      }
+    },
+    "/api/transfers": {
+      "get": {
+        "summary": "Get transfer history",
+        "tags": [
+          "Transfers"
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transfers"
+          }
+        }
+      }
+    },
+    "/api/transfers/{id}/retry": {
+      "post": {
+        "summary": "Retry a failed transfer",
+        "tags": [
+          "Transfers"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transfer retried"
+          }
+        }
+      }
+    },
+    "/transfers/otp/request": {
+      "post": {
+        "summary": "Request OTP for transfer authorization",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "wallet_id": {
+                    "type": "string",
+                    "description": "Optional wallet ID to charge SMS fee from"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP sent"
+          }
+        }
+      }
+    },
+    "/transfers/single": {
+      "post": {
+        "summary": "Initiate a single transfer",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "bankCode",
+                  "accountNumber",
+                  "amount",
+                  "otp"
+                ],
+                "properties": {
+                  "bankCode": {
+                    "type": "string"
+                  },
+                  "accountNumber": {
+                    "type": "string"
+                  },
+                  "accountName": {
+                    "type": "string"
+                  },
+                  "amount": {
+                    "type": "number"
+                  },
+                  "remark": {
+                    "type": "string"
+                  },
+                  "otp": {
+                    "type": "string"
+                  },
+                  "wallet_id": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transfer queued"
+          }
+        }
+      }
+    },
+    "/transfers/bulk": {
+      "post": {
+        "summary": "Initiate a bulk transfer",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "type",
+                  "otp"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "manual",
+                      "sprint",
+                      "salary",
+                      "task"
+                    ]
+                  },
+                  "otp": {
+                    "type": "string",
+                    "description": "OTP code for authorization"
+                  },
+                  "source_wallet_id": {
+                    "type": "string",
+                    "description": "ID of the wallet to fund the transfer from"
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Data depending on type (manual items, sprint name, task IDs)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transfers queued"
+          }
+        }
+      }
+    },
+    "/transfers": {
+      "get": {
+        "summary": "Get transfer queue",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search by recipient name, account or reference"
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "processing",
+                "success",
+                "failed"
+              ]
+            },
+            "description": "Filter by status"
+          },
+          {
+            "in": "query",
+            "name": "startDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by start date (YYYY-MM-DD)"
+          },
+          {
+            "in": "query",
+            "name": "endDate",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "Filter by end date (YYYY-MM-DD)"
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "Page number"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            },
+            "description": "Items per page"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transfers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "total": {
+                          "type": "integer"
+                        },
+                        "page": {
+                          "type": "integer"
+                        },
+                        "limit": {
+                          "type": "integer"
+                        },
+                        "totalPages": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transfers/{id}/retry": {
+      "post": {
+        "summary": "Retry a failed transfer",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Retry initiated"
+          }
+        }
+      }
+    },
+    "/transfers/banks": {
+      "get": {
+        "summary": "Get list of supported banks",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of banks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "code": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transfers/lookup": {
+      "post": {
+        "summary": "Lookup account name",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "bankCode",
+                  "accountNumber"
+                ],
+                "properties": {
+                  "bankCode": {
+                    "type": "string"
+                  },
+                  "accountNumber": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account details"
+          }
+        }
+      }
+    },
+    "/wallet/create-virtual-account": {
+      "post": {
+        "summary": "Retry creation of Virtual Account for User Wallet",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Virtual Account created successfully"
+          }
+        }
+      }
+    },
+    "/wallet": {
+      "get": {
+        "summary": "Get wallet details (Balance, Virtual Account)",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Wallet details"
+          }
+        }
+      }
+    },
+    "/wallet/fund/card": {
+      "post": {
+        "summary": "Initiate wallet funding via Card",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "amount": {
+                    "type": "number"
+                  },
+                  "wallet_type": {
+                    "type": "string",
+                    "enum": [
+                      "user",
+                      "business"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment link generated"
+          }
+        }
+      }
+    },
+    "/wallet/business/create": {
+      "post": {
+        "summary": "Create Business Virtual Account (Wallet)",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "gtb_account_number": {
+                    "type": "string"
+                  },
+                  "business_name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Business Wallet created"
+          }
+        }
+      }
+    },
+    "/wallet/verify": {
+      "get": {
+        "summary": "Verify payment transaction",
+        "tags": [
+          "Wallet"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "reference",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment verified successfully"
+          }
+        }
+      }
     }
   },
   "tags": [
+    {
+      "name": "Admin Fees",
+      "description": "Fee management for admins"
+    },
     {
       "name": "Auth",
       "description": "Authentication endpoints"
@@ -4128,6 +6465,22 @@
       "description": "Epic management endpoints"
     },
     {
+      "name": "Fees",
+      "description": "Fee information for users"
+    },
+    {
+      "name": "KYC",
+      "description": "Know Your Customer verification endpoints"
+    },
+    {
+      "name": "Payroll",
+      "description": "Payroll management and adjustments"
+    },
+    {
+      "name": "Settings",
+      "description": "Business settings management"
+    },
+    {
       "name": "Subscription",
       "description": "Subscription management endpoints"
     },
@@ -4138,6 +6491,14 @@
     {
       "name": "Team",
       "description": "Team management endpoints"
+    },
+    {
+      "name": "Transfers",
+      "description": "Transfer management and payout"
+    },
+    {
+      "name": "Wallet",
+      "description": "Wallet management endpoints"
     }
   ]
 }

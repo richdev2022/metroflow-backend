@@ -216,11 +216,15 @@ export const createTask: RequestHandler = async (req: AuthenticatedRequest, res)
       });
     }
 
+    // Get business currency for default
+    const businessRes = await query(`SELECT currency FROM businesses WHERE id = $1`, [businessId]);
+    const businessCurrency = businessRes.rows[0]?.currency || 'NGN';
+
     const result = await query(
       `INSERT INTO tasks
-        (business_id, created_by, title, description, epic, epic_id, sprint, target_value, start_date, end_date, due_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         RETURNING id, title, description, epic, epic_id as "epicId", sprint, target_value as "targetValue",
+        (business_id, created_by, title, description, epic, epic_id, sprint, target_value, currency, start_date, end_date, due_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING id, title, description, epic, epic_id as "epicId", sprint, target_value as "targetValue", currency,
                    accomplished_value as "accomplishedValue",
                    start_date as "startDate", end_date as "endDate",
                    due_date as "dueDate", status, is_overdue as "isOverdue",
@@ -234,6 +238,7 @@ export const createTask: RequestHandler = async (req: AuthenticatedRequest, res)
         input.epicId || null,
         input.sprint || null,
         0, // default target_value
+        businessCurrency, // default currency from business
         input.startDate || new Date().toISOString().split("T")[0],
         input.endDate || new Date().toISOString().split("T")[0],
         input.dueDate || null,

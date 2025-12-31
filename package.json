@@ -12,7 +12,6 @@
     "generate-swagger": "tsx scripts/generate-swagger.ts",
     "build": "npm run generate-swagger && vite build --config vite.config.server.ts",
     "start": "node dist/server/node-build.mjs",
-
     "test": "vitest --run",
     "format.fix": "prettier --write .",
     "typecheck": "tsc"
@@ -22,6 +21,7 @@
     "axios": "^1.7.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
+    "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.11",
     "pg": "^8.11.3",

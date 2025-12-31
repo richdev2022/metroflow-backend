@@ -1,4 +1,5 @@
 /// <reference types="node" />
+import "dotenv/config";
 import { createServer } from "./index";
 
 const port = process.env.PORT || 3000;

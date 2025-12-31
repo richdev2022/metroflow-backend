@@ -54,6 +54,13 @@ import adminRouter from "./routes/admin";
 import subscriptionRouter from "./routes/subscription";
 import webhookRouter from "./routes/webhook";
 import dashboardRouter from "./routes/dashboard";
+import transferRouter from "./routes/transfers";
+import payrollRouter from "./routes/payroll";
+import settingsRouter from "./routes/settings";
+import kycRouter from "./routes/kyc";
+import walletRouter from "./routes/wallet";
+import adminFeesRouter from "./routes/admin_fees";
+import feesRouter from "./routes/fees";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -256,6 +263,10 @@ export async function createServer() {
   app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
   app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
 
+  // Fee Management Routes
+  app.use("/api/fees", feesRouter);
+  app.use("/api/admin/fees", adminFeesRouter);
+
   // Admin API routes
   app.use("/api/admin", adminRouter);
 
@@ -267,6 +278,27 @@ export async function createServer() {
 
   // Webhook API routes
   app.use("/api/webhook", webhookRouter);
+
+  // Transfer API routes
+  app.use("/api/transfers", transferRouter);
+
+  // Payroll API routes
+  app.use("/api/payroll", payrollRouter);
+
+  // Settings API routes
+  app.use("/api/settings", settingsRouter);
+
+  // KYC API routes
+  app.use("/api/kyc", kycRouter);
+
+  // Wallet API routes
+  app.use("/api/wallet", walletRouter);
+
+  // Redirect /wallet/verify to /api/wallet/verify (for backward compatibility with old callback URLs)
+  app.get("/wallet/verify", (req, res) => {
+    const queryString = req.url.split('?')[1] || '';
+    res.redirect(`/api/wallet/verify?${queryString}`);
+  });
 
   return app;
 }

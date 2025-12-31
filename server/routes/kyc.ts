@@ -412,7 +412,8 @@ router.post("/business", authenticateToken, upload.single('proof_of_address'), a
     const businessId = req.user!.businessId;
     const { country, state, city, street, house_number } = req.body;
     
-    if (!req.file) {
+    const request = req as any;
+    if (!request.file) {
          return res.status(400).json({ success: false, error: "Proof of address file is required" });
     }
     
@@ -421,12 +422,12 @@ router.post("/business", authenticateToken, upload.single('proof_of_address'), a
     }
 
     let proofUrl = "";
-    if (req.file.buffer) {
-        const b64 = req.file.buffer.toString('base64');
-        proofUrl = `data:${req.file.mimetype};base64,${b64}`;
-    } else if (req.file.filename) {
+    if (request.file.buffer) {
+        const b64 = request.file.buffer.toString('base64');
+        proofUrl = `data:${request.file.mimetype};base64,${b64}`;
+    } else if (request.file.filename) {
          // Fallback if disk storage is somehow used
-         proofUrl = `/uploads/${req.file.filename}`;
+         proofUrl = `/uploads/${request.file.filename}`;
     }
 
     await query(

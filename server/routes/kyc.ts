@@ -420,7 +420,14 @@ router.post("/business", authenticateToken, upload.single('proof_of_address'), a
          return res.status(400).json({ success: false, error: "All address fields are required" });
     }
 
-    const proofUrl = `/uploads/${req.file.filename}`;
+    let proofUrl = "";
+    if (req.file.buffer) {
+        const b64 = req.file.buffer.toString('base64');
+        proofUrl = `data:${req.file.mimetype};base64,${b64}`;
+    } else if (req.file.filename) {
+         // Fallback if disk storage is somehow used
+         proofUrl = `/uploads/${req.file.filename}`;
+    }
 
     await query(
       `UPDATE businesses SET 

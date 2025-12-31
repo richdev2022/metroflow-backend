@@ -143,6 +143,11 @@ export async function createServer() {
   // Serve static files
   // app.use(express.static(path.join(__dirname, "../public")));
   app.use(express.static(path.join(process.cwd(), "public")));
+  
+  // Serve uploaded files
+  const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+  const uploadDir = isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads");
+  app.use("/uploads", express.static(uploadDir));
 
 
   // Fix for potential body parsing issues in serverless environment

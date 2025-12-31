@@ -126,15 +126,22 @@ export async function createServer() {
   });
 
   // Middleware
-  app.use(cors({
-    origin: true, // Allow all origins by reflecting the request origin
+  const corsOptions = {
+    origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) return callback(null, true);
+      // Allow all origins
+      return callback(null, true);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers', 'Access-Control-Request-Method', 'Access-Control-Request-Headers'],
     preflightContinue: false,
     optionsSuccessStatus: 204
-  }));
-  // app.options('*', cors()); // Enable pre-flight across-the-board
+  };
+
+  app.use(cors(corsOptions));
+  // app.options('*', cors(corsOptions)); // Enable pre-flight across-the-board
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 

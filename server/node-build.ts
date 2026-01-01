@@ -8,7 +8,7 @@ async function start() {
   try {
     const app = await createServer();
 
-    app.listen(port, () => {
+    app.listen(Number(port), "0.0.0.0", () => {
       console.log(`🚀 MetricFlow server running on port ${port}`);
       console.log(`🔧 API: http://localhost:${port}/api`);
     });

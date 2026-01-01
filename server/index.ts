@@ -129,7 +129,7 @@ export async function createServer() {
   const corsOptions = {
     origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
       // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin) return callback(null, true);
+      if (!origin || origin === 'null') return callback(null, true);
       // Allow all origins
       return callback(null, true);
     },
@@ -142,6 +142,25 @@ export async function createServer() {
 
   app.use(cors(corsOptions));
   // app.options('*', cors(corsOptions)); // Enable pre-flight across-the-board
+  
+  // Add manual CORS headers as a fallback/redundancy
+  // app.use((req, res, next) => {
+  //   const origin = req.headers.origin;
+  //   if (origin) {
+  //     res.setHeader('Access-Control-Allow-Origin', origin);
+  //   } else {
+  //     res.setHeader('Access-Control-Allow-Origin', '*');
+  //   }
+  //   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  //   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Allow-Headers');
+  //   res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
+  //   if (req.method === 'OPTIONS') {
+  //     return res.sendStatus(204);
+  //   }
+  //   next();
+  // });
+
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 

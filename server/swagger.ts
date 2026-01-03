@@ -253,7 +253,7 @@ const options: swaggerJsdoc.Options = {
     ],
   },
   // In production/bundled env, we don't scan files. We use the imported JSON.
-  apis: process.env.NODE_ENV === 'production' ? [] : ["./server/routes/*.ts", "./server/index.ts"],
+  apis: ["./server/routes/*.ts", "./server/index.ts"],
 };
 
 let specs: object = swaggerJsdoc(options);

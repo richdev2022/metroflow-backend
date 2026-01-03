@@ -3,7 +3,7 @@ import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
 import { processAllPending } from "../services/transfer";
 import { accountLookup, getBanks } from "../services/squad";
-import { calculateFee, creditPlatformWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet } from "../services/fees";
 import { generateOTP, getOTPExpiry } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
@@ -107,7 +107,7 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
                     [businessId, feeAmt, 'NGN', `OTP-FEE-${Date.now()}`, wallet.id, feeAmt]
                  );
                  
-                 await creditPlatformWallet(feeAmt, 'NGN');
+                 await creditRevenueWallet(feeAmt, 'NGN');
                  feeCharged = feeAmt;
             }
 

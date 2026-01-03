@@ -1,7 +1,7 @@
 import { query } from "../db";
 import { chargeCard } from "./squad";
 import { sendEmail } from "./email";
-import { creditPlatformWallet } from "./fees";
+import { creditRevenueWallet } from "./fees";
 import axios from "axios";
 
 export const processSubscriptionRenewals = async () => {
@@ -125,7 +125,7 @@ export const processSubscriptionRenewals = async () => {
                 ]);
 
                 // Credit Platform Revenue Wallet
-                await creditPlatformWallet(amount, 'NGN');
+                await creditRevenueWallet(amount, 'NGN');
 
                 results.success++;
             } else {

@@ -1,19 +1,26 @@
 import { Pool } from "pg";
 import { hashPassword } from "./services/auth";
 
-console.log("Initializing DB Pool...");
+console.log("Initializing DB Pool... (Modified)");
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  connectionTimeoutMillis: 10000, // 10 seconds
-  idleTimeoutMillis: 30000,       // 30 seconds
-  max: 20                         // Max clients in pool
+  connectionTimeoutMillis: 60000, // 60 seconds
+  idleTimeoutMillis: 60000,       // 60 seconds
+  max: 20,                        // Max clients in pool
+  keepAlive: true
+});
+
+// Add error handler to prevent server crash on idle client errors
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+  // Don't exit process, just log. The pool will discard the client.
 });
 
 // Retry logic for transient errors (like DNS/Connection timeouts)
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000; // 1s
+const MAX_RETRIES = 10;
+const RETRY_DELAY = 3000; // 3s
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -35,7 +42,8 @@ export async function query(text: string, params?: unknown[]) {
       const isTransient = error.code === 'ENOTFOUND' || 
                           error.code === 'ETIMEDOUT' || 
                           error.code === 'ECONNRESET' || 
-                          error.message.includes('timeout');
+                          error.message.includes('timeout') ||
+                          error.message.includes('Connection terminated');
       
       if (isTransient && attempt < MAX_RETRIES) {
         console.warn(`Database query failed (Attempt ${attempt}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY}ms... Error: ${error.message}`);
@@ -632,7 +640,7 @@ export async function initializeDatabase() {
     console.log("Database tables initialized successfully");
   } catch (error) {
     console.error("Failed to initialize database:", error);
-    // Don't throw error to prevent server from crashing
+    throw error;
   }
 }
 

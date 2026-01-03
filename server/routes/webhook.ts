@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { verifySquadWebhook } from "../services/squad";
-import { calculateFee, creditPlatformWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet } from "../services/fees";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -165,7 +165,7 @@ router.post("/", async (req, res) => {
 
                         // Credit Platform Revenue Wallet
                         const subAmount = parseFloat(transaction.amount);
-                        await creditPlatformWallet(subAmount, transaction.currency || 'NGN');
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
                     }
                 }
             } else {
@@ -205,7 +205,7 @@ router.post("/", async (req, res) => {
 
                              // Credit Platform Wallet with Fee
                              if (fee > 0) {
-                                await creditPlatformWallet(fee, 'NGN');
+                                await creditRevenueWallet(fee, 'NGN');
                              }
                          }
                      }

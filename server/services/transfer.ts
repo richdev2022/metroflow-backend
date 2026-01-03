@@ -1,6 +1,6 @@
 import { query } from "../db";
 import { initiateTransfer, toMinorUnit } from "./squad";
-import { creditPlatformWallet, debitPlatformWallet } from "./fees";
+import { creditPlatformWallet, debitPlatformWallet, creditRevenueWallet, debitRevenueWallet } from "./fees";
 export { accountLookup } from "./squad";
 
 export async function processAllPending(businessId: string) {
@@ -40,6 +40,14 @@ export async function processAllPending(businessId: string) {
           // Debit Wallet
           await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [totalDebit, transfer.wallet_id]);
           
+          // Credit Platform Wallet (Amount) - Intermediary Step for Payout
+          await creditPlatformWallet(amount, transfer.currency || 'NGN');
+
+          // Credit Revenue Wallet (Fee) - Earnings
+          if (fee > 0) {
+              await creditRevenueWallet(fee, transfer.currency || 'NGN');
+          }
+
           // Record Transaction (Amount)
           await query(
             `INSERT INTO transactions 
@@ -71,7 +79,6 @@ export async function processAllPending(businessId: string) {
                   fee
               ]
             );
-            await creditPlatformWallet(fee, transfer.currency || 'NGN');
           }
       }
 
@@ -92,6 +99,10 @@ export async function processAllPending(businessId: string) {
 
       if (response.status === 200 && response.success) {
          // 4. Success (or queued at Squad side)
+         // Debit Platform Wallet (Amount only) as it has been sent out
+         const amount = parseFloat(transfer.amount);
+         await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
          await query(
            `UPDATE transfer_queue 
             SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2 
@@ -110,6 +121,14 @@ export async function processAllPending(businessId: string) {
 
             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
             
+            // Reversal: Debit Platform Wallet (Amount)
+            await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+            // Reversal: Debit Revenue Wallet (Fee)
+            if (fee > 0) {
+                await debitRevenueWallet(fee, transfer.currency || 'NGN');
+            }
+
             // Record Refund Transaction (Amount)
             await query(
                 `INSERT INTO transactions 
@@ -141,7 +160,6 @@ export async function processAllPending(businessId: string) {
                         transfer.wallet_id
                     ]
                 );
-                await debitPlatformWallet(fee, transfer.currency || 'NGN');
             }
         }
 
@@ -169,6 +187,14 @@ export async function processAllPending(businessId: string) {
 
                 await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
                 
+                // Reversal: Debit Platform Wallet (Amount)
+                await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+                // Reversal: Debit Revenue Wallet (Fee)
+                if (fee > 0) {
+                    await debitRevenueWallet(fee, transfer.currency || 'NGN');
+                }
+
                 await query(
                     `INSERT INTO transactions 
                      (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
@@ -197,7 +223,6 @@ export async function processAllPending(businessId: string) {
                             transfer.wallet_id
                         ]
                     );
-                    await debitPlatformWallet(fee, transfer.currency || 'NGN');
                 }
            }
       }
@@ -280,6 +305,14 @@ export async function processTransfer(transferId: string) {
         // Debit Wallet
         await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [totalDebit, transfer.wallet_id]);
         
+        // Credit Platform Wallet (Amount) - Intermediary Step for Payout
+        await creditPlatformWallet(amount, transfer.currency || 'NGN');
+
+        // Credit Revenue Wallet (Fee) - Earnings
+        if (fee > 0) {
+            await creditRevenueWallet(fee, transfer.currency || 'NGN');
+        }
+
         // Record Transaction
         await query(
           `INSERT INTO transactions 
@@ -310,7 +343,6 @@ export async function processTransfer(transferId: string) {
                   fee
               ]
             );
-            await creditPlatformWallet(fee, transfer.currency || 'NGN');
         }
     }
 
@@ -331,6 +363,10 @@ export async function processTransfer(transferId: string) {
 
     if (response.status === 200 && response.success) {
        // Success
+       // Debit Platform Wallet (Amount only) as it has been sent out
+       const amount = parseFloat(transfer.amount);
+       await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
        await query(
          `UPDATE transfer_queue 
           SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2 
@@ -349,6 +385,15 @@ export async function processTransfer(transferId: string) {
           const totalRefund = amount + fee;
 
           await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
+          
+          // Reversal: Debit Platform Wallet (Amount)
+          await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+          // Reversal: Debit Revenue Wallet (Fee)
+          if (fee > 0) {
+              await debitRevenueWallet(fee, transfer.currency || 'NGN');
+          }
+
           await query(
               `INSERT INTO transactions 
                (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
@@ -377,7 +422,6 @@ export async function processTransfer(transferId: string) {
                     transfer.wallet_id
                 ]
             );
-            await debitPlatformWallet(fee, transfer.currency || 'NGN');
         }
       }
 
@@ -403,6 +447,15 @@ export async function processTransfer(transferId: string) {
              const totalRefund = amount + fee;
 
               await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
+              
+              // Reversal: Debit Platform Wallet (Amount)
+              await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+              // Reversal: Debit Revenue Wallet (Fee)
+              if (fee > 0) {
+                  await debitRevenueWallet(fee, transfer.currency || 'NGN');
+              }
+
               await query(
                   `INSERT INTO transactions 
                    (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
@@ -431,7 +484,6 @@ export async function processTransfer(transferId: string) {
                         transfer.wallet_id
                     ]
                 );
-                await debitPlatformWallet(fee, transfer.currency || 'NGN');
             }
          }
     }

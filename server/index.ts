@@ -69,14 +69,18 @@ import * as cron from "node-cron";
 export async function createServer() {
   const app = express();
 
-  // Initialize database on startup
-  try {
-    await initializeDatabase();
-  } catch (error) {
-    console.error("Failed to initialize database:", error);
-  }
+  // Initialize database in background to allow server to start immediately
+  let isDbReady = false;
+  initializeDatabase()
+    .then(() => {
+      console.log("✅ Database initialized successfully");
+      isDbReady = true;
+    })
+    .catch((error) => {
+      console.error("❌ Failed to initialize database:", error);
+    });
 
-  // Schedule activity log cleanup (runs daily at midnight)
+  // Middleware
   cron.schedule("0 0 * * *", async () => {
     try {
       console.log("Running activity log cleanup...");
@@ -128,50 +132,27 @@ export async function createServer() {
   // Middleware
   const corsOptions = {
     origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+      // console.log("CORS Origin Check:", origin);
       // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin || origin === 'null') return callback(null, true);
-      // Allow all origins
+      // Allow all origins (reflects the request origin)
       return callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers', 'Access-Control-Request-Method', 'Access-Control-Request-Headers'],
+    // allowedHeaders: [], // Omit allowedHeaders to allow the browser to request any headers (reflects Access-Control-Request-Headers)
     preflightContinue: false,
     optionsSuccessStatus: 204
   };
 
   app.use(cors(corsOptions));
-  // app.options('*', cors(corsOptions)); // Enable pre-flight across-the-board
-  
-  // Add manual CORS headers as a fallback/redundancy
-  // app.use((req, res, next) => {
-  //   const origin = req.headers.origin;
-  //   if (origin) {
-  //     res.setHeader('Access-Control-Allow-Origin', origin);
-  //   } else {
-  //     res.setHeader('Access-Control-Allow-Origin', '*');
-  //   }
-  //   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  //   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Allow-Headers');
-  //   res.setHeader('Access-Control-Allow-Credentials', 'true');
-    
-  //   if (req.method === 'OPTIONS') {
-  //     return res.sendStatus(204);
-  //   }
-  //   next();
-  // });
+  // app.options('*', cors(corsOptions)); // Removed due to Express 5 / path-to-regexp issue
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
   // Swagger Documentation
-  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, {
-    customCssUrl: "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui.min.css",
-    customJs: [
-      "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-bundle.js",
-      "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-standalone-preset.js"
-    ]
-  }));
+  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
 
 
   // Serve static files
@@ -224,12 +205,37 @@ export async function createServer() {
     next();
   });
 
+  // Check DB status for API routes
+  app.use('/api', (req, res, next) => {
+    if (req.path === '/' || req.path === '/ping' || req.path === '/demo') return next();
+    
+    if (!isDbReady) {
+      // Allow pre-flight requests to pass through
+      if (req.method === 'OPTIONS') return next();
+
+      return res.status(503).json({ 
+        error: "Service Unavailable", 
+        message: "Server is still initializing database connection. Please try again in a few seconds." 
+      });
+    }
+    next();
+  });
+
   // Example API routes
   app.get("/", (_req, res) => {
     res.json({ 
       message: "MetroFlow Backend API is running", 
       docs: "/api-docs",
       status: "active" 
+    });
+  });
+
+  app.get("/api", (_req, res) => {
+    res.json({
+      message: "MetroFlow Backend API is running",
+      status: isDbReady ? "online" : "initializing",
+      version: "1.0.0",
+      docs: "/api-docs"
     });
   });
 
@@ -337,6 +343,19 @@ export async function createServer() {
   app.get("/wallet/verify", (req, res) => {
     const queryString = req.url.split('?')[1] || '';
     res.redirect(`/api/wallet/verify?${queryString}`);
+  });
+
+  // Global Error Handler
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("❌ Unhandled Error:", err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(500).json({ 
+      error: "Internal Server Error", 
+      message: err.message,
+      path: req.path
+    });
   });
 
   return app;

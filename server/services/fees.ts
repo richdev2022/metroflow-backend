@@ -94,12 +94,41 @@ export async function deleteFee(id: string) {
 }
 
 export async function creditPlatformWallet(amount: number, currency: string = 'NGN') {
+    // This is the Operational Wallet (Intermediary funds)
     if (amount === 0) return;
     
-    // Ensure wallet exists
-    let walletRes = await query(`SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
+    // Find Operational Wallet (business_id is NULL)
+    let walletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL AND currency = $1 LIMIT 1`, [currency]);
+    
     if (walletRes.rows.length === 0) {
-        // Create if not exists (though migration should have handled NGN)
+        // Create if not exists
+        const newWallet = await query(
+            `INSERT INTO wallets (balance, currency, status) VALUES (0, $1, 'active') RETURNING id`, 
+            [currency]
+        );
+        walletRes = newWallet;
+    }
+    
+    const walletId = walletRes.rows[0].id;
+    
+    await query(
+        `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [amount, walletId]
+    );
+}
+
+export async function debitPlatformWallet(amount: number, currency: string = 'NGN') {
+    if (amount <= 0) return;
+    await creditPlatformWallet(-amount, currency);
+}
+
+export async function creditRevenueWallet(amount: number, currency: string = 'NGN') {
+    // This is the Revenue Wallet (platform_wallet table)
+    if (amount === 0) return;
+
+    let walletRes = await query(`SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
+    
+    if (walletRes.rows.length === 0) {
         const newWallet = await query(
             `INSERT INTO platform_wallet (balance, currency) VALUES (0, $1) RETURNING id`, 
             [currency]
@@ -115,7 +144,7 @@ export async function creditPlatformWallet(amount: number, currency: string = 'N
     );
 }
 
-export async function debitPlatformWallet(amount: number, currency: string = 'NGN') {
+export async function debitRevenueWallet(amount: number, currency: string = 'NGN') {
     if (amount <= 0) return;
-    await creditPlatformWallet(-amount, currency);
+    await creditRevenueWallet(-amount, currency);
 }

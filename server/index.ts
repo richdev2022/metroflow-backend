@@ -69,16 +69,30 @@ import * as cron from "node-cron";
 export async function createServer() {
   const app = express();
 
-  // Initialize database in background to allow server to start immediately
+  // Initialize database
   let isDbReady = false;
-  initializeDatabase()
+  let dbInitError: any = null;
+
+  const dbInitPromise = initializeDatabase()
     .then(() => {
       console.log("✅ Database initialized successfully");
       isDbReady = true;
     })
     .catch((error) => {
       console.error("❌ Failed to initialize database:", error);
+      dbInitError = error;
     });
+
+  // In serverless environments, we must wait for the database to initialize
+  // because background tasks may be frozen immediately after the response is sent.
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) {
+    console.log("Serverless environment detected, awaiting database initialization...");
+    try {
+      await dbInitPromise;
+    } catch (e) {
+      // Error is already captured in dbInitError
+    }
+  }
 
   // Middleware
   cron.schedule("0 0 * * *", async () => {
@@ -215,7 +229,8 @@ export async function createServer() {
 
       return res.status(503).json({ 
         error: "Service Unavailable", 
-        message: "Server is still initializing database connection. Please try again in a few seconds." 
+        message: "Server is still initializing database connection. Please try again in a few seconds.",
+        details: dbInitError ? (dbInitError instanceof Error ? dbInitError.message : String(dbInitError)) : undefined
       });
     }
     next();

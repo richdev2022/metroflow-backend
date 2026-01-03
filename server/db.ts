@@ -99,6 +99,7 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_days INTEGER DEFAULT 7`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS duration VARCHAR(20) DEFAULT 'monthly'`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS discount DECIMAL(10, 2) DEFAULT 0`);
 
     // Add plan_id and subscription_status to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS plan_id UUID REFERENCES pricing_plans(id)`);

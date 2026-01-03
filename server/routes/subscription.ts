@@ -276,7 +276,7 @@ router.get("/current", authenticateToken, async (req, res) => {
 
     const businessResult = await query(`
       SELECT b.id, b.name, b.subscription_status, b.trial_ends_at, b.next_billing_date,
-             p.id as plan_id, p.name as plan_name, p.price as plan_price, 
+             p.id as plan_id, p.name as plan_name, p.price as plan_price, p.discount as plan_discount,
              p.max_team_members, p.features
       FROM businesses b
       LEFT JOIN pricing_plans p ON b.plan_id = p.id
@@ -655,7 +655,12 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
     // Generate unique reference
     const reference = `TXN_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
     
-    let finalAmount = plan.price;
+    let finalAmount = Number(plan.price);
+    const discount = Number(plan.discount || 0);
+    
+    if (discount > 0) {
+        finalAmount = Math.max(0, finalAmount - discount);
+    }
     
     // Handle currency conversion
     if (currency === 'NGN') {

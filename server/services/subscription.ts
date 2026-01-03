@@ -10,7 +10,7 @@ export const processSubscriptionRenewals = async () => {
     // Find subscriptions due for renewal
     // We check for active or past_due statuses that are due
     const dueSubscriptions = await query(`
-        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, p.name as plan_name, p.price, p.currency, p.duration
+        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, p.name as plan_name, p.price, p.currency, p.duration, p.discount
         FROM businesses b
         JOIN pricing_plans p ON b.plan_id = p.id
         WHERE b.subscription_status IN ('active', 'past_due') 

@@ -624,6 +624,176 @@ router.post("/kyc/business/:id/reject", authenticateAdmin, requirePermission('ma
 // Businesses Management
 /**
  * @swagger
+ * /admin/pricing:
+ *   get:
+ *     summary: Get all pricing plans (Admin)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of pricing plans
+ */
+router.get("/pricing", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const result = await query(`SELECT * FROM pricing_plans ORDER BY price ASC`);
+        res.json({ success: true, plans: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Failed to fetch plans" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/pricing:
+ *   post:
+ *     summary: Create a new pricing plan
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - price
+ *               - currency
+ *               - duration
+ *             properties:
+ *               name:
+ *                 type: string
+ *               price:
+ *                 type: number
+ *               currency:
+ *                 type: string
+ *               duration:
+ *                 type: string
+ *                 enum: [monthly, yearly]
+ *               discount:
+ *                 type: number
+ *               features:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Plan created
+ */
+router.post("/pricing", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { name, price, currency, duration, discount, features } = req.body;
+        
+        if (!name || !price || !currency || !duration) {
+            return res.status(400).json({ success: false, error: "Missing required fields" });
+        }
+
+        const result = await query(
+            `INSERT INTO pricing_plans (name, price, currency, duration, discount, features, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6, true)
+             RETURNING *`,
+            [name, price, currency, duration, discount || 0, features || []]
+        );
+
+        res.json({ success: true, plan: result.rows[0] });
+    } catch (error) {
+        console.error("Create Plan Error:", error);
+        res.status(500).json({ success: false, error: "Failed to create plan" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/pricing/{id}:
+ *   put:
+ *     summary: Update a pricing plan
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               price:
+ *                 type: number
+ *               discount:
+ *                 type: number
+ *               features:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               is_active:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Plan updated
+ */
+router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, price, discount, features, is_active } = req.body;
+
+        // Dynamic update
+        let queryStr = "UPDATE pricing_plans SET updated_at = NOW()";
+        const params = [id];
+        let paramCount = 2;
+
+        if (name !== undefined) {
+            queryStr += `, name = $${paramCount}`;
+            params.push(name);
+            paramCount++;
+        }
+        if (price !== undefined) {
+            queryStr += `, price = $${paramCount}`;
+            params.push(price);
+            paramCount++;
+        }
+        if (discount !== undefined) {
+            queryStr += `, discount = $${paramCount}`;
+            params.push(discount);
+            paramCount++;
+        }
+        if (features !== undefined) {
+            queryStr += `, features = $${paramCount}`;
+            params.push(features);
+            paramCount++;
+        }
+        if (is_active !== undefined) {
+            queryStr += `, is_active = $${paramCount}`;
+            params.push(is_active);
+            paramCount++;
+        }
+
+        queryStr += ` WHERE id = $1 RETURNING *`;
+
+        const result = await query(queryStr, params);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Plan not found" });
+        }
+
+        res.json({ success: true, plan: result.rows[0] });
+    } catch (error) {
+        console.error("Update Plan Error:", error);
+        res.status(500).json({ success: false, error: "Failed to update plan" });
+    }
+});
+
+/**
+ * @swagger
  * /admin/businesses:
  *   get:
  *     summary: Get all businesses
@@ -1466,13 +1636,13 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
 router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration } = req.body;
+    const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration, discount } = req.body;
     
     // Build dynamic update query
     // For simplicity, updating all fields
     await query(
-      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, duration=$9, updated_at=CURRENT_TIMESTAMP WHERE id=$10`,
-      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, duration || 'monthly', id]
+      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, duration=$9, discount=$10, updated_at=CURRENT_TIMESTAMP WHERE id=$11`,
+      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, duration || 'monthly', discount || 0, id]
     );
     res.json({ success: true });
   } catch (error) {

@@ -27,8 +27,8 @@ async function start() {
     // Handle uncaught exceptions and rejections
     process.on("uncaughtException", (err) => {
       console.error("❌ Uncaught Exception:", err);
-      // Don't exit immediately in dev, or let nodemon restart it
-      process.exit(1);
+      // Keep the server running
+      // process.exit(1);
     });
 
     process.on("unhandledRejection", (reason, promise) => {

@@ -187,6 +187,21 @@ export async function initializeDatabase() {
 
     // Add KYC columns to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(50) DEFAULT 'pending'`);
+
+    // Create product_documentation table
+    await query(`
+      CREATE TABLE IF NOT EXISTS product_documentation (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) REFERENCES businesses(id),
+        idea_id UUID REFERENCES ideas(id),
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        logo_url TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_rejection_reason TEXT`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS proof_of_address_url TEXT`);

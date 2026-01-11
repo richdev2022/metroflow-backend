@@ -244,6 +244,20 @@ const options: swaggerJsdoc.Options = {
             },
           },
         },
+        ProductDocumentation: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+            businessId: { type: "string", format: "uuid" },
+            ideaId: { type: "string", format: "uuid" },
+            title: { type: "string" },
+            content: { type: "string" },
+            logoUrl: { type: "string" },
+            createdBy: { type: "string", format: "uuid" },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+        },
       },
     },
     security: [

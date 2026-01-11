@@ -126,6 +126,32 @@ export interface UpdateIdeaStatusInput {
   status: "under_review" | "executed" | "rejected";
 }
 
+// Product Documentation Types
+export interface ProductDocumentation {
+  id: string;
+  businessId: string;
+  ideaId: string;
+  title: string;
+  content: string;
+  logoUrl?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GenerateDocumentationInput {
+  ideaId: string;
+}
+
+export interface RegenerateDocumentationInput {
+  areasOfConcern: string;
+}
+
+export interface UpdateDocumentationInput {
+  content?: string;
+  logoUrl?: string;
+}
+
 // Comment Types with threading
 export interface Comment {
   id: string;

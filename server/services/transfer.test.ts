@@ -10,7 +10,7 @@ vi.mock('../db', () => ({
 
 // Mock Squad
 vi.mock('./squad', async (importOriginal) => {
-    const actual = await importOriginal();
+    const actual = await importOriginal<any>();
     return {
         ...actual,
         initiateTransfer: vi.fn(),

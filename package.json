@@ -17,13 +17,17 @@
     "typecheck": "tsc"
   },
   "dependencies": {
+    "@google/genai": "^1.35.0",
     "@types/nodemailer": "^7.0.4",
+    "@types/pdfkit": "^0.17.4",
     "axios": "^1.7.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.11",
+    "openai": "^6.16.0",
+    "pdfkit": "^0.17.2",
     "pg": "^8.11.3",
     "serverless-http": "^3.2.0",
     "swagger-jsdoc": "^6.2.8",
@@ -34,6 +38,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
+    "@types/multer": "^2.0.0",
     "@types/node": "^24.2.1",
     "@types/swagger-jsdoc": "^6.0.4",
     "@types/swagger-ui-express": "^4.1.6",

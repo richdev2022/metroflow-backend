@@ -188,7 +188,14 @@ export async function createServer() {
   app.use(express.urlencoded({ extended: true }));
 
   // Swagger Documentation
-  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
+  const CSS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui.min.css";
+  const JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-bundle.min.js";
+  const JS_PRESET_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-standalone-preset.min.js";
+
+  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, {
+    customCssUrl: CSS_URL,
+    customJs: [JS_URL, JS_PRESET_URL]
+  }));
 
 
   // Serve static files

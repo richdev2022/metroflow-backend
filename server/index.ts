@@ -49,7 +49,7 @@ import {
   removeAssignment,
 } from "./routes/assignments";
 import { getActivityLogs } from "./routes/activity";
-import { getIdeas, createIdea, updateIdeaStatus, updateIdea, deleteIdea, getIdeaDocumentation } from "./routes/ideas";
+import { getIdeas, createIdea, updateIdeaStatus, updateIdea, deleteIdea } from "./routes/ideas";
 import productDocsRouter from "./routes/product_docs";
 import adminRouter from "./routes/admin";
 import subscriptionRouter from "./routes/subscription";
@@ -349,14 +349,13 @@ export async function createServer() {
 
   // Ideas API routes
   app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
-  app.get("/api/ideas/:id/documentation", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeaDocumentation);
   app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
   app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
   app.put("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdea);
   app.delete("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
 
   // Product Documentation API routes
-  app.use("/api/product-docs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), productDocsRouter);
+  app.use("/api", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), productDocsRouter);
 
   // Fee Management Routes
   app.use("/api/fees", feesRouter);

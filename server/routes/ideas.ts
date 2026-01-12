@@ -394,31 +394,3 @@ export const deleteIdea: RequestHandler = async (req: AuthenticatedRequest, res)
   }
 };
 
-
-export const getIdeaDocumentation: RequestHandler = async (req: AuthenticatedRequest, res) => {
-  try {
-    const { id } = req.params;
-    const businessId = req.user?.businessId;
-
-    if (!businessId) {
-      return res.status(401).json({ success: false, error: "Authentication required" });
-    }
-
-    // Select documentation associated with the idea
-    const result = await query(
-      `SELECT * FROM product_documentation WHERE idea_id = $1 AND business_id = $2 ORDER BY created_at DESC`,
-      [id, businessId]
-    );
-
-    res.status(200).json({
-      success: true,
-      data: result.rows
-    });
-  } catch (error) {
-    console.error('Error fetching documentation:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal Server Error'
-    });
-  }
-};

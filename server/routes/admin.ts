@@ -12,8 +12,61 @@ import { generateBusinessId } from "../utils/idGenerator";
 
 const router = express.Router();
 
+const authRouter = express.Router();
+const protectedRouter = express.Router();
+
+protectedRouter.use(authenticateAdmin);
+
+/**
+ * @swagger
+ * /admin/auth/login:
+ *   post:
+ *     summary: Admin login
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               password:
+ *                 type: string
+ *                 format: password
+ *     responses:
+ *       200:
+ *         description: Login successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 token:
+ *                   type: string
+ *                 admin:
+ *                   type: object
+ *       401:
+ *         description: Invalid credentials
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
+ */
 // Admin Login
-router.post("/auth/login", async (req, res) => {
+authRouter.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     const result = await loginAdmin(email, password);
@@ -23,12 +76,135 @@ router.post("/auth/login", async (req, res) => {
   }
 });
 
-// Admin Forgot Password
+/**
+ * @swagger
+ * /admin/auth/verify-login:
+ *   post:
+ *     summary: Verify admin login with OTP
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - otp
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               otp:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: OTP verified successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *       401:
+ *         description: Invalid OTP
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
+ */
+// Admin Verify Login
+authRouter.post("/verify-login", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+
+    if (adminCheck.rows.length > 0) {
+      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
+      res.json({ success: true, message: "Admin verified successfully" });
+    } else {
+      res.status(401).json({ success: false, error: "Invalid OTP" });
+    }
+  } catch (error: any) {
+    res.status(401).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * @swagger
+ * /admin/auth/verify-forgot-password-otp:
+ *   post:
+ *     summary: Verify forgot password OTP
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - otp
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               otp:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: OTP verified successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *       401:
+ *         description: Invalid OTP
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
+ */
+// Admin Verify Forgot Password OTP
+authRouter.post("/verify-forgot-password-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+
+    if (adminCheck.rows.length > 0) {
+      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
+      res.json({ success: true, message: "OTP verified successfully" });
+    } else {
+      res.status(401).json({ success: false, error: "Invalid OTP" });
+    }
+  } catch (error: any) {
+    res.status(401).json({ success: false, error: error.message });
+  }
+});
+
 /**
  * @swagger
  * /admin/auth/forgot-password:
  *   post:
- *     summary: Admin forgot password
+ *     summary: Request password reset
  *     tags: [Admin]
  *     requestBody:
  *       required: true
@@ -44,25 +220,39 @@ router.post("/auth/login", async (req, res) => {
  *                 format: email
  *     responses:
  *       200:
- *         description: Reset instructions sent
+ *         description: Reset instructions sent (if account exists)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *       500:
+ *         description: Failed to process request
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
  */
-router.post("/auth/forgot-password", async (req, res) => {
+// Admin Forgot Password
+authRouter.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
     const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, [email]);
     
     if (adminCheck.rows.length > 0) {
-      // In a real app, generate a reset token and send email
-      // For now, we'll simulate it by logging
-      console.log(`Password reset requested for admin: ${email}`);
-      
-      // Example email sending logic (commented out as email service might need config)
-      /*
       const otp = generateOTP();
       await query(`UPDATE platform_admins SET reset_token = $1, reset_expires = $2 WHERE email = $3`, 
         [otp, getOTPExpiry(), email]);
       await sendEmail(email, "Reset Password", `Your reset code is: ${otp}`);
-      */
     }
     
     // Always return success to prevent email enumeration
@@ -72,38 +262,11 @@ router.post("/auth/forgot-password", async (req, res) => {
   }
 });
 
+router.use('/auth', authRouter);
+router.use('/', protectedRouter);
+
 // Dashboard Stats
-/**
- * @swagger
- * /admin/dashboard/stats:
- *   get:
- *     summary: Get dashboard statistics
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Dashboard statistics
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 stats:
- *                   type: object
- *                   properties:
- *                     totalBusinesses:
- *                       type: integer
- *                     totalUsers:
- *                       type: integer
- *                     activeBusinesses:
- *                       type: integer
- *                     totalRevenue:
- *                       type: integer
- */
-router.get("/dashboard/stats", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), async (req, res) => {
   try {
     const businessesCount = await query(`SELECT COUNT(*) FROM businesses`);
     const usersCount = await query(`SELECT COUNT(*) FROM users`);
@@ -139,7 +302,7 @@ router.get("/dashboard/stats", authenticateAdmin, requirePermission('view_dashbo
  *       200:
  *         description: Chart data
  */
-router.get("/dashboard/charts", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/dashboard/charts", requirePermission('view_dashboard'), async (req, res) => {
   try {
     // 1. Revenue Over Time (Last 6 months)
     const revenueRes = await query(`
@@ -196,46 +359,7 @@ router.get("/dashboard/charts", authenticateAdmin, requirePermission('view_dashb
 });
 
 // Admin Wallet
-/**
- * @swagger
- * /admin/wallet:
- *   get:
- *     summary: Get Main Operational Wallet
- *     description: Retrieve the details of the main operational wallet (funding credits, transfers).
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Main Wallet details retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 wallet:
- *                   type: object
- *                   properties:
- *                     id:
- *                       type: string
- *                       format: uuid
- *                     balance:
- *                       type: string
- *                       example: "50000.00"
- *                     currency:
- *                       type: string
- *                       example: "NGN"
- *                     status:
- *                       type: string
- *                       example: "active"
- *                     created_at:
- *                       type: string
- *                       format: date-time
- */
-router.get("/wallet", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/wallet", requirePermission('view_dashboard'), async (req, res) => {
   try {
     // Find or Create Platform Wallet
     // We assume Platform Wallet has business_id = NULL and user_id = NULL
@@ -258,52 +382,7 @@ router.get("/wallet", authenticateAdmin, requirePermission('view_dashboard'), as
   }
 });
 
-/**
- * @swagger
- * /admin/revenue:
- *   get:
- *     summary: Get Platform Revenue Wallet Balance
- *     description: Retrieve the balance of the platform's revenue wallet (fees & subscriptions).
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Revenue Wallet details retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 wallet:
- *                   type: object
- *                   properties:
- *                     id:
- *                       type: string
- *                       format: uuid
- *                     balance:
- *                       type: string
- *                       example: "15000.00"
- *                     currency:
- *                       type: string
- *                       example: "NGN"
- *                 wallets:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       id:
- *                         type: string
- *                         format: uuid
- *                       balance:
- *                         type: string
- *                       currency:
- *                         type: string
- */
-router.get("/revenue", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req, res) => {
   try {
     const walletsRes = await query(`SELECT * FROM platform_wallet`);
     let wallets = walletsRes.rows;
@@ -327,53 +406,7 @@ router.get("/revenue", authenticateAdmin, requirePermission('view_dashboard'), a
   }
 });
 
-/**
- * @swagger
- * /admin/wallet/history:
- *   get:
- *     summary: Get Main Operational Wallet History
- *     description: Retrieve the transaction history of the main operational wallet (funding/transfers).
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Transaction history retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 transactions:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       id:
- *                         type: string
- *                         format: uuid
- *                       amount:
- *                         type: string
- *                         example: "50.00"
- *                       type:
- *                         type: string
- *                         example: "credit"
- *                       description:
- *                         type: string
- *                         example: "Transfer Fee"
- *                       reference:
- *                         type: string
- *                       status:
- *                         type: string
- *                         example: "success"
- *                       created_at:
- *                         type: string
- *                         format: date-time
- */
-router.get("/wallet/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/wallet/history", requirePermission('view_dashboard'), async (req, res) => {
   try {
     const walletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
     if (walletRes.rows.length === 0) {
@@ -397,51 +430,7 @@ router.get("/wallet/history", authenticateAdmin, requirePermission('view_dashboa
   }
 });
 
-/**
- * @swagger
- * /admin/revenue/history:
- *   get:
- *     summary: Get Platform Revenue History (Fees & Subscriptions)
- *     description: Retrieve all revenue-generating transactions (fees and subscriptions).
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Revenue history retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 transactions:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       id:
- *                         type: string
- *                         format: uuid
- *                       amount:
- *                         type: string
- *                         example: "50.00"
- *                       type:
- *                         type: string
- *                         example: "credit"
- *                       description:
- *                         type: string
- *                         example: "Subscription Renewal"
- *                       status:
- *                         type: string
- *                         example: "success"
- *                       created_at:
- *                         type: string
- *                         format: date-time
- */
-router.get("/revenue/history", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/revenue/history", requirePermission('view_dashboard'), async (req, res) => {
   try {
     const transactions = await query(
         `SELECT * FROM transactions 
@@ -465,19 +454,7 @@ router.get("/revenue/history", authenticateAdmin, requirePermission('view_dashbo
 });
 
 // KYC Management
-/**
- * @swagger
- * /admin/kyc:
- *   get:
- *     summary: Get All KYC Details
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: List of KYC records
- */
-router.get("/kyc", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/kyc", requirePermission('manage_businesses'), async (req, res) => {
   try {
     // Fetch Users with KYC
     const users = await query(`
@@ -506,25 +483,7 @@ router.get("/kyc", authenticateAdmin, requirePermission('manage_businesses'), as
   }
 });
 
-/**
- * @swagger
- * /admin/kyc/business/{id}/approve:
- *   post:
- *     summary: Approve Business KYC
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Business Verified
- */
-router.post("/kyc/business/:id/approve", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/kyc/business/:id/approve", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         
@@ -555,36 +514,7 @@ router.post("/kyc/business/:id/approve", authenticateAdmin, requirePermission('m
     }
 });
 
-/**
- * @swagger
- * /admin/kyc/business/{id}/reject:
- *   post:
- *     summary: Reject Business KYC
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - reason
- *             properties:
- *               reason:
- *                 type: string
- *     responses:
- *       200:
- *         description: Business Rejected
- */
-router.post("/kyc/business/:id/reject", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/kyc/business/:id/reject", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         const { reason } = req.body;
@@ -622,20 +552,9 @@ router.post("/kyc/business/:id/reject", authenticateAdmin, requirePermission('ma
 });
 
 // Businesses Management
-/**
- * @swagger
- * /admin/pricing:
- *   get:
- *     summary: Get all pricing plans (Admin)
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: List of pricing plans
- */
-router.get("/pricing", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/pricing", requirePermission('manage_businesses'), async (req, res) => {
     try {
+
         const result = await query(`SELECT * FROM pricing_plans ORDER BY price ASC`);
         res.json({ success: true, plans: result.rows });
     } catch (error) {
@@ -682,7 +601,7 @@ router.get("/pricing", authenticateAdmin, requirePermission('manage_businesses')
  *       200:
  *         description: Plan created
  */
-router.post("/pricing", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { name, price, currency, duration, discount, features } = req.body;
         
@@ -741,7 +660,7 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_businesses'
  *       200:
  *         description: Plan updated
  */
-router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         const { name, price, discount, features, is_active } = req.body;
@@ -825,7 +744,7 @@ router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_business
  *       200:
  *         description: List of businesses
  */
-router.get("/businesses", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/businesses", requirePermission('manage_businesses'), async (req, res) => {
   try {
     const { page = 1, limit = 10, search, status, planId } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
@@ -916,7 +835,7 @@ router.get("/businesses", authenticateAdmin, requirePermission('manage_businesse
  *       500:
  *         description: Server error
  */
-router.get("/businesses/:id/team", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/businesses/:id/team", requirePermission('manage_businesses'), async (req, res) => {
   try {
     const { id } = req.params;
     const result = await query(`
@@ -1023,7 +942,7 @@ router.get("/businesses/:id/team", authenticateAdmin, requirePermission('manage_
  *                     totalPages:
  *                       type: integer
  */
-router.get("/transactions", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/transactions", requirePermission('view_dashboard'), async (req, res) => {
     try {
         const page = parseInt(req.query.page as string) || 1;
         const perPage = parseInt(req.query.perPage as string) || 50;
@@ -1153,7 +1072,7 @@ router.get("/transactions", authenticateAdmin, requirePermission('view_dashboard
  *       200:
  *         description: List of transactions with settlement info
  */
-router.get("/transactions/pending-settlement", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/transactions/pending-settlement", requirePermission('view_dashboard'), async (req, res) => {
     try {
         const page = parseInt(req.query.page as string) || 1;
         const limit = parseInt(req.query.limit as string) || 50;
@@ -1276,7 +1195,7 @@ router.get("/transactions/pending-settlement", authenticateAdmin, requirePermiss
  *       200:
  *         description: Transaction settled
  */
-router.post("/transactions/settle", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/transactions/settle", requirePermission('manage_businesses'), async (req, res) => {
     const client = await pool.connect();
     try {
         const { reference, force } = req.body;
@@ -1472,7 +1391,7 @@ router.post("/transactions/settle", authenticateAdmin, requirePermission('manage
  *       200:
  *         description: Status updated
  */
-router.put("/businesses/:id/status", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.put("/businesses/:id/status", requirePermission('manage_businesses'), async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body; // 'active', 'inactive'
@@ -1496,7 +1415,7 @@ router.put("/businesses/:id/status", authenticateAdmin, requirePermission('manag
  *       200:
  *         description: List of available features
  */
-router.get("/features", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.get("/features", requirePermission('manage_plans'), async (req, res) => {
   res.json({ success: true, features: AVAILABLE_PERMISSIONS });
 });
 
@@ -1513,7 +1432,7 @@ router.get("/features", authenticateAdmin, requirePermission('manage_plans'), as
  *       200:
  *         description: List of pricing plans
  */
-router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.get("/pricing", requirePermission('manage_plans'), async (req, res) => {
   try {
     const result = await query(`SELECT * FROM pricing_plans ORDER BY price ASC`);
     res.json({ success: true, plans: result.rows });
@@ -1567,7 +1486,7 @@ router.get("/pricing", authenticateAdmin, requirePermission('manage_plans'), asy
  *       200:
  *         description: Plan created
  */
-router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.post("/pricing", requirePermission('manage_plans'), async (req, res) => {
   try {
     const { name, description, price, currency, features, permissions, max_team_members, trial_days, duration } = req.body;
     await query(
@@ -1633,7 +1552,7 @@ router.post("/pricing", authenticateAdmin, requirePermission('manage_plans'), as
  *       500:
  *         description: Server error
  */
-router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.put("/pricing/:id", requirePermission('manage_plans'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration, discount } = req.body;
@@ -1684,7 +1603,7 @@ router.put("/pricing/:id", authenticateAdmin, requirePermission('manage_plans'),
  *                       description:
  *                         type: string
  */
-router.get("/permissions", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+protectedRouter.get("/permissions", requirePermission('manage_roles'), async (req, res) => {
   try {
     const result = await query(`SELECT * FROM admin_permissions ORDER BY name ASC`);
     res.json({ success: true, permissions: result.rows });
@@ -1706,7 +1625,7 @@ router.get("/permissions", authenticateAdmin, requirePermission('manage_roles'),
  *       200:
  *         description: List of roles with permissions
  */
-router.get("/roles", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+protectedRouter.get("/roles", requirePermission('manage_roles'), async (req, res) => {
   try {
     // Get roles with their permission slugs
     const result = await query(`
@@ -1754,7 +1673,7 @@ router.get("/roles", authenticateAdmin, requirePermission('manage_roles'), async
  *       200:
  *         description: Role created
  */
-router.post("/roles", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+protectedRouter.post("/roles", requirePermission('manage_roles'), async (req, res) => {
   try {
     const { name, description, permissions } = req.body; // permissions is array of slugs
 
@@ -1822,7 +1741,7 @@ router.post("/roles", authenticateAdmin, requirePermission('manage_roles'), asyn
  *       200:
  *         description: Role updated
  */
-router.put("/roles/:id", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+protectedRouter.put("/roles/:id", requirePermission('manage_roles'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description, permissions } = req.body;
@@ -1876,7 +1795,7 @@ router.put("/roles/:id", authenticateAdmin, requirePermission('manage_roles'), a
  *       200:
  *         description: Role deleted
  */
-router.delete("/roles/:id", authenticateAdmin, requirePermission('manage_roles'), async (req, res) => {
+protectedRouter.delete("/roles/:id", requirePermission('manage_roles'), async (req, res) => {
   try {
     const { id } = req.params;
     
@@ -1941,7 +1860,7 @@ router.delete("/roles/:id", authenticateAdmin, requirePermission('manage_roles')
  *                         type: string
  *                         format: date-time
  */
-router.get("/users", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+protectedRouter.get("/users", requirePermission('manage_admins'), async (req, res) => {
   try {
     const result = await query(`
       SELECT a.id, a.name, a.email, a.status, a.created_at, r.name as role_name, r.id as role_id
@@ -1986,7 +1905,7 @@ router.get("/users", authenticateAdmin, requirePermission('manage_admins'), asyn
  *       200:
  *         description: Admin invited successfully
  */
-router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+protectedRouter.post("/users/invite", requirePermission('manage_admins'), async (req, res) => {
   try {
     const { name, email, roleId } = req.body;
 
@@ -2070,7 +1989,7 @@ router.post("/users/invite", authenticateAdmin, requirePermission('manage_admins
  *       200:
  *         description: Admin updated
  */
-router.put("/users/:id", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+protectedRouter.put("/users/:id", requirePermission('manage_admins'), async (req, res) => {
   try {
     const { id } = req.params;
     const { roleId } = req.body;
@@ -2123,7 +2042,7 @@ router.put("/users/:id", authenticateAdmin, requirePermission('manage_admins'), 
  *       200:
  *         description: Admin status updated
  */
-router.put("/users/:id/status", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+protectedRouter.put("/users/:id/status", requirePermission('manage_admins'), async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -2165,7 +2084,7 @@ router.put("/users/:id/status", authenticateAdmin, requirePermission('manage_adm
  *       200:
  *         description: Admin deleted
  */
-router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'), async (req, res) => {
+protectedRouter.delete("/users/:id", requirePermission('manage_admins'), async (req, res) => {
   try {
     const { id } = req.params;
     const adminReq = req as AuthenticatedAdminRequest;
@@ -2210,7 +2129,7 @@ router.delete("/users/:id", authenticateAdmin, requirePermission('manage_admins'
  *                 amount:
  *                   type: integer
  */
-router.get("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+protectedRouter.get("/settings/card-verification-amount", async (req, res) => {
     try {
         const result = await query(`SELECT value FROM system_settings WHERE key = 'card_verification_amount'`);
         const amount = result.rows.length > 0 ? parseInt(result.rows[0].value) : 100;
@@ -2244,7 +2163,7 @@ router.get("/settings/card-verification-amount", authenticateAdmin, async (req, 
  *       200:
  *         description: Settings updated
  */
-router.put("/settings/card-verification-amount", authenticateAdmin, async (req, res) => {
+protectedRouter.put("/settings/card-verification-amount", async (req, res) => {
     try {
         const { amount } = req.body;
         if (!amount || isNaN(amount) || amount < 50) {
@@ -2318,7 +2237,7 @@ const sendCSV = (res: any, data: any[], filename: string) => {
  *       200:
  *         description: Webhook notifications
  */
-router.get("/webhooks", authenticateAdmin, async (req, res) => {
+protectedRouter.get("/webhooks", async (req, res) => {
     try {
         const { page = 1, limit = 10, provider, status, startDate, endDate, search } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
@@ -2410,7 +2329,7 @@ router.get("/webhooks", authenticateAdmin, async (req, res) => {
  *           type: string
  *         description: Transaction status
  */
-router.get("/reports/transactions/export", authenticateAdmin, async (req, res) => {
+protectedRouter.get("/reports/transactions/export", async (req, res) => {
     try {
         const { startDate, endDate, status } = req.query;
         let queryStr = `
@@ -2476,7 +2395,7 @@ router.get("/reports/transactions/export", authenticateAdmin, async (req, res) =
  *           type: string
  *         description: Subscription status
  */
-router.get("/reports/businesses/export", authenticateAdmin, async (req, res) => {
+protectedRouter.get("/reports/businesses/export", async (req, res) => {
     try {
         const { startDate, endDate, status } = req.query;
         let queryStr = `
@@ -2523,7 +2442,7 @@ router.get("/reports/businesses/export", authenticateAdmin, async (req, res) => 
  *     security:
  *       - bearerAuth: []
  */
-router.post("/migrate-business-ids", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/migrate-business-ids", requirePermission('manage_businesses'), async (req, res) => {
     try {
         // 1. Fetch all businesses
         const businesses = await query(`SELECT id, name FROM businesses`);
@@ -2598,7 +2517,7 @@ router.post("/migrate-business-ids", authenticateAdmin, requirePermission('manag
  *               planId:
  *                 type: string
  */
-router.post("/subscription/manual-upgrade", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.post("/subscription/manual-upgrade", requirePermission('manage_plans'), async (req, res) => {
     try {
         const { businessId, planId } = req.body;
 
@@ -2653,7 +2572,7 @@ router.post("/subscription/manual-upgrade", authenticateAdmin, requirePermission
  *               businessId:
  *                 type: string
  */
-router.post("/subscription/manual-upgrade/revoke", authenticateAdmin, requirePermission('manage_plans'), async (req, res) => {
+protectedRouter.post("/subscription/manual-upgrade/revoke", requirePermission('manage_plans'), async (req, res) => {
     try {
         const { businessId } = req.body;
 
@@ -2736,7 +2655,7 @@ router.post("/subscription/manual-upgrade/revoke", authenticateAdmin, requirePer
  *       200:
  *         description: List of transfers
  */
-router.get("/transfers", authenticateAdmin, requirePermission('view_dashboard'), async (req, res) => {
+protectedRouter.get("/transfers", requirePermission('view_dashboard'), async (req, res) => {
     try {
         const page = parseInt(req.query.page as string) || 1;
         const limit = parseInt(req.query.limit as string) || 50;
@@ -2830,7 +2749,7 @@ router.get("/transfers", authenticateAdmin, requirePermission('view_dashboard'),
  *       200:
  *         description: Pending KYC requests
  */
-router.get("/kyc/pending", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/kyc/pending", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const pendingUsers = await query(`
             SELECT id, name, email, business_id, kyc_status, kyc_data, bvn, nin, phone_number, created_at 
@@ -2889,7 +2808,7 @@ router.get("/kyc/pending", authenticateAdmin, requirePermission('manage_business
  *       200:
  *         description: Status updated
  */
-router.put("/kyc/user/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.put("/kyc/user/:id", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         const { status, reason } = req.body;
@@ -2956,7 +2875,7 @@ router.put("/kyc/user/:id", authenticateAdmin, requirePermission('manage_busines
  *       200:
  *         description: Status updated
  */
-router.put("/kyc/business/:id", authenticateAdmin, requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.put("/kyc/business/:id", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         const { status, reason } = req.body;

@@ -355,7 +355,7 @@ export async function createServer() {
   app.delete("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
 
   // Product Documentation API routes
-  app.use("/api", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), productDocsRouter);
+  app.use("/api/product-docs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), productDocsRouter);
 
   // Fee Management Routes
   app.use("/api/fees", feesRouter);

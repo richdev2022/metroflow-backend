@@ -18,18 +18,20 @@ export async function generatePDF(doc: ProductDocumentation, businessName: strin
       pdf.on("error", (err) => reject(err));
 
       // Add Logo
-      if (doc.logoUrl) {
+      const rawLogoUrl = doc.logoUrl ? String(doc.logoUrl) : "";
+      const logoUrl = rawLogoUrl.trim().replace(/^`+|`+$/g, "");
+      if (logoUrl) {
         try {
           let logoBuffer: Buffer;
           
-          console.log("PDF Generation: Attempting to load logo from:", doc.logoUrl);
+          console.log("PDF Generation: Attempting to load logo from:", logoUrl);
           
           // Check if it is a local file URL (e.g. http://localhost:3000/uploads/...) or a relative path
-          const isLocalUrl = doc.logoUrl.includes('/uploads/');
+          const isLocalUrl = logoUrl.includes('/uploads/');
           
           if (isLocalUrl) {
              // Extract relative path from URL or use as is if already relative
-             const urlParts = doc.logoUrl.split('/uploads/');
+             const urlParts = logoUrl.split('/uploads/');
              const filename = urlParts[1];
              const filePath = path.join(uploadsRoot, filename);
              
@@ -40,22 +42,30 @@ export async function generatePDF(doc: ProductDocumentation, businessName: strin
                console.log("PDF Generation: Successfully loaded logo from local file");
              } else {
                // Fallback to HTTP if file not found locally (maybe hosted elsewhere?)
-               if (doc.logoUrl.startsWith("http")) {
+               if (logoUrl.startsWith("http")) {
                  console.log("PDF Generation: File not found locally, attempting HTTP fetch");
-                 const response = await axios.get(doc.logoUrl, { responseType: "arraybuffer" });
+                 const response = await axios.get(encodeURI(logoUrl), { responseType: "arraybuffer" });
                  logoBuffer = Buffer.from(response.data, "binary");
                  console.log("PDF Generation: Successfully loaded logo via HTTP");
                } else {
                   throw new Error(`Local logo file not found at ${filePath}`);
                }
              }
-          } else if (doc.logoUrl.startsWith("http")) {
+          } else if (logoUrl.startsWith("data:")) {
+            const base64Match = logoUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+            if (!base64Match) {
+              throw new Error("Invalid data URL for logo");
+            }
+            const base64Data = base64Match[2];
+            logoBuffer = Buffer.from(base64Data, "base64");
+            console.log("PDF Generation: Successfully loaded logo from data URL");
+          } else if (logoUrl.startsWith("http")) {
             console.log("PDF Generation: Loading logo via HTTP");
-            const response = await axios.get(doc.logoUrl, { responseType: "arraybuffer" });
+            const response = await axios.get(encodeURI(logoUrl), { responseType: "arraybuffer" });
             logoBuffer = Buffer.from(response.data, "binary");
             console.log("PDF Generation: Successfully loaded logo via HTTP");
           } else {
-             const relativePath = doc.logoUrl.startsWith('/') ? doc.logoUrl.slice(1) : doc.logoUrl;
+             const relativePath = logoUrl.startsWith('/') ? logoUrl.slice(1) : logoUrl;
              const filePath = relativePath.startsWith("uploads/")
                ? path.join(uploadsRoot, relativePath.replace(/^uploads[\\/]/, ""))
                : path.join(process.cwd(), relativePath);

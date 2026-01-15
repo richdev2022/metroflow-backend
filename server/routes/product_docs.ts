@@ -191,12 +191,15 @@ router.put("/product-documentation/:id", uploadLocal.single('logo'), (async (req
     const { content } = req.body;
     const businessId = req.user?.businessId;
     let logoUrl = req.body.logoUrl;
+    if (logoUrl) {
+      logoUrl = String(logoUrl).trim().replace(/^`+|`+$/g, "");
+    }
 
     if (req.file) {
-        // File is already saved to disk by multer
         const protocol = req.protocol;
         const host = req.get('host');
         logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
+        logoUrl = String(logoUrl).trim();
     }
 
     const result = await query(

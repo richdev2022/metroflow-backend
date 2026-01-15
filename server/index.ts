@@ -97,7 +97,6 @@ export async function createServer() {
   }
 
   // Middleware
-  app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
   cron.schedule("0 0 * * *", async () => {
     try {
       console.log("Running activity log cleanup...");

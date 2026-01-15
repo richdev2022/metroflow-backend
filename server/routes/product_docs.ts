@@ -8,6 +8,7 @@ import { ProductDocumentation, ApiResponse } from "@shared/api";
 import { uploadLocal } from "../middleware/uploadLocal";
 import fs from "fs";
 import path from "path";
+import { getStore } from "@netlify/blobs";
 
 const router = Router();
 
@@ -198,8 +199,22 @@ router.put("/product-documentation/:id", uploadLocal.single('logo'), (async (req
     if (req.file) {
         const protocol = req.protocol;
         const host = req.get('host');
-        logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
-        logoUrl = String(logoUrl).trim();
+        const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+        if (isLambda) {
+          const store = getStore("uploads");
+          const filePath = path.join(isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads"), req.file.filename);
+          const buffer = fs.readFileSync(filePath);
+          await store.set(
+            req.file.filename,
+            new Blob([buffer], { type: req.file.mimetype || "application/octet-stream" }) as any,
+            { cacheControl: "public, max-age=31536000" } as any
+          );
+          logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`.trim();
+          try { fs.unlinkSync(filePath); } catch {}
+        } else {
+          logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
+          logoUrl = String(logoUrl).trim();
+        }
     }
 
     const result = await query(

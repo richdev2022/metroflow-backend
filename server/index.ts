@@ -67,6 +67,7 @@ import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeatur
 import { processSubscriptionRenewals } from "./services/subscription";
 import { processPendingProductDocJobs } from "./services/productDocJobs";
 import * as cron from "node-cron";
+import { getStore } from "@netlify/blobs";
 
 export async function createServer() {
   const app = express();
@@ -206,6 +207,34 @@ export async function createServer() {
   const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
   const uploadDir = isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads");
   app.use("/uploads", express.static(uploadDir));
+  app.get("/uploads/:filename", async (req, res) => {
+    try {
+      const { filename } = req.params as any;
+      if (!isLambda) {
+        const localPath = path.join(uploadDir, filename);
+        return res.sendFile(localPath);
+      }
+      const store = getStore("uploads");
+      const blob: any = await store.get(filename, { type: "blob" } as any);
+      if (!blob) {
+        return res.status(404).send("Not found");
+      }
+      const ab = typeof blob.arrayBuffer === "function" ? await blob.arrayBuffer() : blob;
+      const buffer = Buffer.from(ab as ArrayBuffer);
+      const ext = path.extname(filename).toLowerCase();
+      const contentType =
+        ext === ".png" ? "image/png" :
+        ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" :
+        ext === ".gif" ? "image/gif" :
+        "application/octet-stream";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=31536000");
+      return res.send(buffer);
+    } catch (e) {
+      console.error("Uploads route error:", e);
+      return res.status(500).send("Error");
+    }
+  });
 
   let lastDocJobRun = 0;
   app.use((req, res, next) => {

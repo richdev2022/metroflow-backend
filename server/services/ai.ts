@@ -1,22 +1,14 @@
 import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Initialize Google AI
-// The client gets the API key from the environment variable `GOOGLE_AI_KEY` if not passed directly,
-// but the new SDK might expect `GEMINI_API_KEY` or direct passing.
-// Based on doc: const ai = new GoogleGenAI({}); (if env var GEMINI_API_KEY is set)
-// Or pass it:
-const googleAi = new GoogleGenAI({ apiKey: process.env.GOOGLE_AI_KEY });
-
 type AIProvider = "openai" | "google";
 
 const getProvider = (): AIProvider => {
-  return (process.env.AI_PROVIDER as AIProvider) || "openai";
+  const configured = process.env.AI_PROVIDER as AIProvider | undefined;
+  if (configured === "openai" || configured === "google") return configured;
+  if (process.env.OPENAI_API_KEY) return "openai";
+  if (process.env.GOOGLE_AI_KEY || process.env.GEMINI_API_KEY) return "google";
+  return "openai";
 };
 
 export async function generateProductDocumentation(title: string, description: string): Promise<string> {
@@ -43,12 +35,17 @@ export async function generateProductDocumentation(title: string, description: s
 
   try {
     if (provider === "google") {
+      const googleAi = new GoogleGenAI({ apiKey: process.env.GOOGLE_AI_KEY || process.env.GEMINI_API_KEY });
       const result = await googleAi.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
       });
       return result.text || "";
     } else {
+      if (!process.env.OPENAI_API_KEY) {
+        throw new Error("OPENAI_API_KEY is not set");
+      }
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const completion = await openai.chat.completions.create({
         messages: [{ role: "user", content: prompt }],
         model: "gpt-4o",
@@ -86,12 +83,17 @@ export async function regenerateProductDocumentation(
 
   try {
     if (provider === "google") {
+        const googleAi = new GoogleGenAI({ apiKey: process.env.GOOGLE_AI_KEY || process.env.GEMINI_API_KEY });
         const result = await googleAi.models.generateContent({
             model: "gemini-2.5-flash",
             contents: prompt,
         });
         return result.text || "";
     } else {
+      if (!process.env.OPENAI_API_KEY) {
+        throw new Error("OPENAI_API_KEY is not set");
+      }
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const completion = await openai.chat.completions.create({
         messages: [{ role: "user", content: prompt }],
         model: "gpt-4o",

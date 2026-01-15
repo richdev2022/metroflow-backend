@@ -188,7 +188,6 @@ export async function initializeDatabase() {
     // Add KYC columns to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(50) DEFAULT 'pending'`);
 
-    // Create product_documentation table
     await query(`
       CREATE TABLE IF NOT EXISTS product_documentation (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -198,6 +197,25 @@ export async function initializeDatabase() {
         content TEXT NOT NULL,
         logo_url TEXT,
         created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'completed'
+      )
+    `);
+
+    await query(`ALTER TABLE product_documentation ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'completed'`);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS product_documentation_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) REFERENCES businesses(id),
+        user_id UUID REFERENCES users(id),
+        idea_id UUID REFERENCES ideas(id),
+        doc_id UUID REFERENCES product_documentation(id),
+        job_type VARCHAR(50) NOT NULL,
+        areas_of_concern TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        error TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )

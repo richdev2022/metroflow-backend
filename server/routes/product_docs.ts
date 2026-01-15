@@ -3,6 +3,7 @@ import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { generateProductDocumentation, regenerateProductDocumentation } from "../services/ai";
 import { generatePDF } from "../services/pdf";
+import { processPendingProductDocJobs } from "../services/productDocJobs";
 import { ProductDocumentation, ApiResponse } from "@shared/api";
 import { uploadLocal } from "../middleware/uploadLocal";
 import fs from "fs";
@@ -10,7 +11,7 @@ import path from "path";
 
 const router = Router();
 
-// Generate Product Documentation
+// Generate Product Documentation (async via background job)
 router.post("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
@@ -56,23 +57,36 @@ router.post("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, r
 
     const { title, description } = ideaResult.rows[0];
 
-    // Generate Documentation using AI
-    const content = await generateProductDocumentation(title, description);
+    // Create placeholder documentation row with pending status
+    const placeholderContent = "Product documentation generation is in progress.";
 
-    // Save to DB
-    const result = await query(
-      `INSERT INTO product_documentation (business_id, idea_id, title, content, created_by)
-       VALUES ($1, $2, $3, $4, $5)
+    const docResult = await query(
+      `INSERT INTO product_documentation (business_id, idea_id, title, content, created_by, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
        RETURNING *`,
-      [businessId, ideaId, title, content, userId]
+      [businessId, ideaId, title, placeholderContent, userId]
     );
+
+    const doc = docResult.rows[0];
+
+    // Enqueue background job for AI generation
+    await query(
+      `INSERT INTO product_documentation_jobs (business_id, user_id, idea_id, doc_id, job_type, status)
+       VALUES ($1, $2, $3, $4, 'generate', 'pending')`,
+      [businessId, userId, ideaId, doc.id]
+    );
+
+    const message = `Your request to generate product documentation for "${title}" is currently in process. You will receive an email notification once it's ready, then you can refresh your app to see the updated documentation.`;
 
     const response: ApiResponse<ProductDocumentation> = {
       success: true,
-      data: result.rows[0],
+      data: doc,
     };
 
-    res.status(201).json(response);
+    res.status(202).json({
+      ...response,
+      message,
+    } as any);
   } catch (error) {
     console.error("Generate documentation error:", error);
     res.status(500).json({ success: false, error: "failed to generate document" });
@@ -251,7 +265,7 @@ router.delete("/product-documentation/:id", (async (req: AuthenticatedRequest, r
   }
 }) as RequestHandler);
 
-// Regenerate product documentation
+// Regenerate product documentation (async via background job)
 router.post("/product-documentation/:id/regenerate", (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
@@ -300,9 +314,8 @@ router.post("/product-documentation/:id/regenerate", (async (req: AuthenticatedR
       return res.status(400).json({ success: false, error: "Areas of concern are required" });
     }
 
-    // Fetch existing doc
     const docResult = await query(
-      `SELECT content FROM product_documentation WHERE id = $1 AND business_id = $2`,
+      `SELECT * FROM product_documentation WHERE id = $1 AND business_id = $2`,
       [id, businessId]
     );
 
@@ -310,26 +323,32 @@ router.post("/product-documentation/:id/regenerate", (async (req: AuthenticatedR
       return res.status(404).json({ success: false, error: "Documentation not found" });
     }
 
-    const currentContent = docResult.rows[0].content;
-
-    // Regenerate using AI
-    const newContent = await regenerateProductDocumentation(currentContent, areasOfConcern);
-
-    // Update DB
-    const result = await query(
+    // Mark documentation as pending regeneration
+    await query(
       `UPDATE product_documentation 
-       SET content = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2 AND business_id = $3
-       RETURNING *`,
-      [newContent, id, businessId]
+       SET status = 'pending',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND business_id = $2`,
+      [id, businessId]
     );
+
+    await query(
+      `INSERT INTO product_documentation_jobs (business_id, user_id, idea_id, doc_id, job_type, areas_of_concern, status)
+       VALUES ($1, $2, $3, $4, 'regenerate', $5, 'pending')`,
+      [businessId, req.user?.userId, docResult.rows[0].idea_id, id, areasOfConcern]
+    );
+
+    const message = `Your request to regenerate product documentation is currently in process. You will receive an email notification once it's ready, then you can refresh your app to see the updated documentation.`;
 
     const response: ApiResponse<ProductDocumentation> = {
       success: true,
-      data: result.rows[0],
+      data: docResult.rows[0],
     };
 
-    res.json(response);
+    res.status(202).json({
+      ...response,
+      message,
+    } as any);
   } catch (error) {
     console.error("Regenerate documentation error:", error);
     res.status(500).json({ success: false, error: "failed to generate document" });
@@ -392,6 +411,17 @@ router.get("/product-documentation/:id/pdf", (async (req: AuthenticatedRequest, 
   } catch (error) {
     console.error("Generate PDF error:", error);
     res.status(500).json({ success: false, error: "Failed to generate PDF" });
+  }
+}) as RequestHandler);
+
+router.post("/internal/jobs/product-docs/process", (async (req: AuthenticatedRequest, res) => {
+  try {
+    const limit = Number((req.body as any)?.limit) || 3;
+    const result = await processPendingProductDocJobs(limit);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error("Process product doc jobs error:", error);
+    res.status(500).json({ success: false, error: "Failed to process jobs" });
   }
 }) as RequestHandler);
 

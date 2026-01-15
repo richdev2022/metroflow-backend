@@ -2,10 +2,12 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 
-// Configure storage for local disk
+const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    const uploadDir = path.join(process.cwd(), "uploads");
+    const baseDir = isLambda ? path.join("/tmp") : process.cwd();
+    const uploadDir = path.join(baseDir, "uploads");
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }

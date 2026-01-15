@@ -4,6 +4,9 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 
+const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+const uploadsRoot = isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads");
+
 export async function generatePDF(doc: ProductDocumentation, businessName: string, ownerName: string): Promise<Buffer> {
   return new Promise(async (resolve, reject) => {
     try {
@@ -27,9 +30,8 @@ export async function generatePDF(doc: ProductDocumentation, businessName: strin
           if (isLocalUrl) {
              // Extract relative path from URL or use as is if already relative
              const urlParts = doc.logoUrl.split('/uploads/');
-             const filename = urlParts[1]; // Get everything after /uploads/
-             const relativePath = path.join('uploads', filename);
-             const filePath = path.join(process.cwd(), relativePath);
+             const filename = urlParts[1];
+             const filePath = path.join(uploadsRoot, filename);
              
              console.log("PDF Generation: Checking local file path:", filePath);
              
@@ -53,9 +55,10 @@ export async function generatePDF(doc: ProductDocumentation, businessName: strin
             logoBuffer = Buffer.from(response.data, "binary");
             console.log("PDF Generation: Successfully loaded logo via HTTP");
           } else {
-             // Handle raw relative path (legacy)
              const relativePath = doc.logoUrl.startsWith('/') ? doc.logoUrl.slice(1) : doc.logoUrl;
-             const filePath = path.join(process.cwd(), relativePath);
+             const filePath = relativePath.startsWith("uploads/")
+               ? path.join(uploadsRoot, relativePath.replace(/^uploads[\\/]/, ""))
+               : path.join(process.cwd(), relativePath);
              console.log("PDF Generation: Checking legacy file path:", filePath);
              if (fs.existsSync(filePath)) {
                 logoBuffer = fs.readFileSync(filePath);

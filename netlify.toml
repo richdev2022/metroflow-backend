@@ -1,12 +1,6 @@
-[build]
-  command = "npm run build"
-  functions = "netlify/functions"
-  publish = "public"
-
 [functions]
   node_bundler = "esbuild"
 
-[[redirects]]
-  from = "/*"
-  to = "/.netlify/functions/api"
-  status = 200
+[[scheduled]]
+  path = "/.netlify/functions/process-product-doc-jobs"
+  schedule = "*/2 * * * *"

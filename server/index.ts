@@ -65,6 +65,7 @@ import feesRouter from "./routes/fees";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
+import { processPendingProductDocJobs } from "./services/productDocJobs";
 import * as cron from "node-cron";
 
 export async function createServer() {
@@ -207,6 +208,28 @@ export async function createServer() {
   const uploadDir = isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads");
   app.use("/uploads", express.static(uploadDir));
 
+  let lastDocJobRun = 0;
+  app.use((req, res, next) => {
+    const now = Date.now();
+    if (now - lastDocJobRun > 15000) {
+      lastDocJobRun = now;
+      processPendingProductDocJobs(1).catch((e) => console.error("Doc job tick error:", e));
+    }
+    next();
+  });
+
+  // Local-only cron to process product documentation jobs frequently
+  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+    cron.schedule("* * * * *", async () => {
+      try {
+        const result = await processPendingProductDocJobs(5);
+        console.log("Product doc jobs processed by local cron:", result);
+      } catch (error) {
+        console.error("Product doc job cron error:", error);
+      }
+    });
+  }
+
 
   // Fix for potential body parsing issues in serverless environment
   app.use((req, res, next) => {
@@ -248,6 +271,16 @@ export async function createServer() {
     next();
   });
 
+  if (!isLambda) {
+    cron.schedule("* * * * *", async () => {
+      try {
+        await processPendingProductDocJobs(3);
+      } catch (error) {
+        console.error("Product doc cron error:", error);
+      }
+    });
+  }
+
   // Check DB status for API routes
   app.use('/api', (req, res, next) => {
     if (req.path === '/' || req.path === '/ping' || req.path === '/demo') return next();
@@ -263,6 +296,22 @@ export async function createServer() {
       });
     }
     next();
+  });
+
+  app.post("/internal/jobs/product-docs/process", async (req, res) => {
+    try {
+      const secretHeader = req.headers["x-job-secret"];
+      const expected = process.env.JOBS_SECRET;
+      if (expected && secretHeader !== expected) {
+        return res.status(401).json({ success: false, error: "Unauthorized" });
+      }
+      const limit = Number((req.body as any)?.limit) || 3;
+      const result = await processPendingProductDocJobs(limit);
+      res.json({ success: true, data: result });
+    } catch (error) {
+      console.error("Internal job processing error:", error);
+      res.status(500).json({ success: false, error: "Failed to process jobs" });
+    }
   });
 
   // Example API routes

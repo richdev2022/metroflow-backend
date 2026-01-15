@@ -1,4 +1,4 @@
-import { processPendingProductDocJobs } from "../../../server/services/productDocJobs";
+import { processPendingProductDocJobs } from "../../server/services/productDocJobs";
 
 export const handler = async () => {
   const limit = Number(process.env.JOBS_BATCH_LIMIT || "5");

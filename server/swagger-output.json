@@ -255,9 +255,220 @@
         }
       }
     },
+    "/admin/auth/login": {
+      "post": {
+        "summary": "Admin login",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "password"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "token": {
+                      "type": "string"
+                    },
+                    "admin": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/auth/verify-login": {
+      "post": {
+        "summary": "Verify admin login with OTP",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "otp"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "otp": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP verified successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid OTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/auth/verify-forgot-password-otp": {
+      "post": {
+        "summary": "Verify forgot password OTP",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "otp"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "otp": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP verified successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid OTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/auth/forgot-password": {
       "post": {
-        "summary": "Admin forgot password",
+        "summary": "Request password reset",
         "tags": [
           "Admin"
         ],
@@ -282,25 +493,7 @@
         },
         "responses": {
           "200": {
-            "description": "Reset instructions sent"
-          }
-        }
-      }
-    },
-    "/admin/dashboard/stats": {
-      "get": {
-        "summary": "Get dashboard statistics",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Dashboard statistics",
+            "description": "Reset instructions sent (if account exists)",
             "content": {
               "application/json": {
                 "schema": {
@@ -309,22 +502,26 @@
                     "success": {
                       "type": "boolean"
                     },
-                    "stats": {
-                      "type": "object",
-                      "properties": {
-                        "totalBusinesses": {
-                          "type": "integer"
-                        },
-                        "totalUsers": {
-                          "type": "integer"
-                        },
-                        "activeBusinesses": {
-                          "type": "integer"
-                        },
-                        "totalRevenue": {
-                          "type": "integer"
-                        }
-                      }
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to process request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
                     }
                   }
                 }
@@ -352,370 +549,7 @@
         }
       }
     },
-    "/admin/wallet": {
-      "get": {
-        "summary": "Get Main Operational Wallet",
-        "description": "Retrieve the details of the main operational wallet (funding credits, transfers).",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Main Wallet details retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean",
-                      "example": true
-                    },
-                    "wallet": {
-                      "type": "object",
-                      "properties": {
-                        "id": {
-                          "type": "string",
-                          "format": "uuid"
-                        },
-                        "balance": {
-                          "type": "string",
-                          "example": "50000.00"
-                        },
-                        "currency": {
-                          "type": "string",
-                          "example": "NGN"
-                        },
-                        "status": {
-                          "type": "string",
-                          "example": "active"
-                        },
-                        "created_at": {
-                          "type": "string",
-                          "format": "date-time"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/admin/revenue": {
-      "get": {
-        "summary": "Get Platform Revenue Wallet Balance",
-        "description": "Retrieve the balance of the platform's revenue wallet (fees & subscriptions).",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Revenue Wallet details retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean",
-                      "example": true
-                    },
-                    "wallet": {
-                      "type": "object",
-                      "properties": {
-                        "id": {
-                          "type": "string",
-                          "format": "uuid"
-                        },
-                        "balance": {
-                          "type": "string",
-                          "example": "15000.00"
-                        },
-                        "currency": {
-                          "type": "string",
-                          "example": "NGN"
-                        }
-                      }
-                    },
-                    "wallets": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "id": {
-                            "type": "string",
-                            "format": "uuid"
-                          },
-                          "balance": {
-                            "type": "string"
-                          },
-                          "currency": {
-                            "type": "string"
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/admin/wallet/history": {
-      "get": {
-        "summary": "Get Main Operational Wallet History",
-        "description": "Retrieve the transaction history of the main operational wallet (funding/transfers).",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Transaction history retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean",
-                      "example": true
-                    },
-                    "transactions": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "id": {
-                            "type": "string",
-                            "format": "uuid"
-                          },
-                          "amount": {
-                            "type": "string",
-                            "example": "50.00"
-                          },
-                          "type": {
-                            "type": "string",
-                            "example": "credit"
-                          },
-                          "description": {
-                            "type": "string",
-                            "example": "Transfer Fee"
-                          },
-                          "reference": {
-                            "type": "string"
-                          },
-                          "status": {
-                            "type": "string",
-                            "example": "success"
-                          },
-                          "created_at": {
-                            "type": "string",
-                            "format": "date-time"
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/admin/revenue/history": {
-      "get": {
-        "summary": "Get Platform Revenue History (Fees & Subscriptions)",
-        "description": "Retrieve all revenue-generating transactions (fees and subscriptions).",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Revenue history retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean",
-                      "example": true
-                    },
-                    "transactions": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "id": {
-                            "type": "string",
-                            "format": "uuid"
-                          },
-                          "amount": {
-                            "type": "string",
-                            "example": "50.00"
-                          },
-                          "type": {
-                            "type": "string",
-                            "example": "credit"
-                          },
-                          "description": {
-                            "type": "string",
-                            "example": "Subscription Renewal"
-                          },
-                          "status": {
-                            "type": "string",
-                            "example": "success"
-                          },
-                          "created_at": {
-                            "type": "string",
-                            "format": "date-time"
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/admin/kyc": {
-      "get": {
-        "summary": "Get All KYC Details",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of KYC records"
-          }
-        }
-      }
-    },
-    "/admin/kyc/business/{id}/approve": {
-      "post": {
-        "summary": "Approve Business KYC",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Business Verified"
-          }
-        }
-      }
-    },
-    "/admin/kyc/business/{id}/reject": {
-      "post": {
-        "summary": "Reject Business KYC",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Business Rejected"
-          }
-        }
-      }
-    },
     "/admin/pricing": {
-      "get": {
-        "summary": "Get all pricing plans",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of pricing plans"
-          }
-        }
-      },
       "post": {
         "summary": "Create a pricing plan",
         "tags": [
@@ -787,6 +621,22 @@
         "responses": {
           "200": {
             "description": "Plan created"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get all pricing plans",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of pricing plans"
           }
         }
       }

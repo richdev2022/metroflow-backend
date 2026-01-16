@@ -17,6 +17,33 @@ const protectedRouter = express.Router();
 
 protectedRouter.use(authenticateAdmin);
 
+// Backward-compatible public aliases (no token required)
+router.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const result = await loginAdmin(email, password);
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    res.status(401).json({ success: false, error: error.message });
+  }
+});
+
+router.post("/verify-login", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+
+    if (adminCheck.rows.length > 0) {
+      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
+      res.json({ success: true, message: "Admin verified successfully" });
+    } else {
+      res.status(401).json({ success: false, error: "Invalid OTP" });
+    }
+  } catch (error: any) {
+    res.status(401).json({ success: false, error: error.message });
+  }
+});
+
 /**
  * @swagger
  * /admin/auth/login:

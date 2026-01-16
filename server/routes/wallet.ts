@@ -4,6 +4,7 @@ import { query, pool } from "../db";
 import { initiatePayment, createBusinessVirtualAccount, verifyPayment } from "../services/squad";
 import { toMinorUnit } from "../services/squad";
 import { calculateFee } from "../services/fees";
+import { generateToken } from "../services/auth";
 
 const router = express.Router();
 
@@ -376,6 +377,7 @@ router.get("/verify", async (req, res) => {
                     <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                         <h1 style="color: red;">Error</h1>
                         <p>Transaction reference is required</p>
+                        <p style="color:#888;">This page does not require a login token.</p>
                     </body>
                 </html>
             `);
@@ -392,6 +394,7 @@ router.get("/verify", async (req, res) => {
                     <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                         <h1 style="color: orange;">Transaction Not Found</h1>
                         <p>We could not find a transaction with this reference.</p>
+                        <p style="color:#888;">No token is required on this page.</p>
                         <a href="${clientAppUrl}" style="display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                     </body>
                 </html>
@@ -407,10 +410,11 @@ router.get("/verify", async (req, res) => {
         if (transaction.status === 'success') {
              // If settlement is also settled (or missing and we assume success), redirect
              if (!settlement || settlement.status === 'settled') {
+                 const token = generateToken(transaction.user_id, transaction.business_id);
                  return res.send(`
                     <html>
                         <head>
-                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}" />
+                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" />
                         </head>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <div style="margin-bottom: 20px;">
@@ -419,7 +423,7 @@ router.get("/verify", async (req, res) => {
                             <h1 style="color: green;">Payment Successful</h1>
                             <p>Your wallet has been funded.</p>
                             <p>Redirecting you back to the app...</p>
-                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                             <style>
                                 @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             </style>
@@ -505,10 +509,11 @@ router.get("/verify", async (req, res) => {
                 // Send Success Email (Async)
                 // sendEmail(...)
                 
+                const token = generateToken(transaction.user_id, transaction.business_id);
                 return res.send(`
                     <html>
                         <head>
-                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}" />
+                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" />
                         </head>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <div style="margin-bottom: 20px;">
@@ -517,7 +522,7 @@ router.get("/verify", async (req, res) => {
                             <h1 style="color: green;">Payment Successful</h1>
                             <p>Your wallet has been funded.</p>
                             <p>Redirecting you back to the app...</p>
-                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                             <style>
                                 @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             </style>

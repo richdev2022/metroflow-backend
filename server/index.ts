@@ -432,7 +432,9 @@ export async function createServer() {
   app.delete("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
 
   // Product Documentation API routes
-  app.use("/api", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), productDocsRouter);
+  app.use("/api/product-docs", productDocsRouter);
+  // Backward-compatible mount at /api to support existing clients
+  app.use("/api", productDocsRouter);
 
   // Fee Management Routes
   app.use("/api/fees", feesRouter);

@@ -1,6 +1,6 @@
 import { Router, RequestHandler } from "express";
 import { query } from "../db";
-import { AuthenticatedRequest } from "../middleware/auth";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
 import { generateProductDocumentation, regenerateProductDocumentation } from "../services/ai";
 import { generatePDF } from "../services/pdf";
 import { processPendingProductDocJobs } from "../services/productDocJobs";
@@ -13,7 +13,7 @@ import { getStore } from "@netlify/blobs";
 const router = Router();
 
 // Generate Product Documentation (async via background job)
-router.post("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, res) => {
+router.post("/ideas/:ideaId/documentation", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /ideas/{ideaId}/documentation:
@@ -95,7 +95,7 @@ router.post("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, r
 }) as RequestHandler);
 
 // Get all generated Product Documentation for an idea
-router.get("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, res) => {
+router.get("/ideas/:ideaId/documentation", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /ideas/{ideaId}/documentation:
@@ -147,7 +147,7 @@ router.get("/ideas/:ideaId/documentation", (async (req: AuthenticatedRequest, re
 }) as RequestHandler);
 
 // Edit generated product documentation
-router.put("/product-documentation/:id", uploadLocal.single('logo'), (async (req: AuthenticatedRequest, res) => {
+router.put("/product-documentation/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), uploadLocal.single('logo'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /product-documentation/{id}:
@@ -204,13 +204,20 @@ router.put("/product-documentation/:id", uploadLocal.single('logo'), (async (req
           const store = getStore("uploads");
           const filePath = path.join(isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads"), req.file.filename);
           const buffer = fs.readFileSync(filePath);
-          await store.set(
-            req.file.filename,
-            new Blob([buffer], { type: req.file.mimetype || "application/octet-stream" }) as any,
-            { cacheControl: "public, max-age=31536000" } as any
-          );
-          logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`.trim();
-          try { fs.unlinkSync(filePath); } catch {}
+          try {
+            await store.set(
+              req.file.filename,
+              new Blob([buffer], { type: req.file.mimetype || "application/octet-stream" }) as any,
+              { cacheControl: "public, max-age=31536000" } as any
+            );
+            logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`.trim();
+          } catch (e) {
+            const mime = req.file.mimetype || "application/octet-stream";
+            const base64 = buffer.toString("base64");
+            logoUrl = `data:${mime};base64,${base64}`;
+          } finally {
+            try { fs.unlinkSync(filePath); } catch {}
+          }
         } else {
           logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
           logoUrl = String(logoUrl).trim();
@@ -244,7 +251,7 @@ router.put("/product-documentation/:id", uploadLocal.single('logo'), (async (req
 }) as RequestHandler);
 
 // Delete generated product documentation
-router.delete("/product-documentation/:id", (async (req: AuthenticatedRequest, res) => {
+router.delete("/product-documentation/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /product-documentation/{id}:
@@ -284,7 +291,7 @@ router.delete("/product-documentation/:id", (async (req: AuthenticatedRequest, r
 }) as RequestHandler);
 
 // Regenerate product documentation (async via background job)
-router.post("/product-documentation/:id/regenerate", (async (req: AuthenticatedRequest, res) => {
+router.post("/product-documentation/:id/regenerate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /product-documentation/{id}/regenerate:
@@ -374,7 +381,7 @@ router.post("/product-documentation/:id/regenerate", (async (req: AuthenticatedR
 }) as RequestHandler);
 
 // Download PDF
-router.get("/product-documentation/:id/pdf", (async (req: AuthenticatedRequest, res) => {
+router.get("/product-documentation/:id/pdf", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), (async (req: AuthenticatedRequest, res) => {
   /**
    * @swagger
    * /product-documentation/{id}/pdf:

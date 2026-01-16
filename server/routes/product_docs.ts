@@ -201,19 +201,20 @@ router.put("/product-documentation/:id", authenticateToken, checkSubscriptionSta
         const host = req.get('host');
         const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
         if (isLambda) {
-          const store = getStore("uploads");
           const filePath = path.join(isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads"), req.file.filename);
-          const buffer = fs.readFileSync(filePath);
           try {
-            await store.set(
-              req.file.filename,
-              new Blob([buffer], { type: req.file.mimetype || "application/octet-stream" }) as any,
-              { cacheControl: "public, max-age=31536000" } as any
-            );
+            const store = getStore("uploads");
+            const buffer = fs.readFileSync(filePath);
+            const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+            await store.set(req.file.filename, ab as any);
             logoUrl = `${protocol}://${host}/uploads/${req.file.filename}`.trim();
           } catch (e) {
             const mime = req.file.mimetype || "application/octet-stream";
-            const base64 = buffer.toString("base64");
+            let base64 = "";
+            try {
+              const buffer = fs.readFileSync(filePath);
+              base64 = buffer.toString("base64");
+            } catch {}
             logoUrl = `data:${mime};base64,${base64}`;
           } finally {
             try { fs.unlinkSync(filePath); } catch {}
@@ -246,7 +247,7 @@ router.put("/product-documentation/:id", authenticateToken, checkSubscriptionSta
     res.json(response);
   } catch (error) {
     console.error("Update documentation error:", error);
-    res.status(500).json({ success: false, error: "Failed to update documentation" });
+    res.status(500).json({ success: false, error: "Failed to update documentation", details: error instanceof Error ? error.message : String(error) });
   }
 }) as RequestHandler);
 

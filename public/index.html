@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MetroFlow</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      background-color: white;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      text-align: center;
+    }
+    h1 {
+      color: #2563eb;
+      margin-bottom: 20px;
+    }
+    form {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+    input {
+      padding: 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+      font-size: 16px;
+    }
+    button {
+      background-color: #2563eb;
+      color: white;
+      padding: 12px 24px;
+      border: none;
+      border-radius: 4px;
+      font-size: 16px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:hover {
+      background-color: #1d4ed8;
+    }
+    .message {
+      margin-top: 20px;
+      padding: 15px;
+      border-radius: 4px;
+      display: none;
+    }
+    .success {
+      background-color: #d1fae5;
+      color: #065f46;
+      display: block;
+    }
+    .error {
+      background-color: #fee2e2;
+      color: #991b1b;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container" id="app">
+    <h1>Accept Invitation</h1>
+    <form id="acceptForm">
+      <input type="password" id="password" placeholder="Create your password (min 6 characters)" required minlength="6">
+      <input type="password" id="confirmPassword" placeholder="Confirm your password" required minlength="6">
+      <button type="submit">Accept Invitation</button>
+    </form>
+    <div id="message" class="message"></div>
+  </div>
+
+  <script>
+    // Extract token from URL
+    const pathParts = window.location.pathname.split('/');
+    const token = pathParts[pathParts.length - 1];
+
+    if (!token || token === 'accept-invite') {
+      document.getElementById('app').innerHTML = '<h1>Error</h1><p>Invalid invitation link.</p>';
+    }
+
+    // Verify token on page load
+    fetch(`/api/team/verify-invite-token/${token}`)
+      .then(response => response.json())
+      .then(data => {
+        if (!data.success) {
+          document.getElementById('app').innerHTML = '<h1>Error</h1><p>' + (data.error || 'Invalid or expired invitation link.') + '</p>';
+        }
+      })
+      .catch(error => {
+        console.error('Error verifying token:', error);
+      });
+
+    document.getElementById('acceptForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const password = document.getElementById('password').value;
+      const confirmPassword = document.getElementById('confirmPassword').value;
+      const messageDiv = document.getElementById('message');
+
+      if (password !== confirmPassword) {
+        messageDiv.className = 'message error';
+        messageDiv.textContent = 'Passwords do not match!';
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/team/accept-invite/${token}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await response.json();
+        if (data.success) {
+          messageDiv.className = 'message success';
+          messageDiv.textContent = 'Invitation accepted! You can now log in.';
+          document.getElementById('acceptForm').style.display = 'none';
+        } else {
+          messageDiv.className = 'message error';
+          messageDiv.textContent = data.error || 'Failed to accept invitation.';
+        }
+      } catch (error) {
+        messageDiv.className = 'message error';
+        messageDiv.textContent = 'An error occurred. Please try again.';
+        console.error('Error accepting invite:', error);
+      }
+    });
+  </script>
+</body>
+</html>

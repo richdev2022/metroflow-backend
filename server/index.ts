@@ -516,6 +516,15 @@ export async function createServer() {
     res.redirect(`/api/wallet/verify?${queryString}`);
   });
 
+  // Serve index.html for all other routes (client-side routing)
+  app.get("*", (req, res) => {
+    if (!req.path.startsWith("/api") && !req.path.startsWith("/node_modules") && !req.path.startsWith("/.netlify")) {
+      res.sendFile(path.join(process.cwd(), "public", "index.html"));
+    } else {
+      res.status(404).json({ error: "Not found" });
+    }
+  });
+
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error("❌ Unhandled Error:", err);

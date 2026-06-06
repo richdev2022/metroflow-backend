@@ -4,6 +4,7 @@ import { CreateTaskInput, BulkTaskInput, Task, ApiResponse, EpicCounts } from "@
 import { AuthenticatedRequest } from "../middleware/auth";
 import { logActivity } from "../services/activity";
 import { sendTaskNotification } from "../services/email";
+import { isOverdue } from "../utils/date";
 
 export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) => {
 /**
@@ -134,9 +135,15 @@ export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) =
       epicCounts[row.epic] = parseInt(row.count);
     });
 
+    // Dynamically compute isOverdue for each task
+    const tasksWithOverdueStatus = result.rows.map(task => ({
+      ...task,
+      isOverdue: task.status !== 'completed' ? isOverdue(task.endDate, task.dueDate) : false
+    }));
+
     const response: ApiResponse<{ tasks: Task[]; total: number; epicCounts: EpicCounts }> = {
       success: true,
-      data: { tasks: result.rows, total, epicCounts },
+      data: { tasks: tasksWithOverdueStatus, total, epicCounts },
     };
     res.json(response);
   } catch (error) {

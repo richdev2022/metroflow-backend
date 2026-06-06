@@ -5,6 +5,7 @@ import path from "path";
 import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import { specs } from "./swagger";
+import { isOverdue } from "./utils/date";
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = path.dirname(__filename);
@@ -69,6 +70,42 @@ import { processPendingProductDocJobs } from "./services/productDocJobs";
 import * as cron from "node-cron";
 import { getStore } from "@netlify/blobs";
 
+async function updateOverdueTasks() {
+  try {
+    console.log("Updating overdue tasks...");
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // Update tasks that are overdue
+    await query(`
+      UPDATE tasks
+      SET is_overdue = TRUE, updated_at = CURRENT_TIMESTAMP
+      WHERE is_overdue = FALSE
+        AND status != 'completed'
+        AND (
+          (due_date IS NOT NULL AND due_date < $1)
+          OR (due_date IS NULL AND end_date < $1)
+        )
+    `, [today.toISOString().split('T')[0]]);
+    
+    // Update tasks that are no longer overdue (if dates changed)
+    await query(`
+      UPDATE tasks
+      SET is_overdue = FALSE, updated_at = CURRENT_TIMESTAMP
+      WHERE is_overdue = TRUE
+        AND status != 'completed'
+        AND (
+          (due_date IS NOT NULL AND due_date >= $1)
+          OR (due_date IS NULL AND end_date >= $1)
+        )
+    `, [today.toISOString().split('T')[0]]);
+    
+    console.log("Overdue tasks updated successfully");
+  } catch (error) {
+    console.error("Error updating overdue tasks:", error);
+  }
+}
+
 export async function createServer() {
   const app = express();
 
@@ -98,7 +135,7 @@ export async function createServer() {
   }
 
   // Middleware
-  cron.schedule("0 0 * * *", async () => {
+  cron.schedule("0 * * * *", async () => {
     try {
       console.log("Running activity log cleanup...");
       const threeDaysAgo = new Date();
@@ -140,11 +177,17 @@ export async function createServer() {
 
       // Process subscription renewals
       await processSubscriptionRenewals();
-
+      
+      // Update overdue tasks
+      await updateOverdueTasks();
     } catch (error) {
       console.error("Cron job error:", error);
     }
   });
+  
+  // Update overdue tasks on server startup
+  await dbInitPromise;
+  await updateOverdueTasks();
 
   // Logging Middleware
   app.use((req, res, next) => {

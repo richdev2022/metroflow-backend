@@ -20,8 +20,11 @@ export function calculateMonthlyDateRange(startDate?: string): {
 /**
  * Check if a date is overdue (past end date)
  */
-export function isOverdue(endDate: string): boolean {
-  const end = new Date(endDate);
+export function isOverdue(endDate: string | null, dueDate: string | null): boolean {
+  const dateToCheck = dueDate || endDate;
+  if (!dateToCheck) return false;
+  
+  const end = new Date(dateToCheck);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -31,8 +34,11 @@ export function isOverdue(endDate: string): boolean {
 /**
  * Get days remaining until end date
  */
-export function getDaysRemaining(endDate: string): number {
-  const end = new Date(endDate);
+export function getDaysRemaining(endDate: string | null, dueDate: string | null): number {
+  const dateToCheck = dueDate || endDate;
+  if (!dateToCheck) return 0;
+  
+  const end = new Date(dateToCheck);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 

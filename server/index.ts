@@ -212,21 +212,32 @@ export async function createServer() {
   // Middleware
   const corsOptions = {
     origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
-      // console.log("CORS Origin Check:", origin);
+      console.log("CORS Origin Check:", origin);
       // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin || origin === 'null') return callback(null, true);
-      // Allow all origins (reflects the request origin)
+      
+      // Allow your specific frontend origin
+      const allowedOrigins = [
+        'https://metroflow-app.netlify.app',
+        'http://localhost:3000',
+        'http://localhost:5173'
+      ];
+      
+      if (allowedOrigins.includes(origin) || origin.includes('localhost')) {
+        return callback(null, true);
+      }
+      
+      // Allow all origins for development/flexibility
       return callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    // allowedHeaders: [], // Omit allowedHeaders to allow the browser to request any headers (reflects Access-Control-Request-Headers)
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     preflightContinue: false,
     optionsSuccessStatus: 204
   };
 
   app.use(cors(corsOptions));
-  // app.options('*', cors(corsOptions)); // Removed due to Express 5 / path-to-regexp issue
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
@@ -516,13 +527,10 @@ export async function createServer() {
     res.redirect(`/api/wallet/verify?${queryString}`);
   });
 
-  // Serve index.html for all other routes (client-side routing)
-  app.get("*", (req, res) => {
-    if (!req.path.startsWith("/api") && !req.path.startsWith("/node_modules") && !req.path.startsWith("/.netlify")) {
-      res.sendFile(path.join(process.cwd(), "public", "index.html"));
-    } else {
-      res.status(404).json({ error: "Not found" });
-    }
+  // Redirect backend /accept-invite/:token to frontend
+  app.get("/accept-invite/:token", (req, res) => {
+    const frontendUrl = process.env.APP_BASE_URL || 'https://metroflow-app.netlify.app';
+    res.redirect(`${frontendUrl}/accept-invite/${req.params.token}`);
   });
 
   // Global Error Handler

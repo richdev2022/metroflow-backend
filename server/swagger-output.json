@@ -5695,6 +5695,9 @@
                           },
                           "account_name": {
                             "type": "string"
+                          },
+                          "is_owner": {
+                            "type": "boolean"
                           }
                         }
                       }
@@ -6568,6 +6571,46 @@
                     "type": "string"
                   },
                   "accountNumber": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account details"
+          }
+        }
+      }
+    },
+    "/transfers/account-lookup": {
+      "post": {
+        "summary": "Lookup account details",
+        "tags": [
+          "Transfers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "bank_code",
+                  "account_number"
+                ],
+                "properties": {
+                  "bank_code": {
+                    "type": "string"
+                  },
+                  "account_number": {
                     "type": "string"
                   }
                 }

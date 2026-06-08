@@ -447,6 +447,13 @@ export async function createServer() {
   app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
   app.get("/api/team/verify-invite-token/:token", verifyInviteToken);
   app.post("/api/team/accept-invite/:token", acceptInvite);
+  app.patch(
+    "/api/team/:id/status",
+    authenticateToken,
+    checkSubscriptionStatus,
+    checkFeaturePermission('manage_team'),
+    updateTeamMemberStatus,
+  );
   app.put(
     "/api/team/:id/status",
     authenticateToken,
@@ -454,6 +461,7 @@ export async function createServer() {
     checkFeaturePermission('manage_team'),
     updateTeamMemberStatus,
   );
+  app.patch("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
   app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
   app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
 

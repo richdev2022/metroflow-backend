@@ -4180,6 +4180,31 @@
         "responses": {
           "200": {
             "description": "PDF file",
+            "headers": {
+              "Content-Type": {
+                "schema": {
+                  "type": "string",
+                  "example": "application/pdf"
+                }
+              },
+              "Content-Disposition": {
+                "schema": {
+                  "type": "string",
+                  "example": "inline; filename=\"New_Idea_Documentation.pdf\""
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "example": "bytes"
+                }
+              }
+            },
             "content": {
               "application/pdf": {
                 "schema": {
@@ -4188,6 +4213,15 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Documentation not found"
+          },
+          "500": {
+            "description": "Server error"
           }
         }
       }

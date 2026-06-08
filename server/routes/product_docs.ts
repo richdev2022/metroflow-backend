@@ -400,11 +400,33 @@ router.get("/product-documentation/:id/pdf", authenticateToken, checkSubscriptio
    *     responses:
    *       200:
    *         description: PDF file
+   *         headers:
+   *           Content-Type:
+   *             schema:
+   *               type: string
+   *               example: application/pdf
+   *           Content-Disposition:
+   *             schema:
+   *               type: string
+   *               example: inline; filename="New_Idea_Documentation.pdf"
+   *           Content-Length:
+   *             schema:
+   *               type: integer
+   *           Accept-Ranges:
+   *             schema:
+   *               type: string
+   *               example: bytes
    *         content:
    *           application/pdf:
    *             schema:
    *               type: string
    *               format: binary
+   *       401:
+   *         description: Unauthorized
+   *       404:
+   *         description: Documentation not found
+   *       500:
+   *         description: Server error
    */
   try {
     const { id } = req.params;
@@ -427,10 +449,11 @@ router.get("/product-documentation/:id/pdf", authenticateToken, checkSubscriptio
     const doc = result.rows[0];
     const pdfBuffer = await generatePDF(doc, doc.business_name, doc.owner_name);
 
+    res.type('application/pdf');
     res.set({
-      "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename="${doc.title.replace(/\s+/g, "_")}_Documentation.pdf"`,
+      "Content-Disposition": `attachment; filename="${doc.title.replace(/\s+/g, "_")}_Documentation.pdf"`,
       "Content-Length": pdfBuffer.length,
+      "Accept-Ranges": "bytes",
     });
 
     res.send(pdfBuffer);

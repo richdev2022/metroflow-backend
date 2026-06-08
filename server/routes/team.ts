@@ -756,6 +756,22 @@ export const updateTeamMemberRole: RequestHandler = async (req: AuthenticatedReq
       });
     }
 
+    // Get business details
+    const businessResult = await query(
+      `SELECT owner_id FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    if (businessResult.rows.length > 0) {
+      const business = businessResult.rows[0];
+      // If business has an owner and it's the user we're modifying
+      if (business.owner_id && business.owner_id === id) {
+        return res.status(403).json({
+          success: false,
+          error: "Cannot change the role of the business owner"
+        });
+      }
+    }
+
     const result = await query(
       `UPDATE users
         SET role = $1, updated_at = CURRENT_TIMESTAMP
@@ -837,7 +853,7 @@ export const deleteTeamMember: RequestHandler = async (req: AuthenticatedRequest
 
     // Get team member info before deletion for logging
     const memberResult = await query(
-      `SELECT name, email, role FROM users WHERE id = $1 AND business_id = $2`,
+      `SELECT id, name, email, role FROM users WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     );
 
@@ -850,6 +866,54 @@ export const deleteTeamMember: RequestHandler = async (req: AuthenticatedRequest
     }
 
     const member = memberResult.rows[0];
+
+    // Get business details (owner_id)
+    const businessResult = await query(
+      `SELECT owner_id FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    const business = businessResult.rows[0];
+
+    // If no owner set yet: set the first admin as owner (backward compatibility)
+    if (!business.owner_id) {
+      const firstAdminResult = await query(
+        `SELECT id FROM users WHERE business_id = $1 AND role = 'admin' ORDER BY created_at ASC LIMIT 1`,
+        [businessId]
+      );
+      if (firstAdminResult.rows.length > 0) {
+        await query(
+          `UPDATE businesses SET owner_id = $1 WHERE id = $2`,
+          [firstAdminResult.rows[0].id, businessId]
+        );
+        // Refresh business info
+        const refreshedBusinessResult = await query(
+          `SELECT owner_id FROM businesses WHERE id = $1`,
+          [businessId]
+        );
+        business.owner_id = refreshedBusinessResult.rows[0].owner_id;
+      }
+    }
+
+    // Check if trying to delete the owner: FORBIDDEN!
+    if (member.id === business.owner_id) {
+      return res.status(403).json({
+        success: false,
+        error: "Cannot delete the business owner"
+      });
+    }
+
+    // Check how many active users there are
+    const activeUsersResult = await query(
+      `SELECT COUNT(*) FROM users WHERE business_id = $1 AND status = 'active'`,
+      [businessId]
+    );
+    const activeCount = parseInt(activeUsersResult.rows[0].count);
+    if (activeCount <= 1) {
+      return res.status(403).json({
+        success: false,
+        error: "Cannot delete the last active team member"
+      });
+    }
 
     // Unassign from all tasks first
     await query(

@@ -180,10 +180,14 @@ export async function initializeDatabase() {
         email VARCHAR(255) NOT NULL UNIQUE,
         industry VARCHAR(255),
         logo_url TEXT,
+        owner_id UUID REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Add owner_id to businesses if not exists
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE SET NULL`);
 
     // Add KYC columns to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(50) DEFAULT 'pending'`);

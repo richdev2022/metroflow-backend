@@ -160,6 +160,12 @@ export const registerBusiness: RequestHandler = async (req, res) => {
 
     const user = userResult.rows[0];
 
+    // Update business to set owner_id
+    await query(
+      `UPDATE businesses SET owner_id = $1 WHERE id = $2`,
+      [user.id, business.id]
+    );
+
     // Log business registration activity
     await logActivity({
       businessId: business.id,

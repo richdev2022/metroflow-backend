@@ -263,11 +263,15 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
       [businessId],
     );
 
-    // Add is_owner flag to each user
-    const teamMembers = result.rows.map(user => ({
-      ...user,
-      is_owner: user.id === ownerId
-    }));
+    // Add is_owner flag to each user and set role to Owner if owner
+    const teamMembers = result.rows.map(user => {
+      const isOwner = user.id === ownerId;
+      return {
+        ...user,
+        role: isOwner ? "Owner" : user.role,
+        is_owner: isOwner
+      };
+    });
 
     const response: ApiResponse<TeamMember[]> = {
       success: true,

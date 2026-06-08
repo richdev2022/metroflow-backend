@@ -769,4 +769,45 @@ router.post("/lookup", authenticateToken, checkSubscriptionStatus, checkFeatureP
   }
 });
 
+/**
+ * @swagger
+ * /transfers/account-lookup:
+ *   post:
+ *     summary: Lookup account details
+ *     tags: [Transfers]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - bank_code
+ *               - account_number
+ *             properties:
+ *               bank_code:
+ *                 type: string
+ *               account_number:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Account details
+ */
+router.post("/account-lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { bank_code, account_number } = req.body;
+    if (!bank_code || !account_number) {
+      return res.status(400).json({ success: false, error: "Bank code and account number required" });
+    }
+
+    const data = await accountLookup(bank_code, account_number);
+    res.json({ success: true, data });
+
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.response?.data?.message || "Lookup failed" });
+  }
+});
+
 export default router;

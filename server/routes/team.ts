@@ -217,6 +217,8 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
  *                         type: string
  *                       account_name:
  *                         type: string
+ *                       is_owner:
+ *                         type: boolean
  *       500:
  *         description: Server error
  */
@@ -229,6 +231,29 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
       });
     }
 
+    // Get business owner_id first
+    const businessRes = await query(
+      `SELECT owner_id FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    const business = businessRes.rows[0];
+    
+    // If owner_id not set yet, set the first admin as owner
+    let ownerId = business?.owner_id;
+    if (!ownerId) {
+      const firstAdminRes = await query(
+        `SELECT id FROM users WHERE business_id = $1 AND role = 'admin' ORDER BY created_at ASC LIMIT 1`,
+        [businessId]
+      );
+      if (firstAdminRes.rows.length > 0) {
+        ownerId = firstAdminRes.rows[0].id;
+        await query(
+          `UPDATE businesses SET owner_id = $1 WHERE id = $2`,
+          [ownerId, businessId]
+        );
+      }
+    }
+
     const result = await query(
       `SELECT
         id, name, email, role, status, kyc_status, salary_currency, bank_code, account_number, account_name
@@ -238,9 +263,15 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
       [businessId],
     );
 
+    // Add is_owner flag to each user
+    const teamMembers = result.rows.map(user => ({
+      ...user,
+      is_owner: user.id === ownerId
+    }));
+
     const response: ApiResponse<TeamMember[]> = {
       success: true,
-      data: result.rows,
+      data: teamMembers,
     };
     res.json(response);
   } catch (error) {

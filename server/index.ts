@@ -233,6 +233,7 @@ export async function createServer() {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-business-id'],
+    exposedHeaders: ['Content-Disposition', 'Content-Length'],
     preflightContinue: false,
     optionsSuccessStatus: 204
   };

@@ -429,7 +429,7 @@ router.get("/product-documentation/:id/pdf", authenticateToken, checkSubscriptio
 
     res.set({
       "Content-Type": "application/pdf",
-      "Content-Disposition": `attachment; filename="${doc.title.replace(/\s+/g, "_")}_Documentation.pdf"`,
+      "Content-Disposition": `inline; filename="${doc.title.replace(/\s+/g, "_")}_Documentation.pdf"`,
       "Content-Length": pdfBuffer.length,
     });
 

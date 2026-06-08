@@ -233,7 +233,7 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
       `SELECT
         id, name, email, role, status, kyc_status, salary_currency, bank_code, account_number, account_name
        FROM users
-       WHERE business_id = $1 AND status IN ('active', 'invited')
+       WHERE business_id = $1 AND status IN ('active', 'invited', 'inactive')
        ORDER BY created_at DESC`,
       [businessId],
     );

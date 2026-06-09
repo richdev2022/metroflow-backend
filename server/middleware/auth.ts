@@ -9,13 +9,16 @@ export interface AuthenticatedRequest extends Request {
   };
 }
 
-export const authenticateToken = (
+export const authenticateToken = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ) => {
+  console.log("authenticateToken middleware called");
   const authHeader = req.headers.authorization;
+  console.log("Authorization header:", authHeader);
   const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+  console.log("Extracted token:", token);
 
   if (!token) {
     return res.status(401).json({
@@ -24,14 +27,16 @@ export const authenticateToken = (
     });
   }
 
-  const decoded = verifyToken(token);
+  const decoded = await verifyToken(token);
   if (!decoded) {
+    console.log("Token verification failed");
     return res.status(403).json({
       success: false,
       error: "Invalid or expired token",
     });
   }
 
+  console.log("Token verified successfully, decoded:", decoded);
   req.user = decoded;
   next();
 };

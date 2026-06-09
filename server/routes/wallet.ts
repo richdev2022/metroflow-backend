@@ -410,7 +410,7 @@ router.get("/verify", async (req, res) => {
         if (transaction.status === 'success') {
              // If settlement is also settled (or missing and we assume success), redirect
              if (!settlement || settlement.status === 'settled') {
-                 const token = generateToken(transaction.user_id, transaction.business_id);
+                 const token = await generateToken(transaction.user_id, transaction.business_id);
                  return res.send(`
                     <html>
                         <head>
@@ -509,7 +509,7 @@ router.get("/verify", async (req, res) => {
                 // Send Success Email (Async)
                 // sendEmail(...)
                 
-                const token = generateToken(transaction.user_id, transaction.business_id);
+                const token = await generateToken(transaction.user_id, transaction.business_id);
                 return res.send(`
                     <html>
                         <head>

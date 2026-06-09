@@ -663,6 +663,26 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Create user_sessions table for token idle timeout
+    await query(`
+      CREATE TABLE IF NOT EXISTS user_sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        token VARCHAR(255) NOT NULL UNIQUE,
+        last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Fix existing user_sessions rows with null last_activity_at
+    await query(`
+      UPDATE user_sessions 
+      SET last_activity_at = CURRENT_TIMESTAMP 
+      WHERE last_activity_at IS NULL
+    `);
+    console.log("Fixed user_sessions rows with null last_activity_at");
+
     // Insert default card verification amount if not exists
     await query(`
       INSERT INTO system_settings (key, value, description)

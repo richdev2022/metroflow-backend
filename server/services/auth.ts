@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { query } from "../db";
 
 // Simple password hashing (in production, use bcrypt instead)
 export function hashPassword(password: string): string {
@@ -20,31 +21,69 @@ export function getOTPExpiry(): Date {
   return expiry;
 }
 
-// JWT Token (simple implementation - in production use jsonwebtoken library)
-export function generateToken(userId: string, businessId: string): string {
-  const payload = {
-    userId,
-    businessId,
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60, // 24 hours
-  };
-
-  // Simple token encoding - in production use JWT library
-  return Buffer.from(JSON.stringify(payload)).toString("base64");
+// Generate secure random token
+export async function generateToken(userId: string, businessId: string): Promise<string> {
+  // Generate secure token
+  const token = crypto.randomBytes(32).toString("hex");
+  console.log("Generated new token for user:", { userId, businessId, token });
+  
+  // Store token in user_sessions table with last_activity_at set explicitly
+  await query(
+    `INSERT INTO user_sessions (user_id, business_id, token, last_activity_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+    [userId, businessId, token]
+  );
+  console.log("Token stored in user_sessions successfully");
+  
+  return token;
 }
 
-export function verifyToken(
+export async function verifyToken(
   token: string,
-): { userId: string; businessId: string } | null {
+): Promise<{ userId: string; businessId: string } | null> {
   try {
-    const payload = JSON.parse(Buffer.from(token, "base64").toString());
+    console.log("Verifying token:", token);
+    // Get idle timeout from env (default to 30 minutes)
+    const idleTimeoutMinutes = parseInt(process.env.TOKEN_IDLE_TIMEOUT_MINUTES || "30", 10);
+    
+    // First, try to update the session and get the session info in one query
+    const updateResult = await query(
+      `UPDATE user_sessions 
+       SET last_activity_at = NOW() 
+       WHERE token = $1 
+       AND last_activity_at > NOW() - ($2 || ' minutes')::INTERVAL
+       RETURNING user_id, business_id`,
+      [token, idleTimeoutMinutes]
+    );
+    console.log("Update result rows:", updateResult.rows.length);
 
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      return null; // Token expired
+    if (updateResult.rows.length > 0) {
+      // Success! Token was active and we updated it
+      console.log("Token verified successfully");
+      return {
+        userId: updateResult.rows[0].user_id,
+        businessId: updateResult.rows[0].business_id
+      };
     }
 
-    return { userId: payload.userId, businessId: payload.businessId };
+    // If no rows returned, either token doesn't exist or it's expired
+    // Let's check if token exists (so we can delete it if expired)
+    const checkResult = await query(
+      `SELECT user_id, business_id FROM user_sessions WHERE token = $1`,
+      [token]
+    );
+    console.log("Check result rows:", checkResult.rows.length);
+
+    if (checkResult.rows.length > 0) {
+      // Token exists but is expired - delete it
+      console.log("Token expired due to inactivity, deleting it");
+      await query(`DELETE FROM user_sessions WHERE token = $1`, [token]);
+    } else {
+      console.log("Token not found in user_sessions");
+    }
+
+    return null;
   } catch (error) {
+    console.error("Error verifying token:", error);
     return null;
   }
 }

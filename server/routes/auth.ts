@@ -358,7 +358,7 @@ export const verifyOTP: RequestHandler = async (req, res) => {
     }
 
     // Generate token
-    const token = generateToken(user.id, user.businessId);
+    const token = await generateToken(user.id, user.businessId);
 
     const response: AuthResponse = {
       success: true,
@@ -918,7 +918,7 @@ export const login: RequestHandler = async (req, res) => {
       description: "User logged in successfully",
     });
 
-    const token = generateToken(user.id, user.businessId);
+    const token = await generateToken(user.id, user.businessId);
 
     const response: AuthResponse = {
       success: true,

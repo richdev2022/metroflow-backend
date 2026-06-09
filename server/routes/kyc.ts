@@ -139,23 +139,17 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
 
         // Prembly usually returns data including phone number for OTP
         const data = verificationData?.data || verificationData;
-        const phone = data?.phoneNumber || data?.phone_number || data?.phoneNumber1 || data?.mobile || data?.phone;
+        let phone = data?.phoneNumber || data?.phone_number || data?.phoneNumber1 || data?.mobile || data?.phone;
         const firstName = data?.firstName || data?.first_name || data?.firstname;
         const lastName = data?.lastName || data?.last_name || data?.lastname;
 
-        if (!phone) {
-             await query(
-                `UPDATE users SET ${type} = $1, kyc_data = $2, kyc_status = 'pending_review' WHERE id = $3`,
-                [number, JSON.stringify(verificationData), userId]
-             );
-             
-             return res.json({ 
-                 success: true, 
-                 message: "Verification data submitted for review", 
-                 status: "pending_review",
-                 firstName,
-                 lastName
-             });
+        // Send OTP based on Environment
+        const kycEnv = process.env.KYC || 'live';
+
+        // If in test mode and Prembly didn't return a phone, use user's registered phone from users table
+        if (kycEnv.toLowerCase() === 'test' && !phone) {
+            const userPhoneRes = await query(`SELECT phone_number FROM users WHERE id = $1`, [userId]);
+            phone = userPhoneRes.rows[0]?.phone_number;
         }
 
         // Generate OTP
@@ -177,19 +171,36 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
             [number, JSON.stringify(verificationData), otpHash, expiresAt, userId]
         );
 
-        // Send OTP based on Environment
-        const kycEnv = process.env.KYC || 'live';
         const message = `Your Metroflow verification code is: ${otp}. Valid for 10 minutes.`;
+        let messageResponse = "Verification initiated.";
 
-        // Always send to phone
-        await sendSMS(phone, message);
-        let messageResponse = "OTP sent to linked phone number.";
-
-        // If Test, also send to email
-        if (kycEnv.toLowerCase() === 'test' && userEmail) {
-            const emailHtml = generateKYCOtpEmailHtml(userName, otp);
-            await sendEmail(userEmail, userName, "KYC Verification OTP", emailHtml);
-            messageResponse = "OTP sent to linked phone number and email (Test Mode).";
+        // Send OTP
+        if (kycEnv.toLowerCase() === 'test') {
+            // In test mode, send to email at least
+            if (userEmail) {
+                const emailHtml = generateKYCOtpEmailHtml(userName, otp);
+                await sendEmail(userEmail, userName, "KYC Verification OTP", emailHtml);
+            }
+            // If we have a phone, send SMS too
+            if (phone) {
+                await sendSMS(phone, message);
+                messageResponse = "OTP sent to linked phone number and email (Test Mode).";
+            } else {
+                messageResponse = "OTP sent to email (Test Mode).";
+            }
+        } else {
+            // Live mode - must have phone
+            if (!phone) {
+                return res.json({ 
+                    success: true, 
+                    message: "Verification data submitted for review", 
+                    status: "pending_review",
+                    firstName,
+                    lastName
+                });
+            }
+            await sendSMS(phone, message);
+            messageResponse = "OTP sent to linked phone number.";
         }
 
         res.json({ 

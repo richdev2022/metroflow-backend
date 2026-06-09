@@ -7,6 +7,7 @@ import { sendSMS } from "../services/sms";
 import { sendEmail, generateKYCOtpEmailHtml } from "../services/email";
 import { createWallet } from "../services/wallet";
 import { createVirtualAccount } from "../services/squad";
+import { getProvider } from "../services/providers/factory";
 import crypto from "crypto";
 import { upload } from "../middleware/upload";
 
@@ -285,62 +286,81 @@ router.post("/verify-otp", authenticateToken, async (req: AuthenticatedRequest, 
         await createWallet(userId, 'user');
 
         // Create Virtual Account (Individual)
-        try {
-            // Check if wallet already has VA
-            const walletCheck = await query(`SELECT virtual_account_number FROM wallets WHERE user_id = $1`, [userId]);
-            if (!walletCheck.rows[0]?.virtual_account_number) {
+        // Get wallet id
+        const walletRes = await query(`SELECT id FROM wallets WHERE user_id = $1`, [userId]);
+        if (walletRes.rows.length !== 0) {
+            const walletId = walletRes.rows[0].id;
+            const provider = getProvider();
+            
+            // Check if VA already exists for this provider
+            const vaCheck = await query(
+                `SELECT id FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                [walletId, provider.name]
+            );
+            if (vaCheck.rows.length === 0) {
                  // Try to create VA if we have enough data
                  // This is best effort for now as we might lack beneficiary account
-                 
-                 // NOTE: We need to ensure we have the necessary data. 
-                 // Since we don't have account_number and bank_code in users table, 
-                 // we'll try to use hardcoded values or check if kycData has it for now to enable VA creation.
-                 // In a real scenario, we should prompt user to add bank account first.
-                 
-                 // For now, we will use a dummy beneficiary account if not present to allow testing VA creation
-                 // assuming the Squad API allows it or we need to ask user for it.
-                 // However, without a real beneficiary account, payouts from VA might fail.
-                 
-                 // Let's uncomment and adjust to use what we have.
                  
                  const beneficiaryAccount = "0000000000"; // Dummy or needs to be fetched
                  
                  if (kycData) { 
+                     const nameParts = user.name.split(' ');
+                     const firstName = kycData.firstName || nameParts[0] || "User";
+                     const lastName = kycData.lastName || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0] || "User");
+                     
                      const vaData = {
-                         first_name: kycData.firstName || user.name.split(' ')[0],
-                         last_name: kycData.lastName || user.name.split(' ').slice(1).join(' '),
-                         mobile_num: kycData.phoneNumber || "08000000000", // Fallback
+                         firstName,
+                         lastName,
+                         phoneNumber: kycData.phoneNumber || user.phone_number || "08000000000", // Fallback
                          dob: kycData.dateOfBirth || "01/01/1990", // Fallback
                          email: user.email,
                          bvn: kycData.bvn || user.bvn || "12345678901",
+                         nin: kycData.nin || user.nin || "12345678901",
                          gender: kycData.gender === 'Male' ? "1" : "2",
                          address: "Lagos, Nigeria", 
-                         customer_identifier: userId,
-                         beneficiary_account: beneficiaryAccount
+                         customerIdentifier: userId,
+                         beneficiaryAccount: beneficiaryAccount
                      };
                      
                      try {
-                        const vaResponse = await createVirtualAccount(vaData as any);
-                        if (vaResponse && vaResponse.success) {
-                             const vaNumber = vaResponse.data.virtual_account_number;
-                             await query(
-                                 `UPDATE wallets SET virtual_account_number = $1, bank_code = '058', customer_identifier = $2 WHERE user_id = $3`,
-                                 [vaNumber, userId, userId]
-                             );
+                        const vaResponse = await provider.createVirtualAccount(vaData);
+                        
+                        let isSuccess = false;
+                        let vaNumber = null;
+                        let bankCode = '058';
+                        let accountName = `${firstName} ${lastName}`;
+                        
+                        if (provider.name === 'squad') {
+                            isSuccess = vaResponse.success;
+                            vaNumber = vaResponse.data.virtual_account_number;
+                        } else if (provider.name === 'monnify') {
+                            isSuccess = vaResponse.requestSuccessful;
+                            const accounts = vaResponse.responseBody?.accounts;
+                            if (accounts && accounts.length > 0) {
+                                vaNumber = accounts[0].accountNumber;
+                                bankCode = accounts[0].bankCode;
+                                accountName = vaResponse.responseBody.accountName;
+                            }
+                        }
+                        
+                        if (isSuccess && vaNumber) {
+                            // Insert into virtual_accounts
+                            await query(
+                                `INSERT INTO virtual_accounts 
+                                 (wallet_id, payment_provider, virtual_account_number, bank_code, account_name, customer_identifier, beneficiary_account, provider_metadata)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                                [walletId, provider.name, vaNumber, bankCode, accountName, userId, beneficiaryAccount, JSON.stringify(vaResponse)]
+                            );
                         } else {
                             // Report error if VA generation failed but don't fail the whole KYC verification
-                            // Just log it and maybe update a flag that VA is pending
                             console.error("VA Creation Failed (API Response):", vaResponse);
                         }
                      } catch (err: any) {
                          console.error("Failed to create VA:", err);
-                         // Don't swallow error completely if we want to inform user, 
-                         // but user requested "don't generate random one, report error".
-                         // The KYC verification itself is successful, but VA generation failed.
-                         // We can add a warning message to the response?
-                         // Or we can just log it and let the user retry later via the new endpoint.
                      }
                  }
+            }
+        }
                  /*
                  if (kycData && user.account_number && user.bank_code === '058') { // 058 is GTBank
                      const vaData = {
@@ -361,11 +381,6 @@ router.post("/verify-otp", authenticateToken, async (req: AuthenticatedRequest, 
                      // Note: Commented out to prevent errors if data is incomplete, needs robust handling
                  }
                  */
-            }
-        } catch (error) {
-            console.error("VA Creation Warning:", error);
-            // Don't fail the whole request
-        }
 
         res.json({ success: true, message: "KYC Verified successfully" });
 

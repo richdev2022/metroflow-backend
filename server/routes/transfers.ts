@@ -1,8 +1,8 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
-import { processAllPending } from "../services/transfer";
-import { accountLookup, getBanks } from "../services/squad";
+import { processAllPending, accountLookup } from "../services/transfer";
+import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import { generateOTP, getOTPExpiry } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
@@ -196,11 +196,12 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         const fee = await calculateFee(amount, 'transfer');
 
         // Queue Transfer
+        const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
         await query(
             `INSERT INTO transfer_queue 
-            (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id)
-            VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8)`,
-            [businessId, genRef(), accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId]
+            (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider)
+            VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9)`,
+            [businessId, genRef(), accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider]
         );
 
         // Trigger processing
@@ -464,13 +465,14 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     // 2. Insert into transfer_queue
     let queuedCount = 0;
+    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
     for (const t of transfersToQueue) {
       if (t.amount <= 0) continue;
 
       const transferRes = await query(
         `INSERT INTO transfer_queue 
-        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11)
+        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12)
         RETURNING id`,
         [
           businessId,
@@ -483,7 +485,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.remark,
           t.sourceType,
           t.sourceId,
-          walletId
+          walletId,
+          t.payment_provider || defaultProvider
         ]
       );
       
@@ -721,7 +724,8 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
  */
 router.get("/banks", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const banks = getBanks();
+    const provider = getProvider();
+    const banks = provider.getBanks();
     res.json({ success: true, data: banks });
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to fetch banks" });

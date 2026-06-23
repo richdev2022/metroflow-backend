@@ -1,5 +1,5 @@
 
-# Metrocorex Frontend Updates Documentation
+# Metricorex Frontend Updates Documentation
 
 This document outlines the API changes and updates needed for the frontend following the Monnify integration.
 

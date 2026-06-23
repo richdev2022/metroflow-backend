@@ -4,7 +4,7 @@ This document serves as the guide for **Platform Administrators** managing the M
 
 
 **Notification Configuration**:
-- **`KYC_ADMIN_EMAILS`**: Comma-separated list of admin emails to receive notifications upon new Business KYC submissions (e.g., `admin1@metrocorex.com,admin2@metrocorex.com`).
+- **`KYC_ADMIN_EMAILS`**: Comma-separated list of admin emails to receive notifications upon new Business KYC submissions (e.g., `admin1@metricorex.com,admin2@metricorex.com`).
 
 ---
 

@@ -363,7 +363,7 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
     const member = result.rows[0];
 
     // Send invitation email
-    const baseUrl = process.env.APP_BASE_URL || 'https://metrocorex-app.netlify.app';
+    const baseUrl = process.env.APP_BASE_URL || 'https://metricorex-app.netlify.app';
     const inviteLink = `${baseUrl}/accept-invite/${inviteToken}`;
     const emailHtml = generateInviteEmailHtml(input.name, inviteLink);
 

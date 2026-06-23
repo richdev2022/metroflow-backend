@@ -171,7 +171,7 @@ async function sendProductDocReadyEmail(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-            <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
 
           <h1 style="color: #111827; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 16px;">
@@ -195,12 +195,12 @@ async function sendProductDocReadyEmail(
           <div style="text-align: center; margin: 30px 0;">
             <a href="${dashboardUrl}"
                style="background-color: #2563eb; color: white; padding: 12px 30px; text-decoration: none; border-radius: 8px; display: inline-block; font-weight: 600;">
-              View in Metrocorex
+              View in Metricorex
             </a>
           </div>
 
           <p style="color: #6b7280; font-size: 13px; text-align: center; margin-top: 24px;">
-            You received this email because you requested product documentation generation in Metrocorex.
+            You received this email because you requested product documentation generation in Metricorex.
           </p>
         </div>
       </body>

@@ -1,8 +1,8 @@
 
-# Monnify API Extract for Metrocorex Integration
+# Monnify API Extract for Metricorex Integration
 
 ## Overview
-This document extracts the relevant Monnify API endpoints from the provided `monnify-collection.yml` for integrating Monnify as an additional payment provider alongside Squad in Metrocorex.
+This document extracts the relevant Monnify API endpoints from the provided `monnify-collection.yml` for integrating Monnify as an additional payment provider alongside Squad in Metricorex.
 
 ## 1. Authentication
 Monnify uses Basic Authentication to get an access token, which is then used for all other API calls.

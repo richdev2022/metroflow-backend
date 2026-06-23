@@ -67,7 +67,7 @@ export const processSubscriptionRenewals = async () => {
                  // Send No Payment Method Email
                  const emailHtml = generateRenewalFailedEmail(sub.name, sub.plan_name, "No payment method attached");
                  await sendEmail({
-                    sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
+                    sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
                     to: [{ email: sub.email, name: sub.name }],
                     subject: "Action Required: Subscription Renewal Failed",
                     htmlContent: emailHtml
@@ -151,7 +151,7 @@ export const processSubscriptionRenewals = async () => {
             try {
                 const emailHtml = generateRenewalFailedEmail(sub.name, sub.plan_name, err.message);
                 await sendEmail({
-                    sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
+                    sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
                     to: [{ email: sub.email, name: sub.name }],
                     subject: "Payment Failed: Subscription Renewal",
                     htmlContent: emailHtml
@@ -204,7 +204,7 @@ const processPendingChanges = async () => {
                 // Send cancellation confirmation email
                 const emailHtml = generateSubscriptionCancelledEmail(business.name, business.current_plan_name);
                 await sendEmail({
-                    sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
+                    sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
                     to: [{ email: business.email, name: business.name }],
                     subject: "Your Subscription Has Been Cancelled",
                     htmlContent: emailHtml
@@ -226,7 +226,7 @@ const processPendingChanges = async () => {
                     // Send downgrade confirmation email
                     const emailHtml = generateSubscriptionDowngradedEmail(business.name, business.current_plan_name, business.new_plan_name || "Free");
                     await sendEmail({
-                        sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
+                        sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
                         to: [{ email: business.email, name: business.name }],
                         subject: "Your Subscription Has Been Downgraded",
                         htmlContent: emailHtml

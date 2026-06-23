@@ -1,5 +1,5 @@
 
-# Metrocorex Wallet Feature Implementation Guide
+# Metricorex Wallet Feature Implementation Guide
 
 This document provides a detailed guide for implementing the wallet feature, including virtual account (VA) creation flows tailored to the active payment provider.
 

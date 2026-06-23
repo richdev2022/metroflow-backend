@@ -79,8 +79,8 @@ export async function sendEmail(
         // Construct payload from arguments
         payload = {
             sender: {
-                name: process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'Metrocorex',
-                email: process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_FROM_ADDRESS || 'no-reply@metrocorex.com'
+                name: process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'Metricorex',
+                email: process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_FROM_ADDRESS || 'no-reply@metricorex.com'
             },
             to: [{ email: recipientEmail, name: recipientName }],
             subject: subject,
@@ -110,7 +110,7 @@ export async function sendEmail(
     // 4-arg style (or array converted to string)
     if (recipientEmail) {
         const info = await transporter.sendMail({
-            from: `"${process.env.EMAIL_FROM_NAME || 'Metrocorex'}" <${process.env.EMAIL_FROM_ADDRESS || 'no-reply@metrocorex.com'}>`,
+            from: `"${process.env.EMAIL_FROM_NAME || 'Metricorex'}" <${process.env.EMAIL_FROM_ADDRESS || 'no-reply@metricorex.com'}>`,
             to: `"${recipientName}" <${recipientEmail}>`,
             subject: subject,
             html: html,
@@ -199,7 +199,7 @@ export function generateAdminInviteEmailHtml(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Admin Access Invitation</h1>
@@ -209,7 +209,7 @@ export function generateAdminInviteEmailHtml(
           </p>
 
           <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
-            You have been invited to join the <strong>Metrocorex</strong> platform as an Administrator.
+            You have been invited to join the <strong>Metricorex</strong> platform as an Administrator.
           </p>
 
           <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
@@ -244,7 +244,7 @@ export function generateAdminInviteEmailHtml(
           
           <div style="text-align: center; margin-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -505,7 +505,7 @@ export async function sendTransferFailureNotification(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fef2f2; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #ef4444;">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Transfer Failed</h1>
@@ -539,7 +539,7 @@ export async function sendTransferFailureNotification(
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -552,8 +552,8 @@ export async function sendTransferFailureNotification(
       to: [{ email }],
       subject,
       htmlContent,
-      sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
-      replyTo: { email: "support@metrocorex.com" },
+      sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
+      replyTo: { email: "support@metricorex.com" },
     });
   }
 }
@@ -596,8 +596,8 @@ export async function sendPayrollAdjustmentNotification(
       to: [{ email }],
       subject,
       htmlContent,
-      sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
-      replyTo: { email: "support@metrocorex.com" },
+      sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
+      replyTo: { email: "support@metricorex.com" },
     });
   }
 }
@@ -614,7 +614,7 @@ export function generateOtpEmailHtml(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">${purpose}</h1>
@@ -637,7 +637,7 @@ export function generateOtpEmailHtml(
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -714,7 +714,7 @@ export function generateKYCOtpEmailHtml(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">KYC Verification</h1>
@@ -740,12 +740,12 @@ export function generateKYCOtpEmailHtml(
           </p>
           
           <p style="color: #6b7280; font-size: 14px; line-height: 1.6; margin-bottom: 32px; text-align: center;">
-            Do not share this code with anyone. Metrocorex support will never ask for this code.
+            Do not share this code with anyone. Metricorex support will never ask for this code.
           </p>
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -766,7 +766,7 @@ export function generateSubscriptionCancelledEmail(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Your Subscription Has Been Cancelled</h1>
@@ -790,14 +790,14 @@ export function generateSubscriptionCancelledEmail(
           </p>
 
           <div style="text-align: center; margin-bottom: 32px;">
-            <a href="${baseUrl || 'https://app.metrocorex.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
-              Visit Metrocorex
+            <a href="${baseUrl || 'https://app.metricorex.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Visit Metricorex
             </a>
           </div>
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -819,7 +819,7 @@ export function generateSubscriptionDowngradedEmail(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Your Subscription Has Been Downgraded</h1>
@@ -839,18 +839,18 @@ export function generateSubscriptionDowngradedEmail(
           </div>
 
           <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
-            Thank you for being a Metrocorex customer! If you have any questions, please don't hesitate to contact our support team.
+            Thank you for being a Metricorex customer! If you have any questions, please don't hesitate to contact our support team.
           </p>
 
           <div style="text-align: center; margin-bottom: 32px;">
-            <a href="${baseUrl || 'https://app.metrocorex.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
-              Visit Metrocorex
+            <a href="${baseUrl || 'https://app.metricorex.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Visit Metricorex
             </a>
           </div>
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>
@@ -872,7 +872,7 @@ export function generateRenewalFailedEmail(
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fef2f2; padding: 40px 0; margin: 0;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #ef4444;">
           <div style="text-align: center; margin-bottom: 30px;">
-             <img src="${logoUrl}" alt="Metrocorex Logo" style="max-width: 180px; height: auto;" />
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
           <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Subscription Renewal Failed</h1>
@@ -895,14 +895,14 @@ export function generateRenewalFailedEmail(
           </p>
 
           <div style="text-align: center; margin-bottom: 32px;">
-            <a href="${baseUrl || 'https://app.metrocorex.com'}/billing" style="background-color: #ef4444; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+            <a href="${baseUrl || 'https://app.metricorex.com'}/billing" style="background-color: #ef4444; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
               Update Payment Method
             </a>
           </div>
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metrocorex. All rights reserved.
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
             </p>
           </div>
         </div>

@@ -981,61 +981,107 @@ protectedRouter.get("/transactions", requirePermission('view_dashboard'), async 
         const status = req.query.status as string;
         const businessId = req.query.businessId as string;
 
-        // Build query
-        // Join with businesses to show who paid
-        let queryText = `
-            SELECT t.*, b.name as business_name, b.email as business_email, p.name as plan_name 
+        // Build query for transactions
+        let transactionsQuery = `
+            SELECT 
+                t.*, 
+                b.name as business_name, 
+                b.email as business_email, 
+                p.name as plan_name,
+                'transaction' as source
             FROM transactions t
             LEFT JOIN businesses b ON t.business_id = b.id
             LEFT JOIN pricing_plans p ON t.plan_id = p.id
             WHERE 1=1
         `;
-        const queryParams: any[] = [];
-        let paramIndex = 1;
+        const transactionsParams: any[] = [];
+        let tParamIndex = 1;
 
-        if (businessId) {
-            queryText += ` AND t.business_id = $${paramIndex}`;
-            queryParams.push(businessId);
-            paramIndex++;
-        }
+        // Build query for transfer_queue
+        let transfersQuery = `
+            SELECT 
+                tq.*, 
+                b.name as business_name, 
+                b.email as business_email, 
+                NULL as plan_name,
+                'transfer_queue' as source
+            FROM transfer_queue tq
+            LEFT JOIN businesses b ON tq.business_id = b.id
+            WHERE 1=1
+        `;
+        const transfersParams: any[] = [];
+        let tfParamIndex = 1;
 
-        if (startDate) {
-            queryText += ` AND t.created_at >= $${paramIndex}`;
-            queryParams.push(startDate);
-            paramIndex++;
-        }
+        // Apply filters to both queries
+        const applyFilters = (query: string, params: any[], paramIndex: number) => {
+            let newQuery = query;
+            let newParamIndex = paramIndex;
 
-        if (endDate) {
-            const endDateTime = new Date(endDate);
-            endDateTime.setHours(23, 59, 59, 999);
-            queryText += ` AND t.created_at <= $${paramIndex}`;
-            queryParams.push(endDateTime.toISOString());
-            paramIndex++;
-        }
+            if (businessId) {
+                newQuery += ` AND business_id = $${newParamIndex}`;
+                params.push(businessId);
+                newParamIndex++;
+            }
 
-        if (reference) {
-            queryText += ` AND t.reference ILIKE $${paramIndex}`;
-            queryParams.push(`%${reference}%`);
-            paramIndex++;
-        }
+            if (startDate) {
+                newQuery += ` AND created_at >= $${newParamIndex}`;
+                params.push(startDate);
+                newParamIndex++;
+            }
 
-        if (status) {
-            queryText += ` AND t.status = $${paramIndex}`;
-            queryParams.push(status);
-            paramIndex++;
-        }
+            if (endDate) {
+                const endDateTime = new Date(endDate);
+                endDateTime.setHours(23, 59, 59, 999);
+                newQuery += ` AND created_at <= $${newParamIndex}`;
+                params.push(endDateTime.toISOString());
+                newParamIndex++;
+            }
 
-        // Count total
-        // Simple count query (ignoring joins if not filtering by joined columns, but for safety we include them)
-        const whereClause = queryText.substring(queryText.indexOf("WHERE"));
-        const countResult = await query(`SELECT COUNT(*) FROM transactions t ${whereClause}`, queryParams);
-        const total = parseInt(countResult.rows[0].count);
+            if (reference) {
+                newQuery += ` AND reference ILIKE $${newParamIndex}`;
+                params.push(`%${reference}%`);
+                newParamIndex++;
+            }
 
-        // Sorting and Pagination
-        queryText += ` ORDER BY t.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-        queryParams.push(perPage, offset);
+            if (status) {
+                newQuery += ` AND status = $${newParamIndex}`;
+                params.push(status);
+                newParamIndex++;
+            }
 
-        const result = await query(queryText, queryParams);
+            return { query: newQuery, params, paramIndex: newParamIndex };
+        };
+
+        const tResult = applyFilters(transactionsQuery, transactionsParams, tParamIndex);
+        const tfResult = applyFilters(transfersQuery, transfersParams, tfParamIndex);
+
+        // Combine both queries with UNION ALL, sort, then paginate
+        const combinedQuery = `
+            WITH combined AS (
+                ${tResult.query}
+                UNION ALL
+                ${tfResult.query}
+            )
+            SELECT * FROM combined
+            ORDER BY created_at DESC
+            LIMIT $${tResult.paramIndex + tfResult.paramIndex} OFFSET $${tResult.paramIndex + tfResult.paramIndex + 1}
+        `;
+        const combinedParams = [...tResult.params, ...tfResult.params, perPage, offset];
+
+        const result = await query(combinedQuery, combinedParams);
+
+        // Get total count
+        const countQuery = `
+            WITH combined AS (
+                ${tResult.query}
+                UNION ALL
+                ${tfResult.query}
+            )
+            SELECT COUNT(*) as total FROM combined
+        `;
+        const countParams = [...tResult.params, ...tfResult.params];
+        const countResult = await query(countQuery, countParams);
+        const total = parseInt(countResult.rows[0].total);
 
         res.json({ 
             success: true, 

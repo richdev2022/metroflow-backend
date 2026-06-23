@@ -179,48 +179,118 @@ router.get("/transactions", authenticateToken, async (req, res) => {
 
         if (!businessId && !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-        const { page = 1, limit = 20 } = req.query;
+        const { page = 1, limit = 20, status } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
 
-        // Fetch transactions for Business OR User (Wallet)
-        // If businessId is present, fetch business transactions (Subscription + Business Wallet)
-        // If userId is present (and no businessId?), fetch User Wallet transactions.
-        // Actually, user is always authenticated.
-        // If user is Admin/Owner, they see Business Transactions?
-        // If user is Team Member, they see their Wallet Transactions?
-        
-        let queryStr = `SELECT * FROM transactions WHERE 1=1`;
-        const params: any[] = [];
-        let paramCount = 1;
+        // Fetch transactions and transfer_queue entries, combine them
+        // First, get transactions
+        let transactionsQuery = `
+            SELECT 
+                id,
+                business_id,
+                amount,
+                currency,
+                status,
+                reference,
+                type,
+                description,
+                transaction_type,
+                wallet_id,
+                direction,
+                created_at,
+                'transaction' as source
+            FROM transactions 
+            WHERE 1=1`;
+        const transactionsParams: any[] = [];
+        let tParamCount = 1;
 
         if (businessId) {
-             // Show Business Transactions (Subscription + Wallet Funding + Payouts)
-             // AND Team Member Wallet Funding? Maybe not.
-             // Just Business Context.
-             queryStr += ` AND (business_id = $${paramCount}`;
-             params.push(businessId);
-             paramCount++;
-             
-             // Also include transactions where user_id matches but related to business wallet?
-             // The schema has business_id on transactions.
-             queryStr += `)`;
-        } else {
-             // Individual User (e.g. freelancer/contractor not in business context yet? or just personal wallet)
-             queryStr += ` AND user_id = $${paramCount}`;
-             params.push(userId);
-             paramCount++;
+            transactionsQuery += ` AND business_id = $${tParamCount}`;
+            transactionsParams.push(businessId);
+            tParamCount++;
+        } else if (userId) {
+            transactionsQuery += ` AND user_id = $${tParamCount}`;
+            transactionsParams.push(userId);
+            tParamCount++;
         }
 
-        queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-        params.push(limit, offset);
+        if (status) {
+            transactionsQuery += ` AND status = $${tParamCount}`;
+            transactionsParams.push(status);
+            tParamCount++;
+        }
 
-        const result = await query(queryStr, params);
-        
-        // Get Total Count
-        const countQuery = `SELECT COUNT(*) FROM transactions WHERE business_id = $1`; 
-        // Note: Count query needs same logic. Simplified here for brevity.
-        
-        res.json({ success: true, transactions: result.rows });
+        // Now get transfer_queue entries
+        let transfersQuery = `
+            SELECT 
+                id,
+                business_id,
+                amount,
+                currency,
+                status,
+                reference,
+                'debit' as type,
+                remark as description,
+                'transfer' as transaction_type,
+                wallet_id,
+                'debit' as direction,
+                created_at,
+                'transfer_queue' as source
+            FROM transfer_queue 
+            WHERE 1=1`;
+        const transfersParams: any[] = [];
+        let tfParamCount = 1;
+
+        if (businessId) {
+            transfersQuery += ` AND business_id = $${tfParamCount}`;
+            transfersParams.push(businessId);
+            tfParamCount++;
+        }
+
+        if (status) {
+            transfersQuery += ` AND status = $${tfParamCount}`;
+            transfersParams.push(status);
+            tfParamCount++;
+        }
+
+        // Combine both queries with UNION ALL, sort, then paginate
+        const combinedQuery = `
+            WITH combined AS (
+                ${transactionsQuery}
+                UNION ALL
+                ${transfersQuery}
+            )
+            SELECT * FROM combined
+            ORDER BY created_at DESC
+            LIMIT $${tParamCount + tfParamCount} OFFSET $${tParamCount + tfParamCount + 1}
+        `;
+        const combinedParams = [...transactionsParams, ...transfersParams, Number(limit), offset];
+
+        const result = await query(combinedQuery, combinedParams);
+
+        // Get total count
+        const countQuery = `
+            WITH combined AS (
+                ${transactionsQuery}
+                UNION ALL
+                ${transfersQuery}
+            )
+            SELECT COUNT(*) as total FROM combined
+        `;
+        const countParams = [...transactionsParams, ...transfersParams];
+        const countResult = await query(countQuery, countParams);
+        const total = parseInt(countResult.rows[0].total);
+
+        res.json({ 
+            success: true, 
+            transactions: result.rows,
+            pagination: {
+                total,
+                page: Number(page),
+                limit: Number(limit),
+                totalPages: Math.ceil(total / Number(limit))
+            }
+        });
 
     } catch (error) {
         console.error("Get transactions error:", error);

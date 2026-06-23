@@ -511,9 +511,9 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     res.json({ success: true, message: `Queued ${queuedCount} transfers for processing` });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("Bulk transfer error:", error);
-    res.status(500).json({ success: false, error: "Failed to initiate bulk transfer" });
+    res.status(500).json({ success: false, error: "Failed to initiate bulk transfer", details: error.message || error });
   }
 });
 

@@ -32,9 +32,10 @@ const parsePan = (pan: string) => {
 
 // Helper to handle Squad webhook
 const handleSquadWebhook = async (event: any) => {
-    if (event.Event === 'charge_successful') {
+    if (event.Event === 'charge_successful' || event.Event === 'charge_failed') {
         const body = event.Body;
         const reference = body.transaction_ref;
+        const isSuccess = event.Event === 'charge_successful';
         
         // Find transaction
         const txnRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
@@ -44,7 +45,7 @@ const handleSquadWebhook = async (event: any) => {
             const businessId = transaction.business_id;
             const userId = transaction.user_id;
 
-            // Extract Card Data
+            // Extract Card Data if needed
             const paymentInfo = body.payment_information || {};
             const cardDetails = body.card_details || {};
             const tokenId = body.token_id || paymentInfo.token_id || cardDetails.token_id;
@@ -54,14 +55,13 @@ const handleSquadWebhook = async (event: any) => {
             let expMonth = null;
             let expYear = null;
             
-            // Parse PAN/Card info
-            if (paymentInfo.pan) {
+            if (isSuccess && paymentInfo.pan) {
                  const parsed = parsePan(paymentInfo.pan);
                  last4 = parsed.last4;
                  expMonth = parsed.expMonth;
                  expYear = parsed.expYear;
                  cardType = paymentInfo.card_type || paymentInfo.type;
-            } else if (cardDetails.pan) {
+            } else if (isSuccess && cardDetails.pan) {
                  const parsed = parsePan(cardDetails.pan);
                  last4 = parsed.last4;
                  expMonth = parsed.expMonth;
@@ -69,9 +69,8 @@ const handleSquadWebhook = async (event: any) => {
                  cardType = cardDetails.type;
             }
 
-            // If token exists, save card (if business transaction)
-            if (tokenId && businessId) {
-                 // Check if card exists
+            // If token exists, save card (if business transaction and success)
+            if (isSuccess && tokenId && businessId) {
                  const cardCheck = await query(`SELECT id FROM payment_cards WHERE token_id = $1`, [tokenId]);
                  if (cardCheck.rows.length === 0) {
                      await query(`
@@ -79,87 +78,79 @@ const handleSquadWebhook = async (event: any) => {
                         VALUES ($1, $2, $3, $4, $5, $6, true)
                      `, [businessId, tokenId, last4, cardType, expMonth, expYear]);
                  } else {
-                     // Ensure it is active
                      await query(`UPDATE payment_cards SET is_active = true WHERE token_id = $1`, [tokenId]);
                  }
                  
-                 // Deactivate other cards for this business?
                  await query(`UPDATE payment_cards SET is_active = false WHERE business_id = $1 AND token_id != $2`, [businessId, tokenId]);
-
-                 // Update business with card token
                  await query(`UPDATE businesses SET card_token = $1 WHERE id = $2`, [tokenId, businessId]);
             }
 
             // Update Transaction Status
-            if (transaction.status !== 'success') {
+            const newStatus = isSuccess ? 'success' : 'failed';
+            if (transaction.status !== newStatus) {
                 await query(
-                    `UPDATE transactions SET status = 'success', gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-                    [JSON.stringify(body), transaction.id]
+                    `UPDATE transactions SET status = $1, gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                    [newStatus, JSON.stringify(body), transaction.id]
                 );
 
-                // Handle Wallet Funding
-                if (transaction.transaction_type === 'wallet_funding') {
-                    const amount = parseFloat(transaction.amount);
-                    const walletId = transaction.wallet_id;
+                if (isSuccess) {
+                    // Handle Wallet Funding
+                    if (transaction.transaction_type === 'wallet_funding') {
+                        const amount = parseFloat(transaction.amount);
+                        const walletId = transaction.wallet_id;
 
-                    if (walletId) {
-                        // Credit User/Business Wallet
-                        await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
+                        if (walletId) {
+                            await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
 
-                        // Find and Debit Platform Wallet
-                        const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                        if (platformWallet.rows.length > 0) {
-                            await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
-                            
-                            // Record Platform Transaction
-                            await query(
-                                `INSERT INTO transactions 
-                                (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                                [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
-                            );
+                            const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+                            if (platformWallet.rows.length > 0) {
+                                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
+                                
+                                await query(
+                                    `INSERT INTO transactions 
+                                    (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                                    [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
+                                );
+                            }
                         }
                     }
-                }
 
-                // Handle Subscription
-                if (transaction.transaction_type === 'subscription' && businessId) {
-                    // Fetch Plan Duration
-                    const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
-                    const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
+                    // Handle Subscription
+                    if (transaction.transaction_type === 'subscription' && businessId) {
+                        const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+                        const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
 
-                    const nextBillingDate = new Date();
-                    if (planDuration === 'yearly') {
-                        nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
-                    } else {
-                        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                        const nextBillingDate = new Date();
+                        if (planDuration === 'yearly') {
+                            nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+                        } else {
+                            nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                        }
+                        
+                        await query(
+                            `UPDATE businesses 
+                            SET plan_id = $1, 
+                            subscription_status = 'active', 
+                            trial_ends_at = NULL, 
+                            updated_at = CURRENT_TIMESTAMP,
+                            next_billing_date = $3
+                            WHERE id = $2`,
+                            [transaction.plan_id, businessId, nextBillingDate]
+                        );
+
+                        const subAmount = parseFloat(transaction.amount);
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
                     }
-                    
-                    await query(
-                    `UPDATE businesses 
-                    SET plan_id = $1, 
-                        subscription_status = 'active', 
-                        trial_ends_at = NULL, 
-                        updated_at = CURRENT_TIMESTAMP,
-                        next_billing_date = $3
-                    WHERE id = $2`,
-                    [transaction.plan_id, businessId, nextBillingDate]
-                    );
-
-                    // Credit Platform Revenue Wallet
-                    const subAmount = parseFloat(transaction.amount);
-                    await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
                 }
             }
-        } else {
+        } else if (isSuccess) {
             // Transaction not found in DB (Maybe Virtual Account Transfer?)
             const vaNumber = body.virtual_account_number || body.customer?.virtual_account_number;
             
             if (vaNumber) {
-                 // Find wallet by VA via virtual_accounts table
                  const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
                  if (vaRes.rows.length === 0) {
-                     // Fallback to wallets table for backward compatibility
                      const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE virtual_account_number = $1`, [vaNumber]);
                      if (walletRes.rows.length > 0) {
                          vaRes.rows = [{ wallet_id: walletRes.rows[0].id }];
@@ -172,28 +163,23 @@ const handleSquadWebhook = async (event: any) => {
                  
                      if (walletRes.rows.length > 0) {
                          const wallet = walletRes.rows[0];
-                         const amount = parseFloat(body.amount) / 100; // Squad uses minor units
+                         const amount = parseFloat(body.amount) / 100;
                          
-                         // Check if transaction already exists (idempotency)
                          const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
                          
                          if (txnCheck.rows.length === 0) {
-                             // Calculate Fee for Funding via Account
                              const fee = await calculateFee(amount, 'funding_account');
                              const creditAmount = Math.max(0, amount - fee);
 
-                             // Credit Wallet
                              await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [creditAmount, wallet.id]);
                              
-                             // Record Transaction
                              await query(
                                 `INSERT INTO transactions 
                                  (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
                                  VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6)`,
                                 [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
-                             );
+                            );
 
-                             // Credit Platform Wallet with Fee
                              if (fee > 0) {
                                 await creditRevenueWallet(fee, 'NGN');
                              }
@@ -203,15 +189,39 @@ const handleSquadWebhook = async (event: any) => {
             }
         }
     }
+
+    // Handle transfer status updates
+    if (event.Event === 'transfer_successful' || event.Event === 'transfer_failed') {
+        const body = event.Body;
+        const reference = body.transaction_ref || body.reference;
+        const isSuccess = event.Event === 'transfer_successful';
+
+        // Find transfer in transfer_queue
+        const transferRes = await query(`SELECT * FROM transfer_queue WHERE reference = $1`, [reference]);
+        
+        if (transferRes.rows.length > 0) {
+            const transfer = transferRes.rows[0];
+            const newStatus = isSuccess ? 'success' : 'failed';
+            const failureReason = !isSuccess ? body.message || 'Transfer failed' : null;
+
+            await query(
+                `UPDATE transfer_queue 
+                 SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP, meta_data = $3, provider_metadata = $4
+                 WHERE id = $5`,
+                [newStatus, failureReason, JSON.stringify(body), JSON.stringify(body), transfer.id]
+            );
+        }
+    }
 };
 
 // Helper to handle Monnify webhook
 const handleMonnifyWebhook = async (event: any) => {
     const eventType = event.eventType;
     
-    if (eventType === 'SUCCESSFUL_TRANSACTION') {
+    if (eventType === 'SUCCESSFUL_TRANSACTION' || eventType === 'FAILED_TRANSACTION') {
         const transactionData = event.eventData;
         const reference = transactionData.paymentReference;
+        const isSuccess = eventType === 'SUCCESSFUL_TRANSACTION';
         
         // Find transaction
         const txnRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
@@ -220,78 +230,74 @@ const handleMonnifyWebhook = async (event: any) => {
             const transaction = txnRes.rows[0];
             const businessId = transaction.business_id;
             const userId = transaction.user_id;
+            const newStatus = isSuccess ? 'success' : 'failed';
             
             // Update Transaction Status
-            if (transaction.status !== 'success') {
+            if (transaction.status !== newStatus) {
                 await query(
-                    `UPDATE transactions SET status = 'success', gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-                    [JSON.stringify(transactionData), transaction.id]
+                    `UPDATE transactions SET status = $1, gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                    [newStatus, JSON.stringify(transactionData), transaction.id]
                 );
                 
-                // Handle Wallet Funding
-                if (transaction.transaction_type === 'wallet_funding') {
-                    const amount = parseFloat(transaction.amount);
-                    const walletId = transaction.wallet_id;
-                    
-                    if (walletId) {
-                        // Credit User/Business Wallet
-                        await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
+                if (isSuccess) {
+                    // Handle Wallet Funding
+                    if (transaction.transaction_type === 'wallet_funding') {
+                        const amount = parseFloat(transaction.amount);
+                        const walletId = transaction.wallet_id;
                         
-                        // Find and Debit Platform Wallet
-                        const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                        if (platformWallet.rows.length > 0) {
-                            await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
+                        if (walletId) {
+                            await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
                             
-                            // Record Platform Transaction
-                            await query(
-                                `INSERT INTO transactions 
-                                (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                                [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
-                            );
+                            const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+                            if (platformWallet.rows.length > 0) {
+                                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
+                                
+                                await query(
+                                    `INSERT INTO transactions 
+                                    (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                                    [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
+                                );
+                            }
                         }
                     }
-                }
-                
-                // Handle Subscription
-                if (transaction.transaction_type === 'subscription' && businessId) {
-                    // Fetch Plan Duration
-                    const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
-                    const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
                     
-                    const nextBillingDate = new Date();
-                    if (planDuration === 'yearly') {
-                        nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
-                    } else {
-                        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                    // Handle Subscription
+                    if (transaction.transaction_type === 'subscription' && businessId) {
+                        const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+                        const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
+                        
+                        const nextBillingDate = new Date();
+                        if (planDuration === 'yearly') {
+                            nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+                        } else {
+                            nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                        }
+                        
+                        await query(
+                            `UPDATE businesses 
+                            SET plan_id = $1, 
+                            subscription_status = 'active', 
+                            trial_ends_at = NULL, 
+                            updated_at = CURRENT_TIMESTAMP,
+                            next_billing_date = $3
+                            WHERE id = $2`,
+                            [transaction.plan_id, businessId, nextBillingDate]
+                        );
+                        
+                        const subAmount = parseFloat(transaction.amount);
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
                     }
-                    
-                    await query(
-                        `UPDATE businesses 
-                        SET plan_id = $1, 
-                        subscription_status = 'active', 
-                        trial_ends_at = NULL, 
-                        updated_at = CURRENT_TIMESTAMP,
-                        next_billing_date = $3
-                        WHERE id = $2`,
-                        [transaction.plan_id, businessId, nextBillingDate]
-                    );
-                    
-                    // Credit Platform Revenue Wallet
-                    const subAmount = parseFloat(transaction.amount);
-                    await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
                 }
             }
-        } else {
+        } else if (isSuccess) {
             // Check for Virtual Account Credit (Monnify Reserved Account)
             const accountDetails = transactionData.accountDetails;
             const vaNumber = accountDetails?.accountNumber;
             
             if (vaNumber) {
-                // Find wallet by VA via virtual_accounts table
                 const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
                 if (vaRes.rows.length === 0) {
-                    // Fallback to wallets table for backward compatibility
                     const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE virtual_account_number = $1`, [vaNumber]);
                     if (walletRes.rows.length > 0) {
                         vaRes.rows = [{ wallet_id: walletRes.rows[0].id }];
@@ -304,20 +310,16 @@ const handleMonnifyWebhook = async (event: any) => {
                 
                     if (walletRes.rows.length > 0) {
                         const wallet = walletRes.rows[0];
-                        const amount = parseFloat(transactionData.amount); // Monnify uses major units
+                        const amount = parseFloat(transactionData.amount);
                         
-                        // Check if transaction already exists (idempotency)
                         const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
                         
                         if (txnCheck.rows.length === 0) {
-                            // Calculate Fee for Funding via Account
                             const fee = await calculateFee(amount, 'funding_account');
                             const creditAmount = Math.max(0, amount - fee);
                             
-                            // Credit Wallet
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [creditAmount, wallet.id]);
                             
-                            // Record Transaction
                             await query(
                                 `INSERT INTO transactions 
                                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
@@ -325,7 +327,6 @@ const handleMonnifyWebhook = async (event: any) => {
                                 [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
                             );
                             
-                            // Credit Platform Wallet with Fee
                             if (fee > 0) {
                                 await creditRevenueWallet(fee, 'NGN');
                             }
@@ -333,6 +334,29 @@ const handleMonnifyWebhook = async (event: any) => {
                     }
                 }
             }
+        }
+    }
+
+    // Handle transfer status updates
+    if (eventType === 'SUCCESSFUL_TRANSFER' || eventType === 'FAILED_TRANSFER') {
+        const transferData = event.eventData;
+        const reference = transferData.transactionReference || transferData.reference;
+        const isSuccess = eventType === 'SUCCESSFUL_TRANSFER';
+
+        // Find transfer in transfer_queue
+        const transferRes = await query(`SELECT * FROM transfer_queue WHERE reference = $1`, [reference]);
+        
+        if (transferRes.rows.length > 0) {
+            const transfer = transferRes.rows[0];
+            const newStatus = isSuccess ? 'success' : 'failed';
+            const failureReason = !isSuccess ? transferData.responseMessage || 'Transfer failed' : null;
+
+            await query(
+                `UPDATE transfer_queue 
+                 SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP, meta_data = $3, provider_metadata = $4
+                 WHERE id = $5`,
+                [newStatus, failureReason, JSON.stringify(transferData), JSON.stringify(transferData), transfer.id]
+            );
         }
     }
 };

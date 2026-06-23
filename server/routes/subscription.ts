@@ -982,7 +982,7 @@ router.post("/downgrade", authenticateToken, async (req, res) => {
             if (userEmail) {
                 const emailHtml = generateSubscriptionDowngradedEmail(business.name, business.current_plan_name, targetPlanName);
                 await sendEmail({
-                    sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                    sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
                     to: [{ email: userEmail, name: business.name }],
                     subject: "Your Subscription Has Been Downgraded",
                     htmlContent: emailHtml
@@ -1066,7 +1066,7 @@ router.post("/cancel", authenticateToken, async (req, res) => {
            if (userEmail) {
                const emailHtml = generateSubscriptionCancelledEmail(business.name, business.plan_name);
                await sendEmail({
-                   sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                   sender: { name: "Metrocorex", email: "no-reply@metrocorex.com" },
                    to: [{ email: userEmail, name: business.name }],
                    subject: "Your Subscription Has Been Cancelled",
                    htmlContent: emailHtml

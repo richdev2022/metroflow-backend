@@ -1,8 +1,8 @@
 
-# Monnify Integration Plan for MetroFlow
+# Monnify Integration Plan for Metrocorex
 
 ## Goal
-Integrate Monnify as an additional payment provider alongside Squad in MetroFlow, maintaining the same API endpoints for the frontend to ensure backward compatibility.
+Integrate Monnify as an additional payment provider alongside Squad in Metrocorex, maintaining the same API endpoints for the frontend to ensure backward compatibility.
 
 ---
 

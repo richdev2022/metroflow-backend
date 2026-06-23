@@ -200,7 +200,7 @@ export const monnifyProvider: Provider = {
         accountName: data.businessName,
         currencyCode: "NGN",
         contractCode: MONNIFY_CONTRACT_CODE,
-        customerEmail: data.customerIdentifier + "@metroflow.ng", // Temporary email, can be updated later
+        customerEmail: data.customerIdentifier + "@metrocorex.ng", // Temporary email, can be updated later
         customerName: data.businessName,
         bvn: data.bvn,
         nin: data.nin,

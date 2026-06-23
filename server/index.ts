@@ -219,7 +219,7 @@ export async function createServer() {
       
       // Allow your specific frontend origin
       const allowedOrigins = [
-        'https://metroflow-app.netlify.app',
+        'https://metricorex-app.netlify.app',
         'http://localhost:3000',
         'http://localhost:5173'
       ];
@@ -401,7 +401,7 @@ export async function createServer() {
   // Example API routes
   app.get("/", (_req, res) => {
     res.json({ 
-      message: "MetroFlow Backend API is running", 
+      message: "Metricorex Backend API is running", 
       docs: "/api-docs",
       status: "active" 
     });
@@ -409,7 +409,7 @@ export async function createServer() {
 
   app.get("/api", (_req, res) => {
     res.json({
-      message: "MetroFlow Backend API is running",
+      message: "Metricorex Backend API is running",
       status: isDbReady ? "online" : "initializing",
       version: "1.0.0",
       docs: "/api-docs"
@@ -542,7 +542,7 @@ export async function createServer() {
 
   // Redirect backend /accept-invite/:token to frontend
   app.get("/accept-invite/:token", (req, res) => {
-    const frontendUrl = process.env.APP_BASE_URL || 'https://metroflow-app.netlify.app';
+    const frontendUrl = process.env.APP_BASE_URL || 'https://metricorex-app.netlify.app';
     res.redirect(`${frontendUrl}/accept-invite/${req.params.token}`);
   });
 

@@ -486,10 +486,11 @@ export async function initializeDatabase() {
         `);
         
         for (const wallet of walletsRes.rows) {
+            const provider = wallet.payment_provider || 'squad';
             // Check if VA already exists for this provider
             const existingVaRes = await query(
                 `SELECT id FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
-                [wallet.id, wallet.payment_provider]
+                [wallet.id, provider]
             );
             
             if (existingVaRes.rows.length === 0) {
@@ -501,7 +502,7 @@ export async function initializeDatabase() {
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 `, [
                     wallet.id, 
-                    wallet.payment_provider || 'squad', 
+                    provider, 
                     wallet.virtual_account_number, 
                     wallet.bank_code, 
                     wallet.account_name, 
@@ -511,7 +512,7 @@ export async function initializeDatabase() {
                 ]);
                 console.log(`Migrated VA for wallet ${wallet.id} to virtual_accounts table`);
             } else {
-                console.log(`VA already exists for wallet ${wallet.id} and provider ${wallet.payment_provider}, skipping`);
+                console.log(`VA already exists for wallet ${wallet.id} and provider ${provider}, skipping`);
             }
         }
         console.log("Virtual accounts migration completed");
@@ -552,6 +553,11 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS temp_email VARCHAR(255)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_code VARCHAR(6)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP`);
+    
+    // Add columns for pending subscription changes
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS pending_subscription_change VARCHAR(50)`); // 'cancel', 'downgrade'
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS pending_plan_id UUID REFERENCES pricing_plans(id)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS active_payment_provider VARCHAR(50) DEFAULT 'squad'`);
 
     // Create ideas table
     await query(`

@@ -1,16 +1,19 @@
 import { query } from "../db";
-import { chargeCard } from "./squad";
-import { sendEmail } from "./email";
+import { getProvider } from "./providers/factory";
+import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail, generateRenewalFailedEmail } from "./email";
 import { creditRevenueWallet } from "./fees";
 import axios from "axios";
 
 export const processSubscriptionRenewals = async () => {
     console.log("Starting subscription renewal process...");
     
+    // First handle pending changes first
+    await processPendingChanges();
+    
     // Find subscriptions due for renewal
     // We check for active or past_due statuses that are due
     const dueSubscriptions = await query(`
-        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, p.name as plan_name, p.price, p.currency, p.duration, p.discount
+        SELECT b.id as business_id, b.card_token, b.plan_id, b.email, b.name, b.active_payment_provider, p.name as plan_name, p.price, p.currency, p.duration, p.discount
         FROM businesses b
         JOIN pricing_plans p ON b.plan_id = p.id
         WHERE b.subscription_status IN ('active', 'past_due') 
@@ -62,12 +65,13 @@ export const processSubscriptionRenewals = async () => {
                  results.no_card++;
                  
                  // Send No Payment Method Email
-                 await sendEmail(
-                     sub.email,
-                     sub.name,
-                     "Action Required: Subscription Renewal Failed",
-                     `<p>Your subscription for ${sub.plan_name} has expired. We could not renew it because no payment method is attached. Please add a card to continue using MetroFlow.</p>`
-                 );
+                 const emailHtml = generateRenewalFailedEmail(sub.name, sub.plan_name, "No payment method attached");
+                 await sendEmail({
+                    sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                    to: [{ email: sub.email, name: sub.name }],
+                    subject: "Action Required: Subscription Renewal Failed",
+                    htmlContent: emailHtml
+                 });
                  
                  // Update status to past_due
                  await query(`UPDATE businesses SET subscription_status = 'past_due' WHERE id = $1`, [sub.business_id]);
@@ -86,15 +90,20 @@ export const processSubscriptionRenewals = async () => {
                         amount = amount * rateRes.data.rates.NGN;
                     }
                  } catch (e) {
-                     console.error("Rate fetch failed for recurring", e);
-                     throw new Error("Currency conversion failed");
+                    console.error("Rate fetch failed for recurring", e);
+                    throw new Error("Currency conversion failed");
                  }
             }
 
             const amountInMinor = Math.round(amount * 100);
+            const provider = getProvider(sub.active_payment_provider || 'squad');
 
-            console.log(`Charging business ${sub.business_id} amount ${amountInMinor}`);
-            const chargeRes = await chargeCard(amountInMinor, sub.card_token);
+            console.log(`Charging business ${sub.business_id} amount ${amountInMinor} via ${sub.active_payment_provider}`);
+            const chargeRes = await provider.chargeCard({ 
+                amount: amountInMinor, 
+                tokenId: sub.card_token, 
+                transactionRef: `REC_${Date.now()}_${sub.business_id.substring(0,4)}` 
+            });
             
             if (chargeRes && chargeRes.success) {
                 // Update next billing date (1 month from now)
@@ -113,15 +122,16 @@ export const processSubscriptionRenewals = async () => {
 
                 // Log transaction
                 await query(`
-                    INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response, transaction_type)
-                    VALUES ($1, $2, $3, $4, $5, 'success', $6, 'subscription')
+                    INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response, transaction_type, payment_provider)
+                    VALUES ($1, $2, $3, $4, $5, 'success', $6, 'subscription', $7)
                 `, [
                     sub.business_id, 
                     sub.plan_id, 
                     amount, 
                     'NGN', // Assuming we charged in NGN
                     `REC_${Date.now()}_${sub.business_id.substring(0,4)}`,
-                    JSON.stringify(chargeRes)
+                    JSON.stringify(chargeRes),
+                    sub.active_payment_provider
                 ]);
 
                 // Credit Platform Revenue Wallet
@@ -139,12 +149,13 @@ export const processSubscriptionRenewals = async () => {
             
             // Send Payment Failed Email
             try {
-                await sendEmail(
-                    sub.email,
-                    sub.name,
-                    "Payment Failed: Subscription Renewal",
-                    `<p>We attempted to renew your subscription for ${sub.plan_name} but the payment failed. Please update your payment method to avoid service interruption.</p>`
-                );
+                const emailHtml = generateRenewalFailedEmail(sub.name, sub.plan_name, err.message);
+                await sendEmail({
+                    sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                    to: [{ email: sub.email, name: sub.name }],
+                    subject: "Payment Failed: Subscription Renewal",
+                    htmlContent: emailHtml
+                });
             } catch (emailErr) {
                 console.error("Failed to send failure email", emailErr);
             }
@@ -156,4 +167,76 @@ export const processSubscriptionRenewals = async () => {
 
     console.log("Renewal process completed:", results);
     return results;
+};
+
+const processPendingChanges = async () => {
+    console.log("Processing pending subscription changes...");
+    
+    // First get free plan ID
+    const freePlanRes = await query(`SELECT id FROM pricing_plans WHERE price = 0 LIMIT 1`);
+    const freePlanId = freePlanRes.rows[0]?.id;
+    
+    // Get businesses with pending changes where next_billing_date is <= now
+    const pendingChangesRes = await query(`
+        SELECT b.id, b.email, b.name, b.pending_subscription_change, b.pending_plan_id, p.name as current_plan_name, p2.name as new_plan_name
+        FROM businesses b
+        LEFT JOIN pricing_plans p ON b.plan_id = p.id
+        LEFT JOIN pricing_plans p2 ON b.pending_plan_id = p2.id
+        WHERE b.pending_subscription_change IS NOT NULL
+        AND b.next_billing_date <= CURRENT_TIMESTAMP
+    `);
+    
+    for (const business of pendingChangesRes.rows) {
+        try {
+            if (business.pending_subscription_change === 'cancel') {
+                // Cancel subscription
+                await query(`
+                    UPDATE businesses 
+                    SET subscription_status = 'cancelled', 
+                        card_token = NULL, 
+                        next_billing_date = NULL,
+                        pending_subscription_change = NULL,
+                        pending_plan_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP 
+                    WHERE id = $1
+                `, [business.id]);
+                
+                // Send cancellation confirmation email
+                const emailHtml = generateSubscriptionCancelledEmail(business.name, business.current_plan_name);
+                await sendEmail({
+                    sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                    to: [{ email: business.email, name: business.name }],
+                    subject: "Your Subscription Has Been Cancelled",
+                    htmlContent: emailHtml
+                });
+                
+            } else if (business.pending_subscription_change === 'downgrade') {
+                // Downgrade to pending plan
+                const newPlanId = business.pending_plan_id || freePlanId;
+                if (newPlanId) {
+                    await query(`
+                        UPDATE businesses 
+                        SET plan_id = $1, 
+                            pending_subscription_change = NULL,
+                            pending_plan_id = NULL,
+                            updated_at = CURRENT_TIMESTAMP 
+                        WHERE id = $2
+                    `, [newPlanId, business.id]);
+                    
+                    // Send downgrade confirmation email
+                    const emailHtml = generateSubscriptionDowngradedEmail(business.name, business.current_plan_name, business.new_plan_name || "Free");
+                    await sendEmail({
+                        sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                        to: [{ email: business.email, name: business.name }],
+                        subject: "Your Subscription Has Been Downgraded",
+                        htmlContent: emailHtml
+                    });
+                }
+            }
+        } catch (err) {
+            console.error(`Failed to process pending change for business ${business.id}`, err);
+        }
+    }
+    
+    console.log(`Processed ${pendingChangesRes.rows.length} pending changes`);
 };

@@ -416,11 +416,6 @@ export async function initializeDatabase() {
         balance DECIMAL(15, 2) DEFAULT 0.00,
         currency VARCHAR(3) DEFAULT 'NGN',
         status VARCHAR(50) DEFAULT 'active', -- active, frozen
-        virtual_account_number VARCHAR(20),
-        bank_code VARCHAR(10),
-        account_name VARCHAR(255),
-        customer_identifier VARCHAR(255),
-        beneficiary_account VARCHAR(20),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(business_id),
@@ -434,6 +429,96 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)`);
     await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS customer_identifier VARCHAR(255)`);
     await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS beneficiary_account VARCHAR(20)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50)`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+
+    // Create virtual_accounts table (multiple VAs per wallet, one per provider)
+    await query(`
+      CREATE TABLE IF NOT EXISTS virtual_accounts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+        payment_provider VARCHAR(50) NOT NULL,
+        virtual_account_number VARCHAR(20),
+        bank_code VARCHAR(10),
+        account_name VARCHAR(255),
+        customer_identifier VARCHAR(255),
+        beneficiary_account VARCHAR(20),
+        provider_metadata JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(wallet_id, payment_provider)
+      )
+    `);
+
+    // Add virtual_accounts table columns (for existing deployments)
+    try {
+        await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id) ON DELETE CASCADE`);
+    } catch (error) {
+        console.warn("Could not add wallet_id column to virtual_accounts (it may already exist):", error);
+    }
+    try {
+        await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50)`);
+    } catch (error) {
+        console.warn("Could not add payment_provider column to virtual_accounts (it may already exist):", error);
+    }
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS virtual_account_number VARCHAR(20)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS bank_code VARCHAR(10)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS customer_identifier VARCHAR(255)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS beneficiary_account VARCHAR(20)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+    
+    // Try to add unique constraint, ignore error if it already exists
+    try {
+        await query(`ALTER TABLE virtual_accounts ADD CONSTRAINT virtual_accounts_wallet_provider_key UNIQUE(wallet_id, payment_provider)`);
+    } catch (error) {
+        console.warn("Could not add unique constraint to virtual_accounts (it may already exist):", error);
+    }
+    
+    // Migrate existing virtual accounts from wallets to virtual_accounts table
+    try {
+        console.log("Migrating existing virtual accounts from wallets to virtual_accounts table...");
+        const walletsRes = await query(`
+            SELECT id, virtual_account_number, bank_code, account_name, customer_identifier, 
+                   beneficiary_account, payment_provider, provider_metadata
+            FROM wallets
+            WHERE virtual_account_number IS NOT NULL
+        `);
+        
+        for (const wallet of walletsRes.rows) {
+            const provider = wallet.payment_provider || 'squad';
+            // Check if VA already exists for this provider
+            const existingVaRes = await query(
+                `SELECT id FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                [wallet.id, provider]
+            );
+            
+            if (existingVaRes.rows.length === 0) {
+                // Insert VA into virtual_accounts
+                await query(`
+                    INSERT INTO virtual_accounts 
+                    (wallet_id, payment_provider, virtual_account_number, bank_code, account_name, 
+                     customer_identifier, beneficiary_account, provider_metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                `, [
+                    wallet.id, 
+                    provider, 
+                    wallet.virtual_account_number, 
+                    wallet.bank_code, 
+                    wallet.account_name, 
+                    wallet.customer_identifier, 
+                    wallet.beneficiary_account, 
+                    wallet.provider_metadata
+                ]);
+                console.log(`Migrated VA for wallet ${wallet.id} to virtual_accounts table`);
+            } else {
+                console.log(`VA already exists for wallet ${wallet.id} and provider ${provider}, skipping`);
+            }
+        }
+        console.log("Virtual accounts migration completed");
+    } catch (error) {
+        console.warn("Failed to migrate existing virtual accounts:", error);
+    }
     
     // Add wallet_id to transactions
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id) ON DELETE SET NULL`);
@@ -468,6 +553,11 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS temp_email VARCHAR(255)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_code VARCHAR(6)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP`);
+    
+    // Add columns for pending subscription changes
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS pending_subscription_change VARCHAR(50)`); // 'cancel', 'downgrade'
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS pending_plan_id UUID REFERENCES pricing_plans(id)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS active_payment_provider VARCHAR(50) DEFAULT 'squad'`);
 
     // Create ideas table
     await query(`
@@ -602,6 +692,14 @@ export async function initializeDatabase() {
 
     // Add wallet_id to transfer_queue
     await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id)`);
+
+    // Add provider columns to support multiple payment providers
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
+    await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
 
     // Seed Admin Permissions
     const permissions = [

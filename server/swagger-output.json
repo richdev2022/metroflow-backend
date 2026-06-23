@@ -4226,6 +4226,42 @@
         }
       }
     },
+    "/providers/requirements": {
+      "get": {
+        "summary": "Get requirements for the active/default provider or a specific provider",
+        "tags": [
+          "Providers"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "provider",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Specific provider to get requirements for (defaults to DEFAULT_PAYMENT_PROVIDER)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Provider requirements"
+          }
+        }
+      }
+    },
+    "/providers/list": {
+      "get": {
+        "summary": "Get list of available payment providers",
+        "tags": [
+          "Providers"
+        ],
+        "responses": {
+          "200": {
+            "description": "List of providers"
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "summary": "Get business settings",
@@ -6627,7 +6663,7 @@
     },
     "/wallet/create-virtual-account": {
       "post": {
-        "summary": "Retry creation of Virtual Account for User Wallet",
+        "summary": "Create Personal or Business Virtual Account (will create new account if provider is different)",
         "tags": [
           "Wallet"
         ],
@@ -6636,6 +6672,29 @@
             "bearerAuth": []
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "accountType"
+                ],
+                "properties": {
+                  "accountType": {
+                    "type": "string",
+                    "enum": [
+                      "Personal",
+                      "Business"
+                    ],
+                    "description": "Type of virtual account to create"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Virtual Account created successfully"
@@ -6678,16 +6737,19 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "amount",
+                  "wallet_id"
+                ],
                 "properties": {
                   "amount": {
                     "type": "number"
                   },
-                  "wallet_type": {
-                    "type": "string",
-                    "enum": [
-                      "user",
-                      "business"
-                    ]
+                  "wallet_id": {
+                    "type": "string"
+                  },
+                  "redirect_url": {
+                    "type": "string"
                   }
                 }
               }
@@ -6793,6 +6855,10 @@
     {
       "name": "Payroll",
       "description": "Payroll management and adjustments"
+    },
+    {
+      "name": "Providers",
+      "description": "Payment provider management endpoints"
     },
     {
       "name": "Settings",

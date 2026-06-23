@@ -63,6 +63,7 @@ import kycRouter from "./routes/kyc";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
+import providersRouter from "./routes/providers";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -529,6 +530,9 @@ export async function createServer() {
 
   // Wallet API routes
   app.use("/api/wallet", walletRouter);
+
+  // Providers API routes
+  app.use("/api/providers", providersRouter);
 
   // Redirect /wallet/verify to /api/wallet/verify (for backward compatibility with old callback URLs)
   app.get("/wallet/verify", (req, res) => {

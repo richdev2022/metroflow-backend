@@ -1,7 +1,18 @@
 import { query } from "../db";
-import { initiateTransfer, toMinorUnit } from "./squad";
+import { getProvider } from "./providers/factory";
 import { creditPlatformWallet, debitPlatformWallet, creditRevenueWallet, debitRevenueWallet } from "./fees";
-export { accountLookup } from "./squad";
+
+// Re-export accountLookup from provider
+export async function accountLookup(bankCode: string, accountNumber: string) {
+  const provider = getProvider();
+  return provider.accountLookup(bankCode, accountNumber);
+}
+
+// Helper function to convert amount to minor units for both providers
+export function toMinorUnit(amount: number | string): string {
+  const num = typeof amount === 'string' ? parseFloat(amount) : amount;
+  return Math.round(num * 100).toString();
+}
 
 export async function processAllPending(businessId: string) {
   // 1. Fetch pending transfers
@@ -84,34 +95,48 @@ export async function processAllPending(businessId: string) {
 
       // 3. Initiate Transfer
       const amountMinor = toMinorUnit(transfer.amount);
+      const provider = getProvider(transfer.payment_provider); // Use transfer's provider or default
       
       const payload = {
-        bank_code: transfer.recipient_bank,
-        account_number: transfer.recipient_account,
+        bankCode: transfer.recipient_bank,
+        accountNumber: transfer.recipient_account,
         amount: amountMinor,
-        account_name: transfer.recipient_name,
-        transaction_reference: transfer.reference,
+        accountName: transfer.recipient_name,
+        transactionReference: transfer.reference,
         remark: transfer.remark,
-        currency_id: transfer.currency || 'NGN'
+        currencyId: transfer.currency || 'NGN'
       };
 
-      const response = await initiateTransfer(payload);
+      const response = await provider.initiateTransfer(payload);
 
-      if (response.status === 200 && response.success) {
-         // 4. Success (or queued at Squad side)
+      // Handle success for both Squad and Monnify
+      let isSuccess = false;
+      let failureReason = "Unknown error from provider";
+
+      if (provider.name === 'squad') {
+        isSuccess = response.status === 200 && response.success;
+        failureReason = response.message || "Unknown error from Squad";
+      } else if (provider.name === 'monnify') {
+        isSuccess = response.requestSuccessful;
+        failureReason = response.responseMessage || "Unknown error from Monnify";
+      }
+
+      if (isSuccess) {
+         // 4. Success (or queued at provider side)
          // Debit Platform Wallet (Amount only) as it has been sent out
          const amount = parseFloat(transfer.amount);
          await debitPlatformWallet(amount, transfer.currency || 'NGN');
 
+         // Update payment_provider and provider_metadata in transfer_queue
          await query(
            `UPDATE transfer_queue 
-            SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2 
+            SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
             WHERE id = $1`,
-           [transfer.id, JSON.stringify(response.data)]
+           [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
          );
       } else {
-        // Failed at Squad immediate response
-        const reason = response.message || "Unknown error from Squad";
+        // Failed at provider immediate response
+        const reason = failureReason;
         
         // Refund Wallet
         if (transfer.wallet_id) {
@@ -252,10 +277,11 @@ export async function createBulkTransfers(businessId: string, transfers: any[]) 
     const walletId = t.source_type === 'wallet' ? t.source_id : null;
 
     // Insert into transfer_queue
+    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
     const res = await query(
       `INSERT INTO transfer_queue 
-       (business_id, amount, currency, recipient_account, recipient_bank, recipient_name, remark, status, reference, wallet_id, fee)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10)
+       (business_id, amount, currency, recipient_account, recipient_bank, recipient_name, remark, status, reference, wallet_id, fee, payment_provider)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11)
        RETURNING *`,
        [
          businessId, 
@@ -267,7 +293,8 @@ export async function createBulkTransfers(businessId: string, transfers: any[]) 
          t.remark || '',
          reference,
          walletId,
-         t.fee || 0
+         t.fee || 0,
+         t.payment_provider || defaultProvider
        ]
     );
     results.push(res.rows[0]);
@@ -348,20 +375,33 @@ export async function processTransfer(transferId: string) {
 
     // 2. Initiate Transfer
     const amountMinor = toMinorUnit(transfer.amount);
+    const provider = getProvider(transfer.payment_provider);
     
     const payload = {
-      bank_code: transfer.recipient_bank,
-      account_number: transfer.recipient_account,
+      bankCode: transfer.recipient_bank,
+      accountNumber: transfer.recipient_account,
       amount: amountMinor,
-      account_name: transfer.recipient_name,
-      transaction_reference: transfer.reference,
+      accountName: transfer.recipient_name,
+      transactionReference: transfer.reference,
       remark: transfer.remark,
-      currency_id: transfer.currency || 'NGN'
+      currencyId: transfer.currency || 'NGN'
     };
 
-    const response = await initiateTransfer(payload);
+    const response = await provider.initiateTransfer(payload);
 
-    if (response.status === 200 && response.success) {
+    // Handle success for both Squad and Monnify
+    let isSuccess = false;
+    let failureReason = "Unknown error from provider";
+
+    if (provider.name === 'squad') {
+      isSuccess = response.status === 200 && response.success;
+      failureReason = response.message || "Unknown error from Squad";
+    } else if (provider.name === 'monnify') {
+      isSuccess = response.requestSuccessful;
+      failureReason = response.responseMessage || "Unknown error from Monnify";
+    }
+
+    if (isSuccess) {
        // Success
        // Debit Platform Wallet (Amount only) as it has been sent out
        const amount = parseFloat(transfer.amount);
@@ -369,14 +409,14 @@ export async function processTransfer(transferId: string) {
 
        await query(
          `UPDATE transfer_queue 
-          SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2 
+          SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
           WHERE id = $1`,
-         [transfer.id, JSON.stringify(response.data)]
+         [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
        );
-       return { success: true, message: "Transfer processed successfully", data: response.data };
+       return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
     } else {
-      // Failed at Squad
-      const reason = response.message || "Unknown error from Squad";
+      // Failed at provider
+      const reason = failureReason;
       
       // Refund Wallet
       if (transfer.wallet_id) {

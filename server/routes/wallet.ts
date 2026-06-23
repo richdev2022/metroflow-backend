@@ -1,8 +1,8 @@
 import express from "express";
 import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest } from "../middleware/auth";
 import { query, pool } from "../db";
-import { initiatePayment, createBusinessVirtualAccount, verifyPayment } from "../services/squad";
-import { toMinorUnit } from "../services/squad";
+import { getProvider } from "../services/providers/factory";
+import { toMinorUnit } from "../services/transfer";
 import { calculateFee } from "../services/fees";
 import { generateToken } from "../services/auth";
 
@@ -19,10 +19,23 @@ const router = express.Router();
  * @swagger
  * /wallet/create-virtual-account:
  *   post:
- *     summary: Retry creation of Virtual Account for User Wallet
+ *     summary: Create Personal or Business Virtual Account (will create new account if provider is different)
  *     tags: [Wallet]
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - accountType
+ *             properties:
+ *               accountType:
+ *                 type: string
+ *                 enum: [Personal, Business]
+ *                 description: Type of virtual account to create
  *     responses:
  *       200:
  *         description: Virtual Account created successfully
@@ -30,75 +43,218 @@ const router = express.Router();
 router.post("/create-virtual-account", authenticateToken, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
-        
-        // Check if wallet exists
-        const walletRes = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
-        if (walletRes.rows.length === 0) {
-            return res.status(404).json({ success: false, error: "Wallet not found. Complete KYC first." });
-        }
-        
-        const wallet = walletRes.rows[0];
-        if (wallet.virtual_account_number) {
-            return res.status(400).json({ success: false, error: "Virtual account already exists" });
+        const businessId = req.user!.businessId;
+        const { accountType } = req.body;
+
+        if (!accountType || !['Personal', 'Business'].includes(accountType)) {
+            return res.status(400).json({ success: false, error: "Invalid accountType. Must be 'Personal' or 'Business'." });
         }
 
-        // Fetch User Data
-        const userRes = await query(
-            `SELECT id, name, email, bvn, kyc_data, phone_number FROM users WHERE id = $1`, 
-            [userId]
-        );
-        const user = userRes.rows[0];
-        
-        if (!user) {
-             return res.status(404).json({ success: false, error: "User not found" });
+        let walletRes;
+        let wallet;
+        let customerIdentifier;
+        let vaResponse;
+        let isSuccess = false;
+        let vaNumber = null;
+        let bankCode = '058';
+        let accountName;
+
+        const provider = getProvider();
+
+        if (accountType === 'Personal') {
+            // Check if user wallet exists
+            walletRes = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
+            if (walletRes.rows.length === 0) {
+                return res.status(404).json({ success: false, error: "Personal wallet not found. Complete KYC first." });
+            }
+            wallet = walletRes.rows[0];
+            
+            // Check if VA already exists for this provider
+            const existingVaRes = await query(
+                `SELECT * FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                [wallet.id, provider.name]
+            );
+            if (existingVaRes.rows.length > 0 && existingVaRes.rows[0].virtual_account_number) {
+                return res.status(400).json({ success: false, error: "Personal virtual account already exists for this provider" });
+            }
+            
+            customerIdentifier = userId;
+
+            // Fetch User Data
+            const userRes = await query(
+                `SELECT id, name, email, bvn, nin, kyc_data, phone_number FROM users WHERE id = $1`, 
+                [userId]
+            );
+            const user = userRes.rows[0];
+            if (!user) {
+                 return res.status(404).json({ success: false, error: "User not found" });
+            }
+
+            const kycData = user.kyc_data?.data || user.kyc_data;
+            const nameParts = user.name.split(' ');
+            const firstName = kycData?.firstName || nameParts[0] || "User";
+            const lastName = kycData?.lastName || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0] || "User");
+            
+            const vaData = {
+                 firstName,
+                 lastName,
+                 phoneNumber: kycData?.phoneNumber || user.phone_number || "08000000000",
+                 dob: kycData?.dateOfBirth || "01/01/1990",
+                 email: user.email,
+                 bvn: kycData?.bvn || user.bvn || "12345678901",
+                 nin: kycData?.nin || user.nin || "12345678901",
+                 gender: kycData?.gender === 'Male' ? "1" : "2",
+                 address: "Lagos, Nigeria", 
+                 customerIdentifier,
+                 beneficiaryAccount: "0000000000"
+            };
+            vaResponse = await provider.createVirtualAccount(vaData);
+
+            if (provider.name === 'squad') {
+                isSuccess = vaResponse.success;
+                vaNumber = vaResponse.data.virtual_account_number;
+                accountName = `${vaData.firstName} ${vaData.lastName}`;
+            } else if (provider.name === 'monnify') {
+                isSuccess = vaResponse.requestSuccessful;
+                const accounts = vaResponse.responseBody?.accounts;
+                if (accounts && accounts.length > 0) {
+                    vaNumber = accounts[0].accountNumber;
+                    bankCode = accounts[0].bankCode;
+                    accountName = vaResponse.responseBody.accountName;
+                }
+            }
+        } else if (accountType === 'Business') {
+            if (!businessId) {
+                return res.status(400).json({ success: false, error: "No business associated with this account." });
+            }
+
+            // Check permission
+            const roleCheck = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+            if (!['owner', 'admin'].includes(roleCheck.rows[0]?.role)) {
+                return res.status(403).json({ success: false, error: "Only owner or admin can create business virtual account." });
+            }
+
+            // Check if business wallet exists
+            walletRes = await query(`SELECT * FROM wallets WHERE business_id = $1`, [businessId]);
+            if (walletRes.rows.length === 0) {
+                // Create business wallet if not exists
+                const newWallet = await query(
+                    `INSERT INTO wallets (business_id, status) VALUES ($1, 'active') RETURNING *`,
+                    [businessId]
+                );
+                wallet = newWallet.rows[0];
+            } else {
+                wallet = walletRes.rows[0];
+            }
+            
+            // Check if VA already exists for this provider
+            const existingVaRes = await query(
+                `SELECT * FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                [wallet.id, provider.name]
+            );
+            if (existingVaRes.rows.length > 0 && existingVaRes.rows[0].virtual_account_number) {
+                return res.status(400).json({ success: false, error: "Business virtual account already exists for this provider" });
+            }
+
+            customerIdentifier = `BIZ-${businessId.substring(0, 8)}`;
+
+            // Fetch business data
+            const businessRes = await query(
+                `SELECT name FROM businesses WHERE id = $1`,
+                [businessId]
+            );
+            const business = businessRes.rows[0];
+            if (!business) {
+                return res.status(404).json({ success: false, error: "Business not found" });
+            }
+
+            // Fetch user data for BVN/NIN
+            const userRes = await query(
+                `SELECT id, bvn, nin, phone_number FROM users WHERE id = $1`, 
+                [userId]
+            );
+            const user = userRes.rows[0];
+            const kycData = user.kyc_data?.data || user.kyc_data;
+
+            const vaData = {
+                 bvn: kycData?.bvn || user.bvn || "12345678901",
+                 nin: kycData?.nin || user.nin || "12345678901",
+                 businessName: business.name,
+                 customerIdentifier,
+                 phoneNumber: kycData?.phoneNumber || user.phone_number || "08000000000",
+                 beneficiaryAccount: "0000000000"
+            };
+            vaResponse = await provider.createBusinessVirtualAccount(vaData);
+
+            if (provider.name === 'squad') {
+                isSuccess = vaResponse.success && vaResponse.data;
+                if (isSuccess) {
+                    vaNumber = vaResponse.data.virtual_account_number;
+                    bankCode = vaResponse.data.bank_code;
+                    accountName = vaResponse.data.first_name 
+                        ? `${vaResponse.data.first_name} ${vaResponse.data.last_name}` 
+                        : business.name;
+                }
+            } else if (provider.name === 'monnify') {
+                isSuccess = vaResponse.requestSuccessful;
+                if (isSuccess) {
+                    const accounts = vaResponse.responseBody?.accounts;
+                    if (accounts && accounts.length > 0) {
+                        vaNumber = accounts[0].accountNumber;
+                        bankCode = accounts[0].bankCode;
+                        accountName = vaResponse.responseBody.accountName || business.name;
+                    }
+                }
+            }
         }
 
-        const kycData = user.kyc_data?.data || user.kyc_data;
+        if (isSuccess && vaNumber) {
+            // Check if VA record exists for this provider, update or insert
+            const existingVaRes = await query(
+                `SELECT * FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                [wallet.id, provider.name]
+            );
+            
+            if (existingVaRes.rows.length > 0) {
+                // Update existing VA
+                await query(`
+                    UPDATE virtual_accounts 
+                    SET virtual_account_number = $1, 
+                        bank_code = $2, 
+                        account_name = $3, 
+                        customer_identifier = $4, 
+                        beneficiary_account = $5,
+                        provider_metadata = $6,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $7
+                `, [vaNumber, bankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse), existingVaRes.rows[0].id]);
+            } else {
+                // Insert new VA
+                await query(`
+                    INSERT INTO virtual_accounts 
+                    (wallet_id, payment_provider, virtual_account_number, bank_code, account_name, customer_identifier, beneficiary_account, provider_metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                `, [wallet.id, provider.name, vaNumber, bankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse)]);
+            }
 
-        // NOTE: We are using placeholder/fallback data as before because of schema limitations
-        const beneficiaryAccount = "0000000000"; 
-        
-        const nameParts = user.name.split(' ');
-        const firstName = kycData?.firstName || nameParts[0] || "User";
-        const lastName = kycData?.lastName || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0] || "User");
-        
-        const vaData = {
-             first_name: firstName,
-             last_name: lastName,
-             mobile_num: kycData?.phoneNumber || user.phone_number || "08000000000",
-             dob: kycData?.dateOfBirth || "01/01/1990",
-             email: user.email,
-             bvn: kycData?.bvn || user.bvn || "12345678901",
-             gender: kycData?.gender === 'Male' ? "1" : "2",
-             address: "Lagos, Nigeria", 
-             customer_identifier: userId,
-             beneficiary_account: beneficiaryAccount
-        };
-
-        try {
-             // Import createVirtualAccount dynamically or ensure it's imported at top
-             const { createVirtualAccount } = await import("../services/squad");
-             
-             const vaResponse = await createVirtualAccount(vaData as any);
-             
-             if (vaResponse && vaResponse.success) {
-                 const vaNumber = vaResponse.data.virtual_account_number;
-                 await query(
-                     `UPDATE wallets SET virtual_account_number = $1, bank_code = '058', customer_identifier = $2 WHERE user_id = $3`,
-                     [vaNumber, userId, userId]
-                 );
-                 return res.json({ success: true, message: "Virtual Account created successfully", virtual_account_number: vaNumber });
-             } else {
-                 return res.status(400).json({ success: false, error: "Failed to create Virtual Account via provider", details: vaResponse });
-             }
-        } catch (err: any) {
-             console.error("Manual VA Creation Error:", err);
-             return res.status(500).json({ success: false, error: err.message || "Internal server error during VA creation" });
+            return res.json({ 
+                success: true, 
+                message: `${accountType} Virtual Account created successfully`, 
+                virtual_account_number: vaNumber 
+            });
+        } else {
+            const errorMessage = provider.name === 'squad' 
+                ? vaResponse.message 
+                : vaResponse.responseMessage || "Failed to create Virtual Account via provider";
+            return res.status(400).json({ 
+                success: false, 
+                error: errorMessage, 
+                details: vaResponse 
+            });
         }
-
     } catch (error: any) {
-        console.error("Retry VA Creation Error:", error);
-        res.status(500).json({ success: false, error: "Failed to process request" });
+        console.error("Create Virtual Account Error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to process request" });
     }
 });
 
@@ -118,12 +274,44 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
+        const activeProviderName = getProvider().name;
+        
+        // Function to fetch wallet with virtual accounts
+        const getWalletWithVAs = async (walletId: string) => {
+            const vas = await query(`SELECT * FROM virtual_accounts WHERE wallet_id = $1`, [walletId]);
+            return vas.rows.map(va => ({
+                ...va,
+                is_active: va.payment_provider === activeProviderName
+            }));
+        };
         
         // Return User Wallet AND Business Wallet (if user is admin/owner)
         // Or just the context wallet.
         // Usually, users see their personal wallet. Business admins see business wallet.
         
-        const userWallet = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
+        // Function to clean wallet object by removing VA-specific fields
+        const cleanWallet = (wallet: any) => {
+            const {
+                virtual_account_number,
+                bank_code,
+                account_name,
+                customer_identifier,
+                beneficiary_account,
+                payment_provider,
+                provider_metadata,
+                ...cleanedWallet
+            } = wallet;
+            return cleanedWallet;
+        };
+        
+        let userWallet = null;
+        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
+        if (userWalletRes.rows.length > 0) {
+            userWallet = {
+                ...cleanWallet(userWalletRes.rows[0]),
+                virtual_accounts: await getWalletWithVAs(userWalletRes.rows[0].id)
+            };
+        }
         
         let businessWallet = null;
         if (businessId) {
@@ -131,14 +319,19 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
              // Usually only admins.
              const roleCheck = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
              if (['owner', 'admin'].includes(roleCheck.rows[0]?.role)) {
-                 const bw = await query(`SELECT * FROM wallets WHERE business_id = $1`, [businessId]);
-                 businessWallet = bw.rows[0];
+                 const bwRes = await query(`SELECT * FROM wallets WHERE business_id = $1`, [businessId]);
+                 if (bwRes.rows.length > 0) {
+                     businessWallet = {
+                         ...cleanWallet(bwRes.rows[0]),
+                         virtual_accounts: await getWalletWithVAs(bwRes.rows[0].id)
+                     };
+                 }
              }
         }
 
         res.json({
             success: true,
-            user_wallet: userWallet.rows[0],
+            user_wallet: userWallet,
             business_wallet: businessWallet
         });
 
@@ -162,12 +355,16 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
  *         application/json:
  *           schema:
  *             type: object
+ *             required:
+ *               - amount
+ *               - wallet_id
  *             properties:
  *               amount:
  *                 type: number
- *               wallet_type:
+ *               wallet_id:
  *                 type: string
- *                 enum: [user, business]
+ *               redirect_url:
+ *                 type: string
  *     responses:
  *       200:
  *         description: Payment link generated
@@ -181,10 +378,28 @@ router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, r
         // If not, we might need to fetch it.
         // But for now, let's stick to what was there, just fixing userId/businessId.
         
-        const { amount, wallet_type, redirect_url } = req.body;
+        const { amount, wallet_id, redirect_url } = req.body;
 
         if (!amount || amount <= 0) {
             return res.status(400).json({ success: false, error: "Invalid amount" });
+        }
+        if (!wallet_id) {
+            return res.status(400).json({ success: false, error: "wallet_id is required" });
+        }
+
+        // Check wallet exists and user has access
+        const walletRes = await query(`SELECT * FROM wallets WHERE id = $1`, [wallet_id]);
+        if (walletRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Wallet not found" });
+        }
+        const wallet = walletRes.rows[0];
+        
+        // Verify access to the wallet
+        if (wallet.user_id && wallet.user_id !== userId) {
+            return res.status(403).json({ success: false, error: "You do not have access to this wallet" });
+        }
+        if (wallet.business_id && wallet.business_id !== businessId) {
+            return res.status(403).json({ success: false, error: "You do not have access to this business wallet" });
         }
 
         // Calculate Fee for Funding via Card
@@ -192,7 +407,7 @@ router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, r
         const totalAmount = Number(amount) + Number(fee);
 
         // Generate Reference
-        const reference = `FUND-${wallet_type}-${Date.now()}-${userId.substring(0, 8)}`;
+        const reference = `FUND-${wallet_id.substring(0, 8)}-${Date.now()}-${userId.substring(0, 8)}`;
         
         // Convert total amount to minor unit (kobo)
         const amountMinor = toMinorUnit(totalAmount);
@@ -210,37 +425,41 @@ router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, r
              callbackUrl += `?redirect_url=${encodeURIComponent(clientRedirectUrl)}`;
         }
         
+        const provider = getProvider();
+        
         // Use object parameter for initiatePayment
-        const paymentResponse = await initiatePayment({
+        const paymentResponse = await provider.initiatePayment({
             email: email || "user@example.com", // Fallback or fetch from DB if missing
             amount: amountMinor,
             reference,
             callbackUrl
         });
 
-        if (paymentResponse.status === 200 && paymentResponse.success) {
-            // Log pending transaction
-            const walletQuery = wallet_type === 'business' 
-                ? `SELECT id FROM wallets WHERE business_id = $1`
-                : `SELECT id FROM wallets WHERE user_id = $1`;
-            
-            const params = wallet_type === 'business' ? [businessId] : [userId];
-            const walletRes = await query(walletQuery, params);
-            
-            if (walletRes.rows.length === 0) {
-                 return res.status(404).json({ success: false, error: "Wallet not found" });
-            }
+        let isSuccess = false;
+        let paymentUrl = null;
+        
+        if (provider.name === 'squad') {
+            isSuccess = paymentResponse.status === 200 && paymentResponse.success;
+            paymentUrl = paymentResponse.data.checkout_url;
+        } else if (provider.name === 'monnify') {
+            isSuccess = paymentResponse.success;
+            paymentUrl = paymentResponse.data?.checkout_url;
+        }
 
+        if (isSuccess && paymentUrl) {
             await query(
                 `INSERT INTO transactions 
-                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                 VALUES ($1, $2, $3, 'NGN', 'pending', $4, 'credit', 'Wallet Funding via Card', 'wallet_funding', $5, 'credit', $6)`,
-                [businessId, userId, amount, reference, walletRes.rows[0].id, fee]
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
+                 VALUES ($1, $2, $3, 'NGN', 'pending', $4, 'credit', 'Wallet Funding via Card', 'wallet_funding', $5, 'credit', $6, $7)`,
+                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, provider.name]
             );
 
-            res.json({ success: true, payment_url: paymentResponse.data.checkout_url, reference, fee, total_amount: totalAmount });
+            res.json({ success: true, payment_url: paymentUrl, reference, fee, total_amount: totalAmount });
         } else {
-            res.status(400).json({ success: false, error: paymentResponse.message });
+            const errorMessage = provider.name === 'squad' 
+                ? paymentResponse.message 
+                : paymentResponse.message || "Failed to initiate payment";
+            res.status(400).json({ success: false, error: errorMessage });
         }
 
     } catch (error: any) {
@@ -279,7 +498,7 @@ router.post("/business/create", authenticateToken, async (req: AuthenticatedRequ
         const { gtb_account_number, business_name } = req.body;
 
         // Verify Permission
-        const roleCheck = await query(`SELECT role, bvn, phone_number FROM users WHERE id = $1`, [userId]);
+        const roleCheck = await query(`SELECT role, bvn, nin, phone_number FROM users WHERE id = $1`, [userId]);
         if (roleCheck.rows[0]?.role !== 'owner') {
             return res.status(403).json({ success: false, error: "Only business owner can create business wallet" });
         }
@@ -308,41 +527,73 @@ router.post("/business/create", authenticateToken, async (req: AuthenticatedRequ
             }
         }
 
-        // Prepare Squad Payload
-        // "Map other info behind" - using Owner's BVN and Phone
+        const provider = getProvider();
+        
+        // Prepare provider payload
         const vaData = {
             bvn: user.bvn,
-            business_name: business_name,
-            customer_identifier: `BIZ-${businessId.substring(0, 8)}`,
-            mobile_num: user.phone_number || "08000000000",
-            beneficiary_account: gtb_account_number // GTB Account provided by user
+            nin: user.nin || "12345678901", // Monnify requires NIN
+            businessName: business_name,
+            customerIdentifier: `BIZ-${businessId.substring(0, 8)}`,
+            phoneNumber: user.phone_number || "08000000000",
+            beneficiaryAccount: gtb_account_number || "0000000000" // GTB Account provided by user (Squad only)
         };
 
-        const vaResponse = await createBusinessVirtualAccount(vaData);
+        const vaResponse = await provider.createBusinessVirtualAccount(vaData);
 
-        if (vaResponse.success && vaResponse.data) {
+        let isSuccess = false;
+        let vaNumber = null;
+        let bankCode = '058';
+        let accountName = business_name;
+        
+        if (provider.name === 'squad') {
+            isSuccess = vaResponse.success && vaResponse.data;
+            if (isSuccess) {
+                vaNumber = vaResponse.data.virtual_account_number;
+                bankCode = vaResponse.data.bank_code;
+                accountName = vaResponse.data.first_name 
+                    ? `${vaResponse.data.first_name} ${vaResponse.data.last_name}` 
+                    : business_name;
+            }
+        } else if (provider.name === 'monnify') {
+            isSuccess = vaResponse.requestSuccessful;
+            if (isSuccess) {
+                const accounts = vaResponse.responseBody?.accounts;
+                if (accounts && accounts.length > 0) {
+                    vaNumber = accounts[0].accountNumber;
+                    bankCode = accounts[0].bankCode;
+                    accountName = vaResponse.responseBody.accountName || business_name;
+                }
+            }
+        }
+
+        if (isSuccess && vaNumber) {
              await query(
                 `UPDATE wallets SET 
                     virtual_account_number = $1, 
                     bank_code = $2, 
                     account_name = $3, 
                     customer_identifier = $4,
-                    beneficiary_account = $5
-                 WHERE id = $6`,
+                    beneficiary_account = $5,
+                    payment_provider = $6
+                 WHERE id = $7`,
                 [
-                    vaResponse.data.virtual_account_number, 
-                    vaResponse.data.bank_code, 
-                    // Squad B2B response might differ, usually returns name
-                    vaResponse.data.first_name ? `${vaResponse.data.first_name} ${vaResponse.data.last_name}` : business_name,
-                    vaResponse.data.customer_identifier,
-                    vaResponse.data.beneficiary_account,
+                    vaNumber, 
+                    bankCode, 
+                    accountName,
+                    `BIZ-${businessId.substring(0, 8)}`,
+                    gtb_account_number,
+                    provider.name,
                     walletId
                 ]
             );
             
-            res.json({ success: true, message: "Business Wallet created successfully", data: vaResponse.data });
+            res.json({ success: true, message: "Business Wallet created successfully", data: vaResponse.responseBody || vaResponse.data });
         } else {
-            res.status(400).json({ success: false, error: vaResponse.message || "Failed to create Virtual Account" });
+            const errorMessage = provider.name === 'squad' 
+                ? vaResponse.message 
+                : vaResponse.responseMessage || "Failed to create Virtual Account";
+            res.status(400).json({ success: false, error: errorMessage });
         }
 
     } catch (error: any) {
@@ -433,16 +684,26 @@ router.get("/verify", async (req, res) => {
              }
         }
 
-        // 2. Verify with Squad
+        // 2. Get provider from transaction or use default
+        const provider = getProvider(transaction.payment_provider);
+        
+        // 3. Verify with provider
         let verifyResponse;
         try {
-            verifyResponse = await verifyPayment(reference);
+            verifyResponse = await provider.verifyPayment(reference);
         } catch (err: any) {
-            console.error("Squad Verification Failed:", err);
+            console.error(`${provider.name} Verification Failed:`, err);
         }
         
-        // 3. Update Status based on Squad Response
-        if (verifyResponse && verifyResponse.success && verifyResponse.data.transaction_status === 'success') {
+        // 4. Update Status based on provider response
+        let isSuccess = false;
+        if (provider.name === 'squad') {
+            isSuccess = verifyResponse && verifyResponse.success && verifyResponse.data.transaction_status === 'success';
+        } else if (provider.name === 'monnify') {
+            isSuccess = verifyResponse && verifyResponse.success && verifyResponse.data?.paymentStatus === 'PAID';
+        }
+        
+        if (isSuccess) {
             
             // Create Settlement record if missing (Pending)
             if (!settlement) {

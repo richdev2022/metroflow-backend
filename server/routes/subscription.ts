@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest, checkFeaturePermission } from 
 import { query } from "../db";
 import { initiatePayment, verifyPayment, cancelRecurring } from "../services/squad";
 import { processSubscriptionRenewals } from "../services/subscription";
+import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail } from "../services/email";
 import crypto from "crypto";
 import axios from "axios";
 import * as XLSX from "xlsx";
@@ -891,19 +892,29 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
   }
 });
 
-// Downgrade to Free Plan
+// Downgrade Plan
 router.post("/downgrade", authenticateToken, async (req, res) => {
 /**
  * @swagger
  * /subscription/downgrade:
  *   post:
- *     summary: Downgrade to free plan
+ *     summary: Downgrade plan
  *     tags: [Subscription]
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               planId:
+ *                 type: string
+ *                 description: Target plan ID (defaults to free plan if not provided)
  *     responses:
  *       200:
- *         description: Downgraded successfully
+ *         description: Downgrade requested successfully
  *         content:
  *           application/json:
  *             schema:
@@ -915,8 +926,8 @@ router.post("/downgrade", authenticateToken, async (req, res) => {
  *                   type: string
  *       401:
  *         description: Unauthorized
- *       403:
- *         description: Trial exhausted
+ *       404:
+ *         description: Plan not found
  *       500:
  *         description: Server error
  */
@@ -925,55 +936,67 @@ router.post("/downgrade", authenticateToken, async (req, res) => {
         const businessId = authReq.user?.businessId;
         if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-        // Check if user has already used the free trial (trial_used_days > 7?)
-        // The requirement says: "before a user can downgrade to Free plan, check that the user hasn't used Free plan for 7 days yet."
-        // We need to fetch current business state
-        const businessRes = await query(`SELECT * FROM businesses WHERE id = $1`, [businessId]);
+        const { planId } = req.body;
+
+        // Get current business and plan info
+        const businessRes = await query(`
+            SELECT b.*, p.name as current_plan_name 
+            FROM businesses b 
+            LEFT JOIN pricing_plans p ON b.plan_id = p.id 
+            WHERE b.id = $1
+        `, [businessId]);
         if (businessRes.rows.length === 0) return res.status(404).json({ success: false, error: "Business not found" });
         const business = businessRes.rows[0];
 
-        // Check for Free Plan ID
-        const freePlanRes = await query(`SELECT id FROM pricing_plans WHERE price = 0 LIMIT 1`);
-        if (freePlanRes.rows.length === 0) return res.status(500).json({ success: false, error: "Free plan configuration missing" });
-        const freePlanId = freePlanRes.rows[0].id;
-
-        // Check trial usage
-        // If trial_used_days >= 7, they cannot downgrade to Free/Trial.
-        // Or if they previously had a trial that expired?
-        // We will assume `trial_used_days` is incremented by a cron job daily for active free plans.
-        // If it's NULL, treat as 0.
-        const trialUsed = business.trial_used_days || 0;
-        
-        if (trialUsed >= 7) {
-             return res.status(403).json({ 
-                 success: false, 
-                 error: "You have already exhausted your 7-day free trial. Please subscribe to a paid plan." 
-             });
+        // Determine target plan
+        let targetPlanId;
+        let targetPlanName;
+        if (planId) {
+            // Validate target plan exists and is cheaper or equal
+            const targetPlanRes = await query(`SELECT * FROM pricing_plans WHERE id = $1 AND is_active = true`, [planId]);
+            if (targetPlanRes.rows.length === 0) return res.status(404).json({ success: false, error: "Target plan not found" });
+            targetPlanId = targetPlanRes.rows[0].id;
+            targetPlanName = targetPlanRes.rows[0].name;
+        } else {
+            // Default to free plan
+            const freePlanRes = await query(`SELECT id, name FROM pricing_plans WHERE price = 0 AND is_active = true LIMIT 1`);
+            if (freePlanRes.rows.length === 0) return res.status(500).json({ success: false, error: "Free plan configuration missing" });
+            targetPlanId = freePlanRes.rows[0].id;
+            targetPlanName = freePlanRes.rows[0].name;
         }
 
-        // Calculate remaining trial days
-        const remainingDays = 7 - trialUsed;
-        const trialEndsAt = new Date();
-        trialEndsAt.setDate(trialEndsAt.getDate() + remainingDays);
-
-        // Update to Free Plan
+        // Set pending downgrade
         await query(
             `UPDATE businesses 
-             SET plan_id = $1, 
-                 subscription_status = 'active', 
-                 trial_ends_at = $2,
-                 card_token = NULL, -- Remove card token on downgrade? Maybe keep it for easier upgrade? Let's remove to be safe/clean.
-                 next_billing_date = NULL,
+             SET pending_subscription_change = 'downgrade',
+                 pending_plan_id = $1,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = $3`,
-            [freePlanId, trialEndsAt, businessId]
+             WHERE id = $2`,
+            [targetPlanId, businessId]
         );
 
-        res.json({ success: true, message: `Downgraded to Free Trial. You have ${remainingDays} days remaining.` });
+        // Send email notification
+        try {
+            const userRes = await query('SELECT email FROM users WHERE business_id = $1 AND role = $2 LIMIT 1', [businessId, 'owner']);
+            const userEmail = userRes.rows[0]?.email;
+            if (userEmail) {
+                const emailHtml = generateSubscriptionDowngradedEmail(business.name, business.current_plan_name, targetPlanName);
+                await sendEmail({
+                    sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                    to: [{ email: userEmail, name: business.name }],
+                    subject: "Your Subscription Has Been Downgraded",
+                    htmlContent: emailHtml
+                });
+            }
+        } catch (emailErr) {
+            console.error("Failed to send downgrade email:", emailErr);
+        }
+
+        res.json({ success: true, message: `Downgrade to ${targetPlanName} requested. Your current plan will remain active until the end of the billing period, after which the new plan will be applied.` });
 
     } catch (error) {
         console.error("Downgrade error:", error);
-        res.status(500).json({ success: false, error: "Failed to downgrade plan" });
+        res.status(500).json({ success: false, error: "Failed to request downgrade" });
     }
 });
 
@@ -1011,7 +1034,7 @@ router.post("/cancel", authenticateToken, async (req, res) => {
         const businessId = authReq.user?.businessId;
         if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-        const businessRes = await query(`SELECT * FROM businesses WHERE id = $1`, [businessId]);
+        const businessRes = await query(`SELECT b.*, p.name as plan_name FROM businesses b LEFT JOIN pricing_plans p ON b.plan_id = p.id WHERE b.id = $1`, [businessId]);
         if (businessRes.rows.length === 0) return res.status(404).json({ success: false, error: "Business not found" });
         const business = businessRes.rows[0];
 
@@ -1027,18 +1050,33 @@ router.post("/cancel", authenticateToken, async (req, res) => {
             // Continue locally
         }
 
-       // Update DB
+       // Update DB to set pending cancel
        await query(
            `UPDATE businesses 
-            SET subscription_status = 'cancelled', 
-                card_token = NULL, 
-                next_billing_date = NULL,
+            SET pending_subscription_change = 'cancel',
                 updated_at = CURRENT_TIMESTAMP 
             WHERE id = $1`,
            [businessId]
        );
 
-       res.json({ success: true, message: "Subscription cancelled successfully." });
+       // Send email notification
+       try {
+           const userRes = await query('SELECT email FROM users WHERE business_id = $1 AND role = $2 LIMIT 1', [businessId, 'owner']);
+           const userEmail = userRes.rows[0]?.email;
+           if (userEmail) {
+               const emailHtml = generateSubscriptionCancelledEmail(business.name, business.plan_name);
+               await sendEmail({
+                   sender: { name: "MetroFlow", email: "no-reply@metroflow.com" },
+                   to: [{ email: userEmail, name: business.name }],
+                   subject: "Your Subscription Has Been Cancelled",
+                   htmlContent: emailHtml
+               });
+           }
+       } catch (emailErr) {
+           console.error("Failed to send cancellation email:", emailErr);
+       }
+
+       res.json({ success: true, message: "Subscription cancellation requested. Your plan will remain active until the end of the billing period." });
 
     } catch (error) {
         console.error("Cancel subscription error:", error);

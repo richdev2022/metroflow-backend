@@ -125,7 +125,7 @@ export async function sendEmail(
   }
 }
 
-interface EmailPayload {
+export interface EmailPayload {
   to: Array<{
     email: string;
     name?: string;
@@ -136,7 +136,7 @@ interface EmailPayload {
     name: string;
     email: string;
   };
-  replyTo: {
+  replyTo?: {
     email: string;
   };
 }
@@ -742,6 +742,163 @@ export function generateKYCOtpEmailHtml(
           <p style="color: #6b7280; font-size: 14px; line-height: 1.6; margin-bottom: 32px; text-align: center;">
             Do not share this code with anyone. MetroFlow support will never ask for this code.
           </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export function generateSubscriptionCancelledEmail(
+  businessName: string,
+  planName: string
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Your Subscription Has Been Cancelled</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${businessName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            This is to confirm that your subscription to the <strong>${planName}</strong> plan has been cancelled.
+          </p>
+
+          <div style="background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 20px; margin-bottom: 24px; border-radius: 4px;">
+            <p style="color: #92400e; font-size: 14px; margin: 0;">
+              Your access will continue until your current billing period ends. After that, you will be moved to our free plan.
+            </p>
+          </div>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            We're sorry to see you go! If you have any feedback or if there's anything we can do to improve, please don't hesitate to reach out.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${baseUrl || 'https://app.metroflow.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Visit MetroFlow
+            </a>
+          </div>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export function generateSubscriptionDowngradedEmail(
+  businessName: string,
+  oldPlanName: string,
+  newPlanName: string
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Your Subscription Has Been Downgraded</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${businessName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            This is to confirm that your subscription has been changed from <strong>${oldPlanName}</strong> to <strong>${newPlanName}</strong>.
+          </p>
+
+          <div style="background-color: #ecfdf5; border-left: 4px solid #10b981; padding: 20px; margin-bottom: 24px; border-radius: 4px;">
+            <p style="color: #065f46; font-size: 14px; margin: 0;">
+              Your downgrade will take effect at the end of your current billing period. Until then, you'll continue to have access to your current plan features.
+            </p>
+          </div>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            Thank you for being a MetroFlow customer! If you have any questions, please don't hesitate to contact our support team.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${baseUrl || 'https://app.metroflow.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Visit MetroFlow
+            </a>
+          </div>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} MetroFlow. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export function generateRenewalFailedEmail(
+  businessName: string,
+  planName: string,
+  reason: string
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fef2f2; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #ef4444;">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="MetroFlow Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Subscription Renewal Failed</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${businessName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            We attempted to renew your <strong>${planName}</strong> subscription, but the payment failed.
+          </p>
+
+          <div style="background-color: #fee2e2; border: 1px solid #fecaca; padding: 20px; margin-bottom: 24px; border-radius: 8px;">
+            <p style="color: #991b1b; font-size: 14px; margin: 0 0 8px 0; font-weight: 600;">Failure Reason:</p>
+            <p style="color: #7f1d1d; font-size: 16px; margin: 0;">${reason}</p>
+          </div>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            To avoid service interruption, please update your payment method as soon as possible.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${baseUrl || 'https://app.metroflow.com'}/billing" style="background-color: #ef4444; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Update Payment Method
+            </a>
+          </div>
 
           <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             <p style="color: #9ca3af; font-size: 12px;">

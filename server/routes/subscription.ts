@@ -179,7 +179,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
 
         if (!businessId && !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-        const { page = 1, limit = 20, perPage, status } = req.query;
+        const { page = 1, limit = 20, perPage, status, startDate, endDate } = req.query;
         const effectiveLimit = perPage ? Number(perPage) : Number(limit);
         const offset = (Number(page) - 1) * effectiveLimit;
 
@@ -221,6 +221,18 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             tParamCount++;
         }
 
+        if (startDate) {
+            transactionsQuery += ` AND created_at >= $${tParamCount}`;
+            transactionsParams.push(startDate);
+            tParamCount++;
+        }
+
+        if (endDate) {
+            transactionsQuery += ` AND created_at <= $${tParamCount}`;
+            transactionsParams.push(endDate);
+            tParamCount++;
+        }
+
         // Now get transfer_queue entries
         let transfersQuery = `
             SELECT 
@@ -251,6 +263,18 @@ router.get("/transactions", authenticateToken, async (req, res) => {
         if (status) {
             transfersQuery += ` AND status = $${tfParamCount}`;
             transfersParams.push(status);
+            tfParamCount++;
+        }
+
+        if (startDate) {
+            transfersQuery += ` AND created_at >= $${tfParamCount}`;
+            transfersParams.push(startDate);
+            tfParamCount++;
+        }
+
+        if (endDate) {
+            transfersQuery += ` AND created_at <= $${tfParamCount}`;
+            transfersParams.push(endDate);
             tfParamCount++;
         }
 
@@ -288,6 +312,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             pagination: {
                 total,
                 page: Number(page),
+                perPage: effectiveLimit,
                 limit: effectiveLimit,
                 totalPages: Math.ceil(total / effectiveLimit)
             }

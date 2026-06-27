@@ -470,9 +470,16 @@ export async function initializeDatabase() {
     
     // Try to add unique constraint, ignore error if it already exists
     try {
-        await query(`ALTER TABLE virtual_accounts ADD CONSTRAINT virtual_accounts_wallet_provider_key UNIQUE(wallet_id, payment_provider)`);
+        const checkConstraint = await query(`
+            SELECT 1 FROM pg_constraint 
+            WHERE conname = 'virtual_accounts_wallet_provider_key'
+        `);
+        
+        if (checkConstraint.rows.length === 0) {
+            await query(`ALTER TABLE virtual_accounts ADD CONSTRAINT virtual_accounts_wallet_provider_key UNIQUE(wallet_id, payment_provider)`);
+        }
     } catch (error) {
-        console.warn("Could not add unique constraint to virtual_accounts (it may already exist):", error);
+        console.warn("Could not add unique constraint to virtual_accounts:", error);
     }
     
     // Migrate existing virtual accounts from wallets to virtual_accounts table

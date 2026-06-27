@@ -25,10 +25,12 @@ const genRef = () => `TRF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
  * /transfers/otp/request:
  *   post:
  *     summary: Request OTP for transfer authorization
+ *     description: Sends an OTP (One-Time Password) to the authenticated user using their preferred method (email or SMS). The OTP is required to initiate any single or bulk transfer.
  *     tags: [Transfers]
  *     security:
  *       - bearerAuth: []
  *     requestBody:
+ *       required: false
  *       content:
  *         application/json:
  *           schema:
@@ -36,10 +38,60 @@ const genRef = () => `TRF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
  *             properties:
  *               wallet_id:
  *                 type: string
- *                 description: Optional wallet ID to charge SMS fee from
+ *                 format: uuid
+ *                 description: Optional wallet ID to charge SMS fee from (if SMS is the OTP method)
+ *           examples:
+ *             WithWalletId:
+ *               summary: Request OTP with wallet ID for SMS fee
+ *               value:
+ *                 wallet_id: "550e8400-e29b-41d4-a716-446655440000"
+ *             WithoutWalletId:
+ *               summary: Request OTP without wallet ID (uses default wallet)
+ *               value: {}
  *     responses:
  *       200:
- *         description: OTP sent
+ *         description: OTP sent successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "OTP sent successfully"
+ *                 fee_charged:
+ *                   type: number
+ *                   description: Fee charged for SMS (if applicable)
+ *                   example: 10.50
+ *       400:
+ *         description: Bad request (e.g., no wallet found for SMS fee)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "No NGN wallet found to charge OTP fee"
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Failed to request OTP"
  */
 router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
@@ -127,6 +179,7 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  * /transfers/single:
  *   post:
  *     summary: Initiate a single transfer
+ *     description: Queues a single transfer to a recipient's bank account. Requires a valid OTP obtained from /transfers/otp/request.
  *     tags: [Transfers]
  *     security:
  *       - bearerAuth: []
@@ -144,75 +197,218 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  *             properties:
  *               bankCode:
  *                 type: string
+ *                 description: Bank code of the recipient's bank (use /transfers/banks to get valid codes)
+ *                 example: "058"
  *               accountNumber:
  *                 type: string
+ *                 description: Recipient's bank account number
+ *                 example: "0123456789"
  *               accountName:
  *                 type: string
+ *                 description: Recipient's account name (optional, but recommended to verify)
+ *                 example: "John Doe"
  *               amount:
  *                 type: number
+ *                 description: Amount to transfer (in major currency unit, e.g., NGN)
+ *                 example: 5000
  *               remark:
  *                 type: string
+ *                 description: Optional remark for the transfer
+ *                 example: "Payment for services"
  *               otp:
  *                 type: string
+ *                 description: OTP obtained from /transfers/otp/request
+ *                 example: "123456"
  *               wallet_id:
  *                 type: string
+ *                 format: uuid
+ *                 description: Optional wallet ID to debit from (uses default wallet if not provided)
+ *                 example: "550e8400-e29b-41d4-a716-446655440000"
+ *           examples:
+ *             Example1:
+ *               summary: Single transfer with all fields
+ *               value:
+ *                 bankCode: "058"
+ *                 accountNumber: "0123456789"
+ *                 accountName: "John Doe"
+ *                 amount: 5000
+ *                 remark: "Payment for services"
+ *                 otp: "123456"
+ *                 wallet_id: "550e8400-e29b-41d4-a716-446655440000"
+ *             Example2:
+ *               summary: Single transfer with minimal fields
+ *               value:
+ *                 bankCode: "033"
+ *                 accountNumber: "9876543210"
+ *                 amount: 10000
+ *                 otp: "654321"
  *     responses:
  *       200:
- *         description: Transfer queued
+ *         description: Transfer queued successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Transfer initiated successfully"
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                       description: Unique ID of the queued transfer
+ *                     reference:
+ *                       type: string
+ *                       description: Unique transfer reference
+ *                     amount:
+ *                       type: number
+ *                       description: Transfer amount
+ *                     currency:
+ *                       type: string
+ *                       description: Transfer currency
+ *                     fee:
+ *                       type: number
+ *                       description: Transfer fee
+ *                     total:
+ *                       type: number
+ *                       description: Total amount (amount + fee)
+ *                     recipient:
+ *                       type: object
+ *                       properties:
+ *                         accountNumber:
+ *                           type: string
+ *                         bankCode:
+ *                           type: string
+ *                         accountName:
+ *                           type: string
+ *                     status:
+ *                       type: string
+ *                       description: Transfer status
+ *                       enum: [pending, processing, success, failed]
+ *                     walletId:
+ *                       type: string
+ *                       format: uuid
+ *                       description: Wallet ID used for the transfer
+ *                     paymentProvider:
+ *                       type: string
+ *                       description: Payment provider used
+ *                     createdAt:
+ *                       type: string
+ *                       format: date-time
+ *                     updatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       400:
+ *         description: Bad request (invalid OTP, missing fields, etc.)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid OTP"
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Failed to initiate transfer"
  */
 router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
-    try {
-        const { bankCode, accountNumber, accountName, amount, remark, otp, wallet_id } = req.body;
-        const businessId = req.user?.businessId;
-        const userId = req.user?.userId;
+  try {
+    const { bankCode, accountNumber, accountName, amount, remark, otp, wallet_id } = req.body;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
 
-        if (!otp) {
-            return res.status(400).json({ success: false, error: "OTP is required" });
-        }
-
-        // Verify OTP
-        const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
-        const user = uRes.rows[0];
-
-        if (!user.otp_code || user.otp_code !== otp) {
-            return res.status(400).json({ success: false, error: "Invalid OTP" });
-        }
-        if (new Date(user.otp_expires_at) < new Date()) {
-            return res.status(400).json({ success: false, error: "OTP expired" });
-        }
-
-        // Invalidate OTP
-        await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
-
-        // Validate Wallet
-        let walletId = wallet_id;
-        if (!walletId) {
-             const wRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
-             if (wRes.rows.length > 0) walletId = wRes.rows[0].id;
-             else return res.status(400).json({ success: false, error: "Wallet ID required" });
-        }
-
-        // Calculate Fee
-        const fee = await calculateFee(amount, 'transfer');
-
-        // Queue Transfer
-        const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
-        await query(
-            `INSERT INTO transfer_queue 
-            (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider)
-            VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9)`,
-            [businessId, genRef(), accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider]
-        );
-
-        // Trigger processing
-        processAllPending(businessId!).catch(err => console.error("Single transfer process error:", err));
-
-        res.json({ success: true, message: "Transfer initiated successfully" });
-
-    } catch (error) {
-        console.error("Single transfer error:", error);
-        res.status(500).json({ success: false, error: "Failed to initiate transfer" });
+    if (!otp) {
+      return res.status(400).json({ success: false, error: "OTP is required" });
     }
+
+    // Verify OTP
+    const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
+    const user = uRes.rows[0];
+
+    if (!user.otp_code || user.otp_code !== otp) {
+      return res.status(400).json({ success: false, error: "Invalid OTP" });
+    }
+    if (new Date(user.otp_expires_at) < new Date()) {
+      return res.status(400).json({ success: false, error: "OTP expired" });
+    }
+
+    // Invalidate OTP
+    await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
+
+    // Validate Wallet
+    let walletId = wallet_id;
+    if (!walletId) {
+      const wRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
+      if (wRes.rows.length > 0) walletId = wRes.rows[0].id;
+      else return res.status(400).json({ success: false, error: "Wallet ID required" });
+    }
+
+    // Calculate Fee
+    const fee = await calculateFee(amount, 'transfer');
+    const reference = genRef();
+    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+
+    // Queue Transfer
+    const insertRes = await query(
+      `INSERT INTO transfer_queue 
+      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
+      VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9, $10)
+      RETURNING *`,
+      [businessId, reference, accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider, fee]
+    );
+
+    const queuedTransfer = insertRes.rows[0];
+
+    // Trigger processing
+    processAllPending(businessId!).catch(err => console.error("Single transfer process error:", err));
+
+    res.json({ 
+      success: true, 
+      message: "Transfer initiated successfully",
+      data: {
+        id: queuedTransfer.id,
+        reference: queuedTransfer.reference,
+        amount: queuedTransfer.amount,
+        currency: queuedTransfer.currency,
+        fee: queuedTransfer.fee,
+        total: parseFloat(queuedTransfer.amount) + parseFloat(queuedTransfer.fee),
+        recipient: {
+          accountNumber: queuedTransfer.recipient_account,
+          bankCode: queuedTransfer.recipient_bank,
+          accountName: queuedTransfer.recipient_name
+        },
+        status: queuedTransfer.status,
+        walletId: queuedTransfer.wallet_id,
+        paymentProvider: queuedTransfer.payment_provider,
+        createdAt: queuedTransfer.created_at,
+        updatedAt: queuedTransfer.updated_at
+      }
+    });
+
+  } catch (error) {
+    console.error("Single transfer error:", error);
+    res.status(500).json({ success: false, error: "Failed to initiate transfer" });
+  }
 });
 
 /**
@@ -220,6 +416,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  * /transfers/bulk:
  *   post:
  *     summary: Initiate a bulk transfer
+ *     description: "Queues multiple transfers at once. Supports different types: Salary (pay active employees) and Epic (custom list of recipients). Requires a valid OTP obtained from /transfers/otp/request."
  *     tags: [Transfers]
  *     security:
  *       - bearerAuth: []
@@ -235,19 +432,144 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *             properties:
  *               type:
  *                 type: string
- *                 enum: [manual, sprint, salary, task]
+ *                 enum: [Salary, Epic]
+ *                 description: Type of bulk transfer
  *               otp:
  *                 type: string
  *                 description: OTP code for authorization
+ *                 example: "123456"
  *               source_wallet_id:
  *                 type: string
- *                 description: ID of the wallet to fund the transfer from
+ *                 format: uuid
+ *                 description: ID of the wallet to fund the transfer from (uses default wallet if not provided)
+ *                 example: "550e8400-e29b-41d4-a716-446655440000"
  *               data:
  *                 type: object
- *                 description: Data depending on type (manual items, sprint name, task IDs)
+ *                 description: Data depending on transfer type (items for Epic, none for Salary)
+ *           examples:
+ *             EpicType:
+ *               summary: Epic bulk transfer (custom list of recipients)
+ *               value:
+ *                 type: "Epic"
+ *                 otp: "123456"
+ *                 source_wallet_id: "550e8400-e29b-41d4-a716-446655440000"
+ *                 data:
+ *                   items:
+ *                     - amount: 5000
+ *                       bankCode: "058"
+ *                       accountNumber: "0123456789"
+ *                       accountName: "John Doe"
+ *                       remark: "Payment for services"
+ *                     - amount: 10000
+ *                       bankCode: "033"
+ *                       accountNumber: "9876543210"
+ *                       accountName: "Jane Smith"
+ *                       remark: "Commission"
+ *             SalaryType:
+ *               summary: Salary bulk transfer (pay active employees)
+ *               value:
+ *                 type: "Salary"
+ *                 otp: "123456"
+ *                 source_wallet_id: "550e8400-e29b-41d4-a716-446655440000"
  *     responses:
  *       200:
- *         description: Transfers queued
+ *         description: Transfers queued successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Queued 2 transfers for processing"
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     queued:
+ *                       type: integer
+ *                       description: Number of transfers queued
+ *                       example: 2
+ *                     type:
+ *                       type: string
+ *                       description: Type of bulk transfer
+ *                     walletId:
+ *                       type: string
+ *                       format: uuid
+ *                       description: Wallet ID used for the transfers
+ *                     totals:
+ *                       type: object
+ *                       properties:
+ *                         amount:
+ *                           type: number
+ *                           description: Total transfer amount
+ *                         fee:
+ *                           type: number
+ *                           description: Total transfer fee
+ *                         total:
+ *                           type: number
+ *                           description: Total amount (amount + fee)
+ *                     transfers:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           reference:
+ *                             type: string
+ *                           amount:
+ *                             type: number
+ *                           currency:
+ *                             type: string
+ *                           fee:
+ *                             type: number
+ *                           recipient:
+ *                             type: object
+ *                             properties:
+ *                               accountNumber:
+ *                                 type: string
+ *                               bankCode:
+ *                                 type: string
+ *                               accountName:
+ *                                 type: string
+ *                           status:
+ *                             type: string
+ *                             enum: [pending, processing, success, failed]
+ *                           paymentProvider:
+ *                             type: string
+ *                           createdAt:
+ *                             type: string
+ *                             format: date-time
+ *       400:
+ *         description: Bad request (invalid OTP, missing fields, invalid type, etc.)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid transfer type"
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Failed to initiate bulk transfer"
  */
 router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
   try {
@@ -297,19 +619,19 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
     let transfersToQueue: any[] = [];
 
     // 1. Prepare transfers based on type
-    if (type === 'manual') {
+    if (type === 'Epic') {
       // data.items: Array of { amount, bankCode, accountNumber, accountName, remark }
       if (!Array.isArray(data?.items)) {
-        return res.status(400).json({ success: false, error: "Items array required for manual type" });
+        return res.status(400).json({ success: false, error: "Items array required for Epic type" });
       }
       transfersToQueue = await Promise.all(data.items.map(async (item: any) => ({
         ...item,
-        sourceType: 'manual',
+        sourceType: 'Epic',
         sourceId: null,
         fee: await calculateFee(item.amount, 'transfer')
       })));
 
-    } else if (type === 'salary') {
+    } else if (type === 'Salary') {
       // Pay all active employees with salary_amount > 0
       const usersRes = await query(
         `SELECT id, salary_amount, salary_currency, bank_code, account_number, account_name 
@@ -363,117 +685,32 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           accountNumber: u.account_number,
           accountName: u.account_name || 'Employee',
           remark: remarks.join('; '),
-          sourceType: 'salary',
+          sourceType: 'Salary',
           sourceId: u.id,
           adjustments: userAdjustments, // Pass along to mark as processed later
           fee: await calculateFee(finalAmount > 0 ? finalAmount : 0, 'transfer')
         };
       }));
 
-    } else if (type === 'sprint') {
-      // Pay for tasks in a sprint
-      // data.sprint: string (sprint name)
-      if (!data?.sprint) return res.status(400).json({ success: false, error: "Sprint name required" });
-
-      // Get business currency
-      const businessRes = await query(`SELECT currency FROM businesses WHERE id = $1`, [businessId]);
-      const businessCurrency = businessRes.rows[0]?.currency || 'NGN';
-
-      const tasksRes = await query(
-        `SELECT t.id, t.target_value, ta.user_id, t.currency 
-         FROM tasks t
-         JOIN task_assignments ta ON t.id = ta.task_id
-         WHERE t.business_id = $1 AND t.sprint = $2 AND t.status = 'completed'`, 
-        [businessId, data.sprint]
-      );
-
-      for (const row of tasksRes.rows) {
-        const userRes = await query(
-          `SELECT bank_code, account_number, account_name FROM users WHERE id = $1`,
-          [row.user_id]
-        );
-        const user = userRes.rows[0];
-
-        if (user && user.bank_code && user.account_number) {
-          const assigneeCountRes = await query(`SELECT COUNT(*) FROM task_assignments WHERE task_id = $1`, [row.id]);
-          const assigneeCount = parseInt(assigneeCountRes.rows[0].count) || 1;
-          const splitAmount = row.target_value / assigneeCount;
-
-          transfersToQueue.push({
-            amount: splitAmount,
-            currency: row.currency || businessCurrency,
-            bankCode: user.bank_code,
-            accountNumber: user.account_number,
-            accountName: user.account_name,
-            remark: `Sprint Payment: ${data.sprint}`,
-            sourceType: 'sprint',
-            sourceId: row.id, // Task ID
-            fee: await calculateFee(splitAmount, 'transfer')
-          });
-        }
-      }
-
-    } else if (type === 'task') {
-      // Pay specific tasks
-      // data.taskIds: string[]
-      if (!Array.isArray(data?.taskIds)) return res.status(400).json({ success: false, error: "Task IDs required" });
-
-      // Get business currency
-      const businessRes = await query(`SELECT currency FROM businesses WHERE id = $1`, [businessId]);
-      const businessCurrency = businessRes.rows[0]?.currency || 'NGN';
-
-      const tasksRes = await query(
-        `SELECT t.id, t.target_value, ta.user_id, t.currency 
-         FROM tasks t
-         JOIN task_assignments ta ON t.id = ta.task_id
-         WHERE t.business_id = $1 AND t.id = ANY($2::uuid[])`,
-        [businessId, data.taskIds]
-      );
-
-      for (const row of tasksRes.rows) {
-         const userRes = await query(
-          `SELECT bank_code, account_number, account_name FROM users WHERE id = $1`,
-          [row.user_id]
-        );
-        const user = userRes.rows[0];
-
-        if (user && user.bank_code && user.account_number) {
-           const assigneeCountRes = await query(`SELECT COUNT(*) FROM task_assignments WHERE task_id = $1`, [row.id]);
-           const assigneeCount = parseInt(assigneeCountRes.rows[0].count) || 1;
-           const splitAmount = row.target_value / assigneeCount;
-
-           transfersToQueue.push({
-             amount: splitAmount,
-             currency: row.currency || businessCurrency,
-             bankCode: user.bank_code,
-             accountNumber: user.account_number,
-             accountName: user.account_name,
-             remark: `Task Payment`,
-             sourceType: 'task',
-             sourceId: row.id,
-             fee: await calculateFee(splitAmount, 'transfer')
-           });
-        }
-      }
     } else {
       return res.status(400).json({ success: false, error: "Invalid transfer type" });
     }
 
     if (transfersToQueue.length === 0) {
-      return res.json({ success: true, message: "No eligible transfers found to queue" });
+      return res.json({ success: true, message: "No eligible transfers found to queue", data: { queued: 0, transfers: [] } });
     }
 
     // 2. Insert into transfer_queue
-    let queuedCount = 0;
+    let queuedTransfers: any[] = [];
     const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
     for (const t of transfersToQueue) {
       if (t.amount <= 0) continue;
 
       const transferRes = await query(
         `INSERT INTO transfer_queue 
-        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12)
-        RETURNING id`,
+        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13)
+        RETURNING *`,
         [
           businessId,
           genRef(),
@@ -486,11 +723,13 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.sourceType,
           t.sourceId,
           walletId,
-          t.payment_provider || defaultProvider
+          t.payment_provider || defaultProvider,
+          t.fee
         ]
       );
       
-      const transferId = transferRes.rows[0].id;
+      const queuedTransfer = transferRes.rows[0];
+      queuedTransfers.push(queuedTransfer);
 
       // Mark adjustments as processed
       if (t.adjustments && t.adjustments.length > 0) {
@@ -499,17 +738,47 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           `UPDATE payroll_adjustments 
            SET status = 'processed', processed_at = CURRENT_TIMESTAMP, transfer_id = $1 
            WHERE id = ANY($2::uuid[])`,
-          [transferId, adjustmentIds]
+          [queuedTransfer.id, adjustmentIds]
         );
       }
-
-      queuedCount++;
     }
 
     // 3. Trigger processing in background
     processAllPending(businessId).catch(err => console.error("Background processing error:", err));
 
-    res.json({ success: true, message: `Queued ${queuedCount} transfers for processing` });
+    // Calculate totals
+    const totalAmount = queuedTransfers.reduce((sum, t) => sum + parseFloat(t.amount), 0);
+    const totalFee = queuedTransfers.reduce((sum, t) => sum + parseFloat(t.fee || 0), 0);
+
+    res.json({ 
+      success: true, 
+      message: `Queued ${queuedTransfers.length} transfers for processing`,
+      data: {
+        queued: queuedTransfers.length,
+        type,
+        walletId,
+        totals: {
+          amount: totalAmount,
+          fee: totalFee,
+          total: totalAmount + totalFee
+        },
+        transfers: queuedTransfers.map(t => ({
+          id: t.id,
+          reference: t.reference,
+          amount: t.amount,
+          currency: t.currency,
+          fee: t.fee,
+          recipient: {
+            accountNumber: t.recipient_account,
+            bankCode: t.recipient_bank,
+            accountName: t.recipient_name
+          },
+          status: t.status,
+          paymentProvider: t.payment_provider,
+          createdAt: t.created_at
+        }))
+      }
+    });
 
   } catch (error: any) {
     console.error("Bulk transfer error:", error);
@@ -664,9 +933,19 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *           format: uuid
  *     responses:
  *       200:
  *         description: Retry initiated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
  */
 router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
@@ -681,13 +960,33 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
       return res.status(400).json({ success: false, error: "Only failed transfers can be retried" });
     }
 
-    // Reset status to pending
-    await query(`UPDATE transfer_queue SET status = 'pending', failure_reason = NULL, reference = $2 WHERE id = $1`, [id, `TRF-RETRY-${Date.now()}`]);
+    // Reset status to pending and get the updated transfer
+    const updateRes = await query(`UPDATE transfer_queue SET status = 'pending', failure_reason = NULL, reference = $2 WHERE id = $1 RETURNING *`, [id, `TRF-RETRY-${Date.now()}`]);
+    const updatedTransfer = updateRes.rows[0];
 
     // Trigger processing
     processAllPending(businessId).catch(err => console.error("Retry processing error:", err));
 
-    res.json({ success: true, message: "Transfer retry initiated" });
+    res.json({ 
+      success: true, 
+      message: "Transfer retry initiated",
+      data: {
+        id: updatedTransfer.id,
+        reference: updatedTransfer.reference,
+        amount: updatedTransfer.amount,
+        currency: updatedTransfer.currency,
+        fee: updatedTransfer.fee,
+        recipient: {
+          accountNumber: updatedTransfer.recipient_account,
+          bankCode: updatedTransfer.recipient_bank,
+          accountName: updatedTransfer.recipient_name
+        },
+        status: updatedTransfer.status,
+        paymentProvider: updatedTransfer.payment_provider,
+        createdAt: updatedTransfer.created_at,
+        updatedAt: updatedTransfer.updated_at
+      }
+    });
 
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to retry transfer" });

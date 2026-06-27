@@ -12,11 +12,11 @@ const options = {
     },
     servers: [
       {
-        url: "http://localhost:3000/api",
+        url: "http://localhost:3000",
         description: "Local Development Server",
       },
       {
-        url: "/api",
+        url: "/",
         description: "Relative path (Production)",
       }
     ],
@@ -39,6 +39,17 @@ const options = {
 };
 
 const specs = swaggerJsdoc(options);
+
+// Prepend "/api" to all paths
+if (specs.paths) {
+  const newPaths: any = {};
+  for (const [path, methods] of Object.entries(specs.paths)) {
+    const newPath = path.startsWith("/api") ? path : `/api${path}`;
+    newPaths[newPath] = methods;
+  }
+  specs.paths = newPaths;
+}
+
 const outputPath = path.resolve(process.cwd(), "server/swagger-output.json");
 
 fs.writeFileSync(outputPath, JSON.stringify(specs, null, 2));

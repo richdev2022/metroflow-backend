@@ -7,11 +7,11 @@
   },
   "servers": [
     {
-      "url": "http://localhost:3000/api",
+      "url": "http://localhost:3000",
       "description": "Local Development Server"
     },
     {
-      "url": "/api",
+      "url": "/",
       "description": "Relative path (Production)"
     }
   ],
@@ -30,7 +30,7 @@
     }
   ],
   "paths": {
-    "/activity-logs": {
+    "/api/activity-logs": {
       "get": {
         "summary": "Get activity logs",
         "tags": [
@@ -94,7 +94,7 @@
         }
       }
     },
-    "/admin/fees": {
+    "/api/admin/fees": {
       "get": {
         "summary": "List all fee configurations",
         "tags": [
@@ -174,7 +174,7 @@
         }
       }
     },
-    "/admin/fees/{id}": {
+    "/api/admin/fees/{id}": {
       "put": {
         "summary": "Update a fee configuration",
         "tags": [
@@ -255,7 +255,7 @@
         }
       }
     },
-    "/admin/auth/login": {
+    "/api/admin/auth/login": {
       "post": {
         "summary": "Admin login",
         "tags": [
@@ -328,7 +328,7 @@
         }
       }
     },
-    "/admin/auth/verify-login": {
+    "/api/admin/auth/verify-login": {
       "post": {
         "summary": "Verify admin login with OTP",
         "tags": [
@@ -397,7 +397,7 @@
         }
       }
     },
-    "/admin/auth/verify-forgot-password-otp": {
+    "/api/admin/auth/verify-forgot-password-otp": {
       "post": {
         "summary": "Verify forgot password OTP",
         "tags": [
@@ -466,7 +466,7 @@
         }
       }
     },
-    "/admin/auth/forgot-password": {
+    "/api/admin/auth/forgot-password": {
       "post": {
         "summary": "Request password reset",
         "tags": [
@@ -531,7 +531,7 @@
         }
       }
     },
-    "/admin/dashboard/charts": {
+    "/api/admin/dashboard/charts": {
       "get": {
         "summary": "Get dashboard charts data",
         "tags": [
@@ -549,7 +549,7 @@
         }
       }
     },
-    "/admin/pricing": {
+    "/api/admin/pricing": {
       "post": {
         "summary": "Create a pricing plan",
         "tags": [
@@ -641,7 +641,7 @@
         }
       }
     },
-    "/admin/pricing/{id}": {
+    "/api/admin/pricing/{id}": {
       "put": {
         "summary": "Update a pricing plan",
         "tags": [
@@ -728,7 +728,7 @@
         }
       }
     },
-    "/admin/businesses": {
+    "/api/admin/businesses": {
       "get": {
         "summary": "Get all businesses",
         "tags": [
@@ -783,7 +783,7 @@
         }
       }
     },
-    "/admin/businesses/{id}/team": {
+    "/api/admin/businesses/{id}/team": {
       "get": {
         "summary": "Get business team members",
         "tags": [
@@ -836,7 +836,7 @@
         }
       }
     },
-    "/admin/transactions": {
+    "/api/admin/transactions": {
       "get": {
         "summary": "Get all transactions",
         "tags": [
@@ -977,7 +977,7 @@
         }
       }
     },
-    "/admin/transactions/pending-settlement": {
+    "/api/admin/transactions/pending-settlement": {
       "get": {
         "summary": "Get transactions requiring settlement",
         "tags": [
@@ -1050,7 +1050,7 @@
         }
       }
     },
-    "/admin/transactions/settle": {
+    "/api/admin/transactions/settle": {
       "post": {
         "summary": "Manually settle a transaction",
         "tags": [
@@ -1086,7 +1086,7 @@
         }
       }
     },
-    "/admin/businesses/{id}/status": {
+    "/api/admin/businesses/{id}/status": {
       "put": {
         "summary": "Update business status",
         "tags": [
@@ -1132,7 +1132,7 @@
         }
       }
     },
-    "/admin/features": {
+    "/api/admin/features": {
       "get": {
         "summary": "Get all available plan features/permissions",
         "tags": [
@@ -1150,7 +1150,7 @@
         }
       }
     },
-    "/admin/permissions": {
+    "/api/admin/permissions": {
       "get": {
         "summary": "Get all available permissions",
         "tags": [
@@ -1201,7 +1201,7 @@
         }
       }
     },
-    "/admin/roles": {
+    "/api/admin/roles": {
       "get": {
         "summary": "Get all admin roles",
         "tags": [
@@ -1263,7 +1263,7 @@
         }
       }
     },
-    "/admin/roles/{id}": {
+    "/api/admin/roles/{id}": {
       "put": {
         "summary": "Update an admin role",
         "tags": [
@@ -1343,7 +1343,7 @@
         }
       }
     },
-    "/admin/users": {
+    "/api/admin/users": {
       "get": {
         "summary": "Get all admin users",
         "tags": [
@@ -1405,7 +1405,7 @@
         }
       }
     },
-    "/admin/users/invite": {
+    "/api/admin/users/invite": {
       "post": {
         "summary": "Invite a new admin user",
         "tags": [
@@ -1451,7 +1451,7 @@
         }
       }
     },
-    "/admin/users/{id}": {
+    "/api/admin/users/{id}": {
       "put": {
         "summary": "Update an admin user's role",
         "tags": [
@@ -1526,7 +1526,7 @@
         }
       }
     },
-    "/admin/users/{id}/status": {
+    "/api/admin/users/{id}/status": {
       "put": {
         "summary": "Update an admin user's status",
         "tags": [
@@ -1578,7 +1578,7 @@
         }
       }
     },
-    "/admin/settings/card-verification-amount": {
+    "/api/admin/settings/card-verification-amount": {
       "get": {
         "summary": "Get card verification amount",
         "tags": [
@@ -1645,7 +1645,7 @@
         }
       }
     },
-    "/admin/webhooks": {
+    "/api/admin/webhooks": {
       "get": {
         "summary": "Get webhook notifications",
         "tags": [
@@ -1716,7 +1716,7 @@
         }
       }
     },
-    "/admin/reports/transactions/export": {
+    "/api/admin/reports/transactions/export": {
       "get": {
         "summary": "Export transactions to CSV",
         "tags": [
@@ -1757,7 +1757,7 @@
         ]
       }
     },
-    "/admin/reports/businesses/export": {
+    "/api/admin/reports/businesses/export": {
       "get": {
         "summary": "Export businesses to CSV",
         "tags": [
@@ -1798,7 +1798,7 @@
         ]
       }
     },
-    "/admin/migrate-business-ids": {
+    "/api/admin/migrate-business-ids": {
       "post": {
         "summary": "Recreate all business IDs to updated format",
         "tags": [
@@ -1811,7 +1811,7 @@
         ]
       }
     },
-    "/admin/subscription/manual-upgrade": {
+    "/api/admin/subscription/manual-upgrade": {
       "post": {
         "summary": "Manually upgrade a business plan (No expiry)",
         "tags": [
@@ -1846,7 +1846,7 @@
         }
       }
     },
-    "/admin/subscription/manual-upgrade/revoke": {
+    "/api/admin/subscription/manual-upgrade/revoke": {
       "post": {
         "summary": "Revoke manual upgrade and revert to Free/Inactive",
         "tags": [
@@ -1877,7 +1877,7 @@
         }
       }
     },
-    "/admin/transfers": {
+    "/api/admin/transfers": {
       "get": {
         "summary": "Get all transfers (queue)",
         "tags": [
@@ -1951,7 +1951,7 @@
         }
       }
     },
-    "/admin/kyc/pending": {
+    "/api/admin/kyc/pending": {
       "get": {
         "summary": "Get pending KYC requests",
         "tags": [
@@ -1969,7 +1969,7 @@
         }
       }
     },
-    "/admin/kyc/user/{id}": {
+    "/api/admin/kyc/user/{id}": {
       "put": {
         "summary": "Update User KYC status",
         "tags": [
@@ -2022,7 +2022,7 @@
         }
       }
     },
-    "/admin/kyc/business/{id}": {
+    "/api/admin/kyc/business/{id}": {
       "put": {
         "summary": "Update Business KYC status",
         "tags": [
@@ -2075,7 +2075,7 @@
         }
       }
     },
-    "/assignments": {
+    "/api/assignments": {
       "post": {
         "summary": "Assign tasks to users",
         "tags": [
@@ -2150,7 +2150,7 @@
         }
       }
     },
-    "/assignments/{taskId}": {
+    "/api/assignments/{taskId}": {
       "get": {
         "summary": "Get assignments for a task",
         "tags": [
@@ -2203,7 +2203,7 @@
         }
       }
     },
-    "/assignments/{assignmentId}": {
+    "/api/assignments/{assignmentId}": {
       "delete": {
         "summary": "Remove an assignment",
         "tags": [
@@ -2250,7 +2250,7 @@
         }
       }
     },
-    "/auth/register": {
+    "/api/auth/register": {
       "post": {
         "summary": "Register a new business and admin user",
         "tags": [
@@ -2323,7 +2323,7 @@
         }
       }
     },
-    "/auth/verify-otp": {
+    "/api/auth/verify-otp": {
       "post": {
         "summary": "Verify email with OTP",
         "tags": [
@@ -2383,7 +2383,7 @@
         }
       }
     },
-    "/auth/forgot-password": {
+    "/api/auth/forgot-password": {
       "post": {
         "summary": "Request password reset",
         "tags": [
@@ -2418,7 +2418,7 @@
         }
       }
     },
-    "/auth/verify-reset-otp": {
+    "/api/auth/verify-reset-otp": {
       "post": {
         "summary": "Verify password reset OTP",
         "tags": [
@@ -2457,7 +2457,7 @@
         }
       }
     },
-    "/auth/reset-password": {
+    "/api/auth/reset-password": {
       "post": {
         "summary": "Reset password",
         "tags": [
@@ -2500,7 +2500,7 @@
         }
       }
     },
-    "/auth/resend-otp": {
+    "/api/auth/resend-otp": {
       "post": {
         "summary": "Resend OTP",
         "tags": [
@@ -2535,7 +2535,7 @@
         }
       }
     },
-    "/auth/login": {
+    "/api/auth/login": {
       "post": {
         "summary": "Login user",
         "tags": [
@@ -2595,7 +2595,7 @@
         }
       }
     },
-    "/comments/{taskId}": {
+    "/api/comments/{taskId}": {
       "get": {
         "summary": "Get comments for a task",
         "tags": [
@@ -2663,7 +2663,7 @@
         }
       }
     },
-    "/comments": {
+    "/api/comments": {
       "post": {
         "summary": "Create a new comment",
         "tags": [
@@ -2731,7 +2731,7 @@
         }
       }
     },
-    "/comments/{commentId}": {
+    "/api/comments/{commentId}": {
       "delete": {
         "summary": "Delete a comment",
         "tags": [
@@ -2778,7 +2778,7 @@
         }
       }
     },
-    "/comments/{commentId}/reaction": {
+    "/api/comments/{commentId}/reaction": {
       "put": {
         "summary": "Toggle reaction on a comment",
         "tags": [
@@ -2835,7 +2835,7 @@
         }
       }
     },
-    "/dashboard/metrics": {
+    "/api/dashboard/metrics": {
       "get": {
         "summary": "Get dashboard metrics",
         "tags": [
@@ -2884,7 +2884,7 @@
         }
       }
     },
-    "/demo": {
+    "/api/demo": {
       "get": {
         "summary": "Demo endpoint",
         "tags": [
@@ -2909,7 +2909,7 @@
         }
       }
     },
-    "/epics": {
+    "/api/epics": {
       "get": {
         "summary": "Get all epics",
         "tags": [
@@ -3027,7 +3027,7 @@
         }
       }
     },
-    "/epics/{epicId}/link-tasks": {
+    "/api/epics/{epicId}/link-tasks": {
       "post": {
         "summary": "Link tasks to an epic",
         "tags": [
@@ -3081,7 +3081,7 @@
         }
       }
     },
-    "/epics/backfill": {
+    "/api/epics/backfill": {
       "post": {
         "summary": "Backfill epics from tasks",
         "tags": [
@@ -3117,7 +3117,7 @@
         }
       }
     },
-    "/fees": {
+    "/api/fees": {
       "get": {
         "summary": "View applicable fees",
         "tags": [
@@ -3135,7 +3135,7 @@
         }
       }
     },
-    "/ideas": {
+    "/api/ideas": {
       "get": {
         "summary": "Get all ideas",
         "tags": [
@@ -3233,7 +3233,7 @@
         }
       }
     },
-    "/ideas/{id}/status": {
+    "/api/ideas/{id}/status": {
       "put": {
         "summary": "Update idea status",
         "tags": [
@@ -3308,7 +3308,7 @@
         }
       }
     },
-    "/ideas/{id}": {
+    "/api/ideas/{id}": {
       "put": {
         "summary": "Update an idea (title and description)",
         "tags": [
@@ -3419,7 +3419,7 @@
         }
       }
     },
-    "/kyc/status": {
+    "/api/kyc/status": {
       "get": {
         "summary": "Get KYC status for current user and business",
         "tags": [
@@ -3491,7 +3491,7 @@
         }
       }
     },
-    "/kyc/initiate": {
+    "/api/kyc/initiate": {
       "post": {
         "summary": "Initiate KYC verification (BVN or NIN)",
         "tags": [
@@ -3531,7 +3531,7 @@
         }
       }
     },
-    "/kyc/verify-otp": {
+    "/api/kyc/verify-otp": {
       "post": {
         "summary": "Verify OTP to complete KYC",
         "tags": [
@@ -3564,7 +3564,7 @@
         }
       }
     },
-    "/kyc/business": {
+    "/api/kyc/business": {
       "post": {
         "summary": "Submit Business KYC (Address, Proof of Address)",
         "tags": [
@@ -3613,7 +3613,7 @@
         }
       }
     },
-    "/payroll/adjustments": {
+    "/api/payroll/adjustments": {
       "post": {
         "summary": "Add a payroll adjustment (bonus or deduction)",
         "tags": [
@@ -3697,7 +3697,7 @@
         }
       }
     },
-    "/payroll/adjustments/{id}": {
+    "/api/payroll/adjustments/{id}": {
       "delete": {
         "summary": "Delete/Cancel a pending adjustment",
         "tags": [
@@ -3725,7 +3725,7 @@
         }
       }
     },
-    "/payroll/summary": {
+    "/api/payroll/summary": {
       "get": {
         "summary": "Get payroll summary for all team members",
         "tags": [
@@ -3797,7 +3797,7 @@
         }
       }
     },
-    "/payroll/user/{id}": {
+    "/api/payroll/user/{id}": {
       "put": {
         "summary": "Update user payroll details",
         "tags": [
@@ -3856,7 +3856,7 @@
         }
       }
     },
-    "/payroll/config": {
+    "/api/payroll/config": {
       "get": {
         "summary": "Get payroll configuration (salary interval)",
         "tags": [
@@ -3920,7 +3920,7 @@
         }
       }
     },
-    "/ideas/{ideaId}/documentation": {
+    "/api/ideas/{ideaId}/documentation": {
       "post": {
         "summary": "Generate product documentation for an idea",
         "tags": [
@@ -4007,7 +4007,7 @@
         }
       }
     },
-    "/product-documentation/{id}": {
+    "/api/product-documentation/{id}": {
       "put": {
         "summary": "Update product documentation",
         "tags": [
@@ -4095,7 +4095,7 @@
         }
       }
     },
-    "/product-documentation/{id}/regenerate": {
+    "/api/product-documentation/{id}/regenerate": {
       "post": {
         "summary": "Regenerate product documentation",
         "tags": [
@@ -4156,7 +4156,7 @@
         }
       }
     },
-    "/product-documentation/{id}/pdf": {
+    "/api/product-documentation/{id}/pdf": {
       "get": {
         "summary": "Download product documentation as PDF",
         "tags": [
@@ -4226,7 +4226,7 @@
         }
       }
     },
-    "/providers/requirements": {
+    "/api/providers/requirements": {
       "get": {
         "summary": "Get requirements for the active/default provider or a specific provider",
         "tags": [
@@ -4249,7 +4249,7 @@
         }
       }
     },
-    "/providers/list": {
+    "/api/providers/list": {
       "get": {
         "summary": "Get list of available payment providers",
         "tags": [
@@ -4262,7 +4262,7 @@
         }
       }
     },
-    "/settings": {
+    "/api/settings": {
       "get": {
         "summary": "Get business settings",
         "tags": [
@@ -4362,7 +4362,7 @@
         }
       }
     },
-    "/settings/update-contact/request-otp": {
+    "/api/settings/update-contact/request-otp": {
       "post": {
         "summary": "Request OTP to update business email or phone number",
         "tags": [
@@ -4410,7 +4410,7 @@
         }
       }
     },
-    "/settings/update-contact/verify-otp": {
+    "/api/settings/update-contact/verify-otp": {
       "post": {
         "summary": "Verify OTP and update business email or phone number",
         "tags": [
@@ -4449,7 +4449,7 @@
         }
       }
     },
-    "/settings/otp-preference": {
+    "/api/settings/otp-preference": {
       "put": {
         "summary": "Update transaction OTP preference",
         "tags": [
@@ -4506,7 +4506,7 @@
         }
       }
     },
-    "/subscription/transactions/export": {
+    "/api/subscription/transactions/export": {
       "get": {
         "summary": "Export transactions to CSV",
         "tags": [
@@ -4558,7 +4558,7 @@
         }
       }
     },
-    "/subscription/transactions": {
+    "/api/subscription/transactions": {
       "get": {
         "summary": "Get subscription transaction history",
         "tags": [
@@ -4713,7 +4713,7 @@
         }
       }
     },
-    "/subscription/current": {
+    "/api/subscription/current": {
       "get": {
         "summary": "Get current subscription",
         "tags": [
@@ -4764,7 +4764,7 @@
         }
       }
     },
-    "/subscription/cards": {
+    "/api/subscription/cards": {
       "get": {
         "summary": "Get all payment cards",
         "tags": [
@@ -4824,7 +4824,7 @@
         }
       }
     },
-    "/subscription/plans": {
+    "/api/subscription/plans": {
       "get": {
         "summary": "Get all pricing plans",
         "tags": [
@@ -4881,7 +4881,7 @@
         }
       }
     },
-    "/subscription/cards/initiate": {
+    "/api/subscription/cards/initiate": {
       "post": {
         "summary": "Initiate adding a new card",
         "tags": [
@@ -4920,7 +4920,7 @@
         }
       }
     },
-    "/subscription/cards/{id}": {
+    "/api/subscription/cards/{id}": {
       "delete": {
         "summary": "Remove a payment card",
         "tags": [
@@ -4955,7 +4955,7 @@
         }
       }
     },
-    "/subscription/cards/{id}/active": {
+    "/api/subscription/cards/{id}/active": {
       "put": {
         "summary": "Set a card as active for subscription",
         "tags": [
@@ -4990,7 +4990,7 @@
         }
       }
     },
-    "/subscription/initiate-payment": {
+    "/api/subscription/initiate-payment": {
       "post": {
         "summary": "Initiate a payment",
         "tags": [
@@ -5054,7 +5054,7 @@
         }
       }
     },
-    "/subscription/verify-payment": {
+    "/api/subscription/verify-payment": {
       "post": {
         "summary": "Verify a payment (Subscription or Card Addition)",
         "tags": [
@@ -5096,9 +5096,9 @@
         }
       }
     },
-    "/subscription/downgrade": {
+    "/api/subscription/downgrade": {
       "post": {
-        "summary": "Downgrade to free plan",
+        "summary": "Downgrade plan",
         "tags": [
           "Subscription"
         ],
@@ -5107,9 +5107,25 @@
             "bearerAuth": []
           }
         ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "planId": {
+                    "type": "string",
+                    "description": "Target plan ID (defaults to free plan if not provided)"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Downgraded successfully",
+            "description": "Downgrade requested successfully",
             "content": {
               "application/json": {
                 "schema": {
@@ -5129,8 +5145,8 @@
           "401": {
             "description": "Unauthorized"
           },
-          "403": {
-            "description": "Trial exhausted"
+          "404": {
+            "description": "Plan not found"
           },
           "500": {
             "description": "Server error"
@@ -5138,7 +5154,7 @@
         }
       }
     },
-    "/subscription/cancel": {
+    "/api/subscription/cancel": {
       "post": {
         "summary": "Cancel subscription",
         "tags": [
@@ -5180,7 +5196,7 @@
         }
       }
     },
-    "/subscription/cron/process-renewals": {
+    "/api/subscription/cron/process-renewals": {
       "post": {
         "summary": "Process subscription renewals (Cron)",
         "tags": [
@@ -5205,7 +5221,7 @@
         }
       }
     },
-    "/tasks": {
+    "/api/tasks": {
       "get": {
         "summary": "Get all tasks",
         "tags": [
@@ -5363,7 +5379,7 @@
         }
       }
     },
-    "/tasks/bulk": {
+    "/api/tasks/bulk": {
       "post": {
         "summary": "Bulk create tasks",
         "tags": [
@@ -5513,7 +5529,7 @@
         }
       }
     },
-    "/tasks/{id}": {
+    "/api/tasks/{id}": {
       "delete": {
         "summary": "Delete a task",
         "tags": [
@@ -5560,7 +5576,7 @@
         }
       }
     },
-    "/team/ranking": {
+    "/api/team/ranking": {
       "get": {
         "summary": "Get team ranking based on completed tasks",
         "tags": [
@@ -5616,7 +5632,7 @@
         }
       }
     },
-    "/team/ranking/top": {
+    "/api/team/ranking/top": {
       "get": {
         "summary": "Get top 3 team members based on completed tasks",
         "tags": [
@@ -5672,7 +5688,7 @@
         }
       }
     },
-    "/team": {
+    "/api/team": {
       "get": {
         "summary": "Get all team members",
         "tags": [
@@ -5749,7 +5765,7 @@
         }
       }
     },
-    "/team/invite": {
+    "/api/team/invite": {
       "post": {
         "summary": "Invite a new team member",
         "tags": [
@@ -5817,7 +5833,7 @@
         }
       }
     },
-    "/team/accept-invite/{token}": {
+    "/api/team/accept-invite/{token}": {
       "post": {
         "summary": "Accept team invitation",
         "tags": [
@@ -5876,7 +5892,7 @@
         }
       }
     },
-    "/team/verify-invite/{token}": {
+    "/api/team/verify-invite/{token}": {
       "get": {
         "summary": "Verify invitation token",
         "tags": [
@@ -5902,7 +5918,7 @@
         }
       }
     },
-    "/team/{id}": {
+    "/api/team/{id}": {
       "get": {
         "summary": "Get team member by ID",
         "tags": [
@@ -5977,7 +5993,7 @@
         }
       }
     },
-    "/team/{id}/status": {
+    "/api/team/{id}/status": {
       "patch": {
         "summary": "Update team member status",
         "tags": [
@@ -6045,7 +6061,7 @@
         }
       }
     },
-    "/team/{id}/role": {
+    "/api/team/{id}/role": {
       "patch": {
         "summary": "Update team member role",
         "tags": [
@@ -6114,11 +6130,11 @@
         }
       }
     },
-    "/api/transfers/account-lookup": {
+    "/api/test-communications/send": {
       "post": {
-        "summary": "Lookup account details",
+        "summary": "Send test SMS or Email",
         "tags": [
-          "Transfers"
+          "Test Communications"
         ],
         "requestBody": {
           "required": true,
@@ -6127,15 +6143,42 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "bank_code",
-                  "account_number"
+                  "type",
+                  "category",
+                  "recipient"
                 ],
                 "properties": {
-                  "bank_code": {
-                    "type": "string"
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "sms",
+                      "email"
+                    ],
+                    "description": "Type of communication to send"
                   },
-                  "account_number": {
-                    "type": "string"
+                  "category": {
+                    "type": "string",
+                    "description": "Category of message (see examples for available categories)"
+                  },
+                  "recipient": {
+                    "type": "string",
+                    "description": "Phone number for SMS or email address for Email"
+                  },
+                  "otp": {
+                    "type": "string",
+                    "description": "Optional custom OTP (auto-generated if not provided)"
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Optional recipient name (for email)"
+                  },
+                  "purpose": {
+                    "type": "string",
+                    "description": "Optional purpose (for OTP emails)"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional SMS provider (e.g., kudi or termii)"
                   }
                 }
               }
@@ -6144,116 +6187,31 @@
         },
         "responses": {
           "200": {
-            "description": "Account details"
+            "description": "Message sent successfully"
           },
           "400": {
-            "description": "Bad request"
+            "description": "Invalid input"
           }
         }
       }
     },
-    "/api/transfers/bulk": {
-      "post": {
-        "summary": "Initiate bulk transfer",
-        "tags": [
-          "Transfers"
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "transfers"
-                ],
-                "properties": {
-                  "transfers": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "required": [
-                        "recipient_account",
-                        "recipient_bank",
-                        "recipient_name",
-                        "amount"
-                      ],
-                      "properties": {
-                        "recipient_account": {
-                          "type": "string"
-                        },
-                        "recipient_bank": {
-                          "type": "string"
-                        },
-                        "recipient_name": {
-                          "type": "string"
-                        },
-                        "amount": {
-                          "type": "number"
-                        },
-                        "remark": {
-                          "type": "string"
-                        },
-                        "source_type": {
-                          "type": "string"
-                        },
-                        "source_id": {
-                          "type": "string"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Transfers queued"
-          }
-        }
-      }
-    },
-    "/api/transfers": {
+    "/api/test-communications/categories": {
       "get": {
-        "summary": "Get transfer history",
+        "summary": "Get available categories for SMS and Email",
         "tags": [
-          "Transfers"
+          "Test Communications"
         ],
         "responses": {
           "200": {
-            "description": "List of transfers"
+            "description": "List of available categories"
           }
         }
       }
     },
-    "/api/transfers/{id}/retry": {
-      "post": {
-        "summary": "Retry a failed transfer",
-        "tags": [
-          "Transfers"
-        ],
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Transfer retried"
-          }
-        }
-      }
-    },
-    "/transfers/otp/request": {
+    "/api/transfers/otp/request": {
       "post": {
         "summary": "Request OTP for transfer authorization",
+        "description": "Sends an OTP (One-Time Password) to the authenticated user using their preferred method (email or SMS). The OTP is required to initiate any single or bulk transfer.",
         "tags": [
           "Transfers"
         ],
@@ -6263,6 +6221,7 @@
           }
         ],
         "requestBody": {
+          "required": false,
           "content": {
             "application/json": {
               "schema": {
@@ -6270,8 +6229,21 @@
                 "properties": {
                   "wallet_id": {
                     "type": "string",
-                    "description": "Optional wallet ID to charge SMS fee from"
+                    "format": "uuid",
+                    "description": "Optional wallet ID to charge SMS fee from (if SMS is the OTP method)"
                   }
+                }
+              },
+              "examples": {
+                "WithWalletId": {
+                  "summary": "Request OTP with wallet ID for SMS fee",
+                  "value": {
+                    "wallet_id": "550e8400-e29b-41d4-a716-446655440000"
+                  }
+                },
+                "WithoutWalletId": {
+                  "summary": "Request OTP without wallet ID (uses default wallet)",
+                  "value": {}
                 }
               }
             }
@@ -6279,14 +6251,77 @@
         },
         "responses": {
           "200": {
-            "description": "OTP sent"
+            "description": "OTP sent successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "OTP sent successfully"
+                    },
+                    "fee_charged": {
+                      "type": "number",
+                      "description": "Fee charged for SMS (if applicable)",
+                      "example": 10.5
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (e.g., no wallet found for SMS fee)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "No NGN wallet found to charge OTP fee"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "Failed to request OTP"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/transfers/single": {
+    "/api/transfers/single": {
       "post": {
         "summary": "Initiate a single transfer",
+        "description": "Queues a single transfer to a recipient's bank account. Requires a valid OTP obtained from /transfers/otp/request.",
         "tags": [
           "Transfers"
         ],
@@ -6309,25 +6344,63 @@
                 ],
                 "properties": {
                   "bankCode": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Bank code of the recipient's bank (use /transfers/banks to get valid codes)",
+                    "example": "058"
                   },
                   "accountNumber": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Recipient's bank account number",
+                    "example": "0123456789"
                   },
                   "accountName": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Recipient's account name (optional, but recommended to verify)",
+                    "example": "John Doe"
                   },
                   "amount": {
-                    "type": "number"
+                    "type": "number",
+                    "description": "Amount to transfer (in major currency unit, e.g., NGN)",
+                    "example": 5000
                   },
                   "remark": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Optional remark for the transfer",
+                    "example": "Payment for services"
                   },
                   "otp": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "OTP obtained from /transfers/otp/request",
+                    "example": "123456"
                   },
                   "wallet_id": {
-                    "type": "string"
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Optional wallet ID to debit from (uses default wallet if not provided)",
+                    "example": "550e8400-e29b-41d4-a716-446655440000"
+                  }
+                }
+              },
+              "examples": {
+                "Example1": {
+                  "summary": "Single transfer with all fields",
+                  "value": {
+                    "bankCode": "058",
+                    "accountNumber": "0123456789",
+                    "accountName": "John Doe",
+                    "amount": 5000,
+                    "remark": "Payment for services",
+                    "otp": "123456",
+                    "wallet_id": "550e8400-e29b-41d4-a716-446655440000"
+                  }
+                },
+                "Example2": {
+                  "summary": "Single transfer with minimal fields",
+                  "value": {
+                    "bankCode": "033",
+                    "accountNumber": "9876543210",
+                    "amount": 10000,
+                    "otp": "654321"
                   }
                 }
               }
@@ -6336,14 +6409,143 @@
         },
         "responses": {
           "200": {
-            "description": "Transfer queued"
+            "description": "Transfer queued successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Transfer initiated successfully"
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid",
+                          "description": "Unique ID of the queued transfer"
+                        },
+                        "reference": {
+                          "type": "string",
+                          "description": "Unique transfer reference"
+                        },
+                        "amount": {
+                          "type": "number",
+                          "description": "Transfer amount"
+                        },
+                        "currency": {
+                          "type": "string",
+                          "description": "Transfer currency"
+                        },
+                        "fee": {
+                          "type": "number",
+                          "description": "Transfer fee"
+                        },
+                        "total": {
+                          "type": "number",
+                          "description": "Total amount (amount + fee)"
+                        },
+                        "recipient": {
+                          "type": "object",
+                          "properties": {
+                            "accountNumber": {
+                              "type": "string"
+                            },
+                            "bankCode": {
+                              "type": "string"
+                            },
+                            "accountName": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "status": {
+                          "type": "string",
+                          "description": "Transfer status",
+                          "enum": [
+                            "pending",
+                            "processing",
+                            "success",
+                            "failed"
+                          ]
+                        },
+                        "walletId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "description": "Wallet ID used for the transfer"
+                        },
+                        "paymentProvider": {
+                          "type": "string",
+                          "description": "Payment provider used"
+                        },
+                        "createdAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "updatedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (invalid OTP, missing fields, etc.)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "Invalid OTP"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "Failed to initiate transfer"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/transfers/bulk": {
+    "/api/transfers/bulk": {
       "post": {
         "summary": "Initiate a bulk transfer",
+        "description": "Queues multiple transfers at once. Supports different types: Salary (pay active employees) and Epic (custom list of recipients). Requires a valid OTP obtained from /transfers/otp/request.",
         "tags": [
           "Transfers"
         ],
@@ -6366,23 +6568,61 @@
                   "type": {
                     "type": "string",
                     "enum": [
-                      "manual",
-                      "sprint",
-                      "salary",
-                      "task"
-                    ]
+                      "Salary",
+                      "Epic"
+                    ],
+                    "description": "Type of bulk transfer"
                   },
                   "otp": {
                     "type": "string",
-                    "description": "OTP code for authorization"
+                    "description": "OTP code for authorization",
+                    "example": "123456"
                   },
                   "source_wallet_id": {
                     "type": "string",
-                    "description": "ID of the wallet to fund the transfer from"
+                    "format": "uuid",
+                    "description": "ID of the wallet to fund the transfer from (uses default wallet if not provided)",
+                    "example": "550e8400-e29b-41d4-a716-446655440000"
                   },
                   "data": {
                     "type": "object",
-                    "description": "Data depending on type (manual items, sprint name, task IDs)"
+                    "description": "Data depending on transfer type (items for Epic, none for Salary)"
+                  }
+                }
+              },
+              "examples": {
+                "EpicType": {
+                  "summary": "Epic bulk transfer (custom list of recipients)",
+                  "value": {
+                    "type": "Epic",
+                    "otp": "123456",
+                    "source_wallet_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "data": {
+                      "items": [
+                        {
+                          "amount": 5000,
+                          "bankCode": "058",
+                          "accountNumber": "0123456789",
+                          "accountName": "John Doe",
+                          "remark": "Payment for services"
+                        },
+                        {
+                          "amount": 10000,
+                          "bankCode": "033",
+                          "accountNumber": "9876543210",
+                          "accountName": "Jane Smith",
+                          "remark": "Commission"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "SalaryType": {
+                  "summary": "Salary bulk transfer (pay active employees)",
+                  "value": {
+                    "type": "Salary",
+                    "otp": "123456",
+                    "source_wallet_id": "550e8400-e29b-41d4-a716-446655440000"
                   }
                 }
               }
@@ -6391,12 +6631,159 @@
         },
         "responses": {
           "200": {
-            "description": "Transfers queued"
+            "description": "Transfers queued successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Queued 2 transfers for processing"
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "queued": {
+                          "type": "integer",
+                          "description": "Number of transfers queued",
+                          "example": 2
+                        },
+                        "type": {
+                          "type": "string",
+                          "description": "Type of bulk transfer"
+                        },
+                        "walletId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "description": "Wallet ID used for the transfers"
+                        },
+                        "totals": {
+                          "type": "object",
+                          "properties": {
+                            "amount": {
+                              "type": "number",
+                              "description": "Total transfer amount"
+                            },
+                            "fee": {
+                              "type": "number",
+                              "description": "Total transfer fee"
+                            },
+                            "total": {
+                              "type": "number",
+                              "description": "Total amount (amount + fee)"
+                            }
+                          }
+                        },
+                        "transfers": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string",
+                                "format": "uuid"
+                              },
+                              "reference": {
+                                "type": "string"
+                              },
+                              "amount": {
+                                "type": "number"
+                              },
+                              "currency": {
+                                "type": "string"
+                              },
+                              "fee": {
+                                "type": "number"
+                              },
+                              "recipient": {
+                                "type": "object",
+                                "properties": {
+                                  "accountNumber": {
+                                    "type": "string"
+                                  },
+                                  "bankCode": {
+                                    "type": "string"
+                                  },
+                                  "accountName": {
+                                    "type": "string"
+                                  }
+                                }
+                              },
+                              "status": {
+                                "type": "string",
+                                "enum": [
+                                  "pending",
+                                  "processing",
+                                  "success",
+                                  "failed"
+                                ]
+                              },
+                              "paymentProvider": {
+                                "type": "string"
+                              },
+                              "createdAt": {
+                                "type": "string",
+                                "format": "date-time"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (invalid OTP, missing fields, invalid type, etc.)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "Invalid transfer type"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": false
+                    },
+                    "error": {
+                      "type": "string",
+                      "example": "Failed to initiate bulk transfer"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/transfers": {
+    "/api/transfers": {
       "get": {
         "summary": "Get transfer queue",
         "tags": [
@@ -6509,7 +6896,7 @@
         }
       }
     },
-    "/transfers/{id}/retry": {
+    "/api/transfers/{id}/retry": {
       "post": {
         "summary": "Retry a failed transfer",
         "tags": [
@@ -6526,18 +6913,34 @@
             "name": "id",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "Retry initiated"
+            "description": "Retry initiated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/transfers/banks": {
+    "/api/transfers/banks": {
       "get": {
         "summary": "Get list of supported banks",
         "tags": [
@@ -6581,7 +6984,7 @@
         }
       }
     },
-    "/transfers/lookup": {
+    "/api/transfers/lookup": {
       "post": {
         "summary": "Lookup account name",
         "tags": [
@@ -6621,7 +7024,7 @@
         }
       }
     },
-    "/transfers/account-lookup": {
+    "/api/transfers/account-lookup": {
       "post": {
         "summary": "Lookup account details",
         "tags": [
@@ -6661,7 +7064,7 @@
         }
       }
     },
-    "/wallet/create-virtual-account": {
+    "/api/wallet/create-virtual-account": {
       "post": {
         "summary": "Create Personal or Business Virtual Account (will create new account if provider is different)",
         "tags": [
@@ -6702,7 +7105,7 @@
         }
       }
     },
-    "/wallet": {
+    "/api/wallet": {
       "get": {
         "summary": "Get wallet details (Balance, Virtual Account)",
         "tags": [
@@ -6720,7 +7123,7 @@
         }
       }
     },
-    "/wallet/fund/card": {
+    "/api/wallet/fund/card": {
       "post": {
         "summary": "Initiate wallet funding via Card",
         "tags": [
@@ -6763,7 +7166,7 @@
         }
       }
     },
-    "/wallet/business/create": {
+    "/api/wallet/business/create": {
       "post": {
         "summary": "Create Business Virtual Account (Wallet)",
         "tags": [
@@ -6799,7 +7202,7 @@
         }
       }
     },
-    "/wallet/verify": {
+    "/api/wallet/verify": {
       "get": {
         "summary": "Verify payment transaction",
         "tags": [
@@ -6877,8 +7280,12 @@
       "description": "Team management endpoints"
     },
     {
+      "name": "Test Communications",
+      "description": "Test SMS and Email functionality"
+    },
+    {
       "name": "Transfers",
-      "description": "Transfer management and payout"
+      "description": "Bulk transfer and queue management"
     },
     {
       "name": "Wallet",

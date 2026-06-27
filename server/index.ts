@@ -64,6 +64,7 @@ import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
+import testCommunicationsRouter from "./routes/test-communications";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -365,8 +366,8 @@ export async function createServer() {
     });
   }
 
-  // Check DB status for API routes
-  app.use('/api', (req, res, next) => {
+  // Check DB status for API routes (both / and /api paths)
+  const dbCheckMiddleware = (req, res, next) => {
     if (req.path === '/' || req.path === '/ping' || req.path === '/demo') return next();
     
     if (!isDbReady) {
@@ -380,7 +381,7 @@ export async function createServer() {
       });
     }
     next();
-  });
+  };
 
   app.post("/internal/jobs/product-docs/process", async (req, res) => {
     try {
@@ -398,8 +399,11 @@ export async function createServer() {
     }
   });
 
+  // Create a main router for all API endpoints (will be mounted at both / and /api)
+  const mainRouter = express.Router();
+
   // Example API routes
-  app.get("/", (_req, res) => {
+  mainRouter.get("/", (_req, res) => {
     res.json({ 
       message: "Metricorex Backend API is running", 
       docs: "/api-docs",
@@ -407,132 +411,130 @@ export async function createServer() {
     });
   });
 
-  app.get("/api", (_req, res) => {
-    res.json({
-      message: "Metricorex Backend API is running",
-      status: isDbReady ? "online" : "initializing",
-      version: "1.0.0",
-      docs: "/api-docs"
-    });
-  });
-
-  app.get("/api/ping", (_req, res) => {
+  mainRouter.get("/ping", (_req, res) => {
     const ping = process.env.PING_MESSAGE ?? "ping";
     res.json({ message: ping });
   });
 
-  app.get("/api/demo", handleDemo);
+  mainRouter.get("/demo", handleDemo);
 
   // Auth API routes
-  app.post("/api/auth/register", registerBusiness);
-  app.post("/api/auth/verify-otp", verifyOTP);
-  app.post("/api/auth/login", login);
-  app.post("/api/auth/resend-otp", resendOTP);
-  app.post("/api/auth/forgot-password", forgotPassword);
-  app.post("/api/auth/verify-reset-otp", verifyResetOTP);
-  app.post("/api/auth/reset-password", resetPassword);
+  mainRouter.post("/auth/register", registerBusiness);
+  mainRouter.post("/auth/verify-otp", verifyOTP);
+  mainRouter.post("/auth/login", login);
+  mainRouter.post("/auth/resend-otp", resendOTP);
+  mainRouter.post("/auth/forgot-password", forgotPassword);
+  mainRouter.post("/auth/verify-reset-otp", verifyResetOTP);
+  mainRouter.post("/auth/reset-password", resetPassword);
 
   // Tasks API routes
-  app.get("/api/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
-  app.post("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
-  app.post("/api/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
-  app.put("/api/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkUpdateTasks);
-  app.put("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), updateTask);
-  app.delete("/api/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
-  app.delete("/api/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
+  mainRouter.get("/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
+  mainRouter.post("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
+  mainRouter.post("/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
+  mainRouter.put("/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkUpdateTasks);
+  mainRouter.put("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), updateTask);
+  mainRouter.delete("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
+  mainRouter.delete("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
 
   // Team API routes
-  app.get("/api/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
-  app.get("/api/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
-  app.get("/api/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
-  app.get("/api/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
-  app.post("/api/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
-  app.get("/api/team/verify-invite-token/:token", verifyInviteToken);
-  app.post("/api/team/accept-invite/:token", acceptInvite);
-  app.patch(
-    "/api/team/:id/status",
+  mainRouter.get("/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
+  mainRouter.get("/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
+  mainRouter.get("/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
+  mainRouter.get("/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
+  mainRouter.post("/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
+  mainRouter.get("/team/verify-invite-token/:token", verifyInviteToken);
+  mainRouter.post("/team/accept-invite/:token", acceptInvite);
+  mainRouter.patch(
+    "/team/:id/status",
     authenticateToken,
     checkSubscriptionStatus,
     checkFeaturePermission('manage_team'),
     updateTeamMemberStatus,
   );
-  app.put(
-    "/api/team/:id/status",
+  mainRouter.put(
+    "/team/:id/status",
     authenticateToken,
     checkSubscriptionStatus,
     checkFeaturePermission('manage_team'),
     updateTeamMemberStatus,
   );
-  app.patch("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
-  app.put("/api/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
-  app.delete("/api/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
+  mainRouter.patch("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
+  mainRouter.put("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
+  mainRouter.delete("/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
 
   // Comments API routes
-  app.get("/api/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
-  app.get("/api/comments/:taskId", authenticateToken, checkSubscriptionStatus, getComments);
-  app.post("/api/comments", authenticateToken, checkSubscriptionStatus, createComment);
-  app.delete("/api/comments/:commentId", authenticateToken, checkSubscriptionStatus, deleteComment);
-  app.post("/api/comments/:commentId/reaction", authenticateToken, checkSubscriptionStatus, toggleReaction);
+  mainRouter.get("/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
+  mainRouter.get("/comments/:taskId", authenticateToken, checkSubscriptionStatus, getComments);
+  mainRouter.post("/comments", authenticateToken, checkSubscriptionStatus, createComment);
+  mainRouter.delete("/comments/:commentId", authenticateToken, checkSubscriptionStatus, deleteComment);
+  mainRouter.post("/comments/:commentId/reaction", authenticateToken, checkSubscriptionStatus, toggleReaction);
 
   // Epics API routes
-  app.get("/api/epics", authenticateToken, checkSubscriptionStatus, getEpics);
-  app.post("/api/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), createEpic);
-  app.post("/api/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), backfillEpics);
-  app.post("/api/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), linkTasksToEpic);
+  mainRouter.get("/epics", authenticateToken, checkSubscriptionStatus, getEpics);
+  mainRouter.post("/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), createEpic);
+  mainRouter.post("/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), backfillEpics);
+  mainRouter.post("/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), linkTasksToEpic);
 
   // Task assignments API routes
-  app.post("/api/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
-  app.get("/api/assignments/:taskId", authenticateToken, checkSubscriptionStatus, getAssignments);
-  app.delete("/api/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
+  mainRouter.post("/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
+  mainRouter.get("/assignments/:taskId", authenticateToken, checkSubscriptionStatus, getAssignments);
+  mainRouter.delete("/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
 
   // Activity logs API routes
-  app.get("/api/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), getActivityLogs);
+  mainRouter.get("/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), getActivityLogs);
 
   // Ideas API routes
-  app.get("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
-  app.post("/api/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
-  app.put("/api/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
-  app.put("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdea);
-  app.delete("/api/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
+  mainRouter.get("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
+  mainRouter.post("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
+  mainRouter.put("/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
+  mainRouter.put("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdea);
+  mainRouter.delete("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
 
   // Product Documentation API routes
-  app.use("/api/product-docs", productDocsRouter);
-  // Backward-compatible mount at /api to support existing clients
-  app.use("/api", productDocsRouter);
+  mainRouter.use("/product-docs", productDocsRouter);
+  mainRouter.use("/", productDocsRouter); // Backward-compatible mount
 
   // Fee Management Routes
-  app.use("/api/fees", feesRouter);
-  app.use("/api/admin/fees", adminFeesRouter);
+  mainRouter.use("/fees", feesRouter);
+  mainRouter.use("/admin/fees", adminFeesRouter);
 
   // Admin API routes
-  app.use("/api/admin", adminRouter);
+  mainRouter.use("/admin", adminRouter);
 
   // Dashboard API routes
-  app.use("/api/dashboard", dashboardRouter);
+  mainRouter.use("/dashboard", dashboardRouter);
 
   // Subscription API routes
-  app.use("/api/subscription", subscriptionRouter);
+  mainRouter.use("/subscription", subscriptionRouter);
 
   // Webhook API routes
-  app.use("/api/webhook", webhookRouter);
+  mainRouter.use("/webhook", webhookRouter);
 
   // Transfer API routes
-  app.use("/api/transfers", transferRouter);
+  mainRouter.use("/transfers", transferRouter);
 
   // Payroll API routes
-  app.use("/api/payroll", payrollRouter);
+  mainRouter.use("/payroll", payrollRouter);
 
   // Settings API routes
-  app.use("/api/settings", settingsRouter);
+  mainRouter.use("/settings", settingsRouter);
 
   // KYC API routes
-  app.use("/api/kyc", kycRouter);
+  mainRouter.use("/kyc", kycRouter);
 
   // Wallet API routes
-  app.use("/api/wallet", walletRouter);
+  mainRouter.use("/wallet", walletRouter);
 
   // Providers API routes
-  app.use("/api/providers", providersRouter);
+  mainRouter.use("/providers", providersRouter);
+
+  // Test Communications API routes
+  mainRouter.use("/test-communications", testCommunicationsRouter);
+
+  // Mount the main router at both / and /api for backward compatibility
+  app.use(dbCheckMiddleware);
+  app.use("/", mainRouter);
+  app.use("/api", mainRouter);
 
   // Redirect /wallet/verify to /api/wallet/verify (for backward compatibility with old callback URLs)
   app.get("/wallet/verify", (req, res) => {

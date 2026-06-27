@@ -194,7 +194,7 @@ export async function createServer() {
   
   // Start transfer monitor in local environment
   if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
-    startTransferMonitor(30000); // Check every 30 seconds
+    startTransferMonitor(10000); // Check every 10 seconds
   }
   
   // Also add a cron job for serverless environments (though it may not run as frequently)

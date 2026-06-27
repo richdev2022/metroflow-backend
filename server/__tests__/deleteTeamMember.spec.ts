@@ -44,41 +44,45 @@ describe("deleteTeamMember", () => {
     (query as any)
       // 1. Get team member info
       .mockResolvedValueOnce({ rows: [mockTeamMember] })
-      // 2. Unassign from task_assignments (DELETE)
+      // 2. Get business details (owner_id)
+      .mockResolvedValueOnce({ rows: [{ owner_id: "admin-id" }] })
+      // 3. Check active users count
+      .mockResolvedValueOnce({ rows: [{ count: "2" }] })
+      // 4. Unassign from task_assignments (DELETE)
       .mockResolvedValueOnce({})
-      // 3. Reassign tasks created_by (UPDATE)
+      // 5. Reassign tasks created_by (UPDATE)
       .mockResolvedValueOnce({})
-      // 4. Reassign task_assignments assigned_by (UPDATE)
+      // 6. Reassign task_assignments assigned_by (UPDATE)
       .mockResolvedValueOnce({})
-      // 5. Reassign comments (UPDATE)
+      // 7. Reassign comments (UPDATE)
       .mockResolvedValueOnce({})
-      // 6. Reassign attachments (UPDATE)
+      // 8. Reassign attachments (UPDATE)
       .mockResolvedValueOnce({})
-      // 7. Reassign activity logs (UPDATE)
+      // 9. Reassign activity logs (UPDATE)
       .mockResolvedValueOnce({})
-      // 8. Delete user (DELETE)
+      // 10. Delete user (DELETE)
       .mockResolvedValueOnce({ rowCount: 1 });
 
     await deleteTeamMember(req, res, vi.fn());
 
     // Verify all queries were called with correct params
-    expect(query).toHaveBeenCalledTimes(8);
+    expect(query).toHaveBeenCalledTimes(10);
     
     // Check specific queries for our fix
-    // 5. Reassign comments
-    expect(query).toHaveBeenNthCalledWith(5, 
+    // 7. Reassign comments
+    expect(query).toHaveBeenNthCalledWith(7, 
       expect.stringContaining("UPDATE comments SET user_id = $1 WHERE user_id = $2"),
       [mockAdmin.userId, mockTeamMember.id]
     );
 
-    // 6. Reassign attachments
-    expect(query).toHaveBeenNthCalledWith(6, 
+    // 8. Reassign attachments
+    expect(query).toHaveBeenNthCalledWith(8, 
       expect.stringContaining("UPDATE attachments SET uploaded_by = $1 WHERE uploaded_by = $2"),
       [mockAdmin.userId, mockTeamMember.id]
     );
 
-    // 7. Reassign activity logs
-    expect(query).toHaveBeenNthCalledWith(7, 
+    // 9. Reassign activity logs
+    expect(query).toHaveBeenNthCalledWith(9, 
       expect.stringContaining("UPDATE activity_logs SET user_id = $1 WHERE user_id = $2"),
       [mockAdmin.userId, mockTeamMember.id]
     );

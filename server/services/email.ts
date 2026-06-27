@@ -1,129 +1,4 @@
-import axios from "axios";
-import nodemailer from "nodemailer";
-
-// Configure Nodemailer Transporter
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: parseInt(process.env.SMTP_PORT || "587"),
-  secure: process.env.SMTP_SECURE === "true", // true for 465, false for other ports
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
-const BREVO_URL = process.env.BREVO_BASE_URL || "https://api.brevo.com/v3/smtp/email";
-
-async function sendEmailViaBrevo(payload: any) {
-    try {
-        const response = await axios.post(
-            `${BREVO_URL}/v3/smtp/email`,
-            {
-                sender: payload.sender,
-                to: payload.to,
-                subject: payload.subject,
-                htmlContent: payload.htmlContent,
-                replyTo: payload.replyTo
-            },
-            {
-                headers: {
-                    'api-key': BREVO_API_KEY,
-                    'Content-Type': 'application/json',
-                    'accept': 'application/json'
-                },
-                timeout: parseInt(process.env.BREVO_TIMEOUT_SECONDS || '30') * 1000
-            }
-        );
-        console.log("Email sent via Brevo:", response.data?.messageId);
-        return response.data;
-    } catch (error: any) {
-        console.error("Brevo Email Error:", error.response?.data || error.message);
-        throw error;
-    }
-}
-
-export async function sendEmail(
-  to: string | EmailPayload | { email: string; name?: string }[],
-  nameOrSubject?: string,
-  subjectOrHtml?: string,
-  htmlContent?: string
-) {
-  try {
-    let recipientEmail = "";
-    let recipientName = "";
-    let subject = "";
-    let html = "";
-
-    // Handle overload: sendEmail(to: string, name: string, subject: string, html: string)
-    if (typeof to === "string") {
-      recipientEmail = to;
-      recipientName = nameOrSubject || "";
-      subject = subjectOrHtml || "";
-      html = htmlContent || "";
-    } else if (Array.isArray(to)) {
-      const recipients = (to as { email: string; name?: string }[]).map(r => r.email).join(",");
-      recipientEmail = recipients;
-      recipientName = nameOrSubject || "";
-      subject = subjectOrHtml || "";
-      html = htmlContent || "";
-    }
-
-    // Prepare payload for Brevo/Nodemailer
-    let payload: any = {};
-    
-    if (typeof to === 'object' && !Array.isArray(to)) {
-        // It's the object payload style
-        payload = to;
-    } else {
-        // Construct payload from arguments
-        payload = {
-            sender: {
-                name: process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'Metricorex',
-                email: process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_FROM_ADDRESS || 'no-reply@metricorex.com'
-            },
-            to: [{ email: recipientEmail, name: recipientName }],
-            subject: subject,
-            htmlContent: html
-        };
-    }
-
-    // Try Brevo first if API Key is present
-    if (BREVO_API_KEY) {
-        return await sendEmailViaBrevo(payload);
-    }
-
-    // Fallback to Nodemailer
-    if (typeof to === 'object' && !Array.isArray(to)) {
-        // It's the object payload style
-        const info = await transporter.sendMail({
-            from: `"${payload.sender.name}" <${payload.sender.email}>`,
-            to: payload.to.map((r: any) => r.email).join(", "),
-            subject: payload.subject,
-            html: payload.htmlContent,
-            replyTo: payload.replyTo?.email
-        });
-        console.log("Email sent:", info.messageId);
-        return info;
-    }
-    
-    // 4-arg style (or array converted to string)
-    if (recipientEmail) {
-        const info = await transporter.sendMail({
-            from: `"${process.env.EMAIL_FROM_NAME || 'Metricorex'}" <${process.env.EMAIL_FROM_ADDRESS || 'no-reply@metricorex.com'}>`,
-            to: `"${recipientName}" <${recipientEmail}>`,
-            subject: subject,
-            html: html,
-        });
-        console.log("Email sent:", info.messageId);
-        return info;
-    }
-
-  } catch (error) {
-    console.error("Error sending email:", error);
-    // Don't throw to avoid breaking the flow, just log
-  }
-}
+import { sendEmail as sendEmailFromSender } from "./email-sender";
 
 export interface EmailPayload {
   to: Array<{
@@ -139,6 +14,25 @@ export interface EmailPayload {
   replyTo?: {
     email: string;
   };
+}
+
+export async function sendEmail(
+  toOrPayload: string | EmailPayload,
+  nameOrSubject?: string,
+  subjectOrHtml?: string,
+  htmlContent?: string
+) {
+  if (typeof toOrPayload === 'object') {
+    // Object payload: we'll just send to first email for now for backward compatibility
+    const payload = toOrPayload as EmailPayload;
+    if (payload.to.length > 0) {
+      const recipient = payload.to[0];
+      return await sendEmailFromSender(recipient.email, recipient.name || '', payload.subject, payload.htmlContent);
+    }
+  } else {
+    // Regular 4-arg call
+    return await sendEmailFromSender(toOrPayload, nameOrSubject || '', subjectOrHtml || '', htmlContent || '');
+  }
 }
 
 export function generateInviteEmailHtml(

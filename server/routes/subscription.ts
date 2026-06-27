@@ -179,8 +179,9 @@ router.get("/transactions", authenticateToken, async (req, res) => {
 
         if (!businessId && !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-        const { page = 1, limit = 20, status } = req.query;
-        const offset = (Number(page) - 1) * Number(limit);
+        const { page = 1, limit = 20, perPage, status } = req.query;
+        const effectiveLimit = perPage ? Number(perPage) : Number(limit);
+        const offset = (Number(page) - 1) * effectiveLimit;
 
         // Fetch transactions and transfer_queue entries, combine them
         // First, get transactions
@@ -264,7 +265,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             ORDER BY created_at DESC
             LIMIT $${tParamCount + tfParamCount} OFFSET $${tParamCount + tfParamCount + 1}
         `;
-        const combinedParams = [...transactionsParams, ...transfersParams, Number(limit), offset];
+        const combinedParams = [...transactionsParams, ...transfersParams, effectiveLimit, offset];
 
         const result = await query(combinedQuery, combinedParams);
 
@@ -287,8 +288,8 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             pagination: {
                 total,
                 page: Number(page),
-                limit: Number(limit),
-                totalPages: Math.ceil(total / Number(limit))
+                limit: effectiveLimit,
+                totalPages: Math.ceil(total / effectiveLimit)
             }
         });
 

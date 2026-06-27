@@ -69,6 +69,7 @@ import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { processSubscriptionRenewals } from "./services/subscription";
 import { processPendingProductDocJobs } from "./services/productDocJobs";
+import { startTransferMonitor } from "./services/transfer";
 import * as cron from "node-cron";
 import { getStore } from "@netlify/blobs";
 
@@ -190,6 +191,22 @@ export async function createServer() {
   // Update overdue tasks on server startup
   await dbInitPromise;
   await updateOverdueTasks();
+  
+  // Start transfer monitor in local environment
+  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+    startTransferMonitor(30000); // Check every 30 seconds
+  }
+  
+  // Also add a cron job for serverless environments (though it may not run as frequently)
+  cron.schedule("* * * * *", async () => {
+    try {
+      console.log("[Cron] Checking processing transfers...");
+      const { checkProcessingTransfers } = await import("./services/transfer");
+      await checkProcessingTransfers();
+    } catch (error) {
+      console.error("[Cron] Error checking processing transfers:", error);
+    }
+  });
 
   // Logging Middleware
   app.use((req, res, next) => {

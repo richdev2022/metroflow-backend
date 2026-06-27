@@ -391,6 +391,23 @@ export const monnifyProvider: Provider = {
     }
   },
 
+  async verifyTransfer(reference: string) {
+    try {
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/single/query?reference=${reference}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Verify Transfer Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Transfer verification failed"
+      );
+    }
+  },
+
   async accountLookup(bankCode: string, accountNumber: string) {
     try {
       const response = await monnifyClient.get(

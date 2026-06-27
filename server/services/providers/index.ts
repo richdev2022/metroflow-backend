@@ -63,6 +63,7 @@ export interface Provider {
   chargeCard(data: ChargeCardRequest): Promise<any>;
   cancelRecurring(token: string): Promise<any>;
   initiateTransfer(data: TransferRequest): Promise<any>;
+  verifyTransfer(reference: string): Promise<any>;
   accountLookup(bankCode: string, accountNumber: string): Promise<any>;
   getBanks(): any[];
   verifyWebhook(body: any, signature: string): boolean;

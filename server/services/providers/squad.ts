@@ -223,6 +223,21 @@ export const squadProvider: Provider = {
     }
   },
 
+  async verifyTransfer(reference: string) {
+    try {
+      const response = await squadClient.get(`/payout/transfer/${reference}`);
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Squad Verify Transfer Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.message || "Transfer verification failed"
+      );
+    }
+  },
+
   async accountLookup(bankCode: string, accountNumber: string) {
     try {
       const response = await squadClient.post("/payout/account/lookup", {

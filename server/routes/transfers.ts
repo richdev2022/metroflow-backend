@@ -960,8 +960,13 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
       return res.status(400).json({ success: false, error: "Only failed transfers can be retried" });
     }
 
+    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    
     // Reset status to pending and get the updated transfer
-    const updateRes = await query(`UPDATE transfer_queue SET status = 'pending', failure_reason = NULL, reference = $2 WHERE id = $1 RETURNING *`, [id, `TRF-RETRY-${Date.now()}`]);
+    const updateRes = await query(
+      `UPDATE transfer_queue SET status = 'pending', failure_reason = NULL, reference = $2, payment_provider = $3 WHERE id = $1 RETURNING *`,
+      [id, `TRF-RETRY-${Date.now()}`, defaultProvider]
+    );
     const updatedTransfer = updateRes.rows[0];
 
     // Trigger processing

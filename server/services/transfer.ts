@@ -14,6 +14,131 @@ export function toMinorUnit(amount: number | string): string {
   return Math.round(num * 100).toString();
 }
 
+// Helper function to verify a single transfer
+export async function verifySingleTransfer(transfer: any) {
+  try {
+    console.log(`[TransferMonitor] Verifying transfer ${transfer.reference} (ID: ${transfer.id}, Provider: ${transfer.payment_provider})`);
+    
+    const provider = getProvider(transfer.payment_provider);
+    const verificationResponse = await provider.verifyTransfer(transfer.reference);
+    
+    let isSuccess = false;
+    let failureReason = "Unknown error from provider";
+    let shouldRefund = true;
+
+    if (provider.name === 'squad') {
+      isSuccess = verificationResponse.success && (
+        verificationResponse.data?.status === 'success' || 
+        verificationResponse.data?.transaction_status === 'success'
+      );
+      failureReason = verificationResponse.message || 
+                      verificationResponse.data?.failure_reason || 
+                      verificationResponse.data?.error_message || 
+                      "Transfer failed at provider";
+    } else if (provider.name === 'monnify') {
+      isSuccess = verificationResponse.requestSuccessful && (
+        verificationResponse.responseBody?.status === 'SUCCESS' ||
+        verificationResponse.responseBody?.transactionStatus === 'SUCCESS'
+      );
+      failureReason = verificationResponse.responseMessage || 
+                      verificationResponse.responseBody?.failureReason || 
+                      verificationResponse.responseBody?.errorMessage || 
+                      "Transfer failed at provider";
+    }
+
+    console.log(`[TransferMonitor] Transfer ${transfer.reference} - Success: ${isSuccess}, Reason: ${failureReason}`);
+
+    if (isSuccess) {
+      shouldRefund = false;
+      await query(
+        `UPDATE transfer_queue 
+         SET status = 'success', 
+             updated_at = CURRENT_TIMESTAMP, 
+             meta_data = $2 
+         WHERE id = $1`,
+        [transfer.id, JSON.stringify(verificationResponse)]
+      );
+    } else {
+      await query(
+        `UPDATE transfer_queue 
+         SET status = 'failed', 
+             failure_reason = $2, 
+             updated_at = CURRENT_TIMESTAMP, 
+             meta_data = $3 
+         WHERE id = $1`,
+        [transfer.id, failureReason, JSON.stringify(verificationResponse)]
+      );
+    }
+
+    // Handle refunds if needed
+    if (shouldRefund && transfer.wallet_id) {
+      const amount = parseFloat(transfer.amount);
+      const fee = parseFloat(transfer.fee || '0');
+      const totalRefund = amount + fee;
+
+      // Check if we already debited the wallet
+      const txnCheck = await query(
+        `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+        [transfer.reference]
+      );
+      if (txnCheck.rows.length > 0) {
+        console.log(`[TransferMonitor] Refunding transfer ${transfer.reference} - Amount: ${totalRefund}`);
+        
+        await query(
+          `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+          [totalRefund, transfer.wallet_id]
+        );
+        
+        await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+        if (fee > 0) {
+          await debitRevenueWallet(fee, transfer.currency || 'NGN');
+        }
+
+        await query(
+          `INSERT INTO transactions 
+           (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+           VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+          [
+            transfer.business_id, 
+            amount, 
+            transfer.currency || 'NGN', 
+            transfer.reference + '-REFUND', 
+            `Refund for failed transfer: ${transfer.reference}`,
+            transfer.wallet_id
+          ]
+        );
+
+        if (fee > 0) {
+          await query(
+            `INSERT INTO transactions 
+             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+            [
+              transfer.business_id, 
+              fee, 
+              transfer.currency || 'NGN', 
+              transfer.reference + '-FEE-REFUND', 
+              `Refund fee for failed transfer: ${transfer.reference}`,
+              transfer.wallet_id
+            ]
+          );
+        }
+      }
+    }
+
+    // Return updated transfer
+    const updatedRes = await query(
+      `SELECT * FROM transfer_queue WHERE id = $1`,
+      [transfer.id]
+    );
+    return updatedRes.rows[0];
+  } catch (error: any) {
+    console.error(`[TransferMonitor] Error verifying transfer ${transfer.reference}:`, error);
+    return transfer; // Return original transfer if verification fails
+  }
+}
+
 // Background service to check processing transfers
 export async function checkProcessingTransfers() {
     try {
@@ -32,123 +157,7 @@ export async function checkProcessingTransfers() {
         console.log(`[TransferMonitor] Found ${processingTransfers.rows.length} processing transfers`);
 
         for (const transfer of processingTransfers.rows) {
-            try {
-                console.log(`[TransferMonitor] Checking transfer ${transfer.reference} (ID: ${transfer.id}, Provider: ${transfer.payment_provider})`);
-                
-                const provider = getProvider(transfer.payment_provider);
-                const verificationResponse = await provider.verifyTransfer(transfer.reference);
-                
-                let isSuccess = false;
-                let failureReason = "Unknown error from provider";
-                let shouldRefund = true;
-
-                if (provider.name === 'squad') {
-                    // Squad: Check response structure
-                    // Assume Squad returns { success: boolean, data: { status: string, ... } }
-                    isSuccess = verificationResponse.success && (
-                        verificationResponse.data?.status === 'success' || 
-                        verificationResponse.data?.transaction_status === 'success'
-                    );
-                    failureReason = verificationResponse.message || 
-                                    verificationResponse.data?.failure_reason || 
-                                    verificationResponse.data?.error_message || 
-                                    "Transfer failed at provider";
-                } else if (provider.name === 'monnify') {
-                    // Monnify: Check response structure
-                    isSuccess = verificationResponse.requestSuccessful && (
-                        verificationResponse.responseBody?.status === 'SUCCESS' ||
-                        verificationResponse.responseBody?.transactionStatus === 'SUCCESS'
-                    );
-                    failureReason = verificationResponse.responseMessage || 
-                                    verificationResponse.responseBody?.failureReason || 
-                                    verificationResponse.responseBody?.errorMessage || 
-                                    "Transfer failed at provider";
-                }
-
-                console.log(`[TransferMonitor] Transfer ${transfer.reference} - Success: ${isSuccess}, Reason: ${failureReason}`);
-
-                if (isSuccess) {
-                    shouldRefund = false;
-                    await query(
-                        `UPDATE transfer_queue 
-                         SET status = 'success', 
-                             updated_at = CURRENT_TIMESTAMP, 
-                             meta_data = $2 
-                         WHERE id = $1`,
-                        [transfer.id, JSON.stringify(verificationResponse)]
-                    );
-                } else {
-                    await query(
-                        `UPDATE transfer_queue 
-                         SET status = 'failed', 
-                             failure_reason = $2, 
-                             updated_at = CURRENT_TIMESTAMP, 
-                             meta_data = $3 
-                         WHERE id = $1`,
-                        [transfer.id, failureReason, JSON.stringify(verificationResponse)]
-                    );
-                }
-
-                // Handle refunds if needed
-                if (shouldRefund && transfer.wallet_id) {
-                    const amount = parseFloat(transfer.amount);
-                    const fee = parseFloat(transfer.fee || '0');
-                    const totalRefund = amount + fee;
-
-                    // Check if we already debited the wallet (by checking if there's a transaction)
-                    const txnCheck = await query(
-                        `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
-                        [transfer.reference]
-                    );
-                    if (txnCheck.rows.length > 0) {
-                        console.log(`[TransferMonitor] Refunding transfer ${transfer.reference} - Amount: ${totalRefund}`);
-                        
-                        await query(
-                            `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
-                            [totalRefund, transfer.wallet_id]
-                        );
-                        
-                        await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-                        if (fee > 0) {
-                            await debitRevenueWallet(fee, transfer.currency || 'NGN');
-                        }
-
-                        await query(
-                            `INSERT INTO transactions 
-                             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                            [
-                                transfer.business_id, 
-                                amount, 
-                                transfer.currency || 'NGN', 
-                                transfer.reference + '-REFUND', 
-                                `Refund for failed transfer: ${transfer.reference}`,
-                                transfer.wallet_id
-                            ]
-                        );
-
-                        if (fee > 0) {
-                            await query(
-                                `INSERT INTO transactions 
-                                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                                [
-                                    transfer.business_id, 
-                                    fee, 
-                                    transfer.currency || 'NGN', 
-                                    transfer.reference + '-FEE-REFUND', 
-                                    `Refund fee for failed transfer: ${transfer.reference}`,
-                                    transfer.wallet_id
-                                ]
-                            );
-                        }
-                    }
-                }
-
-            } catch (error: any) {
-                console.error(`[TransferMonitor] Error checking transfer ${transfer.reference}:`, error);
-            }
+            await verifySingleTransfer(transfer);
         }
     } catch (error: any) {
         console.error("[TransferMonitor] Error in checkProcessingTransfers:", error);
@@ -562,63 +571,24 @@ export async function processTransfer(transferId: string) {
        );
        return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
     } else {
-      // Failed at provider
-      const reason = failureReason;
-      
-      // Refund Wallet
-      if (transfer.wallet_id) {
-          const amount = parseFloat(transfer.amount);
-          const fee = parseFloat(transfer.fee || '0');
-          const totalRefund = amount + fee;
-
-          await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
-          
-          // Reversal: Debit Platform Wallet (Amount)
-          await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-          // Reversal: Debit Revenue Wallet (Fee)
-          if (fee > 0) {
-              await debitRevenueWallet(fee, transfer.currency || 'NGN');
-          }
-
-          await query(
-              `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-              [
-                  transfer.business_id, 
-                  amount, 
-                  transfer.currency || 'NGN', 
-                  transfer.reference + '-REFUND', 
-                  `Refund for failed transfer: ${transfer.reference}`,
-                  transfer.wallet_id
-              ]
-          );
-
-          if (fee > 0) {
-            await query(
-                `INSERT INTO transactions 
-                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                [
-                    transfer.business_id, 
-                    fee, 
-                    transfer.currency || 'NGN', 
-                    transfer.reference + '-FEE-REFUND', 
-                    `Refund fee for failed transfer: ${transfer.reference}`,
-                    transfer.wallet_id
-                ]
-            );
-        }
-      }
-
+      // If provider didn't immediately confirm success, mark as processing and try to verify immediately
       await query(
-         `UPDATE transfer_queue 
-          SET status = 'failed', failure_reason = $2, updated_at = CURRENT_TIMESTAMP 
-          WHERE id = $1`,
-         [transfer.id, reason]
-       );
-       throw new Error(reason);
+        `UPDATE transfer_queue 
+         SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
+         WHERE id = $1`,
+        [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
+      );
+      
+      // Try immediate verification
+      const updatedTransfer = await verifySingleTransfer(transfer);
+      
+      if (updatedTransfer.status === 'success') {
+        return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
+      } else if (updatedTransfer.status === 'failed') {
+        throw new Error(updatedTransfer.failure_reason || "Transfer failed");
+      }
+      
+      return { success: true, message: "Transfer is being processed", data: response.responseBody || response.data };
     }
 
   } catch (error: any) {

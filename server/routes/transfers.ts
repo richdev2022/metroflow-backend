@@ -998,6 +998,39 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
   }
 });
 
+router.post("/:id/verify", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+
+    // Verify ownership
+    const check = await query(`SELECT * FROM transfer_queue WHERE id = $1 AND business_id = $2`, [id, businessId]);
+    if (check.rows.length === 0) return res.status(404).json({ success: false, error: "Transfer not found" });
+    
+    const transfer = check.rows[0];
+
+    if (transfer.status === 'success' || transfer.status === 'failed') {
+      return res.json({ 
+        success: true, 
+        message: "Transfer already in final state", 
+        data: transfer 
+      });
+    }
+
+    // Import verifySingleTransfer
+    const { verifySingleTransfer } = await import("../services/transfer");
+    const updatedTransfer = await verifySingleTransfer(transfer);
+
+    res.json({ 
+      success: true, 
+      message: updatedTransfer.status === 'success' ? "Transfer completed successfully" : "Transfer failed",
+      data: updatedTransfer
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Failed to verify transfer" });
+  }
+});
+
 /**
  * @swagger
  * /transfers/banks:

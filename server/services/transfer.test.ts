@@ -9,10 +9,12 @@ vi.mock('../db', () => ({
 
 // Mock the providers factory to return a mock squad provider
 const mockInitiateTransfer = vi.fn();
+const mockVerifyTransfer = vi.fn();
 vi.mock('./providers/factory', () => ({
   getProvider: () => ({
     name: 'squad',
     initiateTransfer: mockInitiateTransfer,
+    verifyTransfer: mockVerifyTransfer,
     getBanks: () => [],
     createVirtualAccount: vi.fn(),
     createBusinessVirtualAccount: vi.fn(),
@@ -94,15 +96,30 @@ describe('processAllPending', () => {
             data: { id: 'sq_1' } 
         });
 
-        // 10. Debit Platform Wallet (Success) - Amount only = 100
+        // 10. Update transfer_queue to processing (new step added)
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+
+        // 11. Debit Platform Wallet (Success) - Amount only = 100
         // inside debitPlatformWallet -> creditPlatformWallet:
         //   a. Select Operational Wallet (returns existing one)
         mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] });
         //   b. Update Operational Wallet (-100)
         mockQuery.mockResolvedValueOnce({ rows: [] });
 
-        // 11. Update Transfer Queue (Success)
+        // 12. Mock verifyTransfer success
+        mockVerifyTransfer.mockResolvedValue({
+            success: true,
+            data: {
+                status: 'success',
+                transaction_status: 'success'
+            }
+        });
+
+        // 13. verifySingleTransfer calls:
+        //   a. Update transfer_queue to success
         mockQuery.mockResolvedValueOnce({ rows: [] });
+        //   b. Get updated transfer
+        mockQuery.mockResolvedValueOnce({ rows: [{ ...transfer, status: 'success' }] });
 
         await processAllPending(businessId);
 
@@ -159,25 +176,38 @@ describe('processAllPending', () => {
         // 9. Squad Fails
         mockInitiateTransfer.mockResolvedValue({ success: false, message: 'Failed' });
 
-        // Failure handling
-        // 10. Refund User Wallet (110)
+        // 10. Update transfer_queue to processing (new step added)
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+
+        // 11. Mock verifyTransfer failed
+        mockVerifyTransfer.mockResolvedValue({
+            success: false,
+            message: 'Failed',
+            data: {
+                status: 'failed',
+                failure_reason: 'Failed'
+            }
+        });
+
+        // 12. verifySingleTransfer calls:
+        //   a. Update transfer_queue to failed
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        //   b. Check if we debited (txnCheck)
+        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'txn_1' }] });
+        //   c. Refund user wallet
         mockQuery.mockResolvedValueOnce({ rows: [] }); 
-        
-        // 11. Reverse Platform Wallet (Debit 100)
+        //   d. Reverse Platform Wallet (Debit 100)
         mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] }); // a. Get Op
         mockQuery.mockResolvedValueOnce({ rows: [] }); // b. Update Op (-100)
-
-        // 12. Reverse Revenue Wallet (Debit 10)
+        //   e. Reverse Revenue Wallet (Debit 10)
         mockQuery.mockResolvedValueOnce({ rows: [{ id: 'rev_1' }] }); // a. Get Rev
         mockQuery.mockResolvedValueOnce({ rows: [] }); // b. Update Rev (-10)
-
-        // 13. Record Refund Txn 1
+        //   f. Record Refund Txn 1
         mockQuery.mockResolvedValueOnce({ rows: [] });
-        // 14. Record Refund Txn 2
+        //   g. Record Refund Txn 2
         mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 15. Update Transfer Queue (Failed)
-        mockQuery.mockResolvedValueOnce({ rows: [] });
+        //   h. Get updated transfer
+        mockQuery.mockResolvedValueOnce({ rows: [{ ...transfer, status: 'failed' }] });
 
         await processAllPending(businessId);
     });

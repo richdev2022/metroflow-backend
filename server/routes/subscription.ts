@@ -289,7 +289,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             ORDER BY created_at DESC
             LIMIT $${tParamCount + tfParamCount} OFFSET $${tParamCount + tfParamCount + 1}
         `;
-        const combinedParams = [...transactionsParams, ...transfersParams, effectiveLimit, offset];
+        const combinedParams = [...transactionsParams, ...transactionsParams, effectiveLimit, offset];
 
         const result = await query(combinedQuery, combinedParams);
 
@@ -302,7 +302,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             )
             SELECT COUNT(*) as total FROM combined
         `;
-        const countParams = [...transactionsParams, ...transfersParams];
+        const countParams = [...transactionsParams, ...transactionsParams];
         const countResult = await query(countQuery, countParams);
         const total = parseInt(countResult.rows[0].total);
 

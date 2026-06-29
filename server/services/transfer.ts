@@ -277,80 +277,22 @@ export async function processAllPending(businessId: string) {
         failureReason = response.responseMessage || "Unknown error from Monnify";
       }
 
+      // Always mark as processing first, then verify immediately
+      await query(
+        `UPDATE transfer_queue 
+         SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
+         WHERE id = $1`,
+        [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
+      );
+      
+      // Debit Platform Wallet (Amount only) if initial response was success
       if (isSuccess) {
-         // 4. Success (or queued at provider side)
-         // Debit Platform Wallet (Amount only) as it has been sent out
-         const amount = parseFloat(transfer.amount);
-         await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-         // Update payment_provider and provider_metadata in transfer_queue
-         await query(
-           `UPDATE transfer_queue 
-            SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
-            WHERE id = $1`,
-           [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
-         );
-      } else {
-        // Failed at provider immediate response
-        const reason = failureReason;
-        
-        // Refund Wallet
-        if (transfer.wallet_id) {
-            const amount = parseFloat(transfer.amount);
-            const fee = parseFloat(transfer.fee || '0');
-            const totalRefund = amount + fee;
-
-            await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
-            
-            // Reversal: Debit Platform Wallet (Amount)
-            await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-            // Reversal: Debit Revenue Wallet (Fee)
-            if (fee > 0) {
-                await debitRevenueWallet(fee, transfer.currency || 'NGN');
-            }
-
-            // Record Refund Transaction (Amount)
-            await query(
-                `INSERT INTO transactions 
-                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                [
-                    transfer.business_id, 
-                    amount, 
-                    transfer.currency || 'NGN', 
-                    transfer.reference + '-REFUND', 
-                    `Refund for failed transfer: ${transfer.reference}`,
-                    transfer.wallet_id
-                ]
-            );
-
-            // Refund Fee logic
-            if (fee > 0) {
-                // Record Fee Refund
-                await query(
-                    `INSERT INTO transactions 
-                     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                     VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                    [
-                        transfer.business_id, 
-                        fee, 
-                        transfer.currency || 'NGN', 
-                        transfer.reference + '-FEE-REFUND', 
-                        `Refund fee for failed transfer: ${transfer.reference}`,
-                        transfer.wallet_id
-                    ]
-                );
-            }
-        }
-
-        await query(
-           `UPDATE transfer_queue 
-            SET status = 'failed', failure_reason = $2, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = $1`,
-           [transfer.id, reason]
-         );
+        const amount = parseFloat(transfer.amount);
+        await debitPlatformWallet(amount, transfer.currency || 'NGN');
       }
+      
+      // Try immediate verification
+      await verifySingleTransfer(transfer);
 
     } catch (error: any) {
       // 5. Handle Exception
@@ -557,39 +499,30 @@ export async function processTransfer(transferId: string) {
       failureReason = response.responseMessage || "Unknown error from Monnify";
     }
 
+    // Always mark as processing first, then verify immediately
+    await query(
+      `UPDATE transfer_queue 
+       SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
+       WHERE id = $1`,
+      [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
+    );
+    
+    // Debit Platform Wallet (Amount only) as it has been sent out
     if (isSuccess) {
-       // Success
-       // Debit Platform Wallet (Amount only) as it has been sent out
-       const amount = parseFloat(transfer.amount);
-       await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-       await query(
-         `UPDATE transfer_queue 
-          SET status = 'success', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
-          WHERE id = $1`,
-         [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
-       );
-       return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
-    } else {
-      // If provider didn't immediately confirm success, mark as processing and try to verify immediately
-      await query(
-        `UPDATE transfer_queue 
-         SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
-         WHERE id = $1`,
-        [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
-      );
-      
-      // Try immediate verification
-      const updatedTransfer = await verifySingleTransfer(transfer);
-      
-      if (updatedTransfer.status === 'success') {
-        return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
-      } else if (updatedTransfer.status === 'failed') {
-        throw new Error(updatedTransfer.failure_reason || "Transfer failed");
-      }
-      
-      return { success: true, message: "Transfer is being processed", data: response.responseBody || response.data };
+      const amount = parseFloat(transfer.amount);
+      await debitPlatformWallet(amount, transfer.currency || 'NGN');
     }
+    
+    // Try immediate verification
+    const updatedTransfer = await verifySingleTransfer(transfer);
+    
+    if (updatedTransfer.status === 'success') {
+      return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
+    } else if (updatedTransfer.status === 'failed') {
+      throw new Error(updatedTransfer.failure_reason || "Transfer failed");
+    }
+    
+    return { success: true, message: "Transfer is being processed", data: response.responseBody || response.data };
 
   } catch (error: any) {
     const reason = error.message || "Internal processing error";

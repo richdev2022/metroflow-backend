@@ -4,6 +4,7 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { query } from "../db";
 import { verifyBVN, verifyNIN } from "../services/prembly";
 import { sendSMS } from "../services/sms";
+import { sendWhatsApp } from "../services/whatsapp";
 import { sendEmail, generateKYCOtpEmailHtml } from "../services/email";
 import { createWallet } from "../services/wallet";
 import { createVirtualAccount } from "../services/squad";
@@ -102,6 +103,10 @@ router.get("/status", authenticateToken, async (req: AuthenticatedRequest, res) 
  *                 enum: [bvn, nin]
  *               number:
  *                 type: string
+ *               otp_method:
+ *                 type: string
+ *                 enum: [sms, whatsapp, email]
+ *                 description: Preferred OTP delivery method (default: sms)
  *     responses:
  *       200:
  *         description: Verification initiated, OTP sent if applicable
@@ -110,7 +115,7 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
-        const { type, number } = req.body;
+        const { type, number, otp_method } = req.body;
 
         if (!['bvn', 'nin'].includes(type) || !number) {
             return res.status(400).json({ success: false, error: "Invalid KYC type or number missing" });
@@ -178,19 +183,30 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
             [number, JSON.stringify(verificationData), otpHash, expiresAt, userId]
         );
 
-        // Send OTP based on Environment
+        // Send OTP based on Environment and chosen method
         const kycEnv = process.env.KYC || 'live';
         const message = `Your Metroflow verification code is: ${otp}. Valid for 10 minutes.`;
+        const chosenMethod = otp_method || 'sms'; // default to sms
 
-        // Always send to phone
-        await sendSMS(phone, message);
-        let messageResponse = "OTP sent to linked phone number.";
-
-        // If Test, also send to email
-        if (kycEnv.toLowerCase() === 'test' && userEmail) {
+        let messageResponse = "";
+        
+        if (chosenMethod === 'whatsapp') {
+            await sendWhatsApp(phone, message);
+            messageResponse = "OTP sent to linked WhatsApp number.";
+        } else if (chosenMethod === 'sms') {
+            await sendSMS(phone, message);
+            messageResponse = "OTP sent to linked phone number.";
+        } else if (chosenMethod === 'email' && userEmail) {
             const emailHtml = generateKYCOtpEmailHtml(userName, otp);
             await sendEmail(userEmail, userName, "KYC Verification OTP", emailHtml);
-            messageResponse = "OTP sent to linked phone number and email (Test Mode).";
+            messageResponse = "OTP sent to email.";
+        }
+
+        // If Test, also send to email as backup
+        if (kycEnv.toLowerCase() === 'test' && userEmail && chosenMethod !== 'email') {
+            const emailHtml = generateKYCOtpEmailHtml(userName, otp);
+            await sendEmail(userEmail, userName, "KYC Verification OTP", emailHtml);
+            messageResponse += " and email (Test Mode).";
         }
 
         res.json({ 

@@ -19,6 +19,11 @@ import {
 import { sendEmail, generateBusinessRegistrationEmailHtml } from "../services/email";
 import { logActivity } from "../services/activity";
 import { generateBusinessId } from "../utils/idGenerator";
+import {
+  checkAccountLockout,
+  recordFailedLogin,
+  recordSuccessfulLogin,
+} from "../services/login-security";
 
 export const registerBusiness: RequestHandler = async (req, res) => {
 /**
@@ -141,7 +146,7 @@ export const registerBusiness: RequestHandler = async (req, res) => {
     // Create admin user
     const otpCode = generateOTP();
     const otpExpiresAt = getOTPExpiry();
-    const passwordHash = hashPassword(input.password);
+    const passwordHash = await hashPassword(input.password);
 
     const userResult = await query(
       `INSERT INTO users
@@ -165,6 +170,20 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       `UPDATE businesses SET owner_id = $1 WHERE id = $2`,
       [user.id, business.id]
     );
+
+    // Seed default task statuses for the new business
+    const defaultStatuses = [
+      { name: 'pending', color: '#6b7280', is_default: true, sort_order: 0 },
+      { name: 'in_progress', color: '#3b82f6', is_default: true, sort_order: 1 },
+      { name: 'completed', color: '#10b981', is_default: true, sort_order: 2 }
+    ];
+    for (const status of defaultStatuses) {
+      await query(
+        `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [business.id, status.name, status.color, status.is_default, status.sort_order]
+      );
+    }
 
     // Log business registration activity
     await logActivity({
@@ -660,7 +679,7 @@ export const resetPassword: RequestHandler = async (req, res) => {
     }
 
     // Update password and clear OTP
-    const passwordHash = hashPassword(input.newPassword);
+    const passwordHash = await hashPassword(input.newPassword);
 
     await query(
       `UPDATE users
@@ -839,6 +858,8 @@ export const login: RequestHandler = async (req, res) => {
  */
   try {
     const input: LoginInput = req.body;
+    const ipAddress = req.ip || req.connection.remoteAddress || undefined;
+    const userAgent = req.headers['user-agent'] || undefined;
     console.log("Login input:", input);
 
     if (!input.email || !input.password) {
@@ -857,6 +878,16 @@ export const login: RequestHandler = async (req, res) => {
       });
     }
 
+    // Check for account lockout
+    const lockoutStatus = await checkAccountLockout(input.email);
+    if (lockoutStatus.locked) {
+      return res.status(403).json({
+        success: false,
+        message: "Account temporarily locked. Please try again later.",
+        lockoutEnd: lockoutStatus.lockoutEnd?.toISOString(),
+      });
+    }
+
     const result = await query(
       `SELECT id, business_id as "businessId", password_hash, email_verified, otp_code, otp_expires_at
        FROM users
@@ -867,6 +898,8 @@ export const login: RequestHandler = async (req, res) => {
 
     if (result.rows.length === 0) {
       console.log("User not found for email:", input.email);
+      // Log failed attempt
+      await recordFailedLogin(input.email, ipAddress, userAgent);
       return res.status(400).json({
         success: false,
         message: "Invalid email or password",
@@ -876,8 +909,10 @@ export const login: RequestHandler = async (req, res) => {
     const user = result.rows[0];
     console.log("User found, email_verified:", user.email_verified);
 
-    if (!verifyPassword(input.password, user.password_hash)) {
+    const passwordValid = await verifyPassword(input.password, user.password_hash);
+    if (!passwordValid) {
       console.log("Password verification failed");
+      await recordFailedLogin(input.email, ipAddress, userAgent);
       return res.status(400).json({
         success: false,
         message: "Invalid email or password",
@@ -903,11 +938,8 @@ export const login: RequestHandler = async (req, res) => {
       });
     }
 
-    // Update last login
-    await query(
-      `UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1`,
-      [user.id],
-    );
+    // Record successful login
+    await recordSuccessfulLogin(input.email, ipAddress, userAgent);
 
     // Log login activity
     await logActivity({

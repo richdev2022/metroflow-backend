@@ -1,13 +1,16 @@
 import crypto from "crypto";
+import bcrypt from "bcrypt";
 import { query } from "../db";
 
-// Simple password hashing (in production, use bcrypt instead)
-export function hashPassword(password: string): string {
-  return crypto.createHash("sha256").update(password).digest("hex");
+// Secure password hashing with bcrypt
+const SALT_ROUNDS = 12;
+
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
 }
 
-export function verifyPassword(password: string, hash: string): boolean {
-  return hashPassword(password) === hash;
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
 }
 
 // OTP Generation

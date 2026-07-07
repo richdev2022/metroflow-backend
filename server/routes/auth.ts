@@ -858,8 +858,16 @@ export const login: RequestHandler = async (req, res) => {
  */
   try {
     const input: LoginInput = req.body;
-    const ipAddress = req.ip || req.connection.remoteAddress || undefined;
-    const userAgent = req.headers['user-agent'] || undefined;
+    // Get IP address with better detection
+    let ipAddress: string | undefined;
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (typeof xForwardedFor === 'string') {
+      // Get first IP in the list (client IP)
+      ipAddress = xForwardedFor.split(',')[0].trim();
+    } else {
+      ipAddress = req.ip || req.connection.remoteAddress;
+    }
+    const userAgent = req.headers['user-agent'];
     console.log("Login input:", input);
 
     if (!input.email || !input.password) {

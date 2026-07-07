@@ -15,7 +15,7 @@ export const getQueueConnection = (): Redis | null => {
   }
 
   connection = new Redis(process.env.REDIS_URL, {
-    maxRetriesPerRequest: 3,
+    maxRetriesPerRequest: null,
     retryStrategy: (times) => Math.min(times * 100, 3000),
   });
 

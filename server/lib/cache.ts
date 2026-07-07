@@ -11,12 +11,12 @@ export function initRedis(): void {
 
   try {
     redisClient = new Redis(process.env.REDIS_URL, {
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => {
-        const delay = Math.min(times * 100, 3000);
-        return delay;
-      },
-    });
+    maxRetriesPerRequest: null,
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 100, 3000);
+      return delay;
+    },
+  });
 
     redisClient.on("connect", () => {
       logger.info("✅ Connected to Redis");

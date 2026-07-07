@@ -106,7 +106,6 @@ router.get("/status", authenticateToken, async (req: AuthenticatedRequest, res) 
  *               otp_method:
  *                 type: string
  *                 enum: [sms, whatsapp, email]
- *                 description: Preferred OTP delivery method (default: sms)
  *     responses:
  *       200:
  *         description: Verification initiated, OTP sent if applicable

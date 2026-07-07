@@ -9,16 +9,8 @@ import { specs } from "./swagger";
 import { isOverdue } from "./utils/date";
 import logger from "./lib/logger";
 
-// Initialize Sentry (v10 API)
-let sentryInitialized = false;
-if (process.env.SENTRY_DSN) {
-  Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    environment: process.env.NODE_ENV || "development",
-    tracesSampleRate: 1.0,
-  });
-  sentryInitialized = true;
-}
+// Sentry is initialized in instrument.ts which is imported first in the entry file
+let sentryInitialized = !!process.env.SENTRY_DSN;
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = path.dirname(__filename);
@@ -290,7 +282,6 @@ export async function createServer() {
   // Security middleware
   app.use(secureHeaders);
   app.use(rateLimiter);
-  app.use(sanitizeMiddleware);
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
@@ -464,6 +455,24 @@ export async function createServer() {
   mainRouter.get("/ping", (_req, res) => {
     const ping = process.env.PING_MESSAGE ?? "ping";
     res.json({ message: ping });
+  });
+
+  // Test route for Sentry verification
+  mainRouter.get("/test-sentry", (_req, res) => {
+    try {
+      // Intentional error to test Sentry
+      // @ts-ignore
+      foo();
+    } catch (e) {
+      if (sentryInitialized) {
+        Sentry.captureException(e);
+        console.log("📨 Error captured and sent to Sentry");
+      }
+      res.status(500).json({ 
+        message: "Test error generated", 
+        sentry: sentryInitialized ? "Error sent to Sentry" : "Sentry not initialized" 
+      });
+    }
   });
 
   mainRouter.get("/demo", handleDemo);

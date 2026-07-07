@@ -10,11 +10,32 @@ vi.mock('../db', () => ({
 // Mock the providers factory to return a mock squad provider
 const mockInitiateTransfer = vi.fn();
 const mockVerifyTransfer = vi.fn();
+const mockAuthorizeTransfer = vi.fn();
+const mockResendTransferOTP = vi.fn();
+const mockGetAllTransfers = vi.fn();
+const mockGetWalletBalance = vi.fn();
+const mockSearchDisbursementTransactions = vi.fn();
+const mockInitiateBulkTransfer = vi.fn();
+const mockAuthorizeBulkTransfer = vi.fn();
+const mockResendBulkTransferOTP = vi.fn();
+const mockGetBulkTransferStatus = vi.fn();
+const mockGetBulkTransferTransactions = vi.fn();
+
 vi.mock('./providers/factory', () => ({
-  getProvider: () => ({
-    name: 'squad',
+  getProvider: (name: string) => ({
+    name: name || 'squad',
     initiateTransfer: mockInitiateTransfer,
     verifyTransfer: mockVerifyTransfer,
+    authorizeTransfer: mockAuthorizeTransfer,
+    resendTransferOTP: mockResendTransferOTP,
+    getAllTransfers: mockGetAllTransfers,
+    getWalletBalance: mockGetWalletBalance,
+    searchDisbursementTransactions: mockSearchDisbursementTransactions,
+    initiateBulkTransfer: mockInitiateBulkTransfer,
+    authorizeBulkTransfer: mockAuthorizeBulkTransfer,
+    resendBulkTransferOTP: mockResendBulkTransferOTP,
+    getBulkTransferStatus: mockGetBulkTransferStatus,
+    getBulkTransferTransactions: mockGetBulkTransferTransactions,
     getBanks: () => [],
     createVirtualAccount: vi.fn(),
     createBusinessVirtualAccount: vi.fn(),
@@ -26,7 +47,7 @@ vi.mock('./providers/factory', () => ({
     verifyWebhook: vi.fn(),
     getRequirements: () => ({ personalVirtualAccount: { requiredFields: [] }, businessVirtualAccount: { requiredFields: [] } }),
   }),
-  getAvailableProviders: () => ['squad'],
+  getAvailableProviders: () => ['squad', 'monnify'],
 }));
 
 describe('processAllPending', () => {

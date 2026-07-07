@@ -70,7 +70,7 @@ export async function recordFailedLogin(email: string, ipAddress?: string, userA
     );
 
     // Send lockout email notification
-    await sendAccountLockoutEmail(email, lockoutEnd);
+    await sendAccountLockoutEmail(email, lockoutEnd, ipAddress, userAgent);
   }
 
   // Log the attempt
@@ -107,54 +107,129 @@ export async function recordSuccessfulLogin(email: string, ipAddress?: string, u
   await sendLoginNotificationEmail(email, ipAddress, userAgent);
 }
 
-async function sendAccountLockoutEmail(email: string, lockoutEnd: Date) {
+function parseUserAgent(userAgent?: string) {
+  if (!userAgent) return { browser: 'Unknown', device: 'Unknown', os: 'Unknown' };
+  
+  let browser = 'Unknown';
+  let device = 'Unknown';
+  let os = 'Unknown';
+
+  // Detect OS
+  if (userAgent.includes('Windows NT')) os = 'Windows';
+  else if (userAgent.includes('Mac OS X')) os = 'macOS';
+  else if (userAgent.includes('Linux')) os = 'Linux';
+  else if (userAgent.includes('Android')) os = 'Android';
+  else if (userAgent.includes('iPhone') || userAgent.includes('iPad') || userAgent.includes('iOS')) os = 'iOS';
+  else if (userAgent.includes('CrOS')) os = 'Chrome OS';
+
+  // Detect Browser
+  if (userAgent.includes('Chrome') && !userAgent.includes('Edg')) browser = 'Chrome';
+  else if (userAgent.includes('Firefox')) browser = 'Firefox';
+  else if (userAgent.includes('Safari') && !userAgent.includes('Chrome')) browser = 'Safari';
+  else if (userAgent.includes('Edg')) browser = 'Edge';
+  else if (userAgent.includes('Opera') || userAgent.includes('OPR')) browser = 'Opera';
+
+  // Detect Device Type
+  if (userAgent.includes('Mobile')) device = 'Mobile';
+  else if (userAgent.includes('Tablet')) device = 'Tablet';
+  else device = 'Desktop';
+
+  return { browser, device, os };
+}
+
+async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddress?: string, userAgent?: string) {
   const lockoutEndLocal = lockoutEnd.toLocaleString();
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const userAgentInfo = parseUserAgent(userAgent);
+
   const html = `
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-      <div style="background: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-        <h2 style="color: #dc2626; margin-bottom: 20px;">Account Locked</h2>
-        <p style="color: #374151; line-height: 1.6;">
-          Your account has been temporarily locked due to multiple failed login attempts.
-        </p>
-        <p style="color: #374151; line-height: 1.6;">
-          Your account will be unlocked at: <strong>${lockoutEndLocal}</strong>
-        </p>
-        <p style="color: #374151; line-height: 1.6;">
-          If you did not attempt to login, please reset your password immediately and contact support.
-        </p>
-        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
-          <p style="color: #9ca3af; font-size: 12px;">
-            This is an automated email. Please do not reply.
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fef2f2; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #dc2626;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Account Locked</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Your account has been temporarily locked due to multiple failed login attempts.
           </p>
+          
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Your account will be unlocked at: <strong>${lockoutEndLocal}</strong>
+          </p>
+          
+          ${ipAddress ? `<p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>IP Address:</strong> ${ipAddress}</p>` : ''}
+          
+          ${userAgent ? `
+            <div style="margin: 20px 0;">
+              <p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>Device:</strong> ${userAgentInfo.device}</p>
+              <p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>Browser:</strong> ${userAgentInfo.browser}</p>
+              <p style="color: #374151; line-height: 1.6;"><strong>Operating System:</strong> ${userAgentInfo.os}</p>
+            </div>
+          ` : ''}
+          
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            If you didn't attempt to login, please reset your password immediately and contact support.
+          </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+            </p>
+          </div>
         </div>
-      </div>
-    </div>
+      </body>
+    </html>
   `;
 
-  await sendEmail(email, "Account Locked - MetricFlow", "Your account has been locked", html);
+  await sendEmail(email, "Account Locked - Metricorex", "Your account has been locked", html);
 }
 
 async function sendLoginNotificationEmail(email: string, ipAddress?: string, userAgent?: string) {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const userAgentInfo = parseUserAgent(userAgent);
+
   const html = `
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-      <div style="background: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-        <h2 style="color: #1d4ed8; margin-bottom: 20px;">New Login to Your Account</h2>
-        <p style="color: #374151; line-height: 1.6;">
-          A new login was detected to your MetricFlow account.
-        </p>
-        ${ipAddress ? `<p style="color: #374151; line-height: 1.6;"><strong>IP Address:</strong> ${ipAddress}</p>` : ''}
-        ${userAgent ? `<p style="color: #374151; line-height: 1.6;"><strong>Device:</strong> ${userAgent.substring(0, 200)}</p>` : ''}
-        <p style="color: #374151; line-height: 1.6;">
-          If this was you, you can ignore this email. If you did not login, please reset your password immediately and contact support.
-        </p>
-        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
-          <p style="color: #9ca3af; font-size: 12px;">
-            This is an automated email. Please do not reply.
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #1d4ed8;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">New Login to Your Account</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            A new login was detected to your Metricorex account.
           </p>
+          
+          ${ipAddress ? `<p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>IP Address:</strong> ${ipAddress}</p>` : ''}
+          
+          ${userAgent ? `
+            <div style="margin: 20px 0;">
+              <p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>Device:</strong> ${userAgentInfo.device}</p>
+              <p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>Browser:</strong> ${userAgentInfo.browser}</p>
+              <p style="color: #374151; line-height: 1.6;"><strong>Operating System:</strong> ${userAgentInfo.os}</p>
+            </div>
+          ` : ''}
+          
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            If this was you, you can ignore this email. If you didn't login, please reset your password immediately and contact support.
+          </p>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+            </p>
+          </div>
         </div>
-      </div>
-    </div>
+      </body>
+    </html>
   `;
 
-  await sendEmail(email, "New Login Detected - MetricFlow", "New login to your account", html);
+  await sendEmail(email, "New Login Detected - Metricorex", "New login to your account", html);
 }

@@ -804,3 +804,145 @@ export function generateRenewalFailedEmail(
     </html>
   `;
 }
+
+export function generateTransactionAlertEmailHtml(
+  userName: string,
+  transactionType: 'credit' | 'debit',
+  amount: number,
+  currency: string,
+  availableBalance: number,
+  transactionDate: string,
+  status: string,
+  reference: string,
+  description: string
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  const isCredit = transactionType === 'credit';
+  const primaryColor = isCredit ? '#10b981' : '#ef4444';
+  const bgColor = isCredit ? '#ecfdf5' : '#fef2f2';
+  const borderColor = isCredit ? '#d1fae5' : '#fecaca';
+  const accentColor = isCredit ? '#065f46' : '#991b1b';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid ${primaryColor};">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 8px;">
+            ${isCredit ? 'Credit Alert' : 'Debit Alert'}
+          </h1>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-bottom: 24px;">
+            Hello ${userName}, here's your transaction notification
+          </p>
+
+          <div style="background-color: ${bgColor}; border: 1px solid ${borderColor}; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid ${borderColor};">
+              <span style="color: #6b7280; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">
+                ${transactionType.toUpperCase()}
+              </span>
+              <span style="font-size: 28px; font-weight: 700; color: ${accentColor};">
+                ${isCredit ? '+' : '-'}${currency} ${amount.toLocaleString()}
+              </span>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px;">
+              <div>
+                <span style="color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 4px;">
+                  Available Balance
+                </span>
+                <span style="color: #111827; font-size: 18px; font-weight: 600;">
+                  ${currency} ${availableBalance.toLocaleString()}
+                </span>
+              </div>
+              <div>
+                <span style="color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 4px;">
+                  Status
+                </span>
+                <span style="color: ${primaryColor}; font-size: 18px; font-weight: 600; text-transform: capitalize;">
+                  ${status}
+                </span>
+              </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr; gap: 12px;">
+              <div>
+                <span style="color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 4px;">
+                  Reference
+                </span>
+                <span style="color: #374151; font-family: monospace; font-size: 14px;">
+                  ${reference}
+                </span>
+              </div>
+              <div>
+                <span style="color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 4px;">
+                  Date & Time
+                </span>
+                <span style="color: #374151; font-size: 14px;">
+                  ${transactionDate}
+                </span>
+              </div>
+              <div>
+                <span style="color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 4px;">
+                  Description
+                </span>
+                <span style="color: #374151; font-size: 14px;">
+                  ${description}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              If you did not initiate this transaction, please contact our support team immediately.
+            </p>
+            <p style="color: #9ca3af; font-size: 12px; margin-top: 8px;">
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export async function sendTransactionAlert(
+  userEmail: string,
+  userName: string,
+  transactionType: 'credit' | 'debit',
+  amount: number,
+  currency: string,
+  availableBalance: number,
+  status: string,
+  reference: string,
+  description: string
+): Promise<void> {
+  const transactionDate = new Date().toLocaleString('en-NG', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  
+  const htmlContent = generateTransactionAlertEmailHtml(
+    userName,
+    transactionType,
+    amount,
+    currency,
+    availableBalance,
+    transactionDate,
+    status,
+    reference,
+    description
+  );
+  
+  await sendEmail(userEmail, userName, `${transactionType.toUpperCase()} Alert - ${reference}`, htmlContent);
+}

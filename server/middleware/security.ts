@@ -93,13 +93,20 @@ export function sanitizeInput(input: any): any {
 
 export function sanitizeMiddleware(req: Request, res: Response, next: NextFunction) {
   if (req.body) {
-    req.body = sanitizeInput(req.body);
+    // Use Object.assign to modify in-place instead of replacing the entire object
+    const sanitizedBody = sanitizeInput(req.body);
+    Object.keys(req.body).forEach(key => delete req.body[key]);
+    Object.assign(req.body, sanitizedBody);
   }
   if (req.query) {
-    req.query = sanitizeInput(req.query);
+    const sanitizedQuery = sanitizeInput(req.query);
+    Object.keys(req.query).forEach(key => delete (req.query as any)[key]);
+    Object.assign(req.query, sanitizedQuery);
   }
   if (req.params) {
-    req.params = sanitizeInput(req.params);
+    const sanitizedParams = sanitizeInput(req.params);
+    Object.keys(req.params).forEach(key => delete (req.params as any)[key]);
+    Object.assign(req.params, sanitizedParams);
   }
   next();
 }

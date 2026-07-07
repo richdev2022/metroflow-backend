@@ -252,7 +252,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             FROM transfer_queue 
             WHERE 1=1`;
         const transfersParams: any[] = [];
-        let tfParamCount = 1;
+        let tfParamCount = tParamCount;
 
         if (businessId) {
             transfersQuery += ` AND business_id = $${tfParamCount}`;
@@ -287,7 +287,7 @@ router.get("/transactions", authenticateToken, async (req, res) => {
             )
             SELECT * FROM combined
             ORDER BY created_at DESC
-            LIMIT $${tParamCount + tfParamCount} OFFSET $${tParamCount + tfParamCount + 1}
+            LIMIT $${tfParamCount} OFFSET $${tfParamCount + 1}
         `;
         const combinedParams = [...transactionsParams, ...transfersParams, effectiveLimit, offset];
 
@@ -1134,16 +1134,19 @@ router.post("/cancel", authenticateToken, async (req, res) => {
         if (businessRes.rows.length === 0) return res.status(404).json({ success: false, error: "Business not found" });
         const business = businessRes.rows[0];
 
-        if (!business.card_token) {
-            return res.status(400).json({ success: false, error: "No active recurring subscription found" });
+        // Check if subscription is active
+        if (business.subscription_status !== 'active' && business.subscription_status !== 'past_due') {
+            return res.status(400).json({ success: false, error: "No active subscription found" });
         }
 
-        // Call Squad to cancel recurring
-        try {
-            await cancelRecurring(business.card_token);
-        } catch (err) {
-            console.warn("Squad cancel recurring warning:", err);
-            // Continue locally
+        // Call Squad to cancel recurring if we have a card token
+        if (business.card_token) {
+            try {
+                await cancelRecurring(business.card_token);
+            } catch (err) {
+                console.warn("Squad cancel recurring warning:", err);
+                // Continue locally
+            }
         }
 
        // Update DB to set pending cancel

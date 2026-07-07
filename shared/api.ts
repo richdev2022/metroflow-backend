@@ -49,6 +49,18 @@ export interface InviteTeamMemberInput {
   role: "admin" | "manager" | "member";
 }
 
+// Task Status Types
+export interface TaskStatus {
+  id: string;
+  businessId: string;
+  name: string;
+  color?: string;
+  isDefault: boolean;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // Task Types
 export interface Task {
   id: string;
@@ -64,7 +76,7 @@ export interface Task {
   startDate: string;
   endDate: string;
   dueDate?: string;
-  status: "pending" | "in_progress" | "completed";
+  status: string;
   isOverdue: boolean;
   assignedTo?: string[];
   attachments?: Attachment[];
@@ -317,4 +329,51 @@ export interface EpicCounts {
 
 export interface DemoResponse {
   message: string;
+}
+
+// Transaction PIN types
+export interface CreateTransactionPinInput {
+  pin: string;
+}
+
+export interface VerifyTransactionPinInput {
+  pin: string;
+}
+
+export interface UpdateTransactionPinInput {
+  oldPin: string;
+  newPin: string;
+}
+
+// OTP toggle types
+export interface ToggleOtpInput {
+  enabled: boolean;
+}
+
+// Updated transfer input types with PIN and optional OTP
+export interface InitiateSingleTransferInput {
+  bankCode: string;
+  accountNumber: string;
+  accountName?: string;
+  amount: number;
+  remark?: string;
+  otp?: string;
+  pin: string;
+  walletId?: string;
+}
+
+export interface InitiateBulkTransferInput {
+  type: 'Salary' | 'Epic';
+  otp?: string;
+  pin: string;
+  sourceWalletId?: string;
+  data?: {
+    items?: Array<{
+      amount: number;
+      bankCode: string;
+      accountNumber: string;
+      accountName?: string;
+      remark?: string;
+    }>;
+  };
 }

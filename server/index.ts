@@ -1,4 +1,5 @@
 import "dotenv/config";
+import * as Sentry from "@sentry/node";
 import express from "express";
 import path from "path";
 // import { fileURLToPath } from 'url';
@@ -6,6 +7,10 @@ import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import { specs } from "./swagger";
 import { isOverdue } from "./utils/date";
+import logger from "./lib/logger";
+
+// Sentry is initialized in instrument.ts which is imported first in the entry file
+let sentryInitialized = !!process.env.SENTRY_DSN;
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = path.dirname(__filename);
@@ -65,13 +70,21 @@ import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
+import taskStatusesRouter from "./routes/task-statuses";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
+import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
 import { processSubscriptionRenewals } from "./services/subscription";
 import { processPendingProductDocJobs } from "./services/productDocJobs";
 import { startTransferMonitor } from "./services/transfer";
 import * as cron from "node-cron";
 import { getStore } from "@netlify/blobs";
+import { initRedis } from "./lib/cache";
+import { transferQueue, productDocQueue, scheduledQueue } from "./lib/queues";
+// Import workers for non-serverless environments
+if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+  import("./lib/workers");
+}
 
 async function updateOverdueTasks() {
   try {
@@ -112,17 +125,24 @@ async function updateOverdueTasks() {
 export async function createServer() {
   const app = express();
 
+  // Sentry is initialized at the top, we'll keep our current setup is already initialized
+  // No Handlers in Sentry v10, keep existing setup
+
+  // Initialize Redis
+  initRedis();
+  logger.info("✅ Redis initialization attempted");
+
   // Initialize database
   let isDbReady = false;
   let dbInitError: any = null;
 
   const dbInitPromise = initializeDatabase()
     .then(() => {
-      console.log("✅ Database initialized successfully");
+      logger.info("✅ Database initialized successfully");
       isDbReady = true;
     })
     .catch((error) => {
-      console.error("❌ Failed to initialize database:", error);
+      logger.error("❌ Failed to initialize database:", error);
       dbInitError = error;
     });
 
@@ -140,7 +160,7 @@ export async function createServer() {
   // Middleware
   cron.schedule("0 * * * *", async () => {
     try {
-      console.log("Running activity log cleanup...");
+      logger.info("Running activity log cleanup...");
       const threeDaysAgo = new Date();
       threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
 
@@ -149,10 +169,10 @@ export async function createServer() {
         [threeDaysAgo],
       );
 
-      console.log(`Cleaned up ${result.rowCount} old activity logs`);
+      logger.info(`Cleaned up ${result.rowCount} old activity logs`);
 
       // Check for expired trials
-      console.log("Checking for expired trials...");
+      logger.info("Checking for expired trials...");
       const expiredResult = await query(`
         UPDATE businesses 
         SET subscription_status = 'inactive' 
@@ -162,7 +182,7 @@ export async function createServer() {
         RETURNING id, email
       `);
       
-      console.log(`Deactivated ${expiredResult.rowCount} expired trials`);
+      logger.info(`Deactivated ${expiredResult.rowCount} expired trials`);
       
       // Send expiration warning emails (for trials expiring tomorrow)
       const warningResult = await query(`
@@ -174,7 +194,7 @@ export async function createServer() {
       
       // Mock sending emails
       warningResult.rows.forEach(b => {
-        console.log(`Sending trial expiration warning to ${b.email}`);
+        logger.info(`Sending trial expiration warning to ${b.email}`);
         // await sendEmail(...)
       });
 
@@ -184,7 +204,7 @@ export async function createServer() {
       // Update overdue tasks
       await updateOverdueTasks();
     } catch (error) {
-      console.error("Cron job error:", error);
+      logger.error("Cron job error:", error);
     }
   });
   
@@ -258,6 +278,10 @@ export async function createServer() {
   };
 
   app.use(cors(corsOptions));
+
+  // Security middleware
+  app.use(secureHeaders);
+  app.use(rateLimiter);
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
@@ -433,6 +457,24 @@ export async function createServer() {
     res.json({ message: ping });
   });
 
+  // Test route for Sentry verification
+  mainRouter.get("/test-sentry", (_req, res) => {
+    try {
+      // Intentional error to test Sentry
+      // @ts-ignore
+      foo();
+    } catch (e) {
+      if (sentryInitialized) {
+        Sentry.captureException(e);
+        console.log("📨 Error captured and sent to Sentry");
+      }
+      res.status(500).json({ 
+        message: "Test error generated", 
+        sentry: sentryInitialized ? "Error sent to Sentry" : "Sentry not initialized" 
+      });
+    }
+  });
+
   mainRouter.get("/demo", handleDemo);
 
   // Auth API routes
@@ -537,10 +579,13 @@ export async function createServer() {
   mainRouter.use("/settings", settingsRouter);
 
   // KYC API routes
-  mainRouter.use("/kyc", kycRouter);
+    mainRouter.use("/kyc", kycRouter);
 
-  // Wallet API routes
-  mainRouter.use("/wallet", walletRouter);
+    // Wallet API routes
+    mainRouter.use("/wallet", walletRouter);
+
+    // Task Statuses API routes
+    mainRouter.use("/task-statuses", taskStatusesRouter);
 
   // Providers API routes
   mainRouter.use("/providers", providersRouter);
@@ -565,9 +610,14 @@ export async function createServer() {
     res.redirect(`${frontendUrl}/accept-invite/${req.params.token}`);
   });
 
+
+
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error("❌ Unhandled Error:", err);
+    logger.error("❌ Unhandled Error:", err);
+    if (sentryInitialized) {
+      Sentry.captureException(err);
+    }
     if (res.headersSent) {
       return next(err);
     }

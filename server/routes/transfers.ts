@@ -1,12 +1,17 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
-import { processAllPending, accountLookup } from "../services/transfer";
+import { validateBody } from "../middleware/validation";
+import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
+import { accountLookup } from "../services/transfer";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
-import { generateOTP, getOTPExpiry } from "../services/auth";
+import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
+import { sendWhatsApp } from "../services/whatsapp";
+import { logAuditEvent, generateTransactionHash } from "../services/audit";
+import { transferQueue } from "../lib/queues";
 
 const router = express.Router();
 
@@ -97,12 +102,12 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
     try {
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;
-        const { wallet_id } = req.body;
+        const { wallet_id, otp_method } = req.body;
 
         // 1. Get Preference & User Info
         const prefRes = await query(`SELECT otp_preference FROM businesses WHERE id = $1`, [businessId]);
         const business = prefRes.rows[0];
-        const preference = business.otp_preference || 'email';
+        const preference = otp_method || business.otp_preference || 'email';
 
         const userRes = await query(`SELECT email, phone_number FROM users WHERE id = $1`, [userId]);
         const user = userRes.rows[0];
@@ -164,6 +169,44 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
             }
 
             await sendSMS(user.phone_number, `Your Transfer OTP is: ${otpCode}`);
+        }
+
+        if (preference === 'whatsapp') {
+            if (!user.phone_number) {
+                 return res.status(400).json({ success: false, error: "User phone number required for WhatsApp OTP. Please update your profile." });
+            }
+            
+            // Charge WhatsApp OTP fee
+            const feeAmt = await calculateFee(1, 'otp_whatsapp'); 
+            if (feeAmt > 0) {
+                 let wallet;
+                 if (wallet_id) {
+                     const wRes = await query(`SELECT * FROM wallets WHERE id = $1 AND business_id = $2`, [wallet_id, businessId]);
+                     wallet = wRes.rows[0];
+                 } else {
+                     const wRes = await query(`SELECT * FROM wallets WHERE business_id = $1 AND currency = 'NGN' LIMIT 1`, [businessId]);
+                     wallet = wRes.rows[0];
+                 }
+
+                 if (!wallet) return res.status(400).json({ success: false, error: "No NGN wallet found to charge OTP WhatsApp fee" });
+                 
+                 if (parseFloat(wallet.balance) < feeAmt) {
+                     return res.status(400).json({ success: false, error: "Insufficient wallet balance for OTP WhatsApp fee" });
+                 }
+
+                 await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [feeAmt, wallet.id]);
+                 await query(
+                    `INSERT INTO transactions 
+                     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+                     VALUES ($1, $2, $3, 'success', $4, 'debit', 'OTP WhatsApp Fee', 'fee', $5, 'debit', $6)`,
+                    [businessId, feeAmt, 'NGN', `OTP-WHATSAPP-FEE-${Date.now()}`, wallet.id, feeAmt]
+                 );
+                 
+                 await creditRevenueWallet(feeAmt, 'NGN');
+                 feeCharged = feeAmt;
+            }
+
+            await sendWhatsApp(user.phone_number, `Your Transfer OTP is: ${otpCode}`);
         }
 
         res.json({ success: true, message: "OTP sent successfully", fee_charged: feeCharged });
@@ -331,29 +374,60 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  *                   type: string
  *                   example: "Failed to initiate transfer"
  */
-router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { bankCode, accountNumber, accountName, amount, remark, otp, wallet_id } = req.body;
+    const { bankCode, accountNumber, accountName, amount, remark, otp, pin, wallet_id } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!otp) {
-      return res.status(400).json({ success: false, error: "OTP is required" });
+    // Get business settings
+    const businessRes = await query(
+      `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    const business = businessRes.rows[0];
+
+    // Check if PIN is set
+    if (!business?.transaction_pin_hash) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Transaction PIN not set. Please create one first.",
+        code: "PIN_NOT_SET"
+      });
     }
 
-    // Verify OTP
-    const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
-    const user = uRes.rows[0];
-
-    if (!user.otp_code || user.otp_code !== otp) {
-      return res.status(400).json({ success: false, error: "Invalid OTP" });
-    }
-    if (new Date(user.otp_expires_at) < new Date()) {
-      return res.status(400).json({ success: false, error: "OTP expired" });
+    // Validate PIN
+    if (!pin) {
+      return res.status(400).json({ success: false, error: "Transaction PIN is required" });
     }
 
-    // Invalidate OTP
-    await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
+    const pinValid = await verifyPassword(pin, business.transaction_pin_hash);
+    if (!pinValid) {
+      return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
+    }
+
+    // Check OTP requirement
+    let isOtpValidated = false;
+    if (business.otp_enabled) {
+      if (!otp) {
+        return res.status(400).json({ success: false, error: "OTP is required" });
+      }
+
+      // Verify OTP
+      const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
+      const user = uRes.rows[0];
+
+      if (!user.otp_code || user.otp_code !== otp) {
+        return res.status(400).json({ success: false, error: "Invalid OTP" });
+      }
+      if (new Date(user.otp_expires_at) < new Date()) {
+        return res.status(400).json({ success: false, error: "OTP expired" });
+      }
+
+      // Invalidate OTP
+      await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
+      isOtpValidated = true;
+    }
 
     // Validate Wallet
     let walletId = wallet_id;
@@ -368,19 +442,43 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     const reference = genRef();
     const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
 
+    // Generate transaction hash for integrity
+    const transactionHash = generateTransactionHash(reference, amount.toString(), accountNumber, bankCode);
+
     // Queue Transfer
     const insertRes = await query(
       `INSERT INTO transfer_queue 
-      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
-      VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9, $10)
+      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by)
+      VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9, $10, $11, $12)
       RETURNING *`,
-      [businessId, reference, accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider, fee]
+      [businessId, reference, accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId]
     );
+
+    // Log audit event
+    await logAuditEvent({
+      businessId,
+      userId,
+      action: 'transfer_initiated',
+      entityType: 'transfer',
+      entityId: insertRes.rows[0].id,
+      newValues: {
+        reference,
+        amount,
+        recipientAccount: accountNumber,
+        recipientBank: bankCode,
+        recipientName: accountName,
+        walletId,
+      },
+      ipAddress: req.ip || req.connection.remoteAddress,
+      userAgent: req.headers['user-agent'],
+    });
 
     const queuedTransfer = insertRes.rows[0];
 
-    // Trigger processing
-    processAllPending(businessId!).catch(err => console.error("Single transfer process error:", err));
+    // Trigger processing via BullMQ
+    if (transferQueue) {
+      await transferQueue.add('process-transfers', { businessId: businessId! });
+    }
 
     res.json({ 
       success: true, 
@@ -571,32 +669,64 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *                   type: string
  *                   example: "Failed to initiate bulk transfer"
  */
-router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { type, data, source_wallet_id, otp } = req.body;
+    const { type, data, source_wallet_id, otp, pin } = req.body;
     const businessId = req.user?.businessId;
     
     if (!businessId) {
       return res.status(400).json({ success: false, error: "Business ID required" });
     }
 
-    // Verify OTP
-    if (!otp) {
+    // Get business settings
+    const businessRes = await query(
+      `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    const business = businessRes.rows[0];
+
+    // Check if PIN is set
+    if (!business?.transaction_pin_hash) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Transaction PIN not set. Please create one first.",
+        code: "PIN_NOT_SET"
+      });
+    }
+
+    // Validate PIN
+    if (!pin) {
+      return res.status(400).json({ success: false, error: "Transaction PIN is required" });
+    }
+
+    const pinValid = await verifyPassword(pin, business.transaction_pin_hash);
+    if (!pinValid) {
+      return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
+    }
+
+    // Check OTP requirement
+    let isOtpValidated = false;
+    if (business.otp_enabled) {
+      if (!otp) {
         return res.status(400).json({ success: false, error: "OTP is required" });
+      }
+
+      // Verify OTP
+      const userId = req.user!.userId;
+      const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
+      const user = uRes.rows[0];
+      
+      if (!user.otp_code || user.otp_code !== otp) {
+          return res.status(400).json({ success: false, error: "Invalid OTP" });
+      }
+      if (new Date(user.otp_expires_at) < new Date()) {
+          return res.status(400).json({ success: false, error: "OTP expired" });
+      }
+      
+      // Invalidate OTP
+      await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
+      isOtpValidated = true;
     }
-    const userId = req.user!.userId;
-    const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
-    const user = uRes.rows[0];
-    
-    if (!user.otp_code || user.otp_code !== otp) {
-        return res.status(400).json({ success: false, error: "Invalid OTP" });
-    }
-    if (new Date(user.otp_expires_at) < new Date()) {
-        return res.status(400).json({ success: false, error: "OTP expired" });
-    }
-    
-    // Invalidate OTP
-    await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
 
     // Validate Source Wallet
     let walletId = source_wallet_id;
@@ -743,8 +873,10 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       }
     }
 
-    // 3. Trigger processing in background
-    processAllPending(businessId).catch(err => console.error("Background processing error:", err));
+    // 3. Trigger processing via BullMQ
+    if (transferQueue) {
+      await transferQueue.add('process-transfers', { businessId: businessId! });
+    }
 
     // Calculate totals
     const totalAmount = queuedTransfers.reduce((sum, t) => sum + parseFloat(t.amount), 0);
@@ -969,8 +1101,10 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
     );
     const updatedTransfer = updateRes.rows[0];
 
-    // Trigger processing
-    processAllPending(businessId).catch(err => console.error("Retry processing error:", err));
+    // Trigger processing via BullMQ
+    if (transferQueue) {
+      await transferQueue.add('process-transfers', { businessId: businessId! });
+    }
 
     res.json({ 
       success: true, 

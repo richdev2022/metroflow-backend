@@ -3,8 +3,36 @@ import { query } from "../db";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import crypto from "crypto";
+import { sendTransactionAlert } from "../services/email";
 
 const router = express.Router();
+
+/**
+ * @swagger
+ * tags:
+ *   name: Webhooks
+ *   description: Webhook endpoints for payment providers (Squad and Monnify)
+ */
+
+/**
+ * @swagger
+ * /webhook:
+ *   post:
+ *     summary: Webhook endpoint for payment providers
+ *     description: Receives and processes webhook events from Squad and Monnify
+ *     tags: [Webhooks]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *     responses:
+ *       200:
+ *         description: Webhook processed successfully
+ *       500:
+ *         description: Internal server error
+ */
 
 // Helper to parse card PAN
 const parsePan = (pan: string) => {
@@ -306,7 +334,7 @@ const handleMonnifyWebhook = async (event: any) => {
                 
                 if (vaRes.rows.length > 0) {
                     const walletId = vaRes.rows[0].wallet_id;
-                    const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE id = $1`, [walletId]);
+                    const walletRes = await query(`SELECT id, user_id, business_id, balance FROM wallets WHERE id = $1`, [walletId]);
                 
                     if (walletRes.rows.length > 0) {
                         const wallet = walletRes.rows[0];
@@ -317,8 +345,9 @@ const handleMonnifyWebhook = async (event: any) => {
                         if (txnCheck.rows.length === 0) {
                             const fee = await calculateFee(amount, 'funding_account');
                             const creditAmount = Math.max(0, amount - fee);
+                            const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
                             
-                            await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [creditAmount, wallet.id]);
+                            await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
                             
                             await query(
                                 `INSERT INTO transactions 
@@ -330,6 +359,23 @@ const handleMonnifyWebhook = async (event: any) => {
                             if (fee > 0) {
                                 await creditRevenueWallet(fee, 'NGN');
                             }
+
+                            // Send email notification
+                            const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
+                            if (userRes.rows.length > 0) {
+                                const user = userRes.rows[0];
+                                await sendTransactionAlert(
+                                    user.email,
+                                    user.name || 'User',
+                                    'credit',
+                                    creditAmount,
+                                    'NGN',
+                                    newBalance,
+                                    'success',
+                                    reference,
+                                    'Wallet Funding via Virtual Account'
+                                );
+                            }
                         }
                     }
                 }
@@ -337,7 +383,7 @@ const handleMonnifyWebhook = async (event: any) => {
         }
     }
 
-    // Handle transfer status updates
+    // Handle single transfer status updates (old event names)
     if (eventType === 'SUCCESSFUL_TRANSFER' || eventType === 'FAILED_TRANSFER') {
         const transferData = event.eventData;
         const reference = transferData.transactionReference || transferData.reference;
@@ -357,6 +403,76 @@ const handleMonnifyWebhook = async (event: any) => {
                  WHERE id = $5`,
                 [newStatus, failureReason, JSON.stringify(transferData), JSON.stringify(transferData), transfer.id]
             );
+        }
+    }
+
+    // Handle disbursement (single and bulk) status updates (new event names)
+    if (eventType === 'SUCCESSFUL_DISBURSEMENT' || eventType === 'FAILED_DISBURSEMENT' || eventType === 'REVERSED_DISBURSEMENT') {
+        const disbursementData = event.eventData;
+        
+        // Check if it's a bulk disbursement (has transactionList or batchReference)
+        if (disbursementData.transactionList && Array.isArray(disbursementData.transactionList)) {
+            // Process each transaction in the bulk
+            for (const tx of disbursementData.transactionList) {
+                const reference = tx.reference;
+                const isSuccess = eventType === 'SUCCESSFUL_DISBURSEMENT' && tx.status === 'SUCCESS';
+                const isFailed = eventType === 'FAILED_DISBURSEMENT' || tx.status === 'FAILED';
+                const isReversed = eventType === 'REVERSED_DISBURSEMENT';
+
+                const transferRes = await query(`SELECT * FROM transfer_queue WHERE reference = $1`, [reference]);
+                if (transferRes.rows.length > 0) {
+                    const transfer = transferRes.rows[0];
+                    let newStatus = 'processing';
+                    let failureReason = null;
+
+                    if (isSuccess) {
+                        newStatus = 'success';
+                    } else if (isFailed) {
+                        newStatus = 'failed';
+                        failureReason = tx.responseMessage || 'Transfer failed';
+                    } else if (isReversed) {
+                        newStatus = 'failed'; // Or create a 'reversed' status if needed
+                        failureReason = 'Transfer reversed';
+                    }
+
+                    await query(
+                        `UPDATE transfer_queue 
+                         SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP, meta_data = $3, provider_metadata = $4
+                         WHERE id = $5`,
+                        [newStatus, failureReason, JSON.stringify(tx), JSON.stringify(disbursementData), transfer.id]
+                    );
+                }
+            }
+        } else {
+            // Single disbursement
+            const reference = disbursementData.transactionReference || disbursementData.reference;
+            const isSuccess = eventType === 'SUCCESSFUL_DISBURSEMENT';
+            const isFailed = eventType === 'FAILED_DISBURSEMENT';
+            const isReversed = eventType === 'REVERSED_DISBURSEMENT';
+
+            const transferRes = await query(`SELECT * FROM transfer_queue WHERE reference = $1`, [reference]);
+            if (transferRes.rows.length > 0) {
+                const transfer = transferRes.rows[0];
+                let newStatus = 'processing';
+                let failureReason = null;
+
+                if (isSuccess) {
+                    newStatus = 'success';
+                } else if (isFailed) {
+                    newStatus = 'failed';
+                    failureReason = disbursementData.responseMessage || 'Transfer failed';
+                } else if (isReversed) {
+                    newStatus = 'failed'; // Or create a 'reversed' status if needed
+                    failureReason = 'Transfer reversed';
+                }
+
+                await query(
+                    `UPDATE transfer_queue 
+                     SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP, meta_data = $3, provider_metadata = $4
+                     WHERE id = $5`,
+                    [newStatus, failureReason, JSON.stringify(disbursementData), JSON.stringify(disbursementData), transfer.id]
+                );
+            }
         }
     }
 };

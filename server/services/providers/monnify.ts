@@ -7,7 +7,7 @@ import {
   BusinessVirtualAccountRequest,
   InitiatePaymentRequest,
   ChargeCardRequest,
-  TransferRequest as ProviderTransferRequest,
+  SingleTransferRequest,
 } from "./index";
 import { BANK_LIST, Bank } from "../../utils/bank-codes";
 
@@ -358,22 +358,31 @@ export const monnifyProvider: Provider = {
     return { success: true, message: "Recurring subscription cancelled locally" };
   },
 
-  async initiateTransfer(data: ProviderTransferRequest) {
+  async initiateTransfer(data: SingleTransferRequest) {
     try {
       const amount =
         typeof data.amount === "string"
           ? parseFloat(data.amount)
           : data.amount;
 
-      const payload = {
+      const payload: any = {
         amount: amount / 100,
         reference: data.transactionReference,
         narration: data.remark,
         destinationBankCode: data.bankCode,
         destinationAccountNumber: data.accountNumber,
+        destinationAccountName: data.accountName,
         currency: "NGN",
         sourceAccountNumber: MONNIFY_WALLET_ACCOUNT_NUMBER,
       };
+
+      if (data.async !== undefined) {
+        payload.async = data.async;
+      }
+
+      if (data.senderInfo) {
+        payload.senderInfo = data.senderInfo;
+      }
 
       const response = await monnifyClient.post(
         "/api/v2/disbursements/single",
@@ -394,7 +403,7 @@ export const monnifyProvider: Provider = {
   async verifyTransfer(reference: string) {
     try {
       const response = await monnifyClient.get(
-        `/api/v2/disbursements/single/query?reference=${reference}`
+        `/api/v2/disbursements/single/summary?reference=${reference}`
       );
       return response.data;
     } catch (error: any) {
@@ -404,6 +413,205 @@ export const monnifyProvider: Provider = {
       );
       throw new Error(
         error.response?.data?.responseMessage || "Transfer verification failed"
+      );
+    }
+  },
+
+  async authorizeTransfer(reference: string, authorizationCode: string) {
+    try {
+      const response = await monnifyClient.post(
+        "/api/v2/disbursements/single/validate-otp",
+        { reference, authorizationCode }
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Authorize Transfer Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Transfer authorization failed"
+      );
+    }
+  },
+
+  async resendTransferOTP(reference: string) {
+    try {
+      const response = await monnifyClient.post(
+        "/api/v2/disbursements/single/resend-otp",
+        { reference }
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Resend OTP Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Resend OTP failed"
+      );
+    }
+  },
+
+  async getAllTransfers(pageNo: number = 0, pageSize: number = 20) {
+    try {
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/single/list?pageNo=${pageNo}&pageSize=${pageSize}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Get All Transfers Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Get transfers failed"
+      );
+    }
+  },
+
+  async getWalletBalance(accountNumber: string) {
+    try {
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/wallet-balance?accountNumber=${accountNumber}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Get Wallet Balance Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Get wallet balance failed"
+      );
+    }
+  },
+
+  async searchDisbursementTransactions(filters: any = {}) {
+    try {
+      const params = new URLSearchParams();
+      Object.entries(filters).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          params.append(key, value.toString());
+        }
+      });
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/search?${params.toString()}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Search Disbursements Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Search disbursements failed"
+      );
+    }
+  },
+
+  async initiateBulkTransfer(data: any) {
+    try {
+      const payload = {
+        title: data.title,
+        batchReference: data.batchReference,
+        narration: data.narration,
+        sourceAccountNumber: data.sourceAccountNumber,
+        onValidationFailure: data.onValidationFailure,
+        notificationInterval: data.notificationInterval,
+        transactionList: data.transactionList.map((tx: any) => ({
+          amount: tx.amount,
+          reference: tx.reference,
+          narration: tx.narration,
+          destinationBankCode: tx.destinationBankCode,
+          destinationAccountNumber: tx.destinationAccountNumber,
+          destinationAccountName: tx.destinationAccountName,
+          currency: tx.currency || "NGN"
+        }))
+      };
+
+      const response = await monnifyClient.post(
+        "/api/v2/disbursements/batch",
+        payload
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Bulk Transfer Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Bulk transfer initiation failed"
+      );
+    }
+  },
+
+  async authorizeBulkTransfer(reference: string, authorizationCode: string) {
+    try {
+      const response = await monnifyClient.post(
+        "/api/v2/disbursements/batch/validate-otp",
+        { reference, authorizationCode }
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Authorize Bulk Transfer Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Bulk transfer authorization failed"
+      );
+    }
+  },
+
+  async resendBulkTransferOTP(reference: string) {
+    try {
+      const response = await monnifyClient.post(
+        "/api/v2/disbursements/single/resend-otp",
+        { reference }
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Resend Bulk OTP Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Resend bulk OTP failed"
+      );
+    }
+  },
+
+  async getBulkTransferStatus(batchReference: string) {
+    try {
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/bulk/summary?batchReference=${batchReference}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Get Bulk Status Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Get bulk transfer status failed"
+      );
+    }
+  },
+
+  async getBulkTransferTransactions(batchReference: string, pageNo: number = 0, pageSize: number = 20) {
+    try {
+      const response = await monnifyClient.get(
+        `/api/v2/disbursements/bulk/transactions?batchReference=${batchReference}&pageNo=${pageNo}&pageSize=${pageSize}`
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error(
+        "Monnify Get Bulk Transactions Error:",
+        error.response?.data || error.message
+      );
+      throw new Error(
+        error.response?.data?.responseMessage || "Get bulk transfer transactions failed"
       );
     }
   },

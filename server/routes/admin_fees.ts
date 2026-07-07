@@ -56,7 +56,7 @@ router.get("/", authenticateAdmin, requirePermission('manage_finance'), async (r
  *                 type: string
  *               fee_type:
  *                 type: string
- *                 enum: [funding_card, funding_account, transfer, otp, stamp_duty]
+ *                 enum: [funding_card, funding_account, transfer, otp, otp_sms, otp_whatsapp, stamp_duty]
  *               config_type:
  *                 type: string
  *                 enum: [percentage_cap, flat, flat_conditional, range]

@@ -1,5 +1,6 @@
 /// <reference types="node" />
-import "dotenv/config";
+// IMPORTANT: Import instrument.ts first to initialize Sentry as early as possible
+import "./instrument";
 import { createServer } from "./index";
 
 const port = process.env.PORT || 3000;

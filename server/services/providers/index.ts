@@ -48,6 +48,37 @@ export interface TransferRequest {
   currencyId?: string;
 }
 
+export interface SenderInfo {
+  sourceAccountName?: string;
+  sourceAccountNumber?: string;
+  senderBankCode?: string;
+}
+
+export interface SingleTransferRequest extends TransferRequest {
+  async?: boolean;
+  senderInfo?: SenderInfo;
+}
+
+export interface BulkTransferTransaction {
+  amount: number;
+  reference: string;
+  narration: string;
+  destinationBankCode: string;
+  destinationAccountNumber: string;
+  destinationAccountName: string;
+  currency: string;
+}
+
+export interface BulkTransferRequest {
+  title: string;
+  batchReference: string;
+  narration: string;
+  sourceAccountNumber: string;
+  onValidationFailure: 'CONTINUE' | 'BREAK';
+  notificationInterval?: number;
+  transactionList: BulkTransferTransaction[];
+}
+
 export interface Provider {
   name: string;
 
@@ -62,8 +93,18 @@ export interface Provider {
   verifyPayment(reference: string): Promise<any>;
   chargeCard(data: ChargeCardRequest): Promise<any>;
   cancelRecurring(token: string): Promise<any>;
-  initiateTransfer(data: TransferRequest): Promise<any>;
+  initiateTransfer(data: SingleTransferRequest): Promise<any>;
   verifyTransfer(reference: string): Promise<any>;
+  authorizeTransfer(reference: string, authorizationCode: string): Promise<any>;
+  resendTransferOTP(reference: string): Promise<any>;
+  getAllTransfers(pageNo?: number, pageSize?: number): Promise<any>;
+  getWalletBalance(accountNumber: string): Promise<any>;
+  searchDisbursementTransactions(filters?: any): Promise<any>;
+  initiateBulkTransfer(data: BulkTransferRequest): Promise<any>;
+  authorizeBulkTransfer(reference: string, authorizationCode: string): Promise<any>;
+  resendBulkTransferOTP(reference: string): Promise<any>;
+  getBulkTransferStatus(batchReference: string): Promise<any>;
+  getBulkTransferTransactions(batchReference: string, pageNo?: number, pageSize?: number): Promise<any>;
   accountLookup(bankCode: string, accountNumber: string): Promise<any>;
   getBanks(): any[];
   verifyWebhook(body: any, signature: string): boolean;

@@ -1,5 +1,5 @@
 import express from "express";
-import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest, checkKycStatus } from "../middleware/auth";
 import { query, pool } from "../db";
 import { getProvider } from "../services/providers/factory";
 import { toMinorUnit } from "../services/transfer";
@@ -40,7 +40,7 @@ const router = express.Router();
  *       200:
  *         description: Virtual Account created successfully
  */
-router.post("/create-virtual-account", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/create-virtual-account", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
@@ -270,7 +270,7 @@ router.post("/create-virtual-account", authenticateToken, async (req: Authentica
  *       200:
  *         description: Wallet details
  */
-router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
@@ -369,7 +369,7 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
  *       200:
  *         description: Payment link generated
  */
-router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/fund/card", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
@@ -491,7 +491,7 @@ router.post("/fund/card", authenticateToken, async (req: AuthenticatedRequest, r
  *       200:
  *         description: Business Wallet created
  */
-router.post("/business/create", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/business/create", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;

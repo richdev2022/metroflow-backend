@@ -9,6 +9,7 @@ import { uploadLocal } from "../middleware/uploadLocal";
 import fs from "fs";
 import path from "path";
 import { getStore } from "@netlify/blobs";
+import { productDocQueue } from "../lib/queues";
 
 const router = Router();
 
@@ -76,6 +77,11 @@ router.post("/ideas/:ideaId/documentation", authenticateToken, checkSubscription
        VALUES ($1, $2, $3, $4, 'generate', 'pending')`,
       [businessId, userId, ideaId, doc.id]
     );
+
+    // Add job to BullMQ queue
+    if (productDocQueue) {
+      await productDocQueue.add('process-doc-jobs', { limit: 1 });
+    }
 
     const message = `Your request to generate product documentation for "${title}" is currently in process. You will receive an email notification once it's ready, then you can refresh your app to see the updated documentation.`;
 
@@ -363,6 +369,11 @@ router.post("/product-documentation/:id/regenerate", authenticateToken, checkSub
        VALUES ($1, $2, $3, $4, 'regenerate', $5, 'pending')`,
       [businessId, req.user?.userId, docResult.rows[0].idea_id, id, areasOfConcern]
     );
+
+    // Add job to BullMQ queue
+    if (productDocQueue) {
+      await productDocQueue.add('process-doc-jobs', { limit: 1 });
+    }
 
     const message = `Your request to regenerate product documentation is currently in process. You will receive an email notification once it's ready, then you can refresh your app to see the updated documentation.`;
 

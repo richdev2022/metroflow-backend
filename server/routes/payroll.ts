@@ -1,6 +1,6 @@
 import express from "express";
 import { query } from "../db";
-import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
 import { sendPayrollAdjustmentNotification } from "../services/email";
 
 const router = express.Router();
@@ -48,7 +48,7 @@ const router = express.Router();
  *       200:
  *         description: Adjustment added
  */
-router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { userId, type, amount, reason, currency } = req.body;
@@ -143,7 +143,7 @@ router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFea
  *       200:
  *         description: List of adjustments
  */
-router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { userId } = req.query;
@@ -189,7 +189,7 @@ router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeat
  *       200:
  *         description: Adjustment deleted
  */
-router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;
@@ -257,31 +257,17 @@ router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, ch
  *       200:
  *         description: List of team members with payroll calculations
  */
-router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { search, role, startDate, endDate, page = 1, limit = 10 } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
 
-        // Check Business KYC Status
-        const businessCheck = await query(`SELECT kyc_status, salary_interval, salary_custom_date FROM businesses WHERE id = $1`, [businessId]);
-        if (businessCheck.rows[0]?.kyc_status !== 'verified') {
-            // Check if user is verified (Auto-verify business if user is verified to fix mismatch)
-            const userCheck = await query(`SELECT bvn_status, nin_status FROM users WHERE id = $1`, [req.user!.userId]);
-            const isUserVerified = userCheck.rows[0]?.bvn_status === 'verified' || userCheck.rows[0]?.nin_status === 'verified';
-
-            if (isUserVerified) {
-                 await query(`UPDATE businesses SET kyc_status = 'verified' WHERE id = $1`, [businessId]);
-            } else {
-                return res.status(403).json({ 
-                    success: false, 
-                    error: "Business KYC verification is required to access payroll summary. Please complete verification in Settings." 
-                });
-            }
-        }
-
-        // Build User Query
-        let userQuery = `
+        // Get business payroll configuration
+    const businessCheck = await query(`SELECT salary_interval, salary_custom_date FROM businesses WHERE id = $1`, [businessId]);
+    
+    // Build User Query
+    let userQuery = `
             SELECT id, name, email, salary_currency, account_number as bank_account_number, bank_code, account_name, role, salary_amount as salary, contract_start_date,
             COUNT(*) OVER() as total_count
             FROM users 
@@ -521,7 +507,7 @@ router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *       200:
  *         description: User payroll details updated
  */
-router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;
@@ -562,7 +548,7 @@ router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeature
  *       200:
  *         description: Current payroll configuration
  */
-router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const result = await query(`SELECT salary_interval, salary_custom_date FROM businesses WHERE id = $1`, [businessId]);
@@ -606,7 +592,7 @@ router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePe
  *       200:
  *         description: Configuration updated
  */
-router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { salary_interval, salary_custom_date } = req.body;

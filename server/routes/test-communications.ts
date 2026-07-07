@@ -1,6 +1,7 @@
 import express from "express";
 import { sendSMS } from "../services/sms";
 import { sendEmail, generateOtpEmailHtml, generateKYCOtpEmailHtml } from "../services/email";
+import { sendWhatsApp } from "../services/whatsapp";
 import { getAvailableSMSProviders, getSMSProvider } from "../services/sms-providers/factory";
 import crypto from "crypto";
 
@@ -43,7 +44,7 @@ const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString()
  * @swagger
  * /test-communications/send:
  *   post:
- *     summary: Send test SMS or Email
+ *     summary: Send test SMS, Email, or WhatsApp
  *     tags: [Test Communications]
  *     requestBody:
  *       required: true
@@ -58,14 +59,17 @@ const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString()
  *             properties:
  *               type:
  *                 type: string
- *                 enum: [sms, email]
+ *                 enum:
+ *                   - sms
+ *                   - email
+ *                   - whatsapp
  *                 description: Type of communication to send
  *               category:
  *                 type: string
  *                 description: Category of message (see examples for available categories)
  *               recipient:
  *                 type: string
- *                 description: Phone number for SMS or email address for Email
+ *                 description: Phone number for SMS/WhatsApp or email address for Email
  *               otp:
  *                 type: string
  *                 description: Optional custom OTP (auto-generated if not provided)
@@ -97,10 +101,10 @@ router.post("/send", async (req, res) => {
     }
 
     // Validate type
-    if (!['sms', 'email'].includes(type)) {
+    if (!['sms', 'email', 'whatsapp'].includes(type)) {
       return res.status(400).json({ 
         success: false, 
-        error: "Type must be 'sms' or 'email'" 
+        error: "Type must be 'sms', 'email', or 'whatsapp'" 
       });
     }
 
@@ -149,6 +153,33 @@ router.post("/send", async (req, res) => {
         providerResponse: smsResult
       });
 
+    } else if (type === 'whatsapp') {
+      // Validate WhatsApp category (uses the same as SMS categories
+      const whatsappCategory = category as keyof typeof SMS_CATEGORIES;
+      if (!SMS_CATEGORIES[whatsappCategory]) {
+        return res.status(400).json({ 
+          success: false, 
+          error: `Invalid WhatsApp category. Available categories: ${Object.keys(SMS_CATEGORIES).join(', ')}` 
+        });
+      }
+
+      // Send WhatsApp
+      const message = SMS_CATEGORIES[whatsappCategory](otp);
+      console.log("Sending WhatsApp with message:", message, "to recipient:", recipient);
+      
+      const whatsappResult = await sendWhatsApp(recipient, message);
+      
+      console.log("WhatsApp provider response:", whatsappResult);
+      
+      res.json({ 
+        success: true, 
+        message: "WhatsApp sent successfully", 
+        otp, 
+        category,
+        recipient,
+        providerResponse: whatsappResult
+      });
+
     } else {
       // Validate Email category
       const emailCategory = category as keyof typeof EMAIL_CATEGORIES;
@@ -186,7 +217,7 @@ router.post("/send", async (req, res) => {
  * @swagger
  * /test-communications/categories:
  *   get:
- *     summary: Get available categories for SMS and Email
+ *     summary: Get available categories for SMS, Email, and WhatsApp
  *     tags: [Test Communications]
  *     responses:
  *       200:
@@ -196,6 +227,7 @@ router.get("/categories", (req, res) => {
   res.json({
     success: true,
     sms_categories: Object.keys(SMS_CATEGORIES),
+    whatsapp_categories: Object.keys(SMS_CATEGORIES),
     email_categories: Object.keys(EMAIL_CATEGORIES),
     available_sms_providers: getAvailableSMSProviders()
   });

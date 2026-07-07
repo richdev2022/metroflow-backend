@@ -116,6 +116,10 @@ export async function initializeDatabase() {
     // Add payroll configuration columns to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS salary_interval VARCHAR(20) DEFAULT 'monthly'`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS salary_custom_date TIMESTAMP`);
+    
+    // Add transaction PIN and OTP toggle columns
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS transaction_pin_hash VARCHAR(255)`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_enabled BOOLEAN DEFAULT TRUE`);
 
     // Create transactions table
     await query(`
@@ -164,7 +168,7 @@ export async function initializeDatabase() {
     // Seed default platform admin if not exists
     const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, ['admin@quantigrate.com']);
     if (adminCheck.rows.length === 0) {
-      const hashedPassword = hashPassword('admin@123');
+      const hashedPassword = await hashPassword('admin@123');
       await query(
         `INSERT INTO platform_admins (email, password_hash, name) VALUES ($1, $2, $3)`,
         ['admin@quantigrate.com', hashedPassword, 'Super Admin']
@@ -543,6 +547,51 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_hash VARCHAR(255)`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_type VARCHAR(20)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45)`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_user_agent TEXT`);
+    
+    // Add security columns to transfer_queue
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS transaction_hash VARCHAR(64)`);
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS initiated_by UUID REFERENCES users(id)`);
+    
+    // Create audit logs table
+    await query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) REFERENCES businesses(id),
+        user_id UUID REFERENCES users(id),
+        action VARCHAR(100) NOT NULL,
+        entity_type VARCHAR(50),
+        entity_id VARCHAR(255),
+        old_values JSONB,
+        new_values JSONB,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create login attempts table
+    await query(`
+      CREATE TABLE IF NOT EXISTS login_attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email VARCHAR(255) NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        success BOOLEAN NOT NULL,
+        failure_reason VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create indexes for security tables
+    await query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_business_id ON audit_logs(business_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_login_attempts_created_at ON login_attempts(created_at DESC)`);
 
     // Add KYC columns to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(20) DEFAULT 'none'`); // none, pending, verified, rejected
@@ -799,6 +848,41 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type VARCHAR(50)`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT`);
+
+    // Create task_statuses table to store custom task statuses per business
+    await query(`
+      CREATE TABLE IF NOT EXISTS task_statuses (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        color VARCHAR(50),
+        is_default BOOLEAN DEFAULT FALSE,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(business_id, name)
+      )
+    `);
+
+    // Seed default statuses for existing businesses
+    const defaultStatuses = [
+      { name: 'pending', color: '#6b7280', is_default: true },
+      { name: 'in_progress', color: '#3b82f6', is_default: true },
+      { name: 'completed', color: '#10b981', is_default: true }
+    ];
+
+    // Get all businesses
+    const businessesResult = await query(`SELECT id FROM businesses`);
+    for (const business of businessesResult.rows) {
+      for (const status of defaultStatuses) {
+        await query(
+          `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (business_id, name) DO NOTHING`,
+          [business.id, status.name, status.color, status.is_default, defaultStatuses.indexOf(status)]
+        );
+      }
+    }
 
     console.log("Database tables initialized successfully");
   } catch (error) {

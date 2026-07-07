@@ -7,7 +7,7 @@ import {
   BusinessVirtualAccountRequest,
   InitiatePaymentRequest,
   ChargeCardRequest,
-  TransferRequest as ProviderTransferRequest,
+  SingleTransferRequest,
 } from "./index";
 import { BANK_LIST, Bank } from "../../utils/bank-codes";
 
@@ -198,7 +198,7 @@ export const squadProvider: Provider = {
     return { success: true, message: "Recurring subscription cancelled locally" };
   },
 
-  async initiateTransfer(data: ProviderTransferRequest) {
+  async initiateTransfer(data: SingleTransferRequest) {
     try {
       const payload = {
         bank_code: data.bankCode,
@@ -236,6 +236,56 @@ export const squadProvider: Provider = {
         error.response?.data?.message || "Transfer verification failed"
       );
     }
+  },
+
+  async authorizeTransfer(reference: string, authorizationCode: string) {
+    console.log(`[Squad] Authorize transfer (not implemented): ${reference}`);
+    throw new Error("Authorize transfer not implemented for Squad");
+  },
+
+  async resendTransferOTP(reference: string) {
+    console.log(`[Squad] Resend transfer OTP (not implemented): ${reference}`);
+    throw new Error("Resend OTP not implemented for Squad");
+  },
+
+  async getAllTransfers(pageNo: number = 0, pageSize: number = 20) {
+    console.log(`[Squad] Get all transfers (not implemented)`);
+    throw new Error("Get all transfers not implemented for Squad");
+  },
+
+  async getWalletBalance(accountNumber: string) {
+    console.log(`[Squad] Get wallet balance (not implemented): ${accountNumber}`);
+    throw new Error("Get wallet balance not implemented for Squad");
+  },
+
+  async searchDisbursementTransactions(filters: any = {}) {
+    console.log(`[Squad] Search disbursement transactions (not implemented)`);
+    throw new Error("Search disbursements not implemented for Squad");
+  },
+
+  async initiateBulkTransfer(data: any) {
+    console.log(`[Squad] Initiate bulk transfer (not implemented)`);
+    throw new Error("Initiate bulk transfer not implemented for Squad");
+  },
+
+  async authorizeBulkTransfer(reference: string, authorizationCode: string) {
+    console.log(`[Squad] Authorize bulk transfer (not implemented): ${reference}`);
+    throw new Error("Authorize bulk transfer not implemented for Squad");
+  },
+
+  async resendBulkTransferOTP(reference: string) {
+    console.log(`[Squad] Resend bulk OTP (not implemented): ${reference}`);
+    throw new Error("Resend bulk OTP not implemented for Squad");
+  },
+
+  async getBulkTransferStatus(batchReference: string) {
+    console.log(`[Squad] Get bulk transfer status (not implemented): ${batchReference}`);
+    throw new Error("Get bulk transfer status not implemented for Squad");
+  },
+
+  async getBulkTransferTransactions(batchReference: string, pageNo: number = 0, pageSize: number = 20) {
+    console.log(`[Squad] Get bulk transfer transactions (not implemented): ${batchReference}`);
+    throw new Error("Get bulk transfer transactions not implemented for Squad");
   },
 
   async accountLookup(bankCode: string, accountNumber: string) {

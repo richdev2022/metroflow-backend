@@ -212,3 +212,35 @@ export const checkFeaturePermission = (requiredPermission: string) => {
     }
   };
 };
+
+export const checkKycStatus = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const businessId = req.user?.businessId;
+
+    if (!userId || !businessId) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+
+    // Check user KYC status
+    const userResult = await query(
+      `SELECT bvn_status, nin_status FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    const user = userResult.rows[0];
+    const isUserVerified = user?.bvn_status === 'verified' || user?.nin_status === 'verified';
+
+    if (!isUserVerified) {
+      return res.status(403).json({
+        success: false,
+        error: "KYC verification is required to access this feature. Please complete your KYC verification."
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error("Check KYC status error:", error);
+    res.status(500).json({ success: false, error: "Failed to verify KYC status" });
+  }
+};

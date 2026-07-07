@@ -1,5 +1,4 @@
 import winston from "winston";
-import DailyRotateFile from "winston-daily-rotate-file";
 
 const { combine, timestamp, json, colorize, printf } = winston.format;
 
@@ -12,42 +11,20 @@ const logger = winston.createLogger({
     json(),
   ),
   defaultMeta: { service: "metricflow-backend" },
-  transports: [],
+  transports: [
+    new winston.transports.Console({
+      format: isProduction
+        ? combine(timestamp(), json())
+        : combine(
+            colorize(),
+            printf(({ timestamp, level, message, ...meta }) => {
+              return `${timestamp} [${level}]: ${message} ${
+                Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ""
+              }`;
+            }),
+          ),
+    }),
+  ],
 });
-
-if (!isProduction) {
-  logger.add(
-    new DailyRotateFile({
-      filename: "logs/error-%DATE%.log",
-      datePattern: "YYYY-MM-DD",
-      level: "error",
-      maxSize: "20m",
-      maxFiles: "14d",
-    }),
-  );
-  logger.add(
-    new DailyRotateFile({
-      filename: "logs/combined-%DATE%.log",
-      datePattern: "YYYY-MM-DD",
-      maxSize: "20m",
-      maxFiles: "14d",
-    }),
-  );
-}
-
-logger.add(
-  new winston.transports.Console({
-    format: isProduction
-      ? combine(timestamp(), json())
-      : combine(
-          colorize(),
-          printf(({ timestamp, level, message, ...meta }) => {
-            return `${timestamp} [${level}]: ${message} ${
-              Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ""
-            }`;
-          }),
-        ),
-  }),
-);
 
 export default logger;

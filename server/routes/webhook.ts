@@ -251,6 +251,8 @@ const handleMonnifyWebhook = async (event: any) => {
         const reference = transactionData.paymentReference;
         const isSuccess = eventType === 'SUCCESSFUL_TRANSACTION';
         
+        console.log('Monnify webhook received:', JSON.stringify(transactionData, null, 2));
+        
         // Find transaction
         const txnRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
         
@@ -320,8 +322,14 @@ const handleMonnifyWebhook = async (event: any) => {
             }
         } else if (isSuccess) {
             // Check for Virtual Account Credit (Monnify Reserved Account)
-            const accountDetails = transactionData.accountDetails;
+            // Try both accountDetails and destinationAccountInformation (Monnify uses both depending on payment type)
+            let accountDetails = transactionData.accountDetails;
+            if (!accountDetails) {
+                accountDetails = transactionData.destinationAccountInformation;
+            }
             const vaNumber = accountDetails?.accountNumber;
+            
+            console.log('Looking for VA number:', vaNumber, 'from accountDetails:', accountDetails);
             
             if (vaNumber) {
                 const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
@@ -332,13 +340,23 @@ const handleMonnifyWebhook = async (event: any) => {
                     }
                 }
                 
+                console.log('VA lookup result:', vaRes.rows);
+                
                 if (vaRes.rows.length > 0) {
                     const walletId = vaRes.rows[0].wallet_id;
                     const walletRes = await query(`SELECT id, user_id, business_id, balance FROM wallets WHERE id = $1`, [walletId]);
                 
                     if (walletRes.rows.length > 0) {
                         const wallet = walletRes.rows[0];
-                        const amount = parseFloat(transactionData.amount);
+                        // Monnify amount is in kobo for some endpoints, in naira for others? Let's check:
+                        // In sample payload, amountPaid is 3000 (kobo), but let's check transactionData.amount vs transactionData.amountPaid
+                        let amount = parseFloat(transactionData.amount || transactionData.amountPaid);
+                        // If amount is > 1000 and we have amountPaid, use amountPaid / 100
+                        if (transactionData.amountPaid && amount > 1000) {
+                            amount = parseFloat(transactionData.amountPaid) / 100;
+                        }
+                        
+                        console.log('Processing credit of amount:', amount);
                         
                         const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
                         

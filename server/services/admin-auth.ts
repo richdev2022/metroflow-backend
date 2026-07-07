@@ -43,7 +43,7 @@ export async function loginAdmin(email: string, password: string) {
     throw new Error("Account is inactive");
   }
 
-  const isValid = verifyPassword(password, admin.password_hash);
+  const isValid = await verifyPassword(password, admin.password_hash);
 
   if (!isValid) {
     throw new Error("Invalid credentials");

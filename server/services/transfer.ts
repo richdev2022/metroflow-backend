@@ -185,34 +185,49 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
               await debitRevenueWallet(fee, transfer.currency || 'NGN');
             }
 
-            await query(
-              `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-              [
-                transfer.business_id, 
-                amount, 
-                transfer.currency || 'NGN', 
-                transfer.reference + '-REFUND', 
-                `Refund for failed transfer: ${transfer.reference}`,
-                transfer.wallet_id
-              ]
+            // Check if refund transaction already exists
+            const refundTxnCheck = await query(
+              `SELECT id FROM transactions WHERE reference = $1`,
+              [transfer.reference + '-REFUND']
             );
-
-            if (fee > 0) {
+            
+            if (refundTxnCheck.rows.length === 0) {
               await query(
                 `INSERT INTO transactions 
                  (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
                  VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
                 [
                   transfer.business_id, 
-                  fee, 
+                  amount, 
                   transfer.currency || 'NGN', 
-                  transfer.reference + '-FEE-REFUND', 
-                  `Refund fee for failed transfer: ${transfer.reference}`,
+                  transfer.reference + '-REFUND', 
+                  `Refund for failed transfer: ${transfer.reference}`,
                   transfer.wallet_id
                 ]
               );
+            }
+
+            if (fee > 0) {
+              const feeRefundTxnCheck = await query(
+                `SELECT id FROM transactions WHERE reference = $1`,
+                [transfer.reference + '-FEE-REFUND']
+              );
+              
+              if (feeRefundTxnCheck.rows.length === 0) {
+                await query(
+                  `INSERT INTO transactions 
+                   (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                   VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                  [
+                    transfer.business_id, 
+                    fee, 
+                    transfer.currency || 'NGN', 
+                    transfer.reference + '-FEE-REFUND', 
+                    `Refund fee for failed transfer: ${transfer.reference}`,
+                    transfer.wallet_id
+                  ]
+                );
+              }
             }
           }
         }
@@ -267,19 +282,27 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
               await debitRevenueWallet(fee, transfer.currency || 'NGN');
             }
             
-            await query(
-              `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-              [
-                transfer.business_id, 
-                amount, 
-                transfer.currency || 'NGN', 
-                transfer.reference + '-REFUND', 
-                `Refund for failed transfer: ${transfer.reference}`,
-                transfer.wallet_id
-              ]
+            // Check if refund transaction already exists
+            const refundTxnCheck = await query(
+              `SELECT id FROM transactions WHERE reference = $1`,
+              [transfer.reference + '-REFUND']
             );
+            
+            if (refundTxnCheck.rows.length === 0) {
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                [
+                  transfer.business_id, 
+                  amount, 
+                  transfer.currency || 'NGN', 
+                  transfer.reference + '-REFUND', 
+                  `Refund for failed transfer: ${transfer.reference}`,
+                  transfer.wallet_id
+                ]
+              );
+            }
           }
         }
         
@@ -364,19 +387,27 @@ export async function checkProcessingTransfers() {
                             await debitRevenueWallet(fee, transfer.currency || 'NGN');
                         }
                         
-                        await query(
-                            `INSERT INTO transactions 
-                             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                            [
-                                transfer.business_id, 
-                                amount, 
-                                transfer.currency || 'NGN', 
-                                transfer.reference + '-REFUND', 
-                                `Refund for timed out transfer: ${transfer.reference}`,
-                                transfer.wallet_id
-                            ]
+                        // Check if refund transaction already exists
+                        const refundTxnCheck = await query(
+                            `SELECT id FROM transactions WHERE reference = $1`,
+                            [transfer.reference + '-REFUND']
                         );
+                        
+                        if (refundTxnCheck.rows.length === 0) {
+                            await query(
+                                `INSERT INTO transactions 
+                                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                                [
+                                    transfer.business_id, 
+                                    amount, 
+                                    transfer.currency || 'NGN', 
+                                    transfer.reference + '-REFUND', 
+                                    `Refund for timed out transfer: ${transfer.reference}`,
+                                    transfer.wallet_id
+                                ]
+                            );
+                        }
                     }
                 }
             } else {
@@ -543,34 +574,49 @@ export async function processAllPending(businessId: string) {
                     await debitRevenueWallet(fee, transfer.currency || 'NGN');
                 }
 
-                await query(
-                    `INSERT INTO transactions 
-                     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                     VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                    [
-                        transfer.business_id, 
-                        amount, 
-                        transfer.currency || 'NGN', 
-                        transfer.reference + '-REFUND', 
-                        `Refund for failed transfer: ${transfer.reference}`,
-                        transfer.wallet_id
-                    ]
+                // Check if refund transaction already exists
+                const refundTxnCheck = await query(
+                    `SELECT id FROM transactions WHERE reference = $1`,
+                    [transfer.reference + '-REFUND']
                 );
-
-                if (fee > 0) {
+                
+                if (refundTxnCheck.rows.length === 0) {
                     await query(
                         `INSERT INTO transactions 
                          (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
                          VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
                         [
                             transfer.business_id, 
-                            fee, 
+                            amount, 
                             transfer.currency || 'NGN', 
-                            transfer.reference + '-FEE-REFUND', 
-                            `Refund fee for failed transfer: ${transfer.reference}`,
+                            transfer.reference + '-REFUND', 
+                            `Refund for failed transfer: ${transfer.reference}`,
                             transfer.wallet_id
                         ]
                     );
+                }
+
+                if (fee > 0) {
+                    const feeRefundTxnCheck = await query(
+                        `SELECT id FROM transactions WHERE reference = $1`,
+                        [transfer.reference + '-FEE-REFUND']
+                    );
+                    
+                    if (feeRefundTxnCheck.rows.length === 0) {
+                        await query(
+                            `INSERT INTO transactions 
+                             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                            [
+                                transfer.business_id, 
+                                fee, 
+                                transfer.currency || 'NGN', 
+                                transfer.reference + '-FEE-REFUND', 
+                                `Refund fee for failed transfer: ${transfer.reference}`,
+                                transfer.wallet_id
+                            ]
+                        );
+                    }
                 }
            }
       }
@@ -771,35 +817,50 @@ export async function processTransfer(transferId: string) {
                   await debitRevenueWallet(fee, transfer.currency || 'NGN');
               }
 
-              await query(
-                  `INSERT INTO transactions 
-                   (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                   VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                  [
-                      transfer.business_id, 
-                      amount, 
-                      transfer.currency || 'NGN', 
-                      transfer.reference + '-REFUND', 
-                      `Refund for failed transfer: ${transfer.reference}`,
-                      transfer.wallet_id
-                  ]
+              // Check if refund transaction already exists
+              const refundTxnCheck = await query(
+                  `SELECT id FROM transactions WHERE reference = $1`,
+                  [transfer.reference + '-REFUND']
               );
-
-              if (fee > 0) {
+              
+              if (refundTxnCheck.rows.length === 0) {
                 await query(
                     `INSERT INTO transactions 
                      (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
                      VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
                     [
                         transfer.business_id, 
-                        fee, 
+                        amount, 
                         transfer.currency || 'NGN', 
-                        transfer.reference + '-FEE-REFUND', 
-                        `Refund fee for failed transfer: ${transfer.reference}`,
+                        transfer.reference + '-REFUND', 
+                        `Refund for failed transfer: ${transfer.reference}`,
                         transfer.wallet_id
                     ]
                 );
-            }
+              }
+
+              if (fee > 0) {
+                const feeRefundTxnCheck = await query(
+                    `SELECT id FROM transactions WHERE reference = $1`,
+                    [transfer.reference + '-FEE-REFUND']
+                );
+                
+                if (feeRefundTxnCheck.rows.length === 0) {
+                  await query(
+                      `INSERT INTO transactions 
+                       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                       VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                      [
+                          transfer.business_id, 
+                          fee, 
+                          transfer.currency || 'NGN', 
+                          transfer.reference + '-FEE-REFUND', 
+                          `Refund fee for failed transfer: ${transfer.reference}`,
+                          transfer.wallet_id
+                      ]
+                  );
+                }
+              }
          }
     }
 

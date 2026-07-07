@@ -229,6 +229,77 @@ authRouter.post("/verify-forgot-password-otp", async (req, res) => {
 
 /**
  * @swagger
+ * /admin/auth/reset-password:
+ *   post:
+ *     summary: Reset admin password
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - otp
+ *               - newPassword
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               otp:
+ *                 type: string
+ *               newPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password reset successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *       401:
+ *         description: Invalid OTP
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
+ */
+// Admin Reset Password
+authRouter.post("/reset-password", async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ success: false, error: "Password must be at least 6 characters" });
+    }
+
+    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+
+    if (adminCheck.rows.length > 0) {
+      const passwordHash = await hashPassword(newPassword);
+      await query(`UPDATE platform_admins SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE email = $2`, [passwordHash, email]);
+      res.json({ success: true, message: "Password reset successfully" });
+    } else {
+      res.status(401).json({ success: false, error: "Invalid OTP" });
+    }
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * @swagger
  * /admin/auth/forgot-password:
  *   post:
  *     summary: Request password reset

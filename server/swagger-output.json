@@ -22,6 +22,76 @@
         "scheme": "bearer",
         "bearerFormat": "JWT"
       }
+    },
+    "schemas": {
+      "TaskStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "business_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string",
+            "description": "Hexadecimal color code (e.g."
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "sort_order": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TaskStatusCreate": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string",
+            "description": "Hexadecimal color code (e.g.",
+            "example": "#6b7280"
+          },
+          "sort_order": {
+            "type": "integer"
+          }
+        }
+      },
+      "TaskStatusUpdate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string",
+            "description": "Hexadecimal color code (e.g.",
+            "example": "#6b7280"
+          },
+          "sort_order": {
+            "type": "integer"
+          }
+        }
+      }
     }
   },
   "security": [
@@ -144,6 +214,8 @@
                       "funding_account",
                       "transfer",
                       "otp",
+                      "otp_sms",
+                      "otp_whatsapp",
                       "stamp_duty"
                     ]
                   },
@@ -429,6 +501,79 @@
         "responses": {
           "200": {
             "description": "OTP verified successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid OTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/auth/reset-password": {
+      "post": {
+        "summary": "Reset admin password",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "otp",
+                  "newPassword"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "otp": {
+                    "type": "string"
+                  },
+                  "newPassword": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Password reset successfully",
             "content": {
               "application/json": {
                 "schema": {
@@ -3518,6 +3663,14 @@
                   },
                   "number": {
                     "type": "string"
+                  },
+                  "otp_method": {
+                    "type": "string",
+                    "enum": [
+                      "sms",
+                      "whatsapp",
+                      "email"
+                    ]
                   }
                 }
               }
@@ -4475,6 +4628,7 @@
                     "enum": [
                       "email",
                       "sms",
+                      "whatsapp",
                       "both"
                     ]
                   }
@@ -4502,6 +4656,145 @@
         "responses": {
           "200": {
             "description": "Current preference"
+          }
+        }
+      }
+    },
+    "/api/settings/pin": {
+      "post": {
+        "summary": "Create transaction PIN",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTransactionPinInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PIN created successfully"
+          },
+          "400": {
+            "description": "PIN already exists or invalid input"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update transaction PIN using OTP",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "newPin",
+                  "otp"
+                ],
+                "properties": {
+                  "newPin": {
+                    "type": "string",
+                    "description": "New 4-digit PIN"
+                  },
+                  "otp": {
+                    "type": "string",
+                    "description": "OTP sent to phone and email"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PIN updated successfully"
+          },
+          "400": {
+            "description": "Invalid OTP or invalid new PIN"
+          }
+        }
+      }
+    },
+    "/api/settings/pin/send-otp": {
+      "post": {
+        "summary": "Send OTP for PIN update",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OTP sent successfully"
+          },
+          "500": {
+            "description": "Failed to send OTP"
+          }
+        }
+      }
+    },
+    "/api/settings/otp-enabled": {
+      "put": {
+        "summary": "Toggle OTP requirement for transfers",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToggleOtpInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP setting updated successfully"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get OTP enabled status",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OTP status retrieved successfully"
           }
         }
       }
@@ -5217,6 +5510,189 @@
           },
           "401": {
             "description": "Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/task-statuses": {
+      "get": {
+        "summary": "Get all task statuses for the current business",
+        "tags": [
+          "Task Statuses"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of task statuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TaskStatus"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a new custom task status",
+        "tags": [
+          "Task Statuses"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskStatusCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Task status created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/TaskStatus"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/api/task-statuses/{id}": {
+      "put": {
+        "summary": "Update an existing task status",
+        "tags": [
+          "Task Statuses"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskStatusUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Task status updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/TaskStatus"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "404": {
+            "description": "Task status not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a custom task status",
+        "tags": [
+          "Task Statuses"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task status deleted"
+          },
+          "400": {
+            "description": "Cannot delete default status"
+          },
+          "404": {
+            "description": "Task status not found"
+          },
+          "500": {
+            "description": "Server error"
           }
         }
       }
@@ -6132,7 +6608,7 @@
     },
     "/api/test-communications/send": {
       "post": {
-        "summary": "Send test SMS or Email",
+        "summary": "Send test SMS, Email, or WhatsApp",
         "tags": [
           "Test Communications"
         ],
@@ -6152,7 +6628,8 @@
                     "type": "string",
                     "enum": [
                       "sms",
-                      "email"
+                      "email",
+                      "whatsapp"
                     ],
                     "description": "Type of communication to send"
                   },
@@ -6162,7 +6639,7 @@
                   },
                   "recipient": {
                     "type": "string",
-                    "description": "Phone number for SMS or email address for Email"
+                    "description": "Phone number for SMS/WhatsApp or email address for Email"
                   },
                   "otp": {
                     "type": "string",
@@ -6197,7 +6674,7 @@
     },
     "/api/test-communications/categories": {
       "get": {
-        "summary": "Get available categories for SMS and Email",
+        "summary": "Get available categories for SMS, Email, and WhatsApp",
         "tags": [
           "Test Communications"
         ],
@@ -7224,6 +7701,33 @@
           }
         }
       }
+    },
+    "/api/webhook": {
+      "post": {
+        "summary": "Webhook endpoint for payment providers",
+        "description": "Receives and processes webhook events from Squad and Monnify",
+        "tags": [
+          "Webhooks"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook processed successfully"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
     }
   },
   "tags": [
@@ -7272,6 +7776,10 @@
       "description": "Subscription management endpoints"
     },
     {
+      "name": "Task Statuses",
+      "description": "Custom task status management"
+    },
+    {
       "name": "Tasks",
       "description": "Task management endpoints"
     },
@@ -7290,6 +7798,10 @@
     {
       "name": "Wallet",
       "description": "Wallet management endpoints"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Webhook endpoints for payment providers (Squad and Monnify)"
     }
   ]
 }

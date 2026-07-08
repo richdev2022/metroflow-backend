@@ -5,7 +5,34 @@ import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 
-export const getCalls: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /calls:
+ *   get:
+ *     summary: Get calls
+ *     description: Returns paginated calls for the authenticated user's business.
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *     responses:
+ *       200:
+ *         description: Calls fetched successfully
+ */
+export const getCalls: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const businessId = req.user?.businessId;
     if (!businessId) {
@@ -61,7 +88,39 @@ export const getCalls: RequestHandler = async (req: AuthenticatedRequest, res) =
   }
 };
 
-export const createCall: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /calls:
+ *   post:
+ *     summary: Create a call
+ *     description: Starts an audio or video call and creates a Jitsi room ID.
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               type:
+ *                 type: string
+ *                 enum: [audio, video]
+ *                 default: video
+ *               participantIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       201:
+ *         description: Call created successfully
+ */
+export const createCall: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { type, participantIds } = req.body;
     const businessId = req.user?.businessId;
@@ -139,7 +198,44 @@ export const createCall: RequestHandler = async (req: AuthenticatedRequest, res)
   }
 };
 
-export const updateCall: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /calls/{id}:
+ *   put:
+ *     summary: Update a call
+ *     description: Updates a call status.
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [ongoing, completed, missed]
+ *     responses:
+ *       200:
+ *         description: Call updated successfully
+ *       404:
+ *         description: Call not found
+ */
+export const updateCall: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -216,7 +312,31 @@ export const updateCall: RequestHandler = async (req: AuthenticatedRequest, res)
   }
 };
 
-export const joinCall: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /calls/{id}/join:
+ *   post:
+ *     summary: Join a call
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Joined call successfully
+ *       404:
+ *         description: Call not found
+ */
+export const joinCall: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -265,7 +385,10 @@ export const joinCall: RequestHandler = async (req: AuthenticatedRequest, res) =
     // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:participantJoined", { callId: id, userId });
+      io.to(`business:${businessId}`).emit("call:participantJoined", {
+        callId: id,
+        userId,
+      });
     }
 
     const response: ApiResponse<any> = {
@@ -283,7 +406,31 @@ export const joinCall: RequestHandler = async (req: AuthenticatedRequest, res) =
   }
 };
 
-export const leaveCall: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /calls/{id}/leave:
+ *   post:
+ *     summary: Leave a call
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Left call successfully
+ *       404:
+ *         description: Call not found
+ */
+export const leaveCall: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -332,7 +479,10 @@ export const leaveCall: RequestHandler = async (req: AuthenticatedRequest, res) 
     // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:participantLeft", { callId: id, userId });
+      io.to(`business:${businessId}`).emit("call:participantLeft", {
+        callId: id,
+        userId,
+      });
     }
 
     const response: ApiResponse<any> = {

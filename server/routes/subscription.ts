@@ -1,9 +1,10 @@
 import express from "express";
 import { authenticateToken, AuthenticatedRequest, checkFeaturePermission } from "../middleware/auth";
 import { query } from "../db";
-import { initiatePayment, verifyPayment, cancelRecurring } from "../services/squad";
+import { getProvider } from "../services/providers/factory";
 import { processSubscriptionRenewals } from "../services/subscription";
-import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail } from "../services/email";
+import { creditRevenueWallet } from "../services/fees";
+import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail, generateSubscriptionActivatedEmail } from "../services/email";
 import crypto from "crypto";
 import axios from "axios";
 import * as XLSX from "xlsx";
@@ -39,6 +40,24 @@ const parsePan = (pan: string) => {
     }
     
     return { last4, expMonth, expYear, cardType };
+};
+
+const isPaymentInitiated = (response: any) =>
+    Boolean(response?.success && response?.data?.checkout_url);
+
+const getCheckoutUrl = (response: any) => response?.data?.checkout_url;
+
+const isPaymentSuccessful = (response: any) => {
+    const data = response?.data || {};
+    return Boolean(
+        response?.success &&
+        (
+            data.transaction_status === 'success' ||
+            data.paymentStatus === 'PAID' ||
+            data.status === 'PAID' ||
+            data.status === 'SUCCESS'
+        )
+    );
 };
 
 /**
@@ -548,8 +567,11 @@ router.post("/cards/initiate", authenticateToken, async (req, res) => {
         if (!userEmail) return res.status(401).json({ success: false, error: "User email not found" });
 
         // Get current plan_id
-        const businessRes = await query('SELECT plan_id FROM businesses WHERE id = $1', [businessId]);
+        const businessRes = await query('SELECT plan_id, active_payment_provider FROM businesses WHERE id = $1', [businessId]);
         const planId = businessRes.rows[0]?.plan_id;
+        const requestedProvider = typeof req.body.provider === 'string' ? req.body.provider : undefined;
+        const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0]?.active_payment_provider || 'squad';
+        const provider = getProvider(providerName);
 
         // Initiate a small charge (e.g., 100 NGN) to tokenize
         // Fetch verification amount from settings
@@ -562,16 +584,16 @@ router.post("/cards/initiate", authenticateToken, async (req, res) => {
         
         // Create transaction
         await query(
-            `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, transaction_type)
-             VALUES ($1, $2, $3, $4, $5, 'pending', 'card_validation')`,
-            [businessId, planId, amount, currency, reference]
+            `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, transaction_type, payment_provider)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 'card_validation', $6)`,
+            [businessId, planId, amount, currency, reference, providerName]
         );
 
         const origin = req.get('origin') || req.get('referer') || 'http://localhost:3000';
         const baseUrl = origin.endsWith('/') ? origin.slice(0, -1) : origin;
         const callbackUrl = `${baseUrl}/payment/callback`;
 
-        const squadResponse = await initiatePayment({
+        const paymentResponse = await provider.initiatePayment({
             email: userEmail,
             amount: amount * 100, // Kobo
             reference,
@@ -580,8 +602,8 @@ router.post("/cards/initiate", authenticateToken, async (req, res) => {
             isRecurring: true
         });
 
-        if (squadResponse && squadResponse.status === 200 && squadResponse.data?.checkout_url) {
-            res.json({ success: true, checkout_url: squadResponse.data.checkout_url });
+        if (isPaymentInitiated(paymentResponse)) {
+            res.json({ success: true, checkout_url: getCheckoutUrl(paymentResponse), payment_provider: providerName });
         } else {
             res.status(500).json({ success: false, error: "Failed to initiate card validation" });
         }
@@ -742,6 +764,14 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
 
     if (!userEmail) return res.status(401).json({ success: false, error: "User email not found" });
 
+    const businessRes = await query(`SELECT active_payment_provider FROM businesses WHERE id = $1`, [businessId]);
+    if (businessRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Business not found" });
+    }
+    const requestedProvider = typeof req.body.provider === 'string' ? req.body.provider : undefined;
+    const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0].active_payment_provider || 'squad';
+    const provider = getProvider(providerName);
+
     // Verify plan exists
     const planResult = await query(`SELECT * FROM pricing_plans WHERE id = $1`, [planId]);
     if (planResult.rows.length === 0) {
@@ -765,7 +795,7 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
          const rateRes = await axios.get('https://api.exchangerate-api.com/v4/latest/USD');
          if (rateRes.data && rateRes.data.rates && rateRes.data.rates.NGN) {
             const rate = rateRes.data.rates.NGN;
-            finalAmount = Math.round(plan.price * rate);
+            finalAmount = Math.round(finalAmount * rate);
          } else {
             // Fallback rate if API fails? Or error out?
             // For now, let's error out to be safe or use a fallback.
@@ -787,12 +817,12 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
 
     // Create pending transaction record
     await query(
-      `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status)
-       VALUES ($1, $2, $3, $4, $5, 'pending')`,
-      [businessId, planId, finalAmount, currency, reference]
+      `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, transaction_type, payment_provider)
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'subscription', $6)`,
+      [businessId, planId, finalAmount, currency, reference, providerName]
     );
 
-    // Call Squad API
+    // Call active payment provider
     // Callback URL: The frontend page that handles the verify
     // Using referer or origin to build callback URL
     const origin = req.get('origin') || req.get('referer') || 'http://localhost:3000';
@@ -802,7 +832,7 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
 
     console.log(`Initiating payment for ${userEmail}, amount: ${amountInMinor} ${currency}, callback: ${callbackUrl}`);
 
-    const squadResponse = await initiatePayment({
+    const paymentResponse = await provider.initiatePayment({
       email: userEmail,
       amount: amountInMinor,
       reference,
@@ -811,10 +841,11 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
       isRecurring: true
     });
 
-    if (squadResponse && squadResponse.status === 200 && squadResponse.data?.checkout_url) {
-       res.json({ success: true, checkout_url: squadResponse.data.checkout_url });
+    if (isPaymentInitiated(paymentResponse)) {
+       await query(`UPDATE businesses SET active_payment_provider = $1 WHERE id = $2`, [providerName, businessId]);
+       res.json({ success: true, checkout_url: getCheckoutUrl(paymentResponse), payment_provider: providerName });
     } else {
-       console.error("Squad response invalid:", squadResponse);
+       console.error("Provider response invalid:", paymentResponse);
        res.status(500).json({ success: false, error: "Failed to initiate payment with provider" });
     }
 
@@ -872,10 +903,13 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
        return res.json({ success: true, message: "Payment already verified" });
     }
 
-    // Verify with Squad
-    const verifyResponse = await verifyPayment(reference);
+    const providerName = transaction.payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const provider = getProvider(providerName);
 
-    if (verifyResponse.success && verifyResponse.data?.transaction_status === 'success') {
+    // Verify with the provider that initiated the transaction
+    const verifyResponse = await provider.verifyPayment(reference);
+
+    if (isPaymentSuccessful(verifyResponse)) {
         // Extract Card Information
         const paymentInfo = verifyResponse.data.payment_information || {};
         const cardDetails = verifyResponse.data.card_details || {}; 
@@ -922,7 +956,7 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
         if (transaction.transaction_type === 'card_validation') {
              // SYNC FIX: Update businesses table with the new card token since we made it active in payment_cards
              if (tokenId) {
-                 await query(`UPDATE businesses SET card_token = $1 WHERE id = $2`, [tokenId, businessId]);
+                 await query(`UPDATE businesses SET card_token = $1, active_payment_provider = $3 WHERE id = $2`, [tokenId, businessId, providerName]);
              }
 
              await query(
@@ -947,7 +981,8 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
         console.log("Verify Payment Response:", JSON.stringify(verifyResponse, null, 2));
 
         // Fetch Plan Duration
-        const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+        const planRes = await query(`SELECT name, duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+        const planName = planRes.rows.length > 0 ? planRes.rows[0].name : 'Subscription';
         const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
 
         // Calculate next billing date
@@ -967,10 +1002,36 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
                trial_ends_at = NULL, 
                updated_at = CURRENT_TIMESTAMP,
                card_token = COALESCE($3, card_token),
-               next_billing_date = $4
+               next_billing_date = $4,
+               active_payment_provider = $5
            WHERE id = $2`,
-          [transaction.plan_id, transaction.business_id, tokenId, nextBillingDate]
+          [transaction.plan_id, transaction.business_id, tokenId, nextBillingDate, providerName]
         );
+
+        await creditRevenueWallet(Number(transaction.amount), transaction.currency || 'NGN');
+
+        try {
+            const businessRes = await query(`SELECT name, email FROM businesses WHERE id = $1`, [transaction.business_id]);
+            const business = businessRes.rows[0];
+            const recipientEmail = business?.email || verifyResponse.data?.email || verifyResponse.data?.customerEmail;
+            if (recipientEmail) {
+                const emailHtml = generateSubscriptionActivatedEmail(
+                    business?.name || 'Business',
+                    planName,
+                    Number(transaction.amount),
+                    transaction.currency || 'NGN',
+                    nextBillingDate
+                );
+                await sendEmail({
+                    sender: { name: "Metricorex", email: "no-reply@metricorex.com" },
+                    to: [{ email: recipientEmail, name: business?.name || 'Business' }],
+                    subject: "Your Subscription Is Active",
+                    htmlContent: emailHtml
+                });
+            }
+        } catch (emailErr) {
+            console.error("Failed to send subscription activation email:", emailErr);
+        }
         
         res.json({ success: true, message: "Payment successful and subscription updated" });
     } else {
@@ -1139,12 +1200,13 @@ router.post("/cancel", authenticateToken, async (req, res) => {
             return res.status(400).json({ success: false, error: "No active subscription found" });
         }
 
-        // Call Squad to cancel recurring if we have a card token
+        // Cancel recurring with the provider attached to this subscription.
         if (business.card_token) {
             try {
-                await cancelRecurring(business.card_token);
+                const provider = getProvider(business.active_payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'squad');
+                await provider.cancelRecurring(business.card_token);
             } catch (err) {
-                console.warn("Squad cancel recurring warning:", err);
+                console.warn("Provider cancel recurring warning:", err);
                 // Continue locally
             }
         }

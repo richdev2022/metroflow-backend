@@ -679,6 +679,7 @@ export async function initializeDatabase() {
     // Add wallet_id to transactions
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS wallet_id UUID REFERENCES wallets(id) ON DELETE SET NULL`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS direction VARCHAR(10) DEFAULT 'credit'`); // credit, debit
+    await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS fee NUMERIC(20, 2) DEFAULT 0`);
 
 
     // Add KYC columns to users
@@ -914,6 +915,94 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_preference VARCHAR(20) DEFAULT 'email'`);
+
+    // Create fee configuration and revenue wallet tables used by admin finance endpoints.
+    await query(`
+      CREATE TABLE IF NOT EXISTS fee_configurations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(255) NOT NULL,
+        fee_type VARCHAR(50) NOT NULL,
+        config_type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS platform_wallet (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        balance NUMERIC(20, 2) DEFAULT 0,
+        currency VARCHAR(3) DEFAULT 'NGN',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`CREATE INDEX IF NOT EXISTS idx_fee_configurations_fee_type ON fee_configurations(fee_type)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_platform_wallet_currency ON platform_wallet(currency)`);
+
+    const platformWalletCheck = await query(`SELECT id FROM platform_wallet WHERE currency = 'NGN' LIMIT 1`);
+    if (platformWalletCheck.rows.length === 0) {
+      await query(`INSERT INTO platform_wallet (balance, currency) VALUES (0, 'NGN')`);
+    }
+
+    const defaultFees = [
+      {
+        name: 'Standard Transfer Fee',
+        fee_type: 'transfer',
+        config_type: 'range',
+        config: {
+          ranges: [
+            { min: 0, max: 5000, fee: 10 },
+            { min: 5001, max: 50000, fee: 25 },
+            { min: 50001, max: 999999999, fee: 50 }
+          ]
+        }
+      },
+      {
+        name: 'Card Funding Fee',
+        fee_type: 'funding_card',
+        config_type: 'percentage_cap',
+        config: { percentage: 1.5, cap: 2000 }
+      },
+      {
+        name: 'Account Funding Fee',
+        fee_type: 'funding_account',
+        config_type: 'flat',
+        config: { amount: 50 }
+      },
+      {
+        name: 'OTP SMS Fee',
+        fee_type: 'otp_sms',
+        config_type: 'flat',
+        config: { amount: 4 }
+      },
+      {
+        name: 'Stamp Duty',
+        fee_type: 'stamp_duty',
+        config_type: 'flat_conditional',
+        config: {
+          conditions: [
+            { operator: '>=', threshold: 10000, fee: 50 }
+          ]
+        }
+      }
+    ];
+
+    for (const fee of defaultFees) {
+      const feeCheck = await query(`SELECT id FROM fee_configurations WHERE fee_type = $1 LIMIT 1`, [fee.fee_type]);
+      if (feeCheck.rows.length === 0) {
+        await query(
+          `INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+           VALUES ($1, $2, $3, $4, 'NGN')`,
+          [fee.name, fee.fee_type, fee.config_type, fee.config]
+        );
+      }
+    }
+
+    await fixUuidIdDefaults(['fee_configurations', 'platform_wallet']);
 
     // Seed Admin Permissions
     const permissions = [
@@ -1044,6 +1133,125 @@ export async function initializeDatabase() {
     `);
 
     await fixUuidIdDefaults(['task_statuses']);
+
+    // Create communication tables used by meetings, chat, and calls routes.
+    await query(`
+      CREATE TABLE IF NOT EXISTS meetings (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        start_time TIMESTAMP NOT NULL,
+        end_time TIMESTAMP NOT NULL,
+        timezone VARCHAR(100) NOT NULL,
+        created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(50) DEFAULT 'scheduled',
+        meeting_url TEXT,
+        google_event_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS meeting_attendees (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(50) DEFAULT 'invited',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(meeting_id, user_id)
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS meeting_reminders (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        minutes INTEGER NOT NULL,
+        sent BOOLEAN DEFAULT FALSE,
+        sent_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        name VARCHAR(255),
+        type VARCHAR(50) DEFAULT 'direct',
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_participants (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id UUID NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        last_read_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(conversation_id, user_id)
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id UUID NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT,
+        attachment_url TEXT,
+        attachment_type VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS calls (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        jitsi_room_id VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS call_participants (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        call_id UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        joined_at TIMESTAMP,
+        left_at TIMESTAMP,
+        status VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(call_id, user_id)
+      )
+    `);
+
+    await query(`CREATE INDEX IF NOT EXISTS idx_meetings_business_id ON meetings(business_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_chat_conversations_business_id ON chat_conversations(business_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_calls_business_id ON calls(business_id)`);
+
+    await fixUuidIdDefaults([
+      'meetings',
+      'meeting_attendees',
+      'meeting_reminders',
+      'chat_conversations',
+      'chat_participants',
+      'chat_messages',
+      'calls',
+      'call_participants'
+    ]);
 
     // Seed default statuses for existing businesses
     const defaultStatuses = [

@@ -6,6 +6,7 @@ import { hashPassword } from "../services/auth";
 import crypto from "crypto";
 import { AuthenticatedRequest, checkTeamLimit } from "../middleware/auth";
 import { logActivity } from "../services/activity";
+import { getRedisClient } from "../lib/cache";
 
 export const getTeamRanking: RequestHandler = async (req: AuthenticatedRequest, res) => {
   /**
@@ -219,6 +220,8 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
  *                         type: string
  *                       is_owner:
  *                         type: boolean
+ *                       presence_status:
+ *                         type: string
  *       500:
  *         description: Server error
  */
@@ -263,17 +266,26 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
       [businessId],
     );
 
-    // Add is_owner flag to each user and set role to Owner if owner
-    const teamMembers = result.rows.map(user => {
+    const redisClient = getRedisClient();
+    // Add is_owner flag and presence status to each user
+    const teamMembers = await Promise.all(result.rows.map(async (user) => {
       const isOwner = user.id === ownerId;
+      let presenceStatus = "offline";
+      if (redisClient) {
+        const isOnline = await redisClient.get(`online:${businessId}:${user.id}`);
+        if (isOnline) {
+          presenceStatus = "online";
+        }
+      }
       return {
         ...user,
         role: isOwner ? "Owner" : user.role,
-        is_owner: isOwner
+        is_owner: isOwner,
+        presence_status: presenceStatus
       };
-    });
+    }));
 
-    const response: ApiResponse<TeamMember[]> = {
+    const response: ApiResponse<any[]> = {
       success: true,
       data: teamMembers,
     };

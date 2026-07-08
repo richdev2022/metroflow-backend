@@ -24,6 +24,91 @@ const RETRY_DELAY = 3000; // 3s
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+async function fixUuidIdDefaults(tableNames: string[]) {
+  for (const tableName of tableNames) {
+    if (!/^[a-z_][a-z0-9_]*$/.test(tableName)) {
+      throw new Error(`Invalid table name: ${tableName}`);
+    }
+
+    try {
+      await query(`ALTER TABLE ${tableName} ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+
+      const nullIdRows = await query(`SELECT * FROM ${tableName} WHERE id IS NULL`);
+      if (nullIdRows.rows.length > 0) {
+        await query(`UPDATE ${tableName} SET id = gen_random_uuid() WHERE id IS NULL`);
+        console.log(`Fixed ${nullIdRows.rows.length} rows with null ids in ${tableName}`);
+      }
+    } catch (error) {
+      console.log(`Could not fix id column on ${tableName}:`, error.message);
+    }
+  }
+}
+
+async function fixExistingUuidIdDefaults() {
+  try {
+    const result = await query(`
+      SELECT table_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND column_name = 'id'
+        AND udt_name = 'uuid'
+    `);
+
+    await fixUuidIdDefaults(result.rows.map((row) => row.table_name));
+  } catch (error) {
+    console.log('Could not repair existing UUID id defaults:', error.message);
+  }
+}
+
+async function ensureBaseSchemaTables() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id VARCHAR(255) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NOT NULL UNIQUE,
+      industry VARCHAR(255),
+      logo_url TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      email VARCHAR(255) NOT NULL,
+      password_hash VARCHAR(255),
+      name VARCHAR(255) NOT NULL,
+      role VARCHAR(50) NOT NULL DEFAULT 'member',
+      status VARCHAR(50) DEFAULT 'active',
+      otp_code VARCHAR(6),
+      otp_expires_at TIMESTAMP,
+      email_verified BOOLEAN DEFAULT FALSE,
+      verified_at TIMESTAMP,
+      invite_token VARCHAR(255),
+      invite_expires_at TIMESTAMP,
+      last_login TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(business_id, email)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ideas (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NOT NULL,
+      status VARCHAR(50) DEFAULT 'under_review',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
 export async function query(text: string, params?: unknown[]) {
   const start = Date.now();
   let lastError;
@@ -60,6 +145,14 @@ export async function query(text: string, params?: unknown[]) {
 
 export async function initializeDatabase() {
   try {
+    try {
+      await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+    } catch (error) {
+      console.log('Could not enable pgcrypto extension:', error.message);
+    }
+
+    await fixExistingUuidIdDefaults();
+
     // Create platform_admins table
     await query(`
       CREATE TABLE IF NOT EXISTS platform_admins (
@@ -75,6 +168,19 @@ export async function initializeDatabase() {
 
     // Add status column if not exists (migration)
     await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'`);
+
+    // Fix id column for existing platform_admins table
+    try {
+      await query(`ALTER TABLE platform_admins ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+
+      const nullIdRows = await query(`SELECT * FROM platform_admins WHERE id IS NULL`);
+      if (nullIdRows.rows.length > 0) {
+        await query(`UPDATE platform_admins SET id = gen_random_uuid() WHERE id IS NULL`);
+        console.log(`Fixed ${nullIdRows.rows.length} rows with null ids in platform_admins`);
+      }
+    } catch (error) {
+      console.log('Could not fix id column on platform_admins:', error.message);
+    }
 
     // Create pricing_plans table
     await query(`
@@ -94,12 +200,29 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Fix id column for existing pricing_plans table
+    try {
+      // Set default for id column
+      await query(`ALTER TABLE pricing_plans ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+      
+      // Update any existing rows with null ids
+      const nullIdRows = await query(`SELECT * FROM pricing_plans WHERE id IS NULL`);
+      if (nullIdRows.rows.length > 0) {
+        await query(`UPDATE pricing_plans SET id = gen_random_uuid() WHERE id IS NULL`);
+        console.log(`Fixed ${nullIdRows.rows.length} rows with null ids in pricing_plans`);
+      }
+    } catch (error) {
+      console.log('Could not fix id column on pricing_plans:', error.message);
+    }
+
     // Add columns if they don't exist (for migration)
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_team_members INTEGER DEFAULT 5`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_days INTEGER DEFAULT 7`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS duration VARCHAR(20) DEFAULT 'monthly'`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS discount DECIMAL(10, 2) DEFAULT 0`);
+
+    await ensureBaseSchemaTables();
 
     // Add plan_id and subscription_status to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS plan_id UUID REFERENCES pricing_plans(id)`);
@@ -166,12 +289,12 @@ export async function initializeDatabase() {
     }
 
     // Seed default platform admin if not exists
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, ['admin@quantigrate.com']);
+    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, ['sunday@metricorex.com']);
     if (adminCheck.rows.length === 0) {
-      const hashedPassword = await hashPassword('admin@123');
+      const hashedPassword = await hashPassword('Password@123');
       await query(
         `INSERT INTO platform_admins (email, password_hash, name) VALUES ($1, $2, $3)`,
-        ['admin@quantigrate.com', hashedPassword, 'Super Admin']
+        ['sunday@metricorex.com', hashedPassword, 'Super Admin']
       );
       console.log('Seeded default platform admin');
     }
@@ -327,21 +450,8 @@ export async function initializeDatabase() {
       await query(`ALTER TABLE task_assignments DROP CONSTRAINT IF EXISTS task_assignments_assigned_by_fkey`);
       await query(`ALTER TABLE task_assignments ADD CONSTRAINT task_assignments_assigned_by_fkey FOREIGN KEY (assigned_by) REFERENCES users(id) ON DELETE SET NULL`);
 
-      // Migration for attachments
-      await query(`ALTER TABLE attachments ALTER COLUMN uploaded_by DROP NOT NULL`);
-      await query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_uploaded_by_fkey`);
-      await query(`ALTER TABLE attachments ADD CONSTRAINT attachments_uploaded_by_fkey FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL`);
-
-      // Migration for comments
-      await query(`ALTER TABLE comments ALTER COLUMN user_id DROP NOT NULL`);
-      await query(`ALTER TABLE comments DROP CONSTRAINT IF EXISTS comments_user_id_fkey`);
-      await query(`ALTER TABLE comments ADD CONSTRAINT comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL`);
-
-      // Migration for Epic comments
-      await query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS epic_name VARCHAR(255)`);
-      await query(`ALTER TABLE comments ALTER COLUMN task_id DROP NOT NULL`);
     } catch (error) {
-      console.error("Migration for foreign key constraints failed:", error);
+      console.error("Migration for task_assignments foreign key constraint failed:", error);
     }
 
     // Create attachments table
@@ -372,6 +482,25 @@ export async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Migration: Fix nullable user references after the dependent tables exist.
+    try {
+      // Migration for attachments
+      await query(`ALTER TABLE attachments ALTER COLUMN uploaded_by DROP NOT NULL`);
+      await query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_uploaded_by_fkey`);
+      await query(`ALTER TABLE attachments ADD CONSTRAINT attachments_uploaded_by_fkey FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL`);
+
+      // Migration for comments
+      await query(`ALTER TABLE comments ALTER COLUMN user_id DROP NOT NULL`);
+      await query(`ALTER TABLE comments DROP CONSTRAINT IF EXISTS comments_user_id_fkey`);
+      await query(`ALTER TABLE comments ADD CONSTRAINT comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL`);
+
+      // Migration for Epic comments
+      await query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS epic_name VARCHAR(255)`);
+      await query(`ALTER TABLE comments ALTER COLUMN task_id DROP NOT NULL`);
+    } catch (error) {
+      console.error("Migration for attachments/comments foreign key constraints failed:", error);
+    }
 
     // Create epics table
     await query(`
@@ -471,6 +600,22 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS customer_identifier VARCHAR(255)`);
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS beneficiary_account VARCHAR(20)`);
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+
+    await fixUuidIdDefaults([
+      'transactions',
+      'settlements',
+      'product_documentation',
+      'product_documentation_jobs',
+      'users',
+      'tasks',
+      'task_assignments',
+      'attachments',
+      'comments',
+      'epics',
+      'activity_logs',
+      'wallets',
+      'virtual_accounts'
+    ]);
     
     // Try to add unique constraint, ignore error if it already exists
     try {
@@ -552,10 +697,6 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45)`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_user_agent TEXT`);
     
-    // Add security columns to transfer_queue
-    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS transaction_hash VARCHAR(64)`);
-    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS initiated_by UUID REFERENCES users(id)`);
-    
     // Create audit logs table
     await query(`
       CREATE TABLE IF NOT EXISTS audit_logs (
@@ -585,6 +726,8 @@ export async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    await fixUuidIdDefaults(['audit_logs', 'login_attempts']);
     
     // Create indexes for security tables
     await query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_business_id ON audit_logs(business_id)`);
@@ -710,6 +853,19 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Add security columns to transfer_queue
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS transaction_hash VARCHAR(64)`);
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS initiated_by UUID REFERENCES users(id)`);
+
+    await fixUuidIdDefaults([
+      'ideas',
+      'admin_permissions',
+      'admin_roles',
+      'payment_cards',
+      'squad_webhooks',
+      'transfer_queue'
+    ]);
+
     // Add provider column to squad_webhooks
     await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'squad'`);
 
@@ -742,6 +898,8 @@ export async function initializeDatabase() {
         processed_at TIMESTAMP
       )
     `);
+
+    await fixUuidIdDefaults(['payroll_adjustments']);
 
     // Ensure currency column exists in payroll_adjustments (for migration if table existed)
     await query(`ALTER TABLE payroll_adjustments ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'NGN'`);
@@ -828,6 +986,8 @@ export async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    await fixUuidIdDefaults(['user_sessions']);
     
     // Fix existing user_sessions rows with null last_activity_at
     await query(`
@@ -864,6 +1024,8 @@ export async function initializeDatabase() {
       )
     `);
 
+    await fixUuidIdDefaults(['task_statuses']);
+
     // Seed default statuses for existing businesses
     const defaultStatuses = [
       { name: 'pending', color: '#6b7280', is_default: true },
@@ -883,6 +1045,8 @@ export async function initializeDatabase() {
         );
       }
     }
+
+    await fixExistingUuidIdDefaults();
 
     console.log("Database tables initialized successfully");
   } catch (error) {

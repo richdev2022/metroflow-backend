@@ -44,4 +44,19 @@ export const AVAILABLE_PERMISSIONS = [
     name: "Manage Finance",
     description: "Access to transfers and payout features",
   },
+  {
+    id: "use_meetings",
+    name: "Use Meetings",
+    description: "Create, schedule, and join team meetings",
+  },
+  {
+    id: "use_chat",
+    name: "Use Chat",
+    description: "Send and receive team chat messages",
+  },
+  {
+    id: "use_calls",
+    name: "Use Calls",
+    description: "Make and receive audio and video calls",
+  },
 ];

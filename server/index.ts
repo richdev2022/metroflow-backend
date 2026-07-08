@@ -71,6 +71,9 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting } from "./routes/meetings";
+import { getConversations, getConversationMessages, createConversation, sendMessage } from "./routes/chat";
+import { getCalls, createCall, updateCall, joinCall, leaveCall } from "./routes/calls";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
@@ -210,6 +213,9 @@ export async function createServer() {
   
   // Update overdue tasks on server startup
   await dbInitPromise;
+  if (!isDbReady) {
+    throw dbInitError ?? new Error("Database initialization failed");
+  }
   await updateOverdueTasks();
   
   // Start transfer monitor in local environment
@@ -592,6 +598,25 @@ export async function createServer() {
 
   // Test Communications API routes
   mainRouter.use("/test-communications", testCommunicationsRouter);
+
+  // Meetings API routes
+  mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
+  mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
+  mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
+  mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
+
+  // Chat API routes
+  mainRouter.get("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversations);
+  mainRouter.post("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createConversation);
+  mainRouter.get("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversationMessages);
+  mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), sendMessage);
+
+  // Calls API routes
+  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCalls);
+  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), createCall);
+  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), updateCall);
+  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), joinCall);
+  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), leaveCall);
 
   // Mount the main router at both / and /api for backward compatibility
   app.use(dbCheckMiddleware);

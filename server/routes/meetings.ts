@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { RequestHandler } from "express";
 import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
@@ -5,7 +6,37 @@ import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 
-export const getMeetings: RequestHandler = async (req: AuthenticatedRequest, res) => {
+const buildMeetingUrl = (meetingId: string) =>
+  `https://meet.jit.si/metricorex-meeting-${meetingId}`;
+
+/**
+ * @swagger
+ * /meetings:
+ *   get:
+ *     summary: Get meetings
+ *     description: Returns paginated meetings for the authenticated user's business.
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *     responses:
+ *       200:
+ *         description: Meetings fetched successfully
+ */
+export const getMeetings: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const businessId = req.user?.businessId;
     if (!businessId) {
@@ -59,18 +90,60 @@ export const getMeetings: RequestHandler = async (req: AuthenticatedRequest, res
   }
 };
 
-export const createMeeting: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /meetings:
+ *   post:
+ *     summary: Create a meeting
+ *     description: Creates a meeting and automatically generates a Jitsi meetingUrl. googleEventId is backend-managed calendar metadata.
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - title
+ *               - startTime
+ *               - endTime
+ *               - timezone
+ *             properties:
+ *               title:
+ *                 type: string
+ *                 example: Sprint Planning
+ *               description:
+ *                 type: string
+ *                 example: Weekly sprint planning
+ *               startTime:
+ *                 type: string
+ *                 format: date-time
+ *                 example: 2024-01-01T10:00:00.000Z
+ *               endTime:
+ *                 type: string
+ *                 format: date-time
+ *                 example: 2024-01-01T11:00:00.000Z
+ *               timezone:
+ *                 type: string
+ *                 example: UTC
+ *               attendeeIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       201:
+ *         description: Meeting created successfully
+ */
+export const createMeeting: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
-    const {
-      title,
-      description,
-      startTime,
-      endTime,
-      timezone,
-      attendeeIds,
-      meetingUrl,
-      googleEventId,
-    } = req.body;
+    const { title, description, startTime, endTime, timezone, attendeeIds } =
+      req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -81,14 +154,18 @@ export const createMeeting: RequestHandler = async (req: AuthenticatedRequest, r
       });
     }
 
+    const meetingId = crypto.randomUUID();
+    const meetingUrl = buildMeetingUrl(meetingId);
+
     const result = await query(
       `INSERT INTO meetings 
-        (business_id, title, description, start_time, end_time, timezone, created_by, meeting_url, google_event_id)
+        (id, business_id, title, description, start_time, end_time, timezone, created_by, meeting_url)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
                  timezone, created_by as "createdById", status, meeting_url as "meetingUrl", 
                  google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"`,
       [
+        meetingId,
         businessId,
         title,
         description || null,
@@ -96,8 +173,7 @@ export const createMeeting: RequestHandler = async (req: AuthenticatedRequest, r
         new Date(endTime).toISOString(),
         timezone,
         userId,
-        meetingUrl || null,
-        googleEventId || null,
+        meetingUrl,
       ],
     );
 
@@ -153,7 +229,58 @@ export const createMeeting: RequestHandler = async (req: AuthenticatedRequest, r
   }
 };
 
-export const updateMeeting: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /meetings/{id}:
+ *   put:
+ *     summary: Update a meeting
+ *     description: Updates meeting details and attendees. meetingUrl and googleEventId are backend-managed and are not accepted as update inputs.
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               title:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               startTime:
+ *                 type: string
+ *                 format: date-time
+ *               endTime:
+ *                 type: string
+ *                 format: date-time
+ *               timezone:
+ *                 type: string
+ *               status:
+ *                 type: string
+ *                 enum: [scheduled, cancelled, completed]
+ *               attendeeIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       200:
+ *         description: Meeting updated successfully
+ *       404:
+ *         description: Meeting not found
+ */
+export const updateMeeting: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -173,8 +300,6 @@ export const updateMeeting: RequestHandler = async (req: AuthenticatedRequest, r
       endTime,
       timezone,
       status,
-      meetingUrl,
-      googleEventId,
       attendeeIds,
     } = req.body;
 
@@ -186,10 +311,8 @@ export const updateMeeting: RequestHandler = async (req: AuthenticatedRequest, r
            end_time = COALESCE($4, end_time),
            timezone = COALESCE($5, timezone),
            status = COALESCE($6, status),
-           meeting_url = COALESCE($7, meeting_url),
-           google_event_id = COALESCE($8, google_event_id),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $9 AND business_id = $10
+       WHERE id = $7 AND business_id = $8
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
                  timezone, created_by as "createdById", status, meeting_url as "meetingUrl", 
                  google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"`,
@@ -200,8 +323,6 @@ export const updateMeeting: RequestHandler = async (req: AuthenticatedRequest, r
         endTime ? new Date(endTime).toISOString() : null,
         timezone,
         status,
-        meetingUrl,
-        googleEventId,
         id,
         businessId,
       ],
@@ -275,7 +396,31 @@ export const updateMeeting: RequestHandler = async (req: AuthenticatedRequest, r
   }
 };
 
-export const deleteMeeting: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /meetings/{id}:
+ *   delete:
+ *     summary: Delete a meeting
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Meeting deleted successfully
+ *       404:
+ *         description: Meeting not found
+ */
+export const deleteMeeting: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -310,7 +455,10 @@ export const deleteMeeting: RequestHandler = async (req: AuthenticatedRequest, r
     await query(`DELETE FROM meeting_reminders WHERE meeting_id = $1`, [id]);
 
     // Delete meeting
-    await query(`DELETE FROM meetings WHERE id = $1 AND business_id = $2`, [id, businessId]);
+    await query(`DELETE FROM meetings WHERE id = $1 AND business_id = $2`, [
+      id,
+      businessId,
+    ]);
 
     // Log activity
     await logActivity({

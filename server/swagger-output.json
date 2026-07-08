@@ -2740,6 +2740,373 @@
         }
       }
     },
+    "/api/calls": {
+      "get": {
+        "summary": "Get calls",
+        "description": "Returns paginated calls for the authenticated user's business.",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Calls fetched successfully"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a call",
+        "description": "Starts an audio or video call and creates a Jitsi room ID.",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "audio",
+                      "video"
+                    ],
+                    "default": "video"
+                  },
+                  "participantIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Call created successfully"
+          }
+        }
+      }
+    },
+    "/api/calls/{id}": {
+      "put": {
+        "summary": "Update a call",
+        "description": "Updates a call status.",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ongoing",
+                      "completed",
+                      "missed"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Call updated successfully"
+          },
+          "404": {
+            "description": "Call not found"
+          }
+        }
+      }
+    },
+    "/api/calls/{id}/join": {
+      "post": {
+        "summary": "Join a call",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Joined call successfully"
+          },
+          "404": {
+            "description": "Call not found"
+          }
+        }
+      }
+    },
+    "/api/calls/{id}/leave": {
+      "post": {
+        "summary": "Leave a call",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Left call successfully"
+          },
+          "404": {
+            "description": "Call not found"
+          }
+        }
+      }
+    },
+    "/api/chat/conversations": {
+      "get": {
+        "summary": "Get chat conversations",
+        "description": "Returns conversations that include the authenticated user.",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversations fetched successfully"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a chat conversation",
+        "description": "Creates a direct or group conversation. Direct conversations with the same two users reuse the existing conversation.",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "example": "Project Team Chat"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "direct",
+                      "group"
+                    ],
+                    "example": "group"
+                  },
+                  "participantIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Existing direct conversation returned"
+          },
+          "201": {
+            "description": "Conversation created successfully"
+          }
+        }
+      }
+    },
+    "/api/chat/conversations/{conversationId}/messages": {
+      "get": {
+        "summary": "Get conversation messages",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversationId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages fetched successfully"
+          }
+        }
+      },
+      "post": {
+        "summary": "Send a chat message",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversationId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "example": "Hello everyone!"
+                  },
+                  "attachmentUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "attachmentType": {
+                    "type": "string",
+                    "example": "image/png"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Message sent successfully"
+          }
+        }
+      }
+    },
     "/api/comments/{taskId}": {
       "get": {
         "summary": "Get comments for a task",
@@ -3762,6 +4129,213 @@
         "responses": {
           "200": {
             "description": "Business KYC submitted"
+          }
+        }
+      }
+    },
+    "/api/meetings": {
+      "get": {
+        "summary": "Get meetings",
+        "description": "Returns paginated meetings for the authenticated user's business.",
+        "tags": [
+          "Meetings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Meetings fetched successfully"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a meeting",
+        "description": "Creates a meeting and automatically generates a Jitsi meetingUrl. googleEventId is backend-managed calendar metadata.",
+        "tags": [
+          "Meetings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title",
+                  "startTime",
+                  "endTime",
+                  "timezone"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "example": "Sprint Planning"
+                  },
+                  "description": {
+                    "type": "string",
+                    "example": "Weekly sprint planning"
+                  },
+                  "startTime": {
+                    "type": "string",
+                    "format": "date-time",
+                    "example": "2024-01-01T10:00:00.000Z"
+                  },
+                  "endTime": {
+                    "type": "string",
+                    "format": "date-time",
+                    "example": "2024-01-01T11:00:00.000Z"
+                  },
+                  "timezone": {
+                    "type": "string",
+                    "example": "UTC"
+                  },
+                  "attendeeIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Meeting created successfully"
+          }
+        }
+      }
+    },
+    "/api/meetings/{id}": {
+      "put": {
+        "summary": "Update a meeting",
+        "description": "Updates meeting details and attendees. meetingUrl and googleEventId are backend-managed and are not accepted as update inputs.",
+        "tags": [
+          "Meetings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "startTime": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "endTime": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "timezone": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "scheduled",
+                      "cancelled",
+                      "completed"
+                    ]
+                  },
+                  "attendeeIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Meeting updated successfully"
+          },
+          "404": {
+            "description": "Meeting not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a meeting",
+        "tags": [
+          "Meetings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Meeting deleted successfully"
+          },
+          "404": {
+            "description": "Meeting not found"
           }
         }
       }

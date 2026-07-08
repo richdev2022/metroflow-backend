@@ -923,6 +923,7 @@ export async function initializeDatabase() {
       { slug: 'manage_admins', name: 'Manage Admins', description: 'Access to create, invite and manage other admins' },
       { slug: 'manage_roles', name: 'Manage Roles', description: 'Access to create and manage admin roles' },
       { slug: 'manage_plans', name: 'Manage Plans', description: 'Access to manage pricing plans' },
+      { slug: 'manage_finance', name: 'Manage Finance', description: 'Access to manage platform fees and finance settings' },
     ];
 
     for (const perm of permissions) {
@@ -957,12 +958,30 @@ export async function initializeDatabase() {
       }
     } else {
       superAdminRoleId = superAdminRoleCheck.rows[0].id;
+      await query(
+        `UPDATE admin_roles 
+         SET is_super_admin = TRUE, updated_at = CURRENT_TIMESTAMP 
+         WHERE id = $1 AND is_super_admin = FALSE`,
+        [superAdminRoleId]
+      );
     }
 
-    // Assign Super Admin Role to existing Super Admin user
+    // Keep the Super Admin role fully hydrated when new permissions are added later.
+    const allPermissions = await query(`SELECT id FROM admin_permissions`);
+    for (const perm of allPermissions.rows) {
+      await query(
+        `INSERT INTO admin_role_permissions (role_id, permission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [superAdminRoleId, perm.id]
+      );
+    }
+
+    // Assign Super Admin Role to default/root admin users created before roles existed.
     await query(
-      `UPDATE platform_admins SET role_id = $1 WHERE email = 'admin@quantigrate.com' AND role_id IS NULL`,
-      [superAdminRoleId]
+      `UPDATE platform_admins 
+       SET role_id = $1, updated_at = CURRENT_TIMESTAMP 
+       WHERE role_id IS NULL 
+         AND LOWER(email) = ANY($2::text[])`,
+      [superAdminRoleId, ['sunday@metricorex.com', 'admin@quantigrate.com']]
     );
 
     // Create system_settings table

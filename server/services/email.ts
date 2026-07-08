@@ -753,6 +753,72 @@ export function generateSubscriptionDowngradedEmail(
   `;
 }
 
+export function generateSubscriptionActivatedEmail(
+  businessName: string,
+  planName: string,
+  amount: number,
+  currency: string,
+  nextBillingDate: Date
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const formattedAmount = `${currency} ${amount.toLocaleString()}`;
+  const formattedDate = nextBillingDate.toLocaleDateString('en-NG', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border-top: 4px solid #10b981;">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Subscription Activated</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hello ${businessName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Your subscription to the <strong>${planName}</strong> plan is now active.
+          </p>
+
+          <div style="background-color: #ecfdf5; border: 1px solid #d1fae5; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <div style="margin-bottom: 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #d1fae5; padding-bottom: 8px;">
+              <span style="color: #065f46; font-weight: 600;">Amount Paid</span>
+              <span style="color: #111827; font-weight: 700;">${formattedAmount}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: #065f46; font-weight: 600;">Next Billing Date</span>
+              <span style="color: #374151;">${formattedDate}</span>
+            </div>
+          </div>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 32px;">
+            Thank you for choosing Metricorex. Your plan features are available in your dashboard.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${baseUrl || 'https://app.metricorex.com'}" style="background-color: #2563eb; color: #ffffff; padding: 12px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block;">
+              Open Dashboard
+            </a>
+          </div>
+
+          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            <p style="color: #9ca3af; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 export function generateRenewalFailedEmail(
   businessName: string,
   planName: string,

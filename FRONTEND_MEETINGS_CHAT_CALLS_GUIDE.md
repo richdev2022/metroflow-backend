@@ -45,17 +45,17 @@ Authorization: Bearer YOUR_ACCESS_TOKEN
           "id": "uuid",
           "title": "Sprint Planning",
           "description": "Weekly sprint planning meeting",
-          "start_time": "2024-01-01T10:00:00.000Z",
-          "end_time": "2024-01-01T11:00:00.000Z",
+          "startTime": "2024-01-01T10:00:00.000Z",
+          "endTime": "2024-01-01T11:00:00.000Z",
           "timezone": "UTC",
-          "created_by": "user-uuid",
+          "createdById": "user-uuid",
           "status": "scheduled",
-          "meeting_url": "https://meet.jit.si/...",
-          "google_event_id": "optional-google-calendar-id",
-          "created_at": "2024-01-01T09:00:00.000Z",
-          "updated_at": "2024-01-01T09:00:00.000Z",
+          "meetingUrl": "https://meet.jit.si/metricorex-meeting-uuid",
+          "googleEventId": "optional-google-calendar-id",
+          "createdAt": "2024-01-01T09:00:00.000Z",
+          "updatedAt": "2024-01-01T09:00:00.000Z",
           "attendees": [
-            { "id": "uuid", "user_id": "user-uuid", "status": "invited" }
+            { "id": "uuid", "userId": "user-uuid", "status": "invited" }
           ]
         }
       ],
@@ -71,19 +71,17 @@ Authorization: Bearer YOUR_ACCESS_TOKEN
   {
     "title": "Sprint Planning",
     "description": "Weekly sprint planning",
-    "start_time": "2024-01-01T10:00:00.000Z",
-    "end_time": "2024-01-01T11:00:00.000Z",
+    "startTime": "2024-01-01T10:00:00.000Z",
+    "endTime": "2024-01-01T11:00:00.000Z",
     "timezone": "UTC",
-    "attendee_ids": ["user-uuid-1", "user-uuid-2"],
-    "meeting_url": "https://meet.jit.si/...",
-    "google_event_id": "optional"
+    "attendeeIds": ["user-uuid-1", "user-uuid-2"]
   }
   ```
-- **Response**: Same as single meeting in Get All Meetings
+- **Response**: Same as single meeting in Get All Meetings. The backend generates `meetingUrl` automatically. `googleEventId` is read-only provider metadata and should only be populated by backend calendar-sync logic.
 
 #### Update a Meeting
 - **Endpoint**: `PUT /api/meetings/:id`
-- **Request Body**: Same as Create (all fields optional)
+- **Request Body**: Same as Create (all fields optional). Do not send `meetingUrl` or `googleEventId`; those are managed by the backend.
 - **Response**: Same as single meeting
 
 #### Delete a Meeting
@@ -261,10 +259,10 @@ const socket = io('YOUR_BACKEND_URL', {
 ```javascript
 socket.on('connect', () => {
   console.log('Connected to server');
-  
+
   // When connected, tell the server you're online
   socket.emit('user-online', 'YOUR_USER_ID', 'YOUR_BUSINESS_ID');
-  
+
   // Set up keep-alive ping every 30 seconds to maintain presence
   setInterval(() => {
     socket.emit('user-keep-alive', 'YOUR_USER_ID', 'YOUR_BUSINESS_ID');
@@ -363,7 +361,7 @@ To integrate Jitsi Meet into your frontend, you can use the `@jitsi/react-sdk` o
 ```javascript
 const domain = 'meet.jit.si';
 const options = {
-  roomName: 'your-jitsi-room-id', // from call.jitsi_room_id
+  roomName: 'your-jitsi-room-id', // from call.jitsiRoomId, or derive from meeting.meetingUrl
   width: '100%',
   height: '100%',
   parentNode: document.getElementById('jitsi-container'),

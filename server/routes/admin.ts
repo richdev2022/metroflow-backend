@@ -17,6 +17,21 @@ const protectedRouter = express.Router();
 
 protectedRouter.use(authenticateAdmin);
 
+const toJsonbParam = (value: unknown, fallback: unknown = []) => {
+  const normalized = value === undefined || value === null || value === "" ? fallback : value;
+
+  if (typeof normalized === "string") {
+    try {
+      JSON.parse(normalized);
+      return normalized;
+    } catch {
+      return JSON.stringify(normalized);
+    }
+  }
+
+  return JSON.stringify(normalized);
+};
+
 // Backward-compatible public aliases (no token required)
 router.post("/login", async (req, res) => {
   try {
@@ -484,6 +499,16 @@ protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req,
   try {
     const walletsRes = await query(`SELECT * FROM platform_wallet`);
     let wallets = walletsRes.rows;
+    const revenueBalancesRes = await query(`
+      SELECT currency, COALESCE(SUM(amount), 0) as balance
+      FROM transactions
+      WHERE status = 'success'
+      AND transaction_type IN ('subscription', 'fee')
+      GROUP BY currency
+    `);
+    const revenueBalanceByCurrency = new Map(
+      revenueBalancesRes.rows.map(row => [row.currency || 'NGN', row.balance])
+    );
     
     // Ensure NGN wallet exists (Default)
     let ngnWallet = wallets.find(w => w.currency === 'NGN');
@@ -494,6 +519,13 @@ protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req,
        ngnWallet = newWallet.rows[0];
        wallets.push(ngnWallet);
     }
+
+    wallets = wallets.map(wallet => ({
+      ...wallet,
+      balance: revenueBalanceByCurrency.get(wallet.currency || 'NGN') || wallet.balance,
+      stored_balance: wallet.balance
+    }));
+    ngnWallet = wallets.find(w => w.currency === 'NGN') || ngnWallet;
 
     // Return NGN wallet as primary 'wallet' for backward compatibility, and full list in 'wallets'
     res.json({ success: true, wallet: ngnWallet, wallets: wallets });
@@ -701,17 +733,17 @@ protectedRouter.get("/pricing", requirePermission('manage_businesses'), async (r
  */
 protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (req, res) => {
     try {
-        const { name, price, currency, duration, discount, features } = req.body;
+        const { name, price, currency, duration, discount, features, permissions } = req.body;
         
         if (!name || !price || !currency || !duration) {
             return res.status(400).json({ success: false, error: "Missing required fields" });
         }
 
         const result = await query(
-            `INSERT INTO pricing_plans (name, price, currency, duration, discount, features, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, true)
+            `INSERT INTO pricing_plans (name, price, currency, duration, discount, features, permissions, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true)
              RETURNING *`,
-            [name, price, currency, duration, discount || 0, features || []]
+            [name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions)]
         );
 
         res.json({ success: true, plan: result.rows[0] });
@@ -761,7 +793,7 @@ protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (
 protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, price, discount, features, is_active } = req.body;
+        const { name, price, discount, features, permissions, is_active } = req.body;
 
         // Dynamic update
         let queryStr = "UPDATE pricing_plans SET updated_at = NOW()";
@@ -784,8 +816,13 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), asyn
             paramCount++;
         }
         if (features !== undefined) {
-            queryStr += `, features = $${paramCount}`;
-            params.push(features);
+            queryStr += `, features = $${paramCount}::jsonb`;
+            params.push(toJsonbParam(features));
+            paramCount++;
+        }
+        if (permissions !== undefined) {
+            queryStr += `, permissions = $${paramCount}::jsonb`;
+            params.push(toJsonbParam(permissions));
             paramCount++;
         }
         if (is_active !== undefined) {
@@ -1043,7 +1080,7 @@ protectedRouter.get("/businesses/:id/team", requirePermission('manage_businesses
 protectedRouter.get("/transactions", requirePermission('view_dashboard'), async (req, res) => {
     try {
         const page = parseInt(req.query.page as string) || 1;
-        const perPage = parseInt(req.query.perPage as string) || 50;
+        const perPage = parseInt((req.query.perPage || req.query.limit) as string) || 50;
         const offset = (page - 1) * perPage;
 
         const startDate = req.query.startDate as string;
@@ -1052,106 +1089,132 @@ protectedRouter.get("/transactions", requirePermission('view_dashboard'), async 
         const status = req.query.status as string;
         const businessId = req.query.businessId as string;
 
-        // Build query for transactions
-        let transactionsQuery = `
-            SELECT 
-                t.*, 
-                b.name as business_name, 
-                b.email as business_email, 
+        const params: any[] = [];
+        const transactionFilters: string[] = [];
+        const transferFilters: string[] = [];
+
+        const addSharedFilter = (transactionCondition: string, transferCondition: string, value: any) => {
+            params.push(value);
+            const placeholder = `$${params.length}`;
+            transactionFilters.push(transactionCondition.replace("?", placeholder));
+            transferFilters.push(transferCondition.replace("?", placeholder));
+        };
+
+        if (businessId) {
+            addSharedFilter("t.business_id = ?", "tq.business_id = ?", businessId);
+        }
+
+        if (startDate) {
+            addSharedFilter("t.created_at >= ?", "tq.created_at >= ?", startDate);
+        }
+
+        if (endDate) {
+            const endDateTime = new Date(endDate);
+            endDateTime.setHours(23, 59, 59, 999);
+            addSharedFilter("t.created_at <= ?", "tq.created_at <= ?", endDateTime.toISOString());
+        }
+
+        if (reference) {
+            addSharedFilter("t.reference ILIKE ?", "tq.reference ILIKE ?", `%${reference}%`);
+        }
+
+        if (status && status !== 'all') {
+            addSharedFilter("t.status = ?", "tq.status = ?", status);
+        }
+
+        const transactionWhere = transactionFilters.length ? `WHERE ${transactionFilters.join(" AND ")}` : "";
+        const transferWhere = transferFilters.length ? `WHERE ${transferFilters.join(" AND ")}` : "";
+
+        const transactionsQuery = `
+            SELECT
+                t.id,
+                t.business_id,
+                t.user_id,
+                t.amount,
+                t.currency,
+                t.status,
+                t.reference,
+                t.type,
+                t.description,
+                t.transaction_type,
+                t.wallet_id,
+                t.direction,
+                t.fee,
+                t.payment_provider,
+                t.created_at,
+                t.updated_at,
+                b.name as business_name,
+                b.email as business_email,
                 p.name as plan_name,
-                'transaction' as source
+                'transaction' as source,
+                NULL::varchar as recipient_account,
+                NULL::varchar as recipient_bank,
+                NULL::varchar as recipient_name,
+                NULL::text as failure_reason
             FROM transactions t
             LEFT JOIN businesses b ON t.business_id = b.id
             LEFT JOIN pricing_plans p ON t.plan_id = p.id
-            WHERE 1=1
+            ${transactionWhere}
         `;
-        const transactionsParams: any[] = [];
-        let tParamIndex = 1;
 
-        // Build query for transfer_queue
-        let transfersQuery = `
-            SELECT 
-                tq.*, 
-                b.name as business_name, 
-                b.email as business_email, 
-                NULL as plan_name,
-                'transfer_queue' as source
+        const transfersQuery = `
+            SELECT
+                tq.id,
+                tq.business_id,
+                tq.initiated_by as user_id,
+                tq.amount,
+                tq.currency,
+                tq.status,
+                tq.reference,
+                'debit' as type,
+                tq.remark as description,
+                'transfer' as transaction_type,
+                tq.wallet_id,
+                'debit' as direction,
+                0::numeric as fee,
+                tq.payment_provider,
+                tq.created_at,
+                tq.updated_at,
+                b.name as business_name,
+                b.email as business_email,
+                NULL::varchar as plan_name,
+                'transfer_queue' as source,
+                tq.recipient_account,
+                tq.recipient_bank,
+                tq.recipient_name,
+                tq.failure_reason
             FROM transfer_queue tq
             LEFT JOIN businesses b ON tq.business_id = b.id
-            WHERE 1=1
+            ${transferWhere}
         `;
-        const transfersParams: any[] = [];
-        let tfParamIndex = 1;
-
-        // Apply filters to both queries
-        const applyFilters = (query: string, params: any[], paramIndex: number) => {
-            let newQuery = query;
-            let newParamIndex = paramIndex;
-
-            if (businessId) {
-                newQuery += ` AND business_id = $${newParamIndex}`;
-                params.push(businessId);
-                newParamIndex++;
-            }
-
-            if (startDate) {
-                newQuery += ` AND created_at >= $${newParamIndex}`;
-                params.push(startDate);
-                newParamIndex++;
-            }
-
-            if (endDate) {
-                const endDateTime = new Date(endDate);
-                endDateTime.setHours(23, 59, 59, 999);
-                newQuery += ` AND created_at <= $${newParamIndex}`;
-                params.push(endDateTime.toISOString());
-                newParamIndex++;
-            }
-
-            if (reference) {
-                newQuery += ` AND reference ILIKE $${newParamIndex}`;
-                params.push(`%${reference}%`);
-                newParamIndex++;
-            }
-
-            if (status) {
-                newQuery += ` AND status = $${newParamIndex}`;
-                params.push(status);
-                newParamIndex++;
-            }
-
-            return { query: newQuery, params, paramIndex: newParamIndex };
-        };
-
-        const tResult = applyFilters(transactionsQuery, transactionsParams, tParamIndex);
-        const tfResult = applyFilters(transfersQuery, transfersParams, tfParamIndex);
 
         // Combine both queries with UNION ALL, sort, then paginate
+        const limitParam = params.length + 1;
+        const offsetParam = params.length + 2;
         const combinedQuery = `
             WITH combined AS (
-                ${tResult.query}
+                ${transactionsQuery}
                 UNION ALL
-                ${tfResult.query}
+                ${transfersQuery}
             )
             SELECT * FROM combined
             ORDER BY created_at DESC
-            LIMIT $${tResult.paramIndex + tfResult.paramIndex} OFFSET $${tResult.paramIndex + tfResult.paramIndex + 1}
+            LIMIT $${limitParam} OFFSET $${offsetParam}
         `;
-        const combinedParams = [...tResult.params, ...tfResult.params, perPage, offset];
+        const combinedParams = [...params, perPage, offset];
 
         const result = await query(combinedQuery, combinedParams);
 
         // Get total count
         const countQuery = `
             WITH combined AS (
-                ${tResult.query}
+                ${transactionsQuery}
                 UNION ALL
-                ${tfResult.query}
+                ${transfersQuery}
             )
             SELECT COUNT(*) as total FROM combined
         `;
-        const countParams = [...tResult.params, ...tfResult.params];
-        const countResult = await query(countQuery, countParams);
+        const countResult = await query(countQuery, params);
         const total = parseInt(countResult.rows[0].total);
 
         res.json({ 
@@ -1634,8 +1697,8 @@ protectedRouter.post("/pricing", requirePermission('manage_plans'), async (req, 
   try {
     const { name, description, price, currency, features, permissions, max_team_members, trial_days, duration } = req.body;
     await query(
-      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days, duration) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [name, description, price, currency || 'USD', JSON.stringify(features), JSON.stringify(permissions || []), max_team_members || 5, trial_days || 0, duration || 'monthly']
+      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days, duration) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)`,
+      [name, description, price, currency || 'USD', toJsonbParam(features), toJsonbParam(permissions), max_team_members || 5, trial_days || 0, duration || 'monthly']
     );
     res.json({ success: true });
   } catch (error) {
@@ -1701,13 +1764,69 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans'), async (re
     const { id } = req.params;
     const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration, discount } = req.body;
     
-    // Build dynamic update query
-    // For simplicity, updating all fields
-    await query(
-      `UPDATE pricing_plans SET name=$1, description=$2, price=$3, is_active=$4, features=$5, permissions=$6, max_team_members=$7, trial_days=$8, duration=$9, discount=$10, updated_at=CURRENT_TIMESTAMP WHERE id=$11`,
-      [name, description, price, is_active, JSON.stringify(features), JSON.stringify(permissions || []), max_team_members, trial_days, duration || 'monthly', discount || 0, id]
-    );
-    res.json({ success: true });
+    let queryStr = "UPDATE pricing_plans SET updated_at = CURRENT_TIMESTAMP";
+    const params: any[] = [id];
+    let paramCount = 2;
+
+    if (name !== undefined) {
+      queryStr += `, name = $${paramCount}`;
+      params.push(name);
+      paramCount++;
+    }
+    if (description !== undefined) {
+      queryStr += `, description = $${paramCount}`;
+      params.push(description);
+      paramCount++;
+    }
+    if (price !== undefined) {
+      queryStr += `, price = $${paramCount}`;
+      params.push(price);
+      paramCount++;
+    }
+    if (is_active !== undefined) {
+      queryStr += `, is_active = $${paramCount}`;
+      params.push(is_active);
+      paramCount++;
+    }
+    if (features !== undefined) {
+      queryStr += `, features = $${paramCount}::jsonb`;
+      params.push(toJsonbParam(features));
+      paramCount++;
+    }
+    if (permissions !== undefined) {
+      queryStr += `, permissions = $${paramCount}::jsonb`;
+      params.push(toJsonbParam(permissions));
+      paramCount++;
+    }
+    if (max_team_members !== undefined) {
+      queryStr += `, max_team_members = $${paramCount}`;
+      params.push(max_team_members);
+      paramCount++;
+    }
+    if (trial_days !== undefined) {
+      queryStr += `, trial_days = $${paramCount}`;
+      params.push(trial_days);
+      paramCount++;
+    }
+    if (duration !== undefined) {
+      queryStr += `, duration = $${paramCount}`;
+      params.push(duration);
+      paramCount++;
+    }
+    if (discount !== undefined) {
+      queryStr += `, discount = $${paramCount}`;
+      params.push(discount);
+      paramCount++;
+    }
+
+    queryStr += ` WHERE id = $1 RETURNING *`;
+
+    const result = await query(queryStr, params);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Plan not found" });
+    }
+
+    res.json({ success: true, plan: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to update pricing plan" });
   }
@@ -2424,6 +2543,37 @@ protectedRouter.get("/webhooks", async (req, res) => {
         const countRes = await query(countQuery, params);
         const total = parseInt(countRes.rows[0].count);
 
+        let reportQuery = `SELECT COALESCE(provider, 'squad') as provider, status, COUNT(*)::int as count FROM squad_webhooks WHERE 1=1`;
+        const reportParams: any[] = [];
+        let reportParamCount = 1;
+
+        if (status) {
+            reportQuery += ` AND status = $${reportParamCount}`;
+            reportParams.push(status);
+            reportParamCount++;
+        }
+
+        if (startDate) {
+            reportQuery += ` AND created_at >= $${reportParamCount}`;
+            reportParams.push(startDate);
+            reportParamCount++;
+        }
+
+        if (endDate) {
+            reportQuery += ` AND created_at <= $${reportParamCount}`;
+            reportParams.push(endDate);
+            reportParamCount++;
+        }
+
+        if (search) {
+            reportQuery += ` AND payload::text ILIKE $${reportParamCount}`;
+            reportParams.push(`%${search}%`);
+            reportParamCount++;
+        }
+
+        reportQuery += ` GROUP BY COALESCE(provider, 'squad'), status ORDER BY provider ASC, status ASC`;
+        const reportRes = await query(reportQuery, reportParams);
+
         queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
         params.push(limit, offset);
 
@@ -2432,6 +2582,7 @@ protectedRouter.get("/webhooks", async (req, res) => {
         res.json({
             success: true,
             webhooks: result.rows,
+            provider_reports: reportRes.rows,
             pagination: {
                 total,
                 page: Number(page),

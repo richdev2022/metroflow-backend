@@ -4,7 +4,23 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { getSocketServer } from "../lib/socket";
 
-export const getConversations: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /chat/conversations:
+ *   get:
+ *     summary: Get chat conversations
+ *     description: Returns conversations that include the authenticated user.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Conversations fetched successfully
+ */
+export const getConversations: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -54,7 +70,39 @@ export const getConversations: RequestHandler = async (req: AuthenticatedRequest
   }
 };
 
-export const getConversationMessages: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /chat/conversations/{conversationId}/messages:
+ *   get:
+ *     summary: Get conversation messages
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *     responses:
+ *       200:
+ *         description: Messages fetched successfully
+ */
+export const getConversationMessages: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { conversationId } = req.params;
     const businessId = req.user?.businessId;
@@ -106,7 +154,44 @@ export const getConversationMessages: RequestHandler = async (req: Authenticated
   }
 };
 
-export const createConversation: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /chat/conversations:
+ *   post:
+ *     summary: Create a chat conversation
+ *     description: Creates a direct or group conversation. Direct conversations with the same two users reuse the existing conversation.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: Project Team Chat
+ *               type:
+ *                 type: string
+ *                 enum: [direct, group]
+ *                 example: group
+ *               participantIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       201:
+ *         description: Conversation created successfully
+ *       200:
+ *         description: Existing direct conversation returned
+ */
+export const createConversation: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { name, type, participantIds } = req.body;
     const businessId = req.user?.businessId;
@@ -188,7 +273,45 @@ export const createConversation: RequestHandler = async (req: AuthenticatedReque
   }
 };
 
-export const sendMessage: RequestHandler = async (req: AuthenticatedRequest, res) => {
+/**
+ * @swagger
+ * /chat/conversations/{conversationId}/messages:
+ *   post:
+ *     summary: Send a chat message
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               content:
+ *                 type: string
+ *                 example: Hello everyone!
+ *               attachmentUrl:
+ *                 type: string
+ *                 format: uri
+ *               attachmentType:
+ *                 type: string
+ *                 example: image/png
+ *     responses:
+ *       201:
+ *         description: Message sent successfully
+ */
+export const sendMessage: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
   try {
     const { conversationId } = req.params;
     const { content, attachmentUrl, attachmentType } = req.body;
@@ -209,16 +332,21 @@ export const sendMessage: RequestHandler = async (req: AuthenticatedRequest, res
        RETURNING id, conversation_id as "conversationId", sender_id as "senderId", 
                  content, attachment_url as "attachmentUrl", attachment_type as "attachmentType", 
                  created_at as "createdAt"`,
-      [conversationId, userId, content || null, attachmentUrl || null, attachmentType || null],
+      [
+        conversationId,
+        userId,
+        content || null,
+        attachmentUrl || null,
+        attachmentType || null,
+      ],
     );
 
     const message = result.rows[0];
 
     // Get sender name
-    const userResult = await query(
-      `SELECT name FROM users WHERE id = $1`,
-      [userId],
-    );
+    const userResult = await query(`SELECT name FROM users WHERE id = $1`, [
+      userId,
+    ]);
     message.senderName = userResult.rows[0]?.name;
 
     // Update conversation updated_at

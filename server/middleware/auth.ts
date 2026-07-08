@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { verifyToken } from "../services/auth";
+import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 
 export interface AuthenticatedRequest extends Request {
   user?: {
@@ -42,6 +43,64 @@ export const authenticateToken = async (
 };
 
 import { query } from "../db";
+
+const knownPermissionAliases = new Map<string, string>();
+for (const permission of AVAILABLE_PERMISSIONS) {
+  knownPermissionAliases.set(permission.id, permission.id);
+  knownPermissionAliases.set(permission.name.toLowerCase(), permission.id);
+}
+
+const collectPlanPermissionValues = (value: unknown): string[] => {
+  if (value === undefined || value === null || value === "") return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap(collectPlanPermissionValues);
+  }
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return [
+      ...collectPlanPermissionValues(record.id),
+      ...collectPlanPermissionValues(record.slug),
+      ...collectPlanPermissionValues(record.key),
+      ...collectPlanPermissionValues(record.name),
+    ];
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+
+    if ((trimmed.startsWith("[") && trimmed.endsWith("]")) || (trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+      try {
+        return collectPlanPermissionValues(JSON.parse(trimmed));
+      } catch {
+        // Fall through and treat the value as a plain permission label.
+      }
+    }
+
+    if (trimmed.includes(",")) {
+      return trimmed.split(",").flatMap(collectPlanPermissionValues);
+    }
+
+    const canonical = knownPermissionAliases.get(trimmed) || knownPermissionAliases.get(trimmed.toLowerCase());
+    return [canonical || trimmed];
+  }
+
+  return [];
+};
+
+export const normalizePlanPermissions = (...values: unknown[]) => {
+  const permissions = new Set<string>();
+
+  for (const value of values) {
+    for (const permission of collectPlanPermissionValues(value)) {
+      permissions.add(permission);
+    }
+  }
+
+  return permissions;
+};
 
 export const checkTeamLimit = async (
   req: AuthenticatedRequest,
@@ -180,9 +239,10 @@ export const checkFeaturePermission = (requiredPermission: string) => {
          return res.status(401).json({ success: false, error: "Unauthorized" });
       }
 
-      // Get plan permissions
+      // Get plan permissions. Some admin flows store selectable feature IDs in
+      // `features`, so both columns are treated as plan-level access grants.
       const result = await query(
-        `SELECT p.permissions 
+        `SELECT p.permissions, p.features 
          FROM businesses b
          JOIN pricing_plans p ON b.plan_id = p.id
          WHERE b.id = $1`,
@@ -193,11 +253,9 @@ export const checkFeaturePermission = (requiredPermission: string) => {
         return res.status(404).json({ success: false, error: "Business plan not found" });
       }
 
-      const permissions = result.rows[0].permissions || [];
+      const permissions = normalizePlanPermissions(result.rows[0].permissions, result.rows[0].features);
       
-      // Check if permissions includes the required one
-      // The permissions column is JSONB, pg driver parses it to array if it's a JSON array
-      if (Array.isArray(permissions) && permissions.includes(requiredPermission)) {
+      if (permissions.has(requiredPermission) || permissions.has("*") || permissions.has("all")) {
         return next();
       }
 

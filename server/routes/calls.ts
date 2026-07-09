@@ -4,6 +4,12 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
+import crypto from "crypto";
+
+// Helper to generate random call code
+function generateCallCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 
 /**
  * @swagger
@@ -55,7 +61,9 @@ export const getCalls: RequestHandler = async (
     const result = await query(
       `SELECT 
         c.id, c.business_id as "businessId", c.type, c.status, c.started_at as "startedAt", 
-        c.ended_at as "endedAt", c.created_by as "createdById", c.jitsi_room_id as "jitsiRoomId",
+        c.ended_at as "endedAt", c.created_by as "createdById", c.host_id as "hostId",
+        c.co_host_id as "coHostId", c.call_code as "callCode", c.is_group_call as "isGroupCall",
+        c.waiting_room_enabled as "waitingRoomEnabled", c.recording_enabled as "recordingEnabled",
         c.created_at as "createdAt", c.updated_at as "updatedAt",
         json_agg(json_build_object(
           'id', cp.id,
@@ -93,7 +101,7 @@ export const getCalls: RequestHandler = async (
  * /calls:
  *   post:
  *     summary: Create a call
- *     description: Starts an audio or video call and creates a Jitsi room ID.
+ *     description: Starts an audio or video call.
  *     tags: [Calls]
  *     security:
  *       - bearerAuth: []
@@ -113,6 +121,18 @@ export const getCalls: RequestHandler = async (
  *                 items:
  *                   type: string
  *                   format: uuid
+ *               isGroupCall:
+ *                 type: boolean
+ *                 default: false
+ *               password:
+ *                 type: string
+ *                 nullable: true
+ *               waitingRoomEnabled:
+ *                 type: boolean
+ *                 default: false
+ *               recordingEnabled:
+ *                 type: boolean
+ *                 default: false
  *     responses:
  *       201:
  *         description: Call created successfully
@@ -122,7 +142,7 @@ export const createCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { type, participantIds } = req.body;
+    const { type, participantIds, isGroupCall, password, waitingRoomEnabled, recordingEnabled } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -133,25 +153,35 @@ export const createCall: RequestHandler = async (
       });
     }
 
-    // Generate unique room id
-    const jitsiRoomId = `call-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    // Generate unique call code
+    let callCode;
+    let isUnique = false;
+    while (!isUnique) {
+      callCode = generateCallCode();
+      const check = await query(`SELECT id FROM calls WHERE call_code = $1`, [callCode]);
+      if (check.rows.length === 0) {
+        isUnique = true;
+      }
+    }
 
     const result = await query(
       `INSERT INTO calls 
-        (business_id, type, status, created_by, jitsi_room_id)
-       VALUES ($1, $2, 'ongoing', $3, $4)
+        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled)
+       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
-                 ended_at as "endedAt", created_by as "createdById", jitsi_room_id as "jitsiRoomId",
+                 ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+                 co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
+                 waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
                  created_at as "createdAt", updated_at as "updatedAt"`,
-      [businessId, type || "video", userId, jitsiRoomId],
+      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false],
     );
 
     const call = result.rows[0];
 
-    // Add participants
-    const allParticipantIds = [userId, ...(participantIds || [])];
+    // Add participants - deduplicate IDs to avoid unique constraint violation
+    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
     const participants = [];
-    for (const pid of allParticipantIds) {
+    for (const pid of uniqueParticipantIds) {
       const participantResult = await query(
         `INSERT INTO call_participants (call_id, user_id, status)
          VALUES ($1, $2, $3)
@@ -172,15 +202,25 @@ export const createCall: RequestHandler = async (
       description: `Started a ${call.type} call`,
       metadata: {
         type: call.type,
-        jitsiRoomId: call.jitsiRoomId,
+        callCode: call.callCode,
+        isGroupCall: call.isGroupCall,
         participantIds: allParticipantIds,
       },
     });
 
-    // Emit socket event
+    // Emit socket events
     const io = getSocketServer();
     if (io) {
       io.to(`business:${businessId}`).emit("call:created", call);
+      // Send invites to participants
+      participantIds?.forEach(targetId => {
+        io.to(`user:${targetId}`).emit("call:incoming", {
+          callId: call.id,
+          from: userId,
+          type: call.type,
+          callCode: call.callCode,
+        });
+      });
     }
 
     const response: ApiResponse<any> = {
@@ -200,10 +240,78 @@ export const createCall: RequestHandler = async (
 
 /**
  * @swagger
+ * /calls/code/{code}:
+ *   get:
+ *     summary: Get call by code
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: code
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Call found
+ *       404:
+ *         description: Call not found
+ */
+export const getCallByCode: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { code } = req.params;
+    const businessId = req.user?.businessId;
+
+    const result = await query(
+      `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+              ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM calls WHERE call_code = $1 AND business_id = $2`,
+      [code, businessId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
+    const call = result.rows[0];
+    const participantsResult = await query(
+      `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
+       FROM call_participants WHERE call_id = $1`,
+      [call.id],
+    );
+    call.participants = participantsResult.rows;
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: call,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get call by code error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to get call",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
  * /calls/{id}:
  *   put:
  *     summary: Update a call
- *     description: Updates a call status.
+ *     description: Updates a call status or settings.
  *     tags: [Calls]
  *     security:
  *       - bearerAuth: []
@@ -220,12 +328,17 @@ export const createCall: RequestHandler = async (
  *         application/json:
  *           schema:
  *             type: object
- *             required:
- *               - status
  *             properties:
  *               status:
  *                 type: string
- *                 enum: [ongoing, completed, missed]
+ *                 enum: [ongoing, completed, missed, cancelled]
+ *               waitingRoomEnabled:
+ *                 type: boolean
+ *               recordingEnabled:
+ *                 type: boolean
+ *               coHostId:
+ *                 type: string
+ *                 format: uuid
  *     responses:
  *       200:
  *         description: Call updated successfully
@@ -248,19 +361,33 @@ export const updateCall: RequestHandler = async (
       });
     }
 
-    const { status } = req.body;
+    const { status, waitingRoomEnabled, recordingEnabled, coHostId } = req.body;
 
     let updateFields = [];
     let values = [];
     let paramIndex = 1;
 
-    if (status === "ongoing") {
-      updateFields.push(`started_at = CURRENT_TIMESTAMP`);
-    } else if (status === "completed" || status === "missed") {
-      updateFields.push(`ended_at = CURRENT_TIMESTAMP`);
+    if (status !== undefined) {
+      updateFields.push(`status = $${paramIndex++}`);
+      values.push(status);
+      if (status === "ongoing") {
+        updateFields.push(`started_at = CURRENT_TIMESTAMP`);
+      } else if (["completed", "missed", "cancelled"].includes(status)) {
+        updateFields.push(`ended_at = CURRENT_TIMESTAMP`);
+      }
     }
-    updateFields.push(`status = $${paramIndex++}`);
-    values.push(status);
+    if (waitingRoomEnabled !== undefined) {
+      updateFields.push(`waiting_room_enabled = $${paramIndex++}`);
+      values.push(waitingRoomEnabled);
+    }
+    if (recordingEnabled !== undefined) {
+      updateFields.push(`recording_enabled = $${paramIndex++}`);
+      values.push(recordingEnabled);
+    }
+    if (coHostId !== undefined) {
+      updateFields.push(`co_host_id = $${paramIndex++}`);
+      values.push(coHostId);
+    }
     updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(id, businessId);
 
@@ -269,7 +396,9 @@ export const updateCall: RequestHandler = async (
        SET ${updateFields.join(", ")}
        WHERE id = $${paramIndex++} AND business_id = $${paramIndex++}
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
-                 ended_at as "endedAt", created_by as "createdById", jitsi_room_id as "jitsiRoomId",
+                 ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+                 co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+                 waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
                  created_at as "createdAt", updated_at as "updatedAt"`,
       values,
     );
@@ -283,7 +412,6 @@ export const updateCall: RequestHandler = async (
 
     const call = result.rows[0];
 
-    // Get participants
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
@@ -291,10 +419,9 @@ export const updateCall: RequestHandler = async (
     );
     call.participants = participantsResult.rows;
 
-    // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:updated", call);
+      io.to(`call:${id}`).emit("call:updated", call);
     }
 
     const response: ApiResponse<any> = {
@@ -327,6 +454,14 @@ export const updateCall: RequestHandler = async (
  *         schema:
  *           type: string
  *           format: uuid
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               password:
+ *                 type: string
  *     responses:
  *       200:
  *         description: Joined call successfully
@@ -339,6 +474,7 @@ export const joinCall: RequestHandler = async (
 ) => {
   try {
     const { id } = req.params;
+    const { password } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -349,32 +485,52 @@ export const joinCall: RequestHandler = async (
       });
     }
 
-    await query(
-      `UPDATE call_participants
-       SET status = 'joined', joined_at = CURRENT_TIMESTAMP
-       WHERE call_id = $1 AND user_id = $2`,
-      [id, userId],
-    );
-
-    // Get updated call
-    const callResult = await query(
-      `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
-              ended_at as "endedAt", created_by as "createdById", jitsi_room_id as "jitsiRoomId",
-              created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND business_id = $2`,
+    // Check call exists and password
+    const callCheck = await query(
+      `SELECT password FROM calls WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     );
-
-    if (callResult.rows.length === 0) {
+    if (callCheck.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: "Call not found",
       });
     }
+    if (callCheck.rows[0].password && callCheck.rows[0].password !== password) {
+      return res.status(403).json({
+        success: false,
+        error: "Invalid password",
+      });
+    }
 
+    // Check if participant exists, if not add them
+    const existingParticipant = await query(
+      `SELECT id FROM call_participants WHERE call_id = $1 AND user_id = $2`,
+      [id, userId],
+    );
+    if (existingParticipant.rows.length === 0) {
+      await query(
+        `INSERT INTO call_participants (call_id, user_id, status) VALUES ($1, $2, 'joined')`,
+        [id, userId],
+      );
+    } else {
+      await query(
+        `UPDATE call_participants SET status = 'joined', joined_at = CURRENT_TIMESTAMP WHERE call_id = $1 AND user_id = $2`,
+        [id, userId],
+      );
+    }
+
+    const callResult = await query(
+      `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+              ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM calls WHERE id = $1 AND business_id = $2`,
+      [id, businessId],
+    );
     const call = callResult.rows[0];
 
-    // Get participants
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
@@ -382,10 +538,9 @@ export const joinCall: RequestHandler = async (
     );
     call.participants = participantsResult.rows;
 
-    // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:participantJoined", {
+      io.to(`call:${id}`).emit("call:participantJoined", {
         callId: id,
         userId,
       });
@@ -450,25 +605,17 @@ export const leaveCall: RequestHandler = async (
       [id, userId],
     );
 
-    // Get updated call
     const callResult = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
-              ended_at as "endedAt", created_by as "createdById", jitsi_room_id as "jitsiRoomId",
+              ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     );
-
-    if (callResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "Call not found",
-      });
-    }
-
     const call = callResult.rows[0];
 
-    // Get participants
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
@@ -476,10 +623,9 @@ export const leaveCall: RequestHandler = async (
     );
     call.participants = participantsResult.rows;
 
-    // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:participantLeft", {
+      io.to(`call:${id}`).emit("call:participantLeft", {
         callId: id,
         userId,
       });
@@ -495,6 +641,99 @@ export const leaveCall: RequestHandler = async (
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to leave call",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /calls/{id}:
+ *   delete:
+ *     summary: Delete a call
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Call deleted successfully
+ *       404:
+ *         description: Call not found
+ */
+export const deleteCall: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    // Check if call exists
+    const callCheck = await query(
+      `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
+      [id, businessId],
+    );
+    if (callCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
+    // Delete participants first
+    await query(`DELETE FROM call_participants WHERE call_id = $1`, [id]);
+
+    // Delete recordings linked to this call
+    await query(`DELETE FROM recordings WHERE call_id = $1`, [id]);
+
+    // Delete call
+    await query(`DELETE FROM calls WHERE id = $1 AND business_id = $2`, [
+      id,
+      businessId,
+    ]);
+
+    // Log activity
+    await logActivity({
+      businessId,
+      userId,
+      action: "delete",
+      actionType: "call",
+      description: `Deleted call`,
+      metadata: {
+        callId: id,
+      },
+    });
+
+    // Emit socket event
+    const io = getSocketServer();
+    if (io) {
+      io.to(`business:${businessId}`).emit("call:deleted", id);
+    }
+
+    const response: ApiResponse<null> = {
+      success: true,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Delete call error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to delete call",
     };
     res.status(500).json(response);
   }

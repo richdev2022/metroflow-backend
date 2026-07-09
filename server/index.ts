@@ -71,9 +71,10 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall } from "./routes/calls";
+import { getRecordings, createRecording, updateRecording, deleteRecording } from "./routes/recordings";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
@@ -601,6 +602,7 @@ export async function createServer() {
 
   // Meetings API routes
   mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
+  mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingByCode);
   mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
@@ -613,10 +615,18 @@ export async function createServer() {
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCalls);
+  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCallByCode);
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), joinCall);
   mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), leaveCall);
+  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), deleteCall);
+
+  // Recordings API routes
+  mainRouter.get("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordings);
+  mainRouter.post("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), createRecording);
+  mainRouter.put("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), updateRecording);
+  mainRouter.delete("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), deleteRecording);
 
   // Mount the main router at both / and /api for backward compatibility
   app.use(dbCheckMiddleware);

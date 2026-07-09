@@ -6,8 +6,10 @@ import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 
-const buildMeetingUrl = (meetingId: string) =>
-  `https://meet.jit.si/metricorex-meeting-${meetingId}`;
+// Helper to generate random meeting code
+function generateMeetingCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 
 /**
  * @swagger
@@ -59,7 +61,10 @@ export const getMeetings: RequestHandler = async (
     const result = await query(
       `SELECT 
         m.id, m.title, m.description, m.start_time as "startTime", m.end_time as "endTime", 
-        m.timezone, m.created_by as "createdById", m.status, m.meeting_url as "meetingUrl", 
+        m.timezone, m.created_by as "createdById", m.host_id as "hostId", m.co_host_id as "coHostId",
+        m.status, m.meeting_code as "meetingCode", m.is_instant as "isInstant", m.password,
+        m.max_participants as "maxParticipants", m.waiting_room_enabled as "waitingRoomEnabled",
+        m.recording_enabled as "recordingEnabled", m.screen_sharing_enabled as "screenSharingEnabled",
         m.google_event_id as "googleEventId", m.created_at as "createdAt", m.updated_at as "updatedAt",
         json_agg(json_build_object(
           'id', ma.id,
@@ -95,7 +100,7 @@ export const getMeetings: RequestHandler = async (
  * /meetings:
  *   post:
  *     summary: Create a meeting
- *     description: Creates a meeting and automatically generates a Jitsi meetingUrl. googleEventId is backend-managed calendar metadata.
+ *     description: Creates a meeting.
  *     tags: [Meetings]
  *     security:
  *       - bearerAuth: []
@@ -128,11 +133,29 @@ export const getMeetings: RequestHandler = async (
  *               timezone:
  *                 type: string
  *                 example: UTC
+ *               isInstant:
+ *                 type: boolean
+ *                 default: false
  *               attendeeIds:
  *                 type: array
  *                 items:
  *                   type: string
  *                   format: uuid
+ *               password:
+ *                 type: string
+ *                 nullable: true
+ *               maxParticipants:
+ *                 type: integer
+ *                 nullable: true
+ *               waitingRoomEnabled:
+ *                 type: boolean
+ *                 default: false
+ *               recordingEnabled:
+ *                 type: boolean
+ *                 default: false
+ *               screenSharingEnabled:
+ *                 type: boolean
+ *                 default: true
  *     responses:
  *       201:
  *         description: Meeting created successfully
@@ -142,7 +165,7 @@ export const createMeeting: RequestHandler = async (
   res,
 ) => {
   try {
-    const { title, description, startTime, endTime, timezone, attendeeIds } =
+    const { title, description, startTime, endTime, timezone, isInstant, attendeeIds, password, maxParticipants, waitingRoomEnabled, recordingEnabled, screenSharingEnabled } =
       req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -154,18 +177,29 @@ export const createMeeting: RequestHandler = async (
       });
     }
 
-    const meetingId = crypto.randomUUID();
-    const meetingUrl = buildMeetingUrl(meetingId);
+    // Generate unique meeting code
+    let meetingCode;
+    let isUnique = false;
+    while (!isUnique) {
+      meetingCode = generateMeetingCode();
+      const check = await query(`SELECT id FROM meetings WHERE meeting_code = $1`, [meetingCode]);
+      if (check.rows.length === 0) {
+        isUnique = true;
+      }
+    }
 
     const result = await query(
       `INSERT INTO meetings 
-        (id, business_id, title, description, start_time, end_time, timezone, created_by, meeting_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (business_id, title, description, start_time, end_time, timezone, created_by, host_id, meeting_code, 
+         is_instant, password, max_participants, waiting_room_enabled, recording_enabled, screen_sharing_enabled)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
-                 timezone, created_by as "createdById", status, meeting_url as "meetingUrl", 
+                 timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+                 status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+                 max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+                 recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
                  google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"`,
       [
-        meetingId,
         businessId,
         title,
         description || null,
@@ -173,16 +207,24 @@ export const createMeeting: RequestHandler = async (
         new Date(endTime).toISOString(),
         timezone,
         userId,
-        meetingUrl,
+        userId,
+        meetingCode,
+        isInstant || false,
+        password || null,
+        maxParticipants || null,
+        waitingRoomEnabled || false,
+        recordingEnabled || false,
+        screenSharingEnabled !== undefined ? screenSharingEnabled : true,
       ],
     );
 
     const meeting = result.rows[0];
 
-    // Add attendees
+    // Add attendees - deduplicate IDs to avoid unique constraint violation
     const attendees = [];
     if (attendeeIds && attendeeIds.length > 0) {
-      for (const attendeeId of attendeeIds) {
+      const uniqueAttendeeIds = [...new Set(attendeeIds)];
+      for (const attendeeId of uniqueAttendeeIds) {
         const attendeeResult = await query(
           `INSERT INTO meeting_attendees (meeting_id, user_id)
            VALUES ($1, $2)
@@ -204,6 +246,7 @@ export const createMeeting: RequestHandler = async (
       description: `Created meeting: ${meeting.title}`,
       metadata: {
         title: meeting.title,
+        meetingCode: meeting.meetingCode,
         attendeeIds: attendeeIds || [],
       },
     });
@@ -231,10 +274,77 @@ export const createMeeting: RequestHandler = async (
 
 /**
  * @swagger
+ * /meetings/code/{code}:
+ *   get:
+ *     summary: Get meeting by code
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: code
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Meeting found
+ *       404:
+ *         description: Meeting not found
+ */
+export const getMeetingByCode: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { code } = req.params;
+    const businessId = req.user?.businessId;
+
+    const result = await query(
+      `SELECT id, title, description, start_time as "startTime", end_time as "endTime", 
+              timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+              status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+              max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+              recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+       FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
+      [code, businessId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
+    const meeting = result.rows[0];
+    const attendeeResult = await query(
+      `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1`,
+      [meeting.id],
+    );
+    meeting.attendees = attendeeResult.rows;
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: meeting,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get meeting by code error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to get meeting",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
  * /meetings/{id}:
  *   put:
  *     summary: Update a meeting
- *     description: Updates meeting details and attendees. meetingUrl and googleEventId are backend-managed and are not accepted as update inputs.
  *     tags: [Meetings]
  *     security:
  *       - bearerAuth: []
@@ -265,12 +375,25 @@ export const createMeeting: RequestHandler = async (
  *                 type: string
  *               status:
  *                 type: string
- *                 enum: [scheduled, cancelled, completed]
+ *                 enum: [scheduled, cancelled, completed, ongoing]
  *               attendeeIds:
  *                 type: array
  *                 items:
  *                   type: string
  *                   format: uuid
+ *               password:
+ *                 type: string
+ *               maxParticipants:
+ *                 type: integer
+ *               waitingRoomEnabled:
+ *                 type: boolean
+ *               recordingEnabled:
+ *                 type: boolean
+ *               screenSharingEnabled:
+ *                 type: boolean
+ *               coHostId:
+ *                 type: string
+ *                 format: uuid
  *     responses:
  *       200:
  *         description: Meeting updated successfully
@@ -301,6 +424,12 @@ export const updateMeeting: RequestHandler = async (
       timezone,
       status,
       attendeeIds,
+      password,
+      maxParticipants,
+      waitingRoomEnabled,
+      recordingEnabled,
+      screenSharingEnabled,
+      coHostId,
     } = req.body;
 
     const result = await query(
@@ -311,10 +440,19 @@ export const updateMeeting: RequestHandler = async (
            end_time = COALESCE($4, end_time),
            timezone = COALESCE($5, timezone),
            status = COALESCE($6, status),
+           password = COALESCE($7, password),
+           max_participants = COALESCE($8, max_participants),
+           waiting_room_enabled = COALESCE($9, waiting_room_enabled),
+           recording_enabled = COALESCE($10, recording_enabled),
+           screen_sharing_enabled = COALESCE($11, screen_sharing_enabled),
+           co_host_id = COALESCE($12, co_host_id),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $7 AND business_id = $8
+       WHERE id = $13 AND business_id = $14
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
-                 timezone, created_by as "createdById", status, meeting_url as "meetingUrl", 
+                 timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+                 status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+                 max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+                 recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
                  google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"`,
       [
         title,
@@ -323,6 +461,12 @@ export const updateMeeting: RequestHandler = async (
         endTime ? new Date(endTime).toISOString() : null,
         timezone,
         status,
+        password,
+        maxParticipants,
+        waitingRoomEnabled,
+        recordingEnabled,
+        screenSharingEnabled,
+        coHostId,
         id,
         businessId,
       ],
@@ -342,7 +486,8 @@ export const updateMeeting: RequestHandler = async (
       await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [id]);
       const attendees = [];
       if (attendeeIds.length > 0) {
-        for (const attendeeId of attendeeIds) {
+        const uniqueAttendeeIds = [...new Set(attendeeIds)];
+        for (const attendeeId of uniqueAttendeeIds) {
           const attendeeResult = await query(
             `INSERT INTO meeting_attendees (meeting_id, user_id)
              VALUES ($1, $2)

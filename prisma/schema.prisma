@@ -168,6 +168,7 @@ model User {
   lockedUntil         DateTime? @map("locked_until")
   lastLoginIp         String?   @map("last_login_ip")
   lastLoginUserAgent  String?   @map("last_login_user_agent")
+  presenceStatus      String    @default("offline") @map("presence_status")
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @default(now()) @map("updated_at")
 
@@ -196,6 +197,7 @@ model User {
   ChatMessage        ChatMessage[]
   Call               Call[]
   CallParticipant    CallParticipant[]
+  Recordings         Recording[]            @relation("recordedByUser")
 
   @@unique([businessId, email])
   @@map("users")
@@ -217,20 +219,31 @@ model UserSession {
 
 // Pricing & Subscription Models
 model PricingPlan {
-  id             String   @id @default(uuid())
-  name           String
-  description    String?
-  price          Decimal  @db.Decimal(10, 2)
-  currency       String   @default("USD")
-  features       Json?
-  maxTeamMembers Int      @default(5) @map("max_team_members")
-  trialDays      Int      @default(7) @map("trial_days")
-  isActive       Boolean  @default(true) @map("is_active")
-  duration       String   @default("monthly")
-  discount       Decimal  @default(0) @db.Decimal(10, 2)
-  permissions    Json?    @default("[]")
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @default(now()) @map("updated_at")
+  id                     String   @id @default(uuid())
+  name                   String
+  description            String?
+  price                  Decimal  @db.Decimal(10, 2)
+  currency               String   @default("USD")
+  features               Json?
+  maxTeamMembers         Int      @default(5) @map("max_team_members")
+  trialDays              Int      @default(7) @map("trial_days")
+  isActive               Boolean  @default(true) @map("is_active")
+  duration               String   @default("monthly")
+  discount               Decimal  @default(0) @db.Decimal(10, 2)
+  permissions            Json?    @default("[]")
+  // RTC Limits
+  maxMeetingDuration     Int?     @map("max_meeting_duration") // In minutes
+  maxParticipants        Int?     @map("max_participants")
+  maxRecordingDuration   Int?     @map("max_recording_duration") // In minutes
+  maxRecordingStorage    Int?     @map("max_recording_storage") // In MB
+  waitingRoomEnabled     Boolean  @default(false) @map("waiting_room_enabled")
+  recordingEnabled       Boolean  @default(false) @map("recording_enabled")
+  screenSharingEnabled   Boolean  @default(true) @map("screen_sharing_enabled")
+  breakoutRoomsEnabled   Boolean  @default(false) @map("breakout_rooms_enabled")
+  virtualBackgrounds     Boolean  @default(false) @map("virtual_backgrounds")
+  liveCaptions           Boolean  @default(false) @map("live_captions")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @default(now()) @map("updated_at")
 
   businesses   Business[]
   transactions Transaction[]
@@ -663,24 +676,35 @@ model TaskStatus {
 
 // Meeting Scheduling
 model Meeting {
-  id            String   @id @default(uuid())
-  businessId    String   @map("business_id")
-  title         String
-  description   String?
-  startTime     DateTime @map("start_time")
-  endTime       DateTime @map("end_time")
-  timezone      String
-  createdById   String   @map("created_by")
-  status        String   @default("scheduled")
-  meetingUrl    String?  @map("meeting_url")
-  googleEventId String?  @map("google_event_id")
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @default(now()) @map("updated_at")
+  id                   String            @id @default(uuid())
+  businessId           String            @map("business_id")
+  title                String
+  description          String?
+  startTime            DateTime          @map("start_time")
+  endTime              DateTime          @map("end_time")
+  timezone             String
+  createdById          String            @map("created_by")
+  hostId               String            @map("host_id")
+  coHostId             String?           @map("co_host_id")
+  status               String            @default("scheduled")
+  meetingCode          String            @unique @map("meeting_code")
+  password             String?
+  isInstant            Boolean           @default(false) @map("is_instant")
+  maxParticipants      Int?              @map("max_participants")
+  waitingRoomEnabled   Boolean           @default(false) @map("waiting_room_enabled")
+  recordingEnabled     Boolean           @default(false) @map("recording_enabled")
+  screenSharingEnabled Boolean           @default(true) @map("screen_sharing_enabled")
+  googleEventId        String?           @map("google_event_id")
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @default(now()) @map("updated_at")
 
-  business  Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  createdBy User              @relation(fields: [createdById], references: [id])
-  attendees MeetingAttendee[]
-  reminders MeetingReminder[]
+  business     Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  createdBy    User              @relation(fields: [createdById], references: [id])
+  host         User              @relation(fields: [hostId], references: [id])
+  coHost       User?             @relation(fields: [coHostId], references: [id])
+  attendees    MeetingAttendee[]
+  reminders    MeetingReminder[]
+  recordings   Recording[]
 
   @@map("meetings")
 }
@@ -761,20 +785,30 @@ model ChatMessage {
 
 // Calls
 model Call {
-  id          String    @id @default(uuid())
-  businessId  String    @map("business_id")
-  type        String // audio or video
-  status      String // ongoing, completed, missed
-  startedAt   DateTime? @map("started_at")
-  endedAt     DateTime? @map("ended_at")
-  createdById String    @map("created_by")
-  jitsiRoomId String    @map("jitsi_room_id") // Jitsi room name
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @default(now()) @map("updated_at")
+  id                   String            @id @default(uuid())
+  businessId           String            @map("business_id")
+  type                 String // audio or video
+  status               String // ongoing, completed, missed, cancelled
+  startedAt            DateTime?         @map("started_at")
+  endedAt              DateTime?         @map("ended_at")
+  createdById          String            @map("created_by")
+  hostId               String            @map("host_id")
+  coHostId             String?           @map("co_host_id")
+  callCode             String            @unique @map("call_code")
+  password             String?
+  isGroupCall          Boolean           @default(false) @map("is_group_call")
+  waitingRoomEnabled   Boolean           @default(false) @map("waiting_room_enabled")
+  recordingEnabled     Boolean           @default(false) @map("recording_enabled")
+  maxParticipants      Int?              @map("max_participants")
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @default(now()) @map("updated_at")
 
   business     Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
   createdBy    User              @relation(fields: [createdById], references: [id])
+  host         User              @relation(fields: [hostId], references: [id])
+  coHost       User?             @relation(fields: [coHostId], references: [id])
   participants CallParticipant[]
+  recordings   Recording[]
 
   @@map("calls")
 }
@@ -793,4 +827,26 @@ model CallParticipant {
 
   @@unique([callId, userId])
   @@map("call_participants")
+}
+
+// Recordings
+model Recording {
+  id           String   @id @default(uuid())
+  businessId   String   @map("business_id")
+  meetingId    String?  @map("meeting_id")
+  callId       String?  @map("call_id")
+  recordedById String   @map("recorded_by")
+  storageUrl   String   @map("storage_url")
+  duration     Int      // in seconds
+  status       String   // recording, paused, completed, failed
+  size         Int?     // in bytes
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @map("updated_at")
+
+  business   Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  meeting    Meeting?  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  call       Call?     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  recordedBy User      @relation("recordedByUser", fields: [recordedById], references: [id])
+
+  @@map("recordings")
 }

@@ -5,6 +5,8 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
+import { createNotification } from "../services/notifications";
+import { sendEmail, generateMeetingInvitationEmailHtml } from "../services/email";
 
 // Helper to generate random meeting code
 function generateMeetingCode() {
@@ -264,6 +266,14 @@ export const createMeeting: RequestHandler = async (
     // Add attendees - deduplicate IDs to avoid unique constraint violation
     const attendees = [];
     if (uniqueAttendeeIds.length > 0) {
+      // Fetch all attendee details first
+      const placeholders = uniqueAttendeeIds.map((_, i) => `$${i + 1}`).join(',');
+      const usersResult = await query(
+        `SELECT id, name, email FROM users WHERE id IN (${placeholders})`,
+        uniqueAttendeeIds
+      );
+      const usersMap = new Map(usersResult.rows.map(user => [user.id, user]));
+
       for (const attendeeId of uniqueAttendeeIds) {
         const attendeeResult = await query(
           `INSERT INTO meeting_attendees (meeting_id, user_id)
@@ -272,6 +282,35 @@ export const createMeeting: RequestHandler = async (
           [meeting.id, attendeeId],
         );
         attendees.push(attendeeResult.rows[0]);
+
+        // Send in-app notification to the attendee
+        await createNotification({
+          businessId: businessId!,
+          userId: attendeeId,
+          type: "meeting",
+          title: "Meeting Invitation",
+          message: `${req.user?.name || "Someone"} invited you to a meeting: ${title}`,
+          actionUrl: `/meetings/${meeting.meetingCode}`,
+          actionType: "view_meeting",
+          metadata: { meetingId: meeting.id, meetingCode: meeting.meetingCode },
+          isActionable: false,
+          expiresInHours: 24,
+        });
+
+        // Send email invitation
+        const user = usersMap.get(attendeeId);
+        if (user?.email) {
+          const emailHtml = generateMeetingInvitationEmailHtml(
+            user.name || 'User',
+            title,
+            description || null,
+            new Date(startTime),
+            new Date(endTime),
+            meeting.meetingCode,
+            req.user?.name || 'Someone'
+          );
+          await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${title}`, emailHtml);
+        }
       }
     }
 

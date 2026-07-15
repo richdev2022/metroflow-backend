@@ -11,6 +11,17 @@ function generateMeetingCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+async function getBusinessUserIds(userIds: string[], businessId: string) {
+  if (userIds.length === 0) return new Set<string>();
+
+  const result = await query(
+    `SELECT id FROM users WHERE business_id = $1 AND id = ANY($2::uuid[])`,
+    [businessId, userIds],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
+}
+
 /**
  * @swagger
  * /meetings:
@@ -41,10 +52,11 @@ export const getMeetings: RequestHandler = async (
 ) => {
   try {
     const businessId = req.user?.businessId;
-    if (!businessId) {
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
       return res.status(400).json({
         success: false,
-        error: "Business ID not found",
+        error: "User authentication required",
       });
     }
 
@@ -53,8 +65,19 @@ export const getMeetings: RequestHandler = async (
     const offset = (page - 1) * limit;
 
     const countResult = await query(
-      `SELECT COUNT(*) as total FROM meetings WHERE business_id = $1`,
-      [businessId],
+      `SELECT COUNT(*) as total
+       FROM meetings m
+       WHERE m.business_id = $1
+       AND (
+         m.created_by = $2
+         OR m.host_id = $2
+         OR m.co_host_id = $2
+         OR EXISTS (
+           SELECT 1 FROM meeting_attendees ma
+           WHERE ma.meeting_id = m.id AND ma.user_id = $2
+         )
+       )`,
+      [businessId, userId],
     );
     const total = parseInt(countResult.rows[0].total);
 
@@ -74,10 +97,19 @@ export const getMeetings: RequestHandler = async (
       FROM meetings m
       LEFT JOIN meeting_attendees ma ON m.id = ma.meeting_id
       WHERE m.business_id = $1
+      AND (
+        m.created_by = $2
+        OR m.host_id = $2
+        OR m.co_host_id = $2
+        OR EXISTS (
+          SELECT 1 FROM meeting_attendees current_ma
+          WHERE current_ma.meeting_id = m.id AND current_ma.user_id = $2
+        )
+      )
       GROUP BY m.id
       ORDER BY m.start_time DESC
-      LIMIT $2 OFFSET $3`,
-      [businessId, limit, offset],
+      LIMIT $3 OFFSET $4`,
+      [businessId, userId, limit, offset],
     );
 
     const response: ApiResponse<{ meetings: any[]; total: number }> = {
@@ -177,6 +209,15 @@ export const createMeeting: RequestHandler = async (
       });
     }
 
+    const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
+    const validAttendeeIds = await getBusinessUserIds(uniqueAttendeeIds, businessId);
+    if (validAttendeeIds.size !== uniqueAttendeeIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "All meeting attendees must belong to this business",
+      });
+    }
+
     // Generate unique meeting code
     let meetingCode;
     let isUnique = false;
@@ -222,8 +263,7 @@ export const createMeeting: RequestHandler = async (
 
     // Add attendees - deduplicate IDs to avoid unique constraint violation
     const attendees = [];
-    if (attendeeIds && attendeeIds.length > 0) {
-      const uniqueAttendeeIds = [...new Set(attendeeIds)];
+    if (uniqueAttendeeIds.length > 0) {
       for (const attendeeId of uniqueAttendeeIds) {
         const attendeeResult = await query(
           `INSERT INTO meeting_attendees (meeting_id, user_id)
@@ -247,14 +287,16 @@ export const createMeeting: RequestHandler = async (
       metadata: {
         title: meeting.title,
         meetingCode: meeting.meetingCode,
-        attendeeIds: attendeeIds || [],
+        attendeeIds: uniqueAttendeeIds,
       },
     });
 
     // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("meeting:created", meeting);
+      [...new Set([userId, ...uniqueAttendeeIds])].forEach(targetId => {
+        io.to(`user:${targetId}`).emit("meeting:created", meeting);
+      });
     }
 
     const response: ApiResponse<any> = {
@@ -432,6 +474,27 @@ export const updateMeeting: RequestHandler = async (
       coHostId,
     } = req.body;
 
+    if (attendeeIds !== undefined) {
+      const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
+      const validAttendeeIds = await getBusinessUserIds(uniqueAttendeeIds, businessId);
+      if (validAttendeeIds.size !== uniqueAttendeeIds.length) {
+        return res.status(400).json({
+          success: false,
+          error: "All meeting attendees must belong to this business",
+        });
+      }
+    }
+
+    if (coHostId !== undefined && coHostId !== null) {
+      const validCoHostIds = await getBusinessUserIds([coHostId], businessId);
+      if (!validCoHostIds.has(coHostId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Meeting co-host must belong to this business",
+        });
+      }
+    }
+
     const result = await query(
       `UPDATE meetings
        SET title = COALESCE($1, title),
@@ -448,6 +511,7 @@ export const updateMeeting: RequestHandler = async (
            co_host_id = COALESCE($12, co_host_id),
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $13 AND business_id = $14
+       AND (created_by = $15 OR host_id = $15 OR co_host_id = $15)
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
                  timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
                  status, meeting_code as "meetingCode", is_instant as "isInstant", password,
@@ -469,6 +533,7 @@ export const updateMeeting: RequestHandler = async (
         coHostId,
         id,
         businessId,
+        userId,
       ],
     );
 
@@ -486,7 +551,7 @@ export const updateMeeting: RequestHandler = async (
       await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [id]);
       const attendees = [];
       if (attendeeIds.length > 0) {
-        const uniqueAttendeeIds = [...new Set(attendeeIds)];
+        const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds));
         for (const attendeeId of uniqueAttendeeIds) {
           const attendeeResult = await query(
             `INSERT INTO meeting_attendees (meeting_id, user_id)
@@ -580,8 +645,10 @@ export const deleteMeeting: RequestHandler = async (
 
     // Get meeting info first for logging
     const meetingResult = await query(
-      `SELECT title FROM meetings WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
+      `SELECT title FROM meetings
+       WHERE id = $1 AND business_id = $2
+       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [id, businessId, userId],
     );
 
     if (meetingResult.rows.length === 0) {

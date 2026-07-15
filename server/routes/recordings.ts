@@ -5,6 +5,44 @@ import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 
+async function canAccessMeeting(meetingId: string, businessId: string, userId: string) {
+  const result = await query(
+    `SELECT id FROM meetings m
+     WHERE m.id = $1 AND m.business_id = $2
+     AND (
+       m.created_by = $3
+       OR m.host_id = $3
+       OR m.co_host_id = $3
+       OR EXISTS (
+         SELECT 1 FROM meeting_attendees ma
+         WHERE ma.meeting_id = m.id AND ma.user_id = $3
+       )
+     )`,
+    [meetingId, businessId, userId],
+  );
+
+  return result.rows.length > 0;
+}
+
+async function canAccessCall(callId: string, businessId: string, userId: string) {
+  const result = await query(
+    `SELECT id FROM calls c
+     WHERE c.id = $1 AND c.business_id = $2
+     AND (
+       c.created_by = $3
+       OR c.host_id = $3
+       OR c.co_host_id = $3
+       OR EXISTS (
+         SELECT 1 FROM call_participants cp
+         WHERE cp.call_id = c.id AND cp.user_id = $3
+       )
+     )`,
+    [callId, businessId, userId],
+  );
+
+  return result.rows.length > 0;
+}
+
 /**
  * @swagger
  * /recordings:
@@ -35,10 +73,11 @@ export const getRecordings: RequestHandler = async (
 ) => {
   try {
     const businessId = req.user?.businessId;
-    if (!businessId) {
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
       return res.status(400).json({
         success: false,
-        error: "Business ID not found",
+        error: "User authentication required",
       });
     }
 
@@ -47,8 +86,29 @@ export const getRecordings: RequestHandler = async (
     const offset = (page - 1) * limit;
 
     const countResult = await query(
-      `SELECT COUNT(*) as total FROM recordings WHERE business_id = $1`,
-      [businessId],
+      `SELECT COUNT(*) as total
+       FROM recordings r
+       LEFT JOIN meetings m ON r.meeting_id = m.id
+       LEFT JOIN calls c ON r.call_id = c.id
+       WHERE r.business_id = $1
+       AND (
+         r.recorded_by = $2
+         OR m.created_by = $2
+         OR m.host_id = $2
+         OR m.co_host_id = $2
+         OR c.created_by = $2
+         OR c.host_id = $2
+         OR c.co_host_id = $2
+         OR EXISTS (
+           SELECT 1 FROM meeting_attendees ma
+           WHERE ma.meeting_id = r.meeting_id AND ma.user_id = $2
+         )
+         OR EXISTS (
+           SELECT 1 FROM call_participants cp
+           WHERE cp.call_id = r.call_id AND cp.user_id = $2
+         )
+       )`,
+      [businessId, userId],
     );
     const total = parseInt(countResult.rows[0].total);
 
@@ -60,10 +120,29 @@ export const getRecordings: RequestHandler = async (
         u.name as "recordedByName"
       FROM recordings r
       JOIN users u ON r.recorded_by = u.id
+      LEFT JOIN meetings m ON r.meeting_id = m.id
+      LEFT JOIN calls c ON r.call_id = c.id
       WHERE r.business_id = $1
+      AND (
+        r.recorded_by = $2
+        OR m.created_by = $2
+        OR m.host_id = $2
+        OR m.co_host_id = $2
+        OR c.created_by = $2
+        OR c.host_id = $2
+        OR c.co_host_id = $2
+        OR EXISTS (
+          SELECT 1 FROM meeting_attendees ma
+          WHERE ma.meeting_id = r.meeting_id AND ma.user_id = $2
+        )
+        OR EXISTS (
+          SELECT 1 FROM call_participants cp
+          WHERE cp.call_id = r.call_id AND cp.user_id = $2
+        )
+      )
       ORDER BY r.created_at DESC
-      LIMIT $2 OFFSET $3`,
-      [businessId, limit, offset],
+      LIMIT $3 OFFSET $4`,
+      [businessId, userId, limit, offset],
     );
 
     const response: ApiResponse<{ recordings: any[]; total: number }> = {
@@ -126,6 +205,20 @@ export const createRecording: RequestHandler = async (
       return res.status(400).json({
         success: false,
         error: "Either meetingId or callId is required",
+      });
+    }
+
+    if (meetingId && !(await canAccessMeeting(meetingId, businessId, userId))) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
+    if (callId && !(await canAccessCall(callId, businessId, userId))) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
       });
     }
 
@@ -243,11 +336,11 @@ export const updateRecording: RequestHandler = async (
            duration = COALESCE($3, duration),
            size = COALESCE($4, size),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5 AND business_id = $6
+       WHERE id = $5 AND business_id = $6 AND recorded_by = $7
        RETURNING id, business_id as "businessId", meeting_id as "meetingId", 
                  call_id as "callId", recorded_by as "recordedById", storage_url as "storageUrl",
                  duration, status, size, created_at as "createdAt", updated_at as "updatedAt"`,
-      [status, storageUrl, duration, size, id, businessId],
+      [status, storageUrl, duration, size, id, businessId, userId],
     );
 
     if (result.rows.length === 0) {
@@ -322,10 +415,18 @@ export const deleteRecording: RequestHandler = async (
       });
     }
 
-    await query(`DELETE FROM recordings WHERE id = $1 AND business_id = $2`, [
+    const result = await query(`DELETE FROM recordings WHERE id = $1 AND business_id = $2 AND recorded_by = $3 RETURNING id`, [
       id,
       businessId,
+      userId,
     ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Recording not found",
+      });
+    }
 
     await logActivity({
       businessId,

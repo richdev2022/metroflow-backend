@@ -8,6 +8,7 @@ import swaggerUi from "swagger-ui-express";
 import { specs } from "./swagger";
 import { isOverdue } from "./utils/date";
 import logger from "./lib/logger";
+import { corsOptions } from "./cors";
 
 // Sentry is initialized in instrument.ts which is imported first in the entry file
 let sentryInitialized = !!process.env.SENTRY_DSN;
@@ -34,6 +35,7 @@ import {
   bulkUpdateTasks,
   deleteTask,
   bulkDeleteTasks,
+  getBoard,
 } from "./routes/tasks";
 import {
   getTeamMembers,
@@ -255,35 +257,6 @@ export async function createServer() {
     next();
   });
 
-  // Middleware
-  const corsOptions = {
-    origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
-      console.log("CORS Origin Check:", origin);
-      // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin || origin === 'null') return callback(null, true);
-      
-      // Allow your specific frontend origin
-      const allowedOrigins = [
-        'https://metricorex-app.netlify.app',
-        'http://localhost:3000',
-        'http://localhost:5173'
-      ];
-      
-      if (allowedOrigins.includes(origin) || origin.includes('localhost')) {
-        return callback(null, true);
-      }
-      
-      // Allow all origins for development/flexibility
-      return callback(null, true);
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-business-id'],
-    exposedHeaders: ['Content-Disposition', 'Content-Length'],
-    preflightContinue: false,
-    optionsSuccessStatus: 204
-  };
-
   app.use(cors(corsOptions));
 
   // Security middleware
@@ -494,6 +467,7 @@ export async function createServer() {
   mainRouter.post("/auth/reset-password", resetPassword);
 
   // Tasks API routes
+  mainRouter.get("/board", authenticateToken, checkSubscriptionStatus, getBoard);
   mainRouter.get("/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
   mainRouter.post("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
   mainRouter.post("/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);

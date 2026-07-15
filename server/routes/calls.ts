@@ -11,6 +11,17 @@ function generateCallCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+async function getBusinessUserIds(userIds: string[], businessId: string) {
+  if (userIds.length === 0) return new Set<string>();
+
+  const result = await query(
+    `SELECT id FROM users WHERE business_id = $1 AND id = ANY($2::uuid[])`,
+    [businessId, userIds],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
+}
+
 /**
  * @swagger
  * /calls:
@@ -41,10 +52,11 @@ export const getCalls: RequestHandler = async (
 ) => {
   try {
     const businessId = req.user?.businessId;
-    if (!businessId) {
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
       return res.status(400).json({
         success: false,
-        error: "Business ID not found",
+        error: "User authentication required",
       });
     }
 
@@ -53,8 +65,19 @@ export const getCalls: RequestHandler = async (
     const offset = (page - 1) * limit;
 
     const countResult = await query(
-      `SELECT COUNT(*) as total FROM calls WHERE business_id = $1`,
-      [businessId],
+      `SELECT COUNT(*) as total
+       FROM calls c
+       WHERE c.business_id = $1
+       AND (
+         c.created_by = $2
+         OR c.host_id = $2
+         OR c.co_host_id = $2
+         OR EXISTS (
+           SELECT 1 FROM call_participants cp
+           WHERE cp.call_id = c.id AND cp.user_id = $2
+         )
+       )`,
+      [businessId, userId],
     );
     const total = parseInt(countResult.rows[0].total);
 
@@ -75,10 +98,19 @@ export const getCalls: RequestHandler = async (
       FROM calls c
       LEFT JOIN call_participants cp ON c.id = cp.call_id
       WHERE c.business_id = $1
+      AND (
+        c.created_by = $2
+        OR c.host_id = $2
+        OR c.co_host_id = $2
+        OR EXISTS (
+          SELECT 1 FROM call_participants current_cp
+          WHERE current_cp.call_id = c.id AND current_cp.user_id = $2
+        )
+      )
       GROUP BY c.id
       ORDER BY c.created_at DESC
-      LIMIT $2 OFFSET $3`,
-      [businessId, limit, offset],
+      LIMIT $3 OFFSET $4`,
+      [businessId, userId, limit, offset],
     );
 
     const response: ApiResponse<{ calls: any[]; total: number }> = {
@@ -153,6 +185,15 @@ export const createCall: RequestHandler = async (
       });
     }
 
+    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
+    const validParticipantIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+    if (validParticipantIds.size !== uniqueParticipantIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "All call participants must belong to this business",
+      });
+    }
+
     // Generate unique call code
     let callCode;
     let isUnique = false;
@@ -178,8 +219,7 @@ export const createCall: RequestHandler = async (
 
     const call = result.rows[0];
 
-    // Add participants - deduplicate IDs to avoid unique constraint violation
-    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
+    // Add participants
     const participants = [];
     for (const pid of uniqueParticipantIds) {
       const participantResult = await query(
@@ -204,14 +244,16 @@ export const createCall: RequestHandler = async (
         type: call.type,
         callCode: call.callCode,
         isGroupCall: call.isGroupCall,
-        participantIds: allParticipantIds,
+        participantIds: uniqueParticipantIds,
       },
     });
 
     // Emit socket events
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:created", call);
+      uniqueParticipantIds.forEach(targetId => {
+        io.to(`user:${targetId}`).emit("call:created", call);
+      });
       // Send invites to participants
       participantIds?.forEach(targetId => {
         io.to(`user:${targetId}`).emit("call:incoming", {
@@ -363,6 +405,16 @@ export const updateCall: RequestHandler = async (
 
     const { status, waitingRoomEnabled, recordingEnabled, coHostId } = req.body;
 
+    if (coHostId !== undefined && coHostId !== null) {
+      const validCoHostIds = await getBusinessUserIds([coHostId], businessId);
+      if (!validCoHostIds.has(coHostId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Call co-host must belong to this business",
+        });
+      }
+    }
+
     let updateFields = [];
     let values = [];
     let paramIndex = 1;
@@ -389,12 +441,13 @@ export const updateCall: RequestHandler = async (
       values.push(coHostId);
     }
     updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(id, businessId);
+    values.push(id, businessId, userId);
 
     const result = await query(
       `UPDATE calls
        SET ${updateFields.join(", ")}
        WHERE id = $${paramIndex++} AND business_id = $${paramIndex++}
+       AND (created_by = $${paramIndex} OR host_id = $${paramIndex} OR co_host_id = $${paramIndex++})
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
@@ -529,6 +582,13 @@ export const joinCall: RequestHandler = async (
        FROM calls WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     );
+    if (callResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
     const call = callResult.rows[0];
 
     const participantsResult = await query(
@@ -685,8 +745,10 @@ export const deleteCall: RequestHandler = async (
 
     // Check if call exists
     const callCheck = await query(
-      `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
+      `SELECT id FROM calls
+       WHERE id = $1 AND business_id = $2
+       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [id, businessId, userId],
     );
     if (callCheck.rows.length === 0) {
       return res.status(404).json({

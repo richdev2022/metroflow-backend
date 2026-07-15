@@ -4,6 +4,34 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { getSocketServer } from "../lib/socket";
 
+async function getBusinessUserIds(userIds: string[], businessId: string) {
+  if (userIds.length === 0) return new Set<string>();
+
+  const result = await query(
+    `SELECT id FROM users WHERE business_id = $1 AND id = ANY($2::uuid[])`,
+    [businessId, userIds],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
+}
+
+async function ensureConversationParticipant(
+  conversationId: string,
+  businessId: string,
+  userId: string,
+) {
+  const result = await query(
+    `SELECT cc.id
+     FROM chat_conversations cc
+     JOIN chat_participants cp_current ON cc.id = cp_current.conversation_id
+     WHERE cc.id = $1 AND cc.business_id = $2 AND cp_current.user_id = $3
+     LIMIT 1`,
+    [conversationId, businessId, userId],
+  );
+
+  return result.rows.length > 0;
+}
+
 /**
  * @swagger
  * /chat/conversations:
@@ -48,8 +76,9 @@ export const getConversations: RequestHandler = async (
          WHERE cm.conversation_id = cc.id 
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt
       FROM chat_conversations cc
-      JOIN chat_participants cp ON cc.id = cp.conversation_id
-      WHERE cc.business_id = $1 AND cp.user_id = $2
+      JOIN chat_participants cp_current ON cc.id = cp_current.conversation_id
+      LEFT JOIN chat_participants cp ON cc.id = cp.conversation_id
+      WHERE cc.business_id = $1 AND cp_current.user_id = $2
       GROUP BY cc.id
       ORDER BY cc.updated_at DESC`,
       [businessId, userId],
@@ -118,6 +147,14 @@ export const getConversationMessages: RequestHandler = async (
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = (page - 1) * limit;
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({
+        success: false,
+        error: "Conversation not found",
+      });
+    }
 
     const countResult = await query(
       `SELECT COUNT(*) as total FROM chat_messages WHERE conversation_id = $1`,
@@ -204,6 +241,15 @@ export const createConversation: RequestHandler = async (
       });
     }
 
+    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
+    const validParticipantIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+    if (validParticipantIds.size !== uniqueParticipantIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "All chat participants must belong to this business",
+      });
+    }
+
     // For direct messages, check if conversation already exists
     if (type === "direct" && participantIds && participantIds.length === 1) {
       const existingResult = await query(
@@ -212,6 +258,10 @@ export const createConversation: RequestHandler = async (
          JOIN chat_participants cp2 ON cc.id = cp2.conversation_id
          WHERE cc.business_id = $1 AND cc.type = 'direct'
          AND cp1.user_id = $2 AND cp2.user_id = $3
+         AND (
+           SELECT COUNT(*) FROM chat_participants cp_count
+           WHERE cp_count.conversation_id = cc.id
+         ) = 2
          LIMIT 1`,
         [businessId, userId, participantIds[0]],
       );
@@ -235,10 +285,8 @@ export const createConversation: RequestHandler = async (
 
     const conversation = result.rows[0];
 
-    // Add participants
-    const allParticipantIds = [userId, ...(participantIds || [])];
     const participants = [];
-    for (const pid of allParticipantIds) {
+    for (const pid of uniqueParticipantIds) {
       const participantResult = await query(
         `INSERT INTO chat_participants (conversation_id, user_id)
          VALUES ($1, $2)
@@ -253,7 +301,7 @@ export const createConversation: RequestHandler = async (
     // Emit socket event
     const io = getSocketServer();
     if (io) {
-      for (const pid of allParticipantIds) {
+      for (const pid of uniqueParticipantIds) {
         io.to(`user:${pid}`).emit("conversation:created", conversation);
       }
     }
@@ -322,6 +370,14 @@ export const sendMessage: RequestHandler = async (
       return res.status(400).json({
         success: false,
         error: "User authentication required",
+      });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({
+        success: false,
+        error: "Conversation not found",
       });
     }
 

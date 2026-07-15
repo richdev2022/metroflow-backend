@@ -4,6 +4,15 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "https://metricorex-app.netlify.app",
   "http://localhost:3000",
   "http://localhost:5173",
+  "https://api.metricorex.com",
+  "https://metricorex.com",
+  "https://files.metricorex.com",
+  "https://app.metricorex.com",
+  "https://admin.metricorex.com",
+  "https://compliance.metricorex.com",
+  "https://metricorex-admin.netlify.app",
+  "https://metricorex-backend.netlify.app",
+  "https://metricorex-site.netlify.app",
 ];
 
 const DEFAULT_ALLOWED_HEADERS = [

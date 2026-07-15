@@ -2778,7 +2778,7 @@
       },
       "post": {
         "summary": "Create a call",
-        "description": "Starts an audio or video call and creates a Jitsi room ID.",
+        "description": "Starts an audio or video call.",
         "tags": [
           "Calls"
         ],
@@ -2808,6 +2808,22 @@
                       "type": "string",
                       "format": "uuid"
                     }
+                  },
+                  "isGroupCall": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "password": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "waitingRoomEnabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "recordingEnabled": {
+                    "type": "boolean",
+                    "default": false
                   }
                 }
               }
@@ -2821,10 +2837,41 @@
         }
       }
     },
+    "/api/calls/code/{code}": {
+      "get": {
+        "summary": "Get call by code",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call found"
+          },
+          "404": {
+            "description": "Call not found"
+          }
+        }
+      }
+    },
     "/api/calls/{id}": {
       "put": {
         "summary": "Update a call",
-        "description": "Updates a call status.",
+        "description": "Updates a call status or settings.",
         "tags": [
           "Calls"
         ],
@@ -2850,17 +2897,25 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": [
-                  "status"
-                ],
                 "properties": {
                   "status": {
                     "type": "string",
                     "enum": [
                       "ongoing",
                       "completed",
-                      "missed"
+                      "missed",
+                      "cancelled"
                     ]
+                  },
+                  "waitingRoomEnabled": {
+                    "type": "boolean"
+                  },
+                  "recordingEnabled": {
+                    "type": "boolean"
+                  },
+                  "coHostId": {
+                    "type": "string",
+                    "format": "uuid"
                   }
                 }
               }
@@ -2870,6 +2925,36 @@
         "responses": {
           "200": {
             "description": "Call updated successfully"
+          },
+          "404": {
+            "description": "Call not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a call",
+        "tags": [
+          "Calls"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call deleted successfully"
           },
           "404": {
             "description": "Call not found"
@@ -2899,6 +2984,20 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Joined call successfully"
@@ -4171,7 +4270,7 @@
       },
       "post": {
         "summary": "Create a meeting",
-        "description": "Creates a meeting and automatically generates a Jitsi meetingUrl. googleEventId is backend-managed calendar metadata.",
+        "description": "Creates a meeting.",
         "tags": [
           "Meetings"
         ],
@@ -4215,12 +4314,36 @@
                     "type": "string",
                     "example": "UTC"
                   },
+                  "isInstant": {
+                    "type": "boolean",
+                    "default": false
+                  },
                   "attendeeIds": {
                     "type": "array",
                     "items": {
                       "type": "string",
                       "format": "uuid"
                     }
+                  },
+                  "password": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "maxParticipants": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "waitingRoomEnabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "recordingEnabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "screenSharingEnabled": {
+                    "type": "boolean",
+                    "default": true
                   }
                 }
               }
@@ -4234,10 +4357,40 @@
         }
       }
     },
+    "/api/meetings/code/{code}": {
+      "get": {
+        "summary": "Get meeting by code",
+        "tags": [
+          "Meetings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Meeting found"
+          },
+          "404": {
+            "description": "Meeting not found"
+          }
+        }
+      }
+    },
     "/api/meetings/{id}": {
       "put": {
         "summary": "Update a meeting",
-        "description": "Updates meeting details and attendees. meetingUrl and googleEventId are backend-managed and are not accepted as update inputs.",
         "tags": [
           "Meetings"
         ],
@@ -4285,7 +4438,8 @@
                     "enum": [
                       "scheduled",
                       "cancelled",
-                      "completed"
+                      "completed",
+                      "ongoing"
                     ]
                   },
                   "attendeeIds": {
@@ -4294,6 +4448,25 @@
                       "type": "string",
                       "format": "uuid"
                     }
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "maxParticipants": {
+                    "type": "integer"
+                  },
+                  "waitingRoomEnabled": {
+                    "type": "boolean"
+                  },
+                  "recordingEnabled": {
+                    "type": "boolean"
+                  },
+                  "screenSharingEnabled": {
+                    "type": "boolean"
+                  },
+                  "coHostId": {
+                    "type": "string",
+                    "format": "uuid"
                   }
                 }
               }
@@ -4985,6 +5158,164 @@
         "responses": {
           "200": {
             "description": "List of providers"
+          }
+        }
+      }
+    },
+    "/api/recordings": {
+      "get": {
+        "summary": "Get recordings",
+        "description": "Returns paginated recordings for the authenticated user's business.",
+        "tags": [
+          "Recordings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recordings fetched successfully"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a recording (start)",
+        "tags": [
+          "Recordings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "meetingId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "callId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recording started successfully"
+          }
+        }
+      }
+    },
+    "/api/recordings/{id}": {
+      "put": {
+        "summary": "Update a recording (stop/pause/resume)",
+        "tags": [
+          "Recordings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "paused",
+                      "completed",
+                      "failed"
+                    ]
+                  },
+                  "storageUrl": {
+                    "type": "string"
+                  },
+                  "duration": {
+                    "type": "integer"
+                  },
+                  "size": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recording updated successfully"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a recording",
+        "tags": [
+          "Recordings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recording deleted successfully"
           }
         }
       }
@@ -6800,6 +7131,9 @@
                           },
                           "is_owner": {
                             "type": "boolean"
+                          },
+                          "presence_status": {
+                            "type": "string"
                           }
                         }
                       }

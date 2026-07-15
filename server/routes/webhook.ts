@@ -4,6 +4,7 @@ import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
+import { createNotification } from "../services/notifications";
 
 const router = express.Router();
 
@@ -331,69 +332,120 @@ const handleMonnifyWebhook = async (event: any) => {
             
             console.log('Looking for VA number:', vaNumber, 'from accountDetails:', accountDetails);
             
+            let walletId: string | null = null;
+            
             if (vaNumber) {
                 const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
                 if (vaRes.rows.length === 0) {
                     const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE virtual_account_number = $1`, [vaNumber]);
                     if (walletRes.rows.length > 0) {
-                        vaRes.rows = [{ wallet_id: walletRes.rows[0].id }];
+                        walletId = walletRes.rows[0].id;
+                    }
+                } else {
+                    walletId = vaRes.rows[0].wallet_id;
+                }
+            }
+            
+            // If no VA found, try product.reference which is user ID
+            if (!walletId && transactionData.product?.reference) {
+                const productRef = transactionData.product.reference;
+                console.log('Trying product reference:', productRef);
+                // Try to find wallet by user_id
+                const walletRes = await query(`SELECT id FROM wallets WHERE user_id = $1`, [productRef]);
+                if (walletRes.rows.length > 0) {
+                    walletId = walletRes.rows[0].id;
+                } else {
+                    // Try to find wallet by business_id
+                    const businessWalletRes = await query(`SELECT id FROM wallets WHERE business_id = $1`, [productRef]);
+                    if (businessWalletRes.rows.length > 0) {
+                        walletId = businessWalletRes.rows[0].id;
                     }
                 }
+            }
                 
-                console.log('VA lookup result:', vaRes.rows);
-                
-                if (vaRes.rows.length > 0) {
-                    const walletId = vaRes.rows[0].wallet_id;
-                    const walletRes = await query(`SELECT id, user_id, business_id, balance FROM wallets WHERE id = $1`, [walletId]);
-                
-                    if (walletRes.rows.length > 0) {
-                        const wallet = walletRes.rows[0];
-                        // Monnify amount is in kobo for some endpoints, in naira for others? Let's check:
-                        // In sample payload, amountPaid is 3000 (kobo), but let's check transactionData.amount vs transactionData.amountPaid
-                        let amount = parseFloat(transactionData.amount || transactionData.amountPaid);
-                        // If amount is > 1000 and we have amountPaid, use amountPaid / 100
-                        if (transactionData.amountPaid && amount > 1000) {
-                            amount = parseFloat(transactionData.amountPaid) / 100;
+            if (walletId) {
+                const walletRes = await query(`SELECT id, user_id, business_id, balance FROM wallets WHERE id = $1`, [walletId]);
+            
+                if (walletRes.rows.length > 0) {
+                    const wallet = walletRes.rows[0];
+                    // Monnify amount for reserved accounts is in Naira
+                    let amount = parseFloat(transactionData.amountPaid || transactionData.amount);
+                    
+                    console.log('Processing credit of amount:', amount);
+                    
+                    // Get active payment provider from business
+                    let paymentProvider = 'monnify'; // Default to monnify since this is a monnify webhook
+                    if (wallet.business_id) {
+                        const businessRes = await query(`SELECT active_payment_provider FROM businesses WHERE id = $1`, [wallet.business_id]);
+                        if (businessRes.rows.length > 0 && businessRes.rows[0].active_payment_provider) {
+                            paymentProvider = businessRes.rows[0].active_payment_provider;
                         }
-                        
-                        console.log('Processing credit of amount:', amount);
-                        
-                        const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
-                        
-                        if (txnCheck.rows.length === 0) {
-                            const fee = await calculateFee(amount, 'funding_account');
-                            const creditAmount = Math.max(0, amount - fee);
-                            const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
-                            
-                            await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
-                            
-                            await query(
-                                `INSERT INTO transactions 
-                                (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                                VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6)`,
-                                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
-                            );
-                            
-                            if (fee > 0) {
-                                await creditRevenueWallet(fee, 'NGN');
-                            }
+                    }
+                    
+                    const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
+                    
+                    if (txnCheck.rows.length === 0) {
+                        const fee = await calculateFee(amount, 'funding_account');
+                        const creditAmount = Math.max(0, amount - fee);
+                        const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
 
-                            // Send email notification
-                            const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
-                            if (userRes.rows.length > 0) {
-                                const user = userRes.rows[0];
-                                await sendTransactionAlert(
-                                    user.email,
-                                    user.name || 'User',
-                                    'credit',
-                                    creditAmount,
-                                    'NGN',
-                                    newBalance,
-                                    'success',
-                                    reference,
-                                    'Wallet Funding via Virtual Account'
-                                );
-                            }
+                        await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
+
+                        // Debit platform wallet
+                        const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+                        if (platformWalletRes.rows.length > 0) {
+                            await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWalletRes.rows[0].id]);
+
+                            await query(
+                              `INSERT INTO transactions 
+                               (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                               VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                              [amount, `${reference}-PLATFORM`, platformWalletRes.rows[0].id]
+                            );
+                        }
+
+                        await query(
+                          `INSERT INTO transactions 
+                           (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
+                           VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, $7)`,
+                          [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, paymentProvider]
+                        );
+
+                        if (fee > 0) {
+                            await creditRevenueWallet(fee, 'NGN');
+                        }
+
+                        // Send in-app notification
+                        if (wallet.user_id) {
+                            await createNotification({
+                                businessId: wallet.business_id!,
+                                userId: wallet.user_id,
+                                type: "credit",
+                                title: "Wallet Credited",
+                                message: `Your wallet has been credited with ₦${creditAmount.toLocaleString()}`,
+                                actionUrl: "/wallet",
+                                actionType: "view_wallet",
+                                metadata: { amount: creditAmount, reference, transactionType: "wallet_funding" },
+                                isActionable: false,
+                                expiresInHours: 24,
+                            });
+                        }
+
+                        // Send email notification
+                        const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
+                        if (userRes.rows.length > 0) {
+                            const user = userRes.rows[0];
+                            await sendTransactionAlert(
+                                user.email,
+                                user.name || 'User',
+                                'credit',
+                                creditAmount,
+                                'NGN',
+                                newBalance,
+                                'success',
+                                reference,
+                                'Wallet Funding via Virtual Account'
+                            );
                         }
                     }
                 }

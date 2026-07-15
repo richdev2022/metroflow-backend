@@ -279,14 +279,44 @@ export async function initializeDatabase() {
     const plansCheck = await query(`SELECT * FROM pricing_plans`);
     if (plansCheck.rows.length === 0) {
       await query(`
-        INSERT INTO pricing_plans (name, description, price, features, max_team_members, trial_days)
+        INSERT INTO pricing_plans (name, description, price, features, max_team_members, trial_days, permissions)
         VALUES 
-        ('Free Trial', '7-day free trial with limited features', 0, '["Basic Analytics", "Up to 5 Team Members"]', 5, 7),
-        ('Starter', 'Perfect for small teams', 29, '["Advanced Analytics", "Up to 20 Team Members", "Email Support"]', 20, 0),
-        ('Pro', 'For growing businesses', 99, '["All Features", "Unlimited Team Members", "Priority Support"]', 999999, 0)
+        ('Free Trial', '7-day free trial with limited features', 0, '["Basic Analytics", "Up to 5 Team Members"]', 5, 7, '["view_dashboard", "manage_tasks", "manage_team", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.join_by_code", "rtc.join_by_link"]'),
+        ('Starter', 'Perfect for small teams', 29, '["Advanced Analytics", "Up to 20 Team Members", "Email Support"]', 20, 0, '["view_dashboard", "manage_tasks", "manage_team", "view_activity", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.group_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.host_controls", "rtc.co_host", "rtc.meeting_password", "rtc.join_by_code", "rtc.join_by_link", "rtc.allow_guest_join"]'),
+        ('Pro', 'For growing businesses', 99, '["All Features", "Unlimited Team Members", "Priority Support"]', 999999, 0, '["view_dashboard", "manage_tasks", "manage_team", "manage_epics", "manage_ideas", "view_activity", "export_data", "view_ranking", "manage_finance", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.group_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.file_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.breakout_room", "rtc.host_controls", "rtc.co_host", "rtc.meeting_password", "rtc.join_by_code", "rtc.join_by_link", "rtc.allow_guest_join", "rtc.max_meeting_duration", "rtc.max_participants", "rtc.max_recording_storage", "rtc.max_recording_duration", "rtc.analytics"]')
       `);
       console.log('Seeded default pricing plans');
+    } else {
+      // Update existing plans with permissions
+      await query(`
+        UPDATE pricing_plans 
+        SET permissions = '["view_dashboard", "manage_tasks", "manage_team", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.join_by_code", "rtc.join_by_link"]'
+        WHERE name = 'Free Trial'
+      `);
+      await query(`
+        UPDATE pricing_plans 
+        SET permissions = '["view_dashboard", "manage_tasks", "manage_team", "view_activity", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.group_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.host_controls", "rtc.co_host", "rtc.meeting_password", "rtc.join_by_code", "rtc.join_by_link", "rtc.allow_guest_join"]'
+        WHERE name = 'Starter'
+      `);
+      await query(`
+        UPDATE pricing_plans 
+        SET permissions = '["view_dashboard", "manage_tasks", "manage_team", "manage_epics", "manage_ideas", "view_activity", "export_data", "view_ranking", "manage_finance", "use_meetings", "use_chat", "use_calls", "rtc.audio_call", "rtc.video_call", "rtc.group_call", "rtc.instant_meeting", "rtc.schedule_meeting", "rtc.recording", "rtc.screen_share", "rtc.file_share", "rtc.chat", "rtc.raise_hand", "rtc.waiting_room", "rtc.breakout_room", "rtc.host_controls", "rtc.co_host", "rtc.meeting_password", "rtc.join_by_code", "rtc.join_by_link", "rtc.allow_guest_join", "rtc.max_meeting_duration", "rtc.max_participants", "rtc.max_recording_storage", "rtc.max_recording_duration", "rtc.analytics"]'
+        WHERE name = 'Pro'
+      `);
+      console.log('Updated existing pricing plans with permissions');
     }
+
+    // Add RTC limit and toggle columns to pricing_plans
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_meeting_duration INT`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_participants INT`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_recording_duration INT`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_recording_storage INT`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS waiting_room_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS screen_sharing_enabled BOOLEAN DEFAULT TRUE`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS breakout_rooms_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS virtual_backgrounds BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS live_captions BOOLEAN DEFAULT FALSE`);
 
     // Seed default platform admin if not exists
     const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, ['sunday@metricorex.com']);
@@ -1145,13 +1175,33 @@ export async function initializeDatabase() {
         end_time TIMESTAMP NOT NULL,
         timezone VARCHAR(100) NOT NULL,
         created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        host_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        co_host_id UUID REFERENCES users(id) ON DELETE SET NULL,
         status VARCHAR(50) DEFAULT 'scheduled',
+        meeting_code VARCHAR(255) UNIQUE,
+        password VARCHAR(255),
+        is_instant BOOLEAN DEFAULT FALSE,
+        max_participants INTEGER,
+        waiting_room_enabled BOOLEAN DEFAULT FALSE,
+        recording_enabled BOOLEAN DEFAULT FALSE,
+        screen_sharing_enabled BOOLEAN DEFAULT TRUE,
         meeting_url TEXT,
         google_event_id VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Add missing columns to meetings table if it already existed
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS host_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS co_host_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS meeting_code VARCHAR(255) UNIQUE`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS password VARCHAR(255)`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS is_instant BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS max_participants INTEGER`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS waiting_room_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS screen_sharing_enabled BOOLEAN DEFAULT TRUE`);
 
     await query(`
       CREATE TABLE IF NOT EXISTS meeting_attendees (
@@ -1219,11 +1269,32 @@ export async function initializeDatabase() {
         started_at TIMESTAMP,
         ended_at TIMESTAMP,
         created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        jitsi_room_id VARCHAR(255) NOT NULL,
+        host_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        co_host_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        call_code VARCHAR(255) UNIQUE,
+        password VARCHAR(255),
+        is_group_call BOOLEAN DEFAULT FALSE,
+        max_participants INTEGER,
+        waiting_room_enabled BOOLEAN DEFAULT FALSE,
+        recording_enabled BOOLEAN DEFAULT FALSE,
+        jitsi_room_id VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Add missing columns to calls table if it already existed
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS host_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS co_host_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_code VARCHAR(255) UNIQUE`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS password VARCHAR(255)`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS is_group_call BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS max_participants INTEGER`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS waiting_room_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS jitsi_room_id VARCHAR(255)`);
+    // Make jitsi_room_id nullable (in case it was originally NOT NULL)
+    await query(`ALTER TABLE calls ALTER COLUMN jitsi_room_id DROP NOT NULL`);
 
     await query(`
       CREATE TABLE IF NOT EXISTS call_participants (
@@ -1238,9 +1309,26 @@ export async function initializeDatabase() {
       )
     `);
 
+    await query(`
+      CREATE TABLE IF NOT EXISTS recordings (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        meeting_id UUID REFERENCES meetings(id) ON DELETE CASCADE,
+        call_id UUID REFERENCES calls(id) ON DELETE CASCADE,
+        recorded_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        storage_url TEXT,
+        duration INTEGER,
+        status VARCHAR(50),
+        size INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     await query(`CREATE INDEX IF NOT EXISTS idx_meetings_business_id ON meetings(business_id)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_chat_conversations_business_id ON chat_conversations(business_id)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_calls_business_id ON calls(business_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_recordings_business_id ON recordings(business_id)`);
 
     await fixUuidIdDefaults([
       'meetings',
@@ -1250,7 +1338,8 @@ export async function initializeDatabase() {
       'chat_participants',
       'chat_messages',
       'calls',
-      'call_participants'
+      'call_participants',
+      'recordings'
     ]);
 
     // Seed default statuses for existing businesses

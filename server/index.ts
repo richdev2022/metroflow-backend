@@ -8,6 +8,7 @@ import swaggerUi from "swagger-ui-express";
 import { specs } from "./swagger";
 import { isOverdue } from "./utils/date";
 import logger from "./lib/logger";
+import { corsOptions } from "./cors";
 
 // Sentry is initialized in instrument.ts which is imported first in the entry file
 let sentryInitialized = !!process.env.SENTRY_DSN;
@@ -34,6 +35,7 @@ import {
   bulkUpdateTasks,
   deleteTask,
   bulkDeleteTasks,
+  getBoard,
 } from "./routes/tasks";
 import {
   getTeamMembers,
@@ -71,9 +73,10 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall } from "./routes/calls";
+import { getRecordings, createRecording, updateRecording, deleteRecording } from "./routes/recordings";
 import { initializeDatabase, query } from "./db";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
@@ -253,35 +256,6 @@ export async function createServer() {
     
     next();
   });
-
-  // Middleware
-  const corsOptions = {
-    origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
-      console.log("CORS Origin Check:", origin);
-      // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin || origin === 'null') return callback(null, true);
-      
-      // Allow your specific frontend origin
-      const allowedOrigins = [
-        'https://metricorex-app.netlify.app',
-        'http://localhost:3000',
-        'http://localhost:5173'
-      ];
-      
-      if (allowedOrigins.includes(origin) || origin.includes('localhost')) {
-        return callback(null, true);
-      }
-      
-      // Allow all origins for development/flexibility
-      return callback(null, true);
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-business-id'],
-    exposedHeaders: ['Content-Disposition', 'Content-Length'],
-    preflightContinue: false,
-    optionsSuccessStatus: 204
-  };
 
   app.use(cors(corsOptions));
 
@@ -493,6 +467,7 @@ export async function createServer() {
   mainRouter.post("/auth/reset-password", resetPassword);
 
   // Tasks API routes
+  mainRouter.get("/board", authenticateToken, checkSubscriptionStatus, getBoard);
   mainRouter.get("/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
   mainRouter.post("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
   mainRouter.post("/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
@@ -601,6 +576,7 @@ export async function createServer() {
 
   // Meetings API routes
   mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
+  mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingByCode);
   mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
@@ -613,10 +589,18 @@ export async function createServer() {
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCalls);
+  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCallByCode);
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), joinCall);
   mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), leaveCall);
+  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), deleteCall);
+
+  // Recordings API routes
+  mainRouter.get("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordings);
+  mainRouter.post("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), createRecording);
+  mainRouter.put("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), updateRecording);
+  mainRouter.delete("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), deleteRecording);
 
   // Mount the main router at both / and /api for backward compatibility
   app.use(dbCheckMiddleware);

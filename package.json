@@ -36,6 +36,7 @@
     "express": "^5.1.0",
     "form-data": "^4.0.6",
     "ioredis": "^5.11.1",
+    "mediasoup": "^3.14.19",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.11",

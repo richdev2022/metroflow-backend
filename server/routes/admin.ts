@@ -733,17 +733,31 @@ protectedRouter.get("/pricing", requirePermission('manage_businesses'), async (r
  */
 protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (req, res) => {
     try {
-        const { name, price, currency, duration, discount, features, permissions } = req.body;
+        const { 
+            name, price, currency, duration, discount, features, permissions,
+            maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
+            waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
+            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+        } = req.body;
         
         if (!name || !price || !currency || !duration) {
             return res.status(400).json({ success: false, error: "Missing required fields" });
         }
 
         const result = await query(
-            `INSERT INTO pricing_plans (name, price, currency, duration, discount, features, permissions, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true)
+            `INSERT INTO pricing_plans 
+            (name, price, currency, duration, discount, features, permissions, is_active,
+            max_meeting_duration, max_participants, max_recording_duration, max_recording_storage,
+            waiting_room_enabled, recording_enabled, screen_sharing_enabled,
+            breakout_rooms_enabled, virtual_backgrounds, live_captions)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              RETURNING *`,
-            [name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions)]
+            [
+                name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions),
+                maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
+                waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
+                breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+            ]
         );
 
         res.json({ success: true, plan: result.rows[0] });
@@ -793,7 +807,12 @@ protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (
 protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, price, discount, features, permissions, is_active } = req.body;
+        const { 
+            name, price, discount, features, permissions, is_active,
+            maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
+            waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
+            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+        } = req.body;
 
         // Dynamic update
         let queryStr = "UPDATE pricing_plans SET updated_at = NOW()";
@@ -828,6 +847,56 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), asyn
         if (is_active !== undefined) {
             queryStr += `, is_active = $${paramCount}`;
             params.push(is_active);
+            paramCount++;
+        }
+        if (maxMeetingDuration !== undefined) {
+            queryStr += `, max_meeting_duration = $${paramCount}`;
+            params.push(maxMeetingDuration);
+            paramCount++;
+        }
+        if (maxParticipants !== undefined) {
+            queryStr += `, max_participants = $${paramCount}`;
+            params.push(maxParticipants);
+            paramCount++;
+        }
+        if (maxRecordingDuration !== undefined) {
+            queryStr += `, max_recording_duration = $${paramCount}`;
+            params.push(maxRecordingDuration);
+            paramCount++;
+        }
+        if (maxRecordingStorage !== undefined) {
+            queryStr += `, max_recording_storage = $${paramCount}`;
+            params.push(maxRecordingStorage);
+            paramCount++;
+        }
+        if (waitingRoomEnabled !== undefined) {
+            queryStr += `, waiting_room_enabled = $${paramCount}`;
+            params.push(waitingRoomEnabled);
+            paramCount++;
+        }
+        if (recordingEnabled !== undefined) {
+            queryStr += `, recording_enabled = $${paramCount}`;
+            params.push(recordingEnabled);
+            paramCount++;
+        }
+        if (screenSharingEnabled !== undefined) {
+            queryStr += `, screen_sharing_enabled = $${paramCount}`;
+            params.push(screenSharingEnabled);
+            paramCount++;
+        }
+        if (breakoutRoomsEnabled !== undefined) {
+            queryStr += `, breakout_rooms_enabled = $${paramCount}`;
+            params.push(breakoutRoomsEnabled);
+            paramCount++;
+        }
+        if (virtualBackgrounds !== undefined) {
+            queryStr += `, virtual_backgrounds = $${paramCount}`;
+            params.push(virtualBackgrounds);
+            paramCount++;
+        }
+        if (liveCaptions !== undefined) {
+            queryStr += `, live_captions = $${paramCount}`;
+            params.push(liveCaptions);
             paramCount++;
         }
 

@@ -6,6 +6,81 @@ import { logActivity } from "../services/activity";
 import { sendTaskNotification } from "../services/email";
 import { isOverdue } from "../utils/date";
 
+export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    if (!businessId) {
+      return res.status(400).json({
+        success: false,
+        error: "Business ID not found",
+      });
+    }
+
+    // Ensure default statuses exist for this business
+    const defaultStatuses = [
+      { name: 'pending', color: '#6b7280', is_default: true },
+      { name: 'in_progress', color: '#3b82f6', is_default: true },
+      { name: 'completed', color: '#10b981', is_default: true }
+    ];
+    for (let i = 0; i < defaultStatuses.length; i++) {
+      const status = defaultStatuses[i];
+      await query(
+        `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (business_id, name) DO NOTHING`,
+        [businessId, status.name, status.color, status.is_default, i]
+      );
+    }
+
+    // First get all task statuses for the business
+    const statusesResult = await query(
+      `SELECT * FROM task_statuses WHERE business_id = $1 ORDER BY sort_order ASC, created_at ASC`,
+      [businessId]
+    );
+
+    // get all tasks for the business
+    const tasksResult = await query(
+      `SELECT
+        t.id, t.title, t.description, t.epic, t.epic_id as "epicId", t.sprint, t.target_value as "targetValue",
+        t.accomplished_value as "accomplishedValue",
+        t.start_date as "startDate", t.end_date as "endDate",
+        t.due_date as "dueDate", t.status, t.is_overdue as "isOverdue",
+        t.created_at as "createdAt", t.updated_at as "updatedAt",
+        array_agg(ta.user_id) FILTER (WHERE ta.user_id IS NOT NULL) as "assignedTo"
+       FROM tasks t
+       LEFT JOIN task_assignments ta ON t.id = ta.task_id
+       WHERE t.business_id = $1
+       GROUP BY t.id
+       ORDER BY t.created_at DESC`,
+      [businessId]
+    );
+
+    // dynamically compute isOverdue for each task
+    const tasksWithOverdueStatus = tasksResult.rows.map(task => ({
+      ...task,
+      isOverdue: task.status !== 'completed' ? isOverdue(task.endDate, task.dueDate) : false
+    }));
+
+    // group tasks by status
+    const board = statusesResult.rows.map(status => ({
+      ...status,
+      tasks: tasksWithOverdueStatus.filter(task => task.status === status.name)
+    }));
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: board,
+    };
+    res.json(response);
+  } catch (error) {
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to get board",
+    };
+    res.status(500).json(response);
+  }
+};
+
 export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) => {
 /**
  * @swagger

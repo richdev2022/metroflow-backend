@@ -130,6 +130,7 @@ model Business {
   ChatConversation      ChatConversation[]
   Call                  Call[]
   Recording             Recording[]
+  Notification          Notification[]
 
   @@map("businesses")
 }
@@ -208,6 +209,7 @@ model User {
 
   CallParticipant CallParticipant[]
   Recordings      Recording[]       @relation("recordedByUser")
+  Notification    Notification[]
 
   @@unique([businessId, email])
   @@map("users")
@@ -862,4 +864,29 @@ model Recording {
   recordedBy User     @relation("recordedByUser", fields: [recordedById], references: [id])
 
   @@map("recordings")
+}
+
+// In-App Notifications
+model Notification {
+  id             String   @id @default(uuid())
+  businessId     String   @map("business_id")
+  userId         String   @map("user_id")
+  type           String   // e.g., task, chat, call, meeting, credit, debit
+  title          String
+  message        String
+  actionUrl      String?  @map("action_url") // URL to take action on the notification
+  actionType     String?  @map("action_type") // e.g., accept_call, decline_call, view_task
+  metadata       Json?    // additional data like taskId, callId, chatId, etc.
+  isRead         Boolean  @default(false) @map("is_read")
+  isActionable   Boolean  @default(false) @map("is_actionable")
+  actionTaken    String?  @map("action_taken") // e.g., accepted, declined
+  createdAt      DateTime @default(now()) @map("created_at")
+  expiresAt      DateTime @map("expires_at") // when to auto-clear the notification
+  updatedAt      DateTime @default(now()) @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, userId, isRead, createdAt])
+  @@map("notifications")
 }

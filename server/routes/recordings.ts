@@ -479,6 +479,37 @@ export const deleteRecording: RequestHandler = async (
   }
 };
 
+/**
+ * @swagger
+ * /recordings/{id}/upload:
+ *   post:
+ *     summary: Upload a recording file
+ *     tags: [Recordings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *               duration:
+ *                 type: integer
+ *     responses:
+ *       200:
+ *         description: Recording uploaded successfully
+ */
 // Upload recording file endpoint
 export const uploadRecording: RequestHandler[] = [
   upload.single('file'),

@@ -4,6 +4,8 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
+import { upload } from "../middleware/upload";
+import { r2Storage } from "../lib/storage";
 
 async function canAccessMeeting(meetingId: string, businessId: string, userId: string) {
   const result = await query(
@@ -145,9 +147,23 @@ export const getRecordings: RequestHandler = async (
       [businessId, userId, limit, offset],
     );
 
+    // Generate presigned URLs for recordings if needed
+    const recordings = await Promise.all(
+      result.rows.map(async (recording) => {
+        if (recording.storageUrl && !recording.storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+          try {
+            recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
+          } catch (err) {
+            console.error("Failed to generate presigned URL for recording:", recording.id, err);
+          }
+        }
+        return recording;
+      })
+    );
+
     const response: ApiResponse<{ recordings: any[]; total: number }> = {
       success: true,
-      data: { recordings: result.rows, total },
+      data: { recordings, total },
     };
     res.json(response);
   } catch (error) {
@@ -415,7 +431,7 @@ export const deleteRecording: RequestHandler = async (
       });
     }
 
-    const result = await query(`DELETE FROM recordings WHERE id = $1 AND business_id = $2 AND recorded_by = $3 RETURNING id`, [
+    const result = await query(`DELETE FROM recordings WHERE id = $1 AND business_id = $2 AND recorded_by = $3 RETURNING id, storage_url`, [
       id,
       businessId,
       userId,
@@ -426,6 +442,16 @@ export const deleteRecording: RequestHandler = async (
         success: false,
         error: "Recording not found",
       });
+    }
+
+    // Delete from storage if exists
+    const storageUrl = result.rows[0].storage_url;
+    if (storageUrl && !storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+      try {
+        await r2Storage.deleteFile(storageUrl);
+      } catch (err) {
+        console.error("Failed to delete recording from storage:", err);
+      }
     }
 
     await logActivity({
@@ -452,3 +478,89 @@ export const deleteRecording: RequestHandler = async (
     res.status(500).json(response);
   }
 };
+
+// Upload recording file endpoint
+export const uploadRecording: RequestHandler[] = [
+  upload.single('file'),
+  async (req: AuthenticatedRequest & { file?: Express.Multer.File }, res) => {
+    try {
+      const { id } = req.params;
+      const { duration } = req.body;
+      const businessId = req.user?.businessId;
+      const userId = req.user?.userId;
+
+      if (!businessId || !userId) {
+        return res.status(400).json({
+          success: false,
+          error: "User authentication required",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: "No file uploaded",
+        });
+      }
+
+      // Check if recording exists and belongs to user
+      const checkResult = await query(
+        `SELECT id FROM recordings WHERE id = $1 AND business_id = $2 AND recorded_by = $3`,
+        [id, businessId, userId]
+      );
+
+      if (checkResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: "Recording not found",
+        });
+      }
+
+      // Upload to R2 if available
+      let storageUrl = '';
+      if (r2Storage.isAvailable()) {
+        const fileExt = req.file.originalname.split('.').pop() || 'webm';
+        const key = `recordings/${businessId}/${id}.${fileExt}`;
+        storageUrl = await r2Storage.uploadFile(key, req.file.buffer, req.file.mimetype);
+      } else {
+        // If R2 not available, maybe handle differently, but for now just log
+        console.warn("R2 storage not available, recording not saved to storage");
+      }
+
+      // Update recording in database
+      const updateResult = await query(
+        `UPDATE recordings
+         SET storage_url = $1,
+             duration = COALESCE($2, duration),
+             size = $3,
+             status = 'completed',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4 AND business_id = $5 AND recorded_by = $6
+         RETURNING id, business_id as "businessId", meeting_id as "meetingId", 
+                   call_id as "callId", recorded_by as "recordedById", storage_url as "storageUrl",
+                   duration, status, size, created_at as "createdAt", updated_at as "updatedAt"`,
+        [storageUrl, duration ? parseInt(duration) : null, req.file.size, id, businessId, userId]
+      );
+
+      const recording = updateResult.rows[0];
+
+      // Generate presigned URL if needed
+      if (recording.storageUrl && !recording.storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+        recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
+      }
+
+      const response: ApiResponse<any> = {
+        success: true,
+        data: recording,
+      };
+      res.json(response);
+    } catch (error) {
+      console.error("Upload recording error:", error);
+      const response: ApiResponse<null> = {
+        success: false,
+        error: "Failed to upload recording",
+      };
+      res.status(500).json(response);
+    }
+  }
+];

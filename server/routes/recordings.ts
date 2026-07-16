@@ -512,7 +512,19 @@ export const deleteRecording: RequestHandler = async (
  */
 // Upload recording file endpoint
 export const uploadRecording: RequestHandler[] = [
-  upload.single('file'),
+  (req, res, next) => {
+    const uploadSingle = upload.single('file');
+    uploadSingle(req, res, (err) => {
+      if (err) {
+        console.error("Multer error:", err);
+        return res.status(400).json({
+          success: false,
+          error: err.message || "File upload error",
+        });
+      }
+      next();
+    });
+  },
   async (req: AuthenticatedRequest & { file?: Express.Multer.File }, res) => {
     try {
       const { id } = req.params;

@@ -7,6 +7,7 @@ export interface AuthenticatedRequest extends Request {
     userId: string;
     businessId: string;
     email?: string;
+    name?: string;
   };
 }
 

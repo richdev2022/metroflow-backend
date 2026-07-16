@@ -27,7 +27,7 @@ export const authenticateAdmin = async (
     });
   }
 
-  const decoded = verifyAdminToken(token);
+  const decoded = await verifyAdminToken(token);
   if (!decoded) {
     return res.status(403).json({
       success: false,
@@ -60,7 +60,7 @@ export const authenticateAdmin = async (
 
     req.admin = {
       adminId: decoded.adminId,
-      role: decoded.role, // 'platform_admin' from token
+      role: 'platform_admin',
       roleName: adminData.role_name,
       isSuperAdmin: adminData.is_super_admin,
       permissions: adminData.permissions

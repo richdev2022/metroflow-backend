@@ -122,9 +122,31 @@ export async function debitPlatformWallet(amount: number, currency: string = 'NG
     await creditPlatformWallet(-amount, currency);
 }
 
-export async function creditRevenueWallet(amount: number, currency: string = 'NGN') {
+export async function creditRevenueWallet(amount: number, currency: string = 'NGN', reference?: string) {
     // This is the Revenue Wallet (platform_wallet table)
     if (amount === 0) return;
+
+    // First debit platform wallet first
+    const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL AND currency = $1 LIMIT 1`, [currency]);
+    let platformWalletId;
+    if (platformWalletRes.rows.length === 0) {
+        // Create platform wallet if not exists
+        const newPlatformWallet = await query(
+            `INSERT INTO wallets (balance, currency, status) VALUES (0, $1, 'active') RETURNING id`,
+            [currency]
+        );
+        platformWalletId = newPlatformWallet.rows[0].id;
+    } else {
+        platformWalletId = platformWalletRes.rows[0].id;
+    }
+
+    await query(`UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [amount, platformWalletId]);
+
+    // Create platform debit transaction
+    await query(
+        `INSERT INTO transactions (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction) VALUES ($1, $2, 'success', $3, 'debit', 'Platform Wallet Debit for Revenue', 'revenue', $4, 'debit')`,
+        [amount, currency, reference ? `${reference}-REVENUE` : `revenue-${Date.now()}`, platformWalletId]
+    );
 
     let walletRes = await query(`SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
     

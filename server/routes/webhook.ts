@@ -174,49 +174,101 @@ const handleSquadWebhook = async (event: any) => {
                 }
             }
         } else if (isSuccess) {
-            // Transaction not found in DB (Maybe Virtual Account Transfer?)
-            const vaNumber = body.virtual_account_number || body.customer?.virtual_account_number;
-            
-            if (vaNumber) {
-                 const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
-                 if (vaRes.rows.length === 0) {
-                     const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE virtual_account_number = $1`, [vaNumber]);
-                     if (walletRes.rows.length > 0) {
-                         vaRes.rows = [{ wallet_id: walletRes.rows[0].id }];
-                     }
-                 }
-                 
-                 if (vaRes.rows.length > 0) {
-                     const walletId = vaRes.rows[0].wallet_id;
-                     const walletRes = await query(`SELECT id, user_id, business_id FROM wallets WHERE id = $1`, [walletId]);
-                 
-                     if (walletRes.rows.length > 0) {
-                         const wallet = walletRes.rows[0];
-                         const amount = parseFloat(body.amount) / 100;
-                         
-                         const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
-                         
-                         if (txnCheck.rows.length === 0) {
-                             const fee = await calculateFee(amount, 'funding_account');
-                             const creditAmount = Math.max(0, amount - fee);
-
-                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [creditAmount, wallet.id]);
-                             
-                             await query(
-                                `INSERT INTO transactions 
-                                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                                 VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6)`,
-                                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
-                            );
-
-                             if (fee > 0) {
-                                await creditRevenueWallet(fee, 'NGN');
-                             }
-                         }
-                     }
-                 }
-            }
+      // Transaction not found in DB (Maybe Virtual Account Transfer?)
+      const vaNumber = body.virtual_account_number || body.customer?.virtual_account_number;
+      
+      if (vaNumber) {
+        let walletId: string | null = null;
+        const vaRes = await query(`SELECT wallet_id FROM virtual_accounts WHERE virtual_account_number = $1`, [vaNumber]);
+        
+        if (vaRes.rows.length > 0) {
+          walletId = vaRes.rows[0].wallet_id;
+        } else {
+          const walletRes = await query(`SELECT id FROM wallets WHERE virtual_account_number = $1`, [vaNumber]);
+          if (walletRes.rows.length > 0) {
+            walletId = walletRes.rows[0].id;
+          }
         }
+        
+        if (walletId) {
+          const walletRes = await query(`SELECT id, user_id, business_id, balance FROM wallets WHERE id = $1`, [walletId]);
+          
+          if (walletRes.rows.length > 0) {
+            const wallet = walletRes.rows[0];
+            let amount = parseFloat(body.amount);
+            
+            const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
+            
+            if (txnCheck.rows.length === 0) {
+              const fee = await calculateFee(amount, 'funding_account');
+              const creditAmount = Math.max(0, amount - fee);
+              const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
+
+              // Credit user wallet first
+              await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
+
+              // Debit platform wallet for user credit
+              const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL LIMIT 1`);
+              if (platformWalletRes.rows.length > 0) {
+                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [creditAmount, platformWalletRes.rows[0].id]);
+                
+                await query(
+                  `INSERT INTO transactions 
+                   (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                   VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                  [creditAmount, `${reference}-USER`, platformWalletRes.rows[0].id]
+                );
+              }
+
+              // Credit revenue wallet (this will also debit platform wallet for fee)
+              if (fee > 0) {
+                await creditRevenueWallet(fee, 'NGN', reference);
+              }
+
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
+                 VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, 'squad')`,
+                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
+              );
+
+              // Send in-app notification
+              if (wallet.user_id) {
+                await createNotification({
+                  businessId: wallet.business_id!,
+                  userId: wallet.user_id,
+                  type: "credit",
+                  title: "Wallet Credited",
+                  message: `Your wallet has been credited with ₦${creditAmount.toLocaleString()}`,
+                  actionUrl: "/wallet",
+                  actionType: "view_wallet",
+                  metadata: { amount: creditAmount, reference, transactionType: "wallet_funding" },
+                  isActionable: false,
+                  expiresInHours: 24,
+                });
+              }
+
+              // Send email notification
+              const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
+              if (userRes.rows.length > 0) {
+                const user = userRes.rows[0];
+                await sendTransactionAlert(
+                  user.email,
+                  user.name || 'User',
+                  'credit',
+                  creditAmount,
+                  'NGN',
+                  newBalance,
+                  'success',
+                  reference,
+                  'Wallet Funding via Virtual Account'
+                );
+              }
+            }
+          }
+        }
+      }
+    }
     }
 
     // Handle transfer status updates
@@ -385,69 +437,71 @@ const handleMonnifyWebhook = async (event: any) => {
                     const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
                     
                     if (txnCheck.rows.length === 0) {
-                        const fee = await calculateFee(amount, 'funding_account');
-                        const creditAmount = Math.max(0, amount - fee);
-                        const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
+              const fee = await calculateFee(amount, 'funding_account');
+              const creditAmount = Math.max(0, amount - fee);
+              const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
 
-                        await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
+              // Credit user wallet first
+              await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-                        // Debit platform wallet
-                        const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                        if (platformWalletRes.rows.length > 0) {
-                            await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWalletRes.rows[0].id]);
+              // Debit platform wallet for user credit
+              const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+              if (platformWalletRes.rows.length > 0) {
+                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [creditAmount, platformWalletRes.rows[0].id]);
+                
+                await query(
+                  `INSERT INTO transactions 
+                   (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                   VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                  [creditAmount, `${reference}-USER`, platformWalletRes.rows[0].id]
+                );
+              }
 
-                            await query(
-                              `INSERT INTO transactions 
-                               (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                               VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                              [amount, `${reference}-PLATFORM`, platformWalletRes.rows[0].id]
-                            );
-                        }
+              // Credit revenue wallet (this will also debit platform wallet for fee)
+              if (fee > 0) {
+                await creditRevenueWallet(fee, 'NGN', reference);
+              }
 
-                        await query(
-                          `INSERT INTO transactions 
-                           (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
-                           VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, $7)`,
-                          [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, paymentProvider]
-                        );
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
+                 VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, $7)`,
+                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, paymentProvider]
+              );
 
-                        if (fee > 0) {
-                            await creditRevenueWallet(fee, 'NGN');
-                        }
+              // Send in-app notification
+              if (wallet.user_id) {
+                await createNotification({
+                  businessId: wallet.business_id!,
+                  userId: wallet.user_id,
+                  type: "credit",
+                  title: "Wallet Credited",
+                  message: `Your wallet has been credited with ₦${creditAmount.toLocaleString()}`,
+                  actionUrl: "/wallet",
+                  actionType: "view_wallet",
+                  metadata: { amount: creditAmount, reference, transactionType: "wallet_funding" },
+                  isActionable: false,
+                  expiresInHours: 24,
+                });
+              }
 
-                        // Send in-app notification
-                        if (wallet.user_id) {
-                            await createNotification({
-                                businessId: wallet.business_id!,
-                                userId: wallet.user_id,
-                                type: "credit",
-                                title: "Wallet Credited",
-                                message: `Your wallet has been credited with ₦${creditAmount.toLocaleString()}`,
-                                actionUrl: "/wallet",
-                                actionType: "view_wallet",
-                                metadata: { amount: creditAmount, reference, transactionType: "wallet_funding" },
-                                isActionable: false,
-                                expiresInHours: 24,
-                            });
-                        }
-
-                        // Send email notification
-                        const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
-                        if (userRes.rows.length > 0) {
-                            const user = userRes.rows[0];
-                            await sendTransactionAlert(
-                                user.email,
-                                user.name || 'User',
-                                'credit',
-                                creditAmount,
-                                'NGN',
-                                newBalance,
-                                'success',
-                                reference,
-                                'Wallet Funding via Virtual Account'
-                            );
-                        }
-                    }
+              // Send email notification
+              const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
+              if (userRes.rows.length > 0) {
+                const user = userRes.rows[0];
+                await sendTransactionAlert(
+                  user.email,
+                  user.name || 'User',
+                  'credit',
+                  creditAmount,
+                  'NGN',
+                  newBalance,
+                  'success',
+                  reference,
+                  'Wallet Funding via Virtual Account'
+                );
+              }
+            }
                 }
             }
         }

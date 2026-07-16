@@ -272,7 +272,19 @@ export const createMeeting: RequestHandler = async (
         `SELECT id, name, email FROM users WHERE id IN (${placeholders})`,
         uniqueAttendeeIds
       );
-      const usersMap = new Map(usersResult.rows.map(user => [user.id, user]));
+      interface UserFromDb {
+        id: string;
+        name: string | null;
+        email: string | null;
+      }
+      const usersMap = new Map<string, UserFromDb>(usersResult.rows.map((user: UserFromDb) => [user.id, user]));
+
+      // Fetch the current user's details to get their name
+      const currentUserResult = await query(
+        `SELECT name FROM users WHERE id = $1`,
+        [userId]
+      );
+      const currentUserName = currentUserResult.rows[0]?.name;
 
       for (const attendeeId of uniqueAttendeeIds) {
         const attendeeResult = await query(
@@ -289,7 +301,7 @@ export const createMeeting: RequestHandler = async (
           userId: attendeeId,
           type: "meeting",
           title: "Meeting Invitation",
-          message: `${req.user?.name || "Someone"} invited you to a meeting: ${title}`,
+          message: `${currentUserName || "Someone"} invited you to a meeting: ${title}`,
           actionUrl: `/meetings/${meeting.meetingCode}`,
           actionType: "view_meeting",
           metadata: { meetingId: meeting.id, meetingCode: meeting.meetingCode },
@@ -307,7 +319,7 @@ export const createMeeting: RequestHandler = async (
             new Date(startTime),
             new Date(endTime),
             meeting.meetingCode,
-            req.user?.name || 'Someone'
+            currentUserName || 'Someone'
           );
           await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${title}`, emailHtml);
         }

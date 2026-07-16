@@ -1,15 +1,68 @@
 import { Pool } from "pg";
 import { hashPassword } from "./services/auth";
 
-console.log("Initializing DB Pool... (Modified)");
+console.log("Initializing DB Pool...");
+
+const parseIntegerEnv = (name: string, fallback: number) => {
+  const value = process.env[name];
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parseBooleanEnv = (name: string, fallback = false) => {
+  const value = process.env[name];
+  if (!value) {
+    return fallback;
+  }
+
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+};
+
+const databaseUrl = process.env.DATABASE_URL;
+const isServerless = Boolean(process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT);
+const databaseHost = (() => {
+  if (!databaseUrl) {
+    return "";
+  }
+
+  try {
+    return new URL(databaseUrl).hostname;
+  } catch {
+    return "";
+  }
+})();
+const isLocalDatabase = ["localhost", "127.0.0.1", "::1"].includes(databaseHost);
+const usesNeon = databaseHost.includes("neon.tech");
+const sslDisabled = databaseUrl?.includes("sslmode=disable") || process.env.PGSSLMODE === "disable";
+const shouldUseSsl = !sslDisabled && !isLocalDatabase;
+const defaultPoolMax = isServerless ? 1 : usesNeon ? 5 : 10;
+const defaultConnectionTimeout = usesNeon ? 60000 : 30000;
+const defaultIdleTimeout = usesNeon ? 30000 : 10000;
+const channelBindingRequired = databaseUrl?.includes("channel_binding=require");
+
+console.log("DB Pool config", {
+  host: databaseHost || "not configured",
+  ssl: shouldUseSsl,
+  channelBinding: channelBindingRequired,
+  poolMax: parseIntegerEnv("PGPOOL_MAX", defaultPoolMax),
+  connectionTimeoutMs: parseIntegerEnv("PG_CONNECTION_TIMEOUT_MS", defaultConnectionTimeout),
+  idleTimeoutMs: parseIntegerEnv("PG_IDLE_TIMEOUT_MS", defaultIdleTimeout),
+});
 
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  connectionTimeoutMillis: 60000, // 60 seconds
-  idleTimeoutMillis: 60000,       // 60 seconds
-  max: 20,                        // Max clients in pool
-  keepAlive: true
+  connectionString: databaseUrl,
+  ssl: shouldUseSsl ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: parseIntegerEnv("PG_CONNECTION_TIMEOUT_MS", defaultConnectionTimeout),
+  idleTimeoutMillis: parseIntegerEnv("PG_IDLE_TIMEOUT_MS", defaultIdleTimeout),
+  max: parseIntegerEnv("PGPOOL_MAX", defaultPoolMax),
+  maxUses: parseIntegerEnv("PG_MAX_USES", 750),
+  keepAlive: true,
+  keepAliveInitialDelayMillis: parseIntegerEnv("PG_KEEPALIVE_INITIAL_DELAY_MS", 10000),
+  enableChannelBinding: channelBindingRequired,
 });
 
 // Add error handler to prevent server crash on idle client errors
@@ -19,10 +72,38 @@ pool.on('error', (err) => {
 });
 
 // Retry logic for transient errors (like DNS/Connection timeouts)
-const MAX_RETRIES = 10;
-const RETRY_DELAY = 3000; // 3s
+const MAX_RETRIES = parseIntegerEnv("DB_MAX_RETRIES", 3);
+const RETRY_DELAY = parseIntegerEnv("DB_RETRY_DELAY_MS", 1000);
+const RETRY_WRITES = parseBooleanEnv("DB_RETRY_WRITES", false);
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const isTransientDatabaseError = (error: any) => {
+  return error.code === 'ENOTFOUND' ||
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNRESET' ||
+    error.code === 'ECONNREFUSED' ||
+    error.message?.includes('timeout') ||
+    error.message?.includes('Connection terminated') ||
+    error.message?.includes('Client has encountered a connection error');
+};
+
+const canRetryQuery = (text: string) => {
+  if (RETRY_WRITES) {
+    return true;
+  }
+
+  const normalized = text.trim().toLowerCase();
+  return normalized.startsWith('select') ||
+    normalized.startsWith('show') ||
+    normalized.startsWith('with') ||
+    normalized.startsWith('create table if not exists') ||
+    normalized.startsWith('create index if not exists') ||
+    normalized.startsWith('create extension if not exists') ||
+    normalized.startsWith('alter table');
+};
+
+const getRetryDelay = (attempt: number) => RETRY_DELAY * attempt;
 
 async function fixUuidIdDefaults(tableNames: string[]) {
   for (const tableName of tableNames) {
@@ -124,15 +205,13 @@ export async function query(text: string, params?: unknown[]) {
       return res;
     } catch (error: any) {
       lastError = error;
-      const isTransient = error.code === 'ENOTFOUND' || 
-                          error.code === 'ETIMEDOUT' || 
-                          error.code === 'ECONNRESET' || 
-                          error.message.includes('timeout') ||
-                          error.message.includes('Connection terminated');
+      const isTransient = isTransientDatabaseError(error);
+      const shouldRetry = isTransient && canRetryQuery(text) && attempt < MAX_RETRIES;
       
-      if (isTransient && attempt < MAX_RETRIES) {
-        console.warn(`Database query failed (Attempt ${attempt}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY}ms... Error: ${error.message}`);
-        await sleep(RETRY_DELAY);
+      if (shouldRetry) {
+        const delay = getRetryDelay(attempt);
+        console.warn(`Database query failed (Attempt ${attempt}/${MAX_RETRIES}). Retrying in ${delay}ms... Error: ${error.message}`);
+        await sleep(delay);
         continue;
       }
       
@@ -1324,6 +1403,38 @@ export async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        action_url TEXT,
+        action_type VARCHAR(50),
+        metadata JSONB,
+        is_read BOOLEAN DEFAULT FALSE,
+        is_actionable BOOLEAN DEFAULT FALSE,
+        action_taken VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        admin_id UUID NOT NULL REFERENCES platform_admins(id) ON DELETE CASCADE,
+        token VARCHAR(255) NOT NULL UNIQUE,
+        last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await fixUuidIdDefaults(['recordings', 'notifications', 'admin_sessions']);
 
     await query(`CREATE INDEX IF NOT EXISTS idx_meetings_business_id ON meetings(business_id)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_chat_conversations_business_id ON chat_conversations(business_id)`);

@@ -994,59 +994,170 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     const { search, status, startDate, endDate, page = 1, limit = 20 } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
-    let queryText = `SELECT * FROM transfer_queue WHERE business_id = $1`;
-    let countQueryText = `SELECT COUNT(*) FROM transfer_queue WHERE business_id = $1`;
-    const params: any[] = [businessId];
-    let paramIdx = 2;
+    // Build query for transfer_queue (existing)
+    let tqQueryText = `SELECT 
+        id,
+        business_id,
+        wallet_id,
+        reference,
+        recipient_account,
+        recipient_bank,
+        recipient_name,
+        amount,
+        currency,
+        remark,
+        status,
+        failure_reason,
+        source_type,
+        source_id,
+        transaction_hash,
+        initiated_by,
+        payment_provider,
+        provider_metadata,
+        created_at,
+        updated_at,
+        'transfer' as type
+      FROM transfer_queue 
+      WHERE business_id = $1`;
+    let tqParams: any[] = [businessId];
+    let tqParamIdx = 2;
 
+    // Build query for transactions (credits, and other transactions)
+    let txQueryText = `SELECT 
+        id,
+        business_id,
+        wallet_id,
+        reference,
+        amount,
+        currency,
+        status,
+        description,
+        transaction_type,
+        direction,
+        fee,
+        payment_provider,
+        provider_metadata,
+        created_at,
+        updated_at,
+        'transaction' as type
+      FROM transactions 
+      WHERE business_id = $1`;
+    let txParams: any[] = [businessId];
+    let txParamIdx = 2;
+
+    // Apply filters to both queries
     if (search) {
-      const searchClause = ` AND (recipient_name ILIKE $${paramIdx} OR recipient_account ILIKE $${paramIdx} OR reference ILIKE $${paramIdx})`;
-      queryText += searchClause;
-      countQueryText += searchClause;
-      params.push(`%${search}%`);
-      paramIdx++;
+      // Transfer Queue: search by recipient_name, recipient_account, reference
+      const tqSearch = ` AND (recipient_name ILIKE $${tqParamIdx} OR recipient_account ILIKE $${tqParamIdx} OR reference ILIKE $${tqParamIdx})`;
+      tqQueryText += tqSearch;
+      tqParams.push(`%${search}%`);
+      tqParamIdx++;
+
+      // Transactions: search by description, reference
+      const txSearch = ` AND (description ILIKE $${txParamIdx} OR reference ILIKE $${txParamIdx})`;
+      txQueryText += txSearch;
+      txParams.push(`%${search}%`);
+      txParamIdx++;
     }
 
     if (status) {
-      const statusClause = ` AND status = $${paramIdx}`;
-      queryText += statusClause;
-      countQueryText += statusClause;
-      params.push(status);
-      paramIdx++;
+      // Transfer Queue: exact status match
+      tqQueryText += ` AND status = $${tqParamIdx}`;
+      tqParams.push(status);
+      tqParamIdx++;
+
+      // Transactions: exact status match
+      txQueryText += ` AND status = $${txParamIdx}`;
+      txParams.push(status);
+      txParamIdx++;
     }
 
     if (startDate) {
-      const startDateClause = ` AND created_at >= $${paramIdx}`;
-      queryText += startDateClause;
-      countQueryText += startDateClause;
-      params.push(startDate);
-      paramIdx++;
+      tqQueryText += ` AND created_at >= $${tqParamIdx}`;
+      tqParams.push(startDate);
+      tqParamIdx++;
+
+      txQueryText += ` AND created_at >= $${txParamIdx}`;
+      txParams.push(startDate);
+      txParamIdx++;
     }
 
     if (endDate) {
-      const endDateClause = ` AND created_at <= $${paramIdx}`;
-      queryText += endDateClause;
-      countQueryText += endDateClause;
-      params.push(endDate);
-      paramIdx++;
+      tqQueryText += ` AND created_at <= $${tqParamIdx}`;
+      tqParams.push(endDate);
+      tqParamIdx++;
+
+      txQueryText += ` AND created_at <= $${txParamIdx}`;
+      txParams.push(endDate);
+      txParamIdx++;
     }
 
-    queryText += ` ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
-    
-    const result = await query(queryText, [...params, Number(limit), offset]);
-    const countRes = await query(countQueryText, params);
-    
+    // Execute both queries
+    const [tqResult, txResult] = await Promise.all([
+      query(tqQueryText, tqParams),
+      query(txQueryText, txParams)
+    ]);
+
+    // Combine results and sort by created_at descending
+    const allItems = [
+      ...tqResult.rows.map(row => ({ ...row, source: 'transfer_queue' })),
+      ...txResult.rows.map(row => ({ ...row, source: 'transaction' }))
+    ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    // Calculate total for pagination
+    const total = allItems.length;
+
+    // Apply pagination manually
+    const paginatedItems = allItems.slice(offset, offset + Number(limit));
+
+    // Format response to be backwards compatible
+    const formattedData = paginatedItems.map(item => {
+      if (item.source === 'transfer_queue') {
+        // Return as before for backwards compatibility
+        return item;
+      } else {
+        // Format transaction to look similar to transfer for consistency
+        return {
+          id: item.id,
+          business_id: item.business_id,
+          wallet_id: item.wallet_id,
+          reference: item.reference,
+          recipient_account: null,
+          recipient_bank: null,
+          recipient_name: item.description,
+          amount: item.amount,
+          currency: item.currency,
+          remark: item.description,
+          status: item.status,
+          failure_reason: null,
+          source_type: item.transaction_type,
+          source_id: null,
+          transaction_hash: null,
+          initiated_by: null,
+          payment_provider: item.payment_provider,
+          provider_metadata: item.provider_metadata,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          type: 'transaction',
+          direction: item.direction,
+          transaction_type: item.transaction_type,
+          fee: item.fee
+        };
+      }
+    });
+
     res.json({
       success: true,
-      data: result.rows,
+      data: formattedData,
       pagination: {
-        total: parseInt(countRes.rows[0].count),
+        total,
         page: Number(page),
         limit: Number(limit),
-        totalPages: Math.ceil(parseInt(countRes.rows[0].count) / Number(limit))
+        totalPages: Math.ceil(total / Number(limit))
       }
     });
   } catch (error) {
+    console.error("Get transfers error:", error);
     res.status(500).json({ success: false, error: "Failed to fetch transfers" });
   }
 });

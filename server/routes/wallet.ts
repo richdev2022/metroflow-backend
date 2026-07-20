@@ -634,7 +634,17 @@ router.get("/verify", async (req, res) => {
             `);
         }
 
-        const clientAppUrl = (redirect_url as string) || process.env.CLIENT_APP_URL || 'http://localhost:5173';
+        const clientAppUrl = (redirect_url as string) || process.env.CLIENT_URL || process.env.CLIENT_APP_URL || process.env.APP_BASE_URL || process.env.APP_URL;
+        if (!clientAppUrl) {
+            return res.status(500).send(`
+                <html>
+                    <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: red;">Error</h1>
+                        <p>CLIENT_URL environment variable is not set</p>
+                    </body>
+                </html>
+            `);
+        }
 
         // 1. Check local transaction status first
         const txRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);

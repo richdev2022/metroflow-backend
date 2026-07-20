@@ -303,6 +303,19 @@ export async function initializeDatabase() {
 
     await ensureBaseSchemaTables();
 
+  // Create invitation tokens table for calls/meetings
+  await query(`
+    CREATE TABLE IF NOT EXISTS invitation_tokens (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      token TEXT UNIQUE NOT NULL,
+      room_id TEXT NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      used BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_invitation_tokens_room_id ON invitation_tokens(room_id);
+  `);
+
     // Add plan_id and subscription_status to businesses
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS plan_id UUID REFERENCES pricing_plans(id)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(50) DEFAULT 'active'`);

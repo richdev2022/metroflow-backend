@@ -194,6 +194,19 @@ export const createCall: RequestHandler = async (
       });
     }
 
+    // Get pricing plan to check max meeting duration
+    const planResult = await query(
+      `SELECT max_meeting_duration as "maxMeetingDuration" FROM businesses b 
+       LEFT JOIN pricing_plans pp ON b.plan_id = pp.id 
+       WHERE b.id = $1`,
+      [businessId]
+    );
+    const maxMeetingDuration = planResult.rows[0]?.maxMeetingDuration;
+    
+    // Calculate endsAt if max duration exists
+    const now = new Date();
+    const endedAt = maxMeetingDuration ? new Date(now.getTime() + maxMeetingDuration * 60000) : null;
+
     // Generate unique call code
     let callCode;
     let isUnique = false;
@@ -207,14 +220,14 @@ export const createCall: RequestHandler = async (
 
     const result = await query(
       `INSERT INTO calls 
-        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled)
-       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9)
+        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at)
+       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
                  created_at as "createdAt", updated_at as "updatedAt"`,
-      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false],
+      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null],
     );
 
     const call = result.rows[0];
@@ -415,6 +428,31 @@ export const updateCall: RequestHandler = async (
       }
     }
 
+    // First get the call's actual id (try UUID first, then code)
+    let actualId: string | undefined;
+    const idResult = await query(
+      `SELECT id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [id, businessId, userId],
+    );
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+    } else {
+      const codeResult = await query(
+        `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
     let updateFields = [];
     let values = [];
     let paramIndex = 1;
@@ -441,7 +479,7 @@ export const updateCall: RequestHandler = async (
       values.push(coHostId);
     }
     updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(id, businessId, userId);
+    values.push(actualId, businessId, userId);
 
     const result = await query(
       `UPDATE calls
@@ -468,13 +506,13 @@ export const updateCall: RequestHandler = async (
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
-      [id],
+      [actualId],
     );
     call.participants = participantsResult.rows;
 
     const io = getSocketServer();
     if (io) {
-      io.to(`call:${id}`).emit("call:updated", call);
+      io.to(`call:${actualId}`).emit("call:updated", call);
     }
 
     const response: ApiResponse<any> = {
@@ -538,18 +576,34 @@ export const joinCall: RequestHandler = async (
       });
     }
 
-    // Check call exists and password
-    const callCheck = await query(
-      `SELECT password FROM calls WHERE id = $1 AND business_id = $2`,
+    // First get the actual call id (try UUID first, then code)
+    let actualId: string | undefined;
+    let callPassword: string | undefined;
+    const idResult = await query(
+      `SELECT id, password FROM calls WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     );
-    if (callCheck.rows.length === 0) {
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+      callPassword = idResult.rows[0].password;
+    } else {
+      const codeResult = await query(
+        `SELECT id, password FROM calls WHERE call_code = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+        callPassword = codeResult.rows[0].password;
+      }
+    }
+
+    if (!actualId) {
       return res.status(404).json({
         success: false,
         error: "Call not found",
       });
     }
-    if (callCheck.rows[0].password && callCheck.rows[0].password !== password) {
+    if (callPassword && callPassword !== password) {
       return res.status(403).json({
         success: false,
         error: "Invalid password",
@@ -559,17 +613,17 @@ export const joinCall: RequestHandler = async (
     // Check if participant exists, if not add them
     const existingParticipant = await query(
       `SELECT id FROM call_participants WHERE call_id = $1 AND user_id = $2`,
-      [id, userId],
+      [actualId, userId],
     );
     if (existingParticipant.rows.length === 0) {
       await query(
         `INSERT INTO call_participants (call_id, user_id, status) VALUES ($1, $2, 'joined')`,
-        [id, userId],
+        [actualId, userId],
       );
     } else {
       await query(
         `UPDATE call_participants SET status = 'joined', joined_at = CURRENT_TIMESTAMP WHERE call_id = $1 AND user_id = $2`,
-        [id, userId],
+        [actualId, userId],
       );
     }
 
@@ -580,7 +634,7 @@ export const joinCall: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
+      [actualId, businessId],
     );
     if (callResult.rows.length === 0) {
       return res.status(404).json({
@@ -594,14 +648,14 @@ export const joinCall: RequestHandler = async (
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
-      [id],
+      [actualId],
     );
     call.participants = participantsResult.rows;
 
     const io = getSocketServer();
     if (io) {
-      io.to(`call:${id}`).emit("call:participantJoined", {
-        callId: id,
+      io.to(`call:${actualId}`).emit("call:participantJoined", {
+        callId: actualId,
         userId,
       });
     }
@@ -658,11 +712,36 @@ export const leaveCall: RequestHandler = async (
       });
     }
 
+    // First get the actual call id (try UUID first, then code)
+    let actualId: string | undefined;
+    const idResult = await query(
+      `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
+      [id, businessId],
+    );
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+    } else {
+      const codeResult = await query(
+        `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
     await query(
       `UPDATE call_participants
        SET status = 'left', left_at = CURRENT_TIMESTAMP
        WHERE call_id = $1 AND user_id = $2`,
-      [id, userId],
+      [actualId, userId],
     );
 
     const callResult = await query(
@@ -672,21 +751,21 @@ export const leaveCall: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
+      [actualId, businessId],
     );
     const call = callResult.rows[0];
 
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
-      [id],
+      [actualId],
     );
     call.participants = participantsResult.rows;
 
     const io = getSocketServer();
     if (io) {
-      io.to(`call:${id}`).emit("call:participantLeft", {
-        callId: id,
+      io.to(`call:${actualId}`).emit("call:participantLeft", {
+        callId: actualId,
         userId,
       });
     }
@@ -743,14 +822,29 @@ export const deleteCall: RequestHandler = async (
       });
     }
 
-    // Check if call exists
-    const callCheck = await query(
+    // Check if call exists (try UUID first, then code)
+    let actualId: string | undefined;
+    const idResult = await query(
       `SELECT id FROM calls
        WHERE id = $1 AND business_id = $2
        AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
       [id, businessId, userId],
     );
-    if (callCheck.rows.length === 0) {
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+    } else {
+      const codeResult = await query(
+        `SELECT id FROM calls
+         WHERE call_code = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       return res.status(404).json({
         success: false,
         error: "Call not found",
@@ -758,14 +852,14 @@ export const deleteCall: RequestHandler = async (
     }
 
     // Delete participants first
-    await query(`DELETE FROM call_participants WHERE call_id = $1`, [id]);
+    await query(`DELETE FROM call_participants WHERE call_id = $1`, [actualId]);
 
     // Delete recordings linked to this call
-    await query(`DELETE FROM recordings WHERE call_id = $1`, [id]);
+    await query(`DELETE FROM recordings WHERE call_id = $1`, [actualId]);
 
     // Delete call
     await query(`DELETE FROM calls WHERE id = $1 AND business_id = $2`, [
-      id,
+      actualId,
       businessId,
     ]);
 
@@ -777,14 +871,14 @@ export const deleteCall: RequestHandler = async (
       actionType: "call",
       description: `Deleted call`,
       metadata: {
-        callId: id,
+        callId: actualId,
       },
     });
 
     // Emit socket event
     const io = getSocketServer();
     if (io) {
-      io.to(`business:${businessId}`).emit("call:deleted", id);
+      io.to(`business:${businessId}`).emit("call:deleted", actualId);
     }
 
     const response: ApiResponse<null> = {
@@ -798,5 +892,223 @@ export const deleteCall: RequestHandler = async (
       error: "Failed to delete call",
     };
     res.status(500).json(response);
+  }
+};
+
+export const addCallParticipants: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { callId } = req.params;
+    const { participantIds } = req.body;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    // Validate participantIds is a non-empty array
+    if (!Array.isArray(participantIds) || participantIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "participantIds must be a non-empty array",
+      });
+    }
+
+    // Check if call exists and user has permission
+    let callResult = await query(
+      `SELECT id, type, call_code FROM calls
+       WHERE id = $1 AND business_id = $2
+       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [callId, businessId, userId],
+    );
+
+    // If not found by UUID, try by call code
+    if (callResult.rows.length === 0) {
+      callResult = await query(
+        `SELECT id, type, call_code FROM calls
+         WHERE call_code = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [callId, businessId, userId],
+      );
+    }
+
+    if (callResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
+    const call = callResult.rows[0];
+    const actualCallId = call.id; // Use actual UUID
+
+    // Get existing participants
+    const existingParticipantsResult = await query(
+      `SELECT user_id FROM call_participants WHERE call_id = $1`,
+      [actualCallId],
+    );
+    const existingUserIds = new Set(existingParticipantsResult.rows.map((row) => row.user_id));
+
+    // Validate all participantIds belong to the business
+    const uniqueParticipantIds = [...new Set(participantIds)];
+    const validUserIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+    if (validUserIds.size !== uniqueParticipantIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "All participants must belong to this business",
+      });
+    }
+
+    // Filter out existing participants
+    const newParticipantIds = uniqueParticipantIds.filter((id) => !existingUserIds.has(id));
+
+    if (newParticipantIds.length === 0) {
+      return res.json({
+        success: true,
+        message: "No new participants added (all were already in the call)",
+        data: { added: [] },
+      });
+    }
+
+    // Add new participants
+    const addedParticipants = [];
+    for (const pid of newParticipantIds) {
+      const participantResult = await query(
+        `INSERT INTO call_participants (call_id, user_id, status)
+         VALUES ($1, $2, 'invited')
+         RETURNING id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"`,
+        [actualCallId, pid],
+      );
+      addedParticipants.push(participantResult.rows[0]);
+    }
+
+    // Log activity
+    await logActivity({
+      businessId,
+      userId,
+      action: "update",
+      actionType: "call",
+      description: `Added participants to call`,
+      metadata: {
+        callId: actualCallId,
+        addedParticipantIds: newParticipantIds,
+      },
+    });
+
+    // Emit socket events
+    const io = getSocketServer();
+    if (io) {
+      const updatedCallResult = await query(
+        `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+                ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+                co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+                waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+                created_at as "createdAt", updated_at as "updatedAt"
+         FROM calls WHERE id = $1`,
+        [actualCallId],
+      );
+      const updatedCall = updatedCallResult.rows[0];
+      const participantsResult = await query(
+        `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
+         FROM call_participants WHERE call_id = $1`,
+        [actualCallId],
+      );
+      updatedCall.participants = participantsResult.rows;
+      
+      io.to(`call:${actualCallId}`).emit("call:updated", updatedCall);
+
+      // Send invites to new participants
+      newParticipantIds.forEach(targetId => {
+        io.to(`user:${targetId}`).emit("call:incoming", {
+          callId: call.id,
+          from: userId,
+          type: call.type,
+          callCode: call.call_code,
+        });
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `${newParticipantIds.length} participant(s) added`,
+      data: { added: newParticipantIds },
+    });
+  } catch (error) {
+    console.error("Add call participants error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to add participants",
+    });
+  }
+};
+
+// Helper function to generate invite link
+async function generateInviteLink(
+  roomId: string,
+  participantName: string,
+  isHost: boolean,
+  waitingRoomEnabled: boolean
+): Promise<string> {
+  const token = crypto.randomBytes(32).toString('hex');
+  
+  // Save token to database (expires in 24 hours)
+  await query(
+    `INSERT INTO invitation_tokens (token, room_id, expires_at, used) VALUES ($1, $2, NOW() + INTERVAL '24 hours', FALSE)`,
+    [token, roomId]
+  );
+
+  const encodedUserName = encodeURIComponent(participantName);
+  const waitingRoomParam = (!isHost && waitingRoomEnabled) ? 'true' : 'false';
+
+  return `https://myapp.com/call?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}`;
+}
+
+// Generate invite link endpoint
+export const generateCallInvite: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { roomId, participantName, isHost, waitingRoomEnabled } = req.body;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    if (!roomId || !participantName) {
+      return res.status(400).json({
+        success: false,
+        error: "roomId and participantName are required",
+      });
+    }
+
+    const inviteLink = await generateInviteLink(
+      roomId,
+      participantName,
+      isHost || false,
+      waitingRoomEnabled || false
+    );
+
+    res.json({
+      success: true,
+      data: { inviteLink },
+    });
+  } catch (error) {
+    console.error("Generate call invite error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to generate invite link",
+    });
   }
 };

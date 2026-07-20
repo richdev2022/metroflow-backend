@@ -546,6 +546,31 @@ export const updateMeeting: RequestHandler = async (
       }
     }
 
+    // First get the meeting's actual id (try UUID first, then code)
+    let actualId: string | undefined;
+    const idResult = await query(
+      `SELECT id FROM meetings WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [id, businessId, userId],
+    );
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+    } else {
+      const codeResult = await query(
+        `SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
     const result = await query(
       `UPDATE meetings
        SET title = COALESCE($1, title),
@@ -582,7 +607,7 @@ export const updateMeeting: RequestHandler = async (
         recordingEnabled,
         screenSharingEnabled,
         coHostId,
-        id,
+        actualId,
         businessId,
         userId,
       ],
@@ -599,7 +624,7 @@ export const updateMeeting: RequestHandler = async (
 
     // Update attendees if provided
     if (attendeeIds !== undefined) {
-      await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [id]);
+      await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [actualId]);
       const attendees = [];
       if (attendeeIds.length > 0) {
         const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds));
@@ -608,7 +633,7 @@ export const updateMeeting: RequestHandler = async (
             `INSERT INTO meeting_attendees (meeting_id, user_id)
              VALUES ($1, $2)
              RETURNING id, user_id as "userId", status`,
-            [id, attendeeId],
+            [actualId, attendeeId],
           );
           attendees.push(attendeeResult.rows[0]);
         }
@@ -618,7 +643,7 @@ export const updateMeeting: RequestHandler = async (
       // Get existing attendees
       const attendeeResult = await query(
         `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1`,
-        [id],
+        [actualId],
       );
       meeting.attendees = attendeeResult.rows;
     }
@@ -694,32 +719,48 @@ export const deleteMeeting: RequestHandler = async (
       });
     }
 
-    // Get meeting info first for logging
-    const meetingResult = await query(
-      `SELECT title FROM meetings
+    // Get meeting info first (try UUID first, then code)
+    let actualId: string | undefined;
+    let meetingTitle: string | undefined;
+
+    const idResult = await query(
+      `SELECT id, title FROM meetings
        WHERE id = $1 AND business_id = $2
        AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
       [id, businessId, userId],
     );
+    if (idResult.rows.length > 0) {
+      actualId = idResult.rows[0].id;
+      meetingTitle = idResult.rows[0].title;
+    } else {
+      const codeResult = await query(
+        `SELECT id, title FROM meetings
+         WHERE meeting_code = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+        meetingTitle = codeResult.rows[0].title;
+      }
+    }
 
-    if (meetingResult.rows.length === 0) {
+    if (!actualId || !meetingTitle) {
       return res.status(404).json({
         success: false,
         error: "Meeting not found",
       });
     }
 
-    const meetingTitle = meetingResult.rows[0].title;
-
     // Delete attendees first
-    await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [id]);
+    await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [actualId]);
 
     // Delete reminders
-    await query(`DELETE FROM meeting_reminders WHERE meeting_id = $1`, [id]);
+    await query(`DELETE FROM meeting_reminders WHERE meeting_id = $1`, [actualId]);
 
     // Delete meeting
     await query(`DELETE FROM meetings WHERE id = $1 AND business_id = $2`, [
-      id,
+      actualId,
       businessId,
     ]);
 
@@ -752,5 +793,185 @@ export const deleteMeeting: RequestHandler = async (
       error: "Failed to delete meeting",
     };
     res.status(500).json(response);
+  }
+};
+
+export const addMeetingParticipants: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { meetingId } = req.params;
+    const { participantIds } = req.body;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    // Validate participantIds is a non-empty array
+    if (!Array.isArray(participantIds) || participantIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "participantIds must be a non-empty array",
+      });
+    }
+
+    // Check if meeting exists by UUID or by meeting code
+    let meetingResult = await query(
+      `SELECT id, title, start_time, end_time, meeting_code FROM meetings
+       WHERE id = $1 AND business_id = $2
+       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+      [meetingId, businessId, userId],
+    );
+
+    // If not found by UUID, try by meeting code
+    if (meetingResult.rows.length === 0) {
+      meetingResult = await query(
+        `SELECT id, title, start_time, end_time, meeting_code FROM meetings
+         WHERE meeting_code = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [meetingId, businessId, userId],
+      );
+    }
+
+    if (meetingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
+    const meeting = meetingResult.rows[0];
+    const actualMeetingId = meeting.id; // Use the actual UUID
+
+    // Get existing attendees
+    const existingAttendeesResult = await query(
+      `SELECT user_id FROM meeting_attendees WHERE meeting_id = $1`,
+      [actualMeetingId],
+    );
+    const existingUserIds = new Set(existingAttendeesResult.rows.map((row) => row.user_id));
+
+    // Validate all participantIds belong to the business
+    const uniqueParticipantIds = Array.from(new Set(participantIds));
+    const validUserIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+    if (validUserIds.size !== uniqueParticipantIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "All participants must belong to this business",
+      });
+    }
+
+    // Filter out existing attendees
+    const newParticipantIds = uniqueParticipantIds.filter((id) => !existingUserIds.has(id));
+
+    if (newParticipantIds.length === 0) {
+      return res.json({
+        success: true,
+        message: "No new participants added (all were already in the meeting)",
+        data: { added: [] },
+      });
+    }
+
+    // Bulk insert new attendees
+    const addedAttendees = [];
+    for (const attendeeId of newParticipantIds) {
+      const attendeeResult = await query(
+        `INSERT INTO meeting_attendees (meeting_id, user_id)
+         VALUES ($1, $2)
+         RETURNING id, user_id as "userId", status`,
+        [actualMeetingId, attendeeId],
+      );
+      addedAttendees.push(attendeeResult.rows[0]);
+
+      // Send in-app notification to the attendee
+      await createNotification({
+        businessId: businessId,
+        userId: attendeeId,
+        type: "meeting",
+        title: "Meeting Invitation",
+        message: `You've been invited to a meeting: ${meeting.title}`,
+        actionUrl: `/meetings/${meeting.meeting_code}`,
+        actionType: "view_meeting",
+        metadata: { meetingId: actualMeetingId },
+        isActionable: false,
+        expiresInHours: 24,
+      });
+
+      // Send email invitation
+      const userResult = await query(
+        `SELECT name, email FROM users WHERE id = $1`,
+        [attendeeId],
+      );
+      const user = userResult.rows[0];
+      if (user?.email) {
+        const currentUserResult = await query(
+          `SELECT name FROM users WHERE id = $1`,
+          [userId],
+        );
+        const currentUserName = currentUserResult.rows[0]?.name;
+        const emailHtml = generateMeetingInvitationEmailHtml(
+          user.name || 'User',
+          meeting.title,
+          null,
+          new Date(meeting.start_time),
+          new Date(meeting.end_time),
+          meeting.meeting_code || '',
+          currentUserName || 'Someone'
+        );
+        await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${meeting.title}`, emailHtml);
+      }
+    }
+
+    // Log activity
+    await logActivity({
+      businessId,
+      userId,
+      action: "update",
+      actionType: "meeting",
+      description: `Added participants to meeting: ${meeting.title}`,
+      metadata: {
+        title: meeting.title,
+        addedParticipantIds: newParticipantIds,
+      },
+    });
+
+    // Emit socket event
+    const io = getSocketServer();
+    if (io) {
+      const updatedMeetingResult = await query(
+        `SELECT m.id, m.title, m.description, m.start_time as "startTime", m.end_time as "endTime",
+                m.timezone, m.created_by as "createdById", m.host_id as "hostId", m.co_host_id as "coHostId",
+                m.status, m.meeting_code as "meetingCode", m.is_instant as "isInstant", m.password,
+                m.max_participants as "maxParticipants", m.waiting_room_enabled as "waitingRoomEnabled",
+                m.recording_enabled as "recordingEnabled", m.screen_sharing_enabled as "screenSharingEnabled",
+                m.google_event_id as "googleEventId", m.created_at as "createdAt", m.updated_at as "updatedAt"
+         FROM meetings m WHERE m.id = $1`,
+        [actualMeetingId],
+      );
+      const updatedMeeting = updatedMeetingResult.rows[0];
+      const attendeeResult = await query(
+        `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1`,
+        [actualMeetingId],
+      );
+      updatedMeeting.attendees = attendeeResult.rows;
+      io.to(`business:${businessId}`).emit("meeting:updated", updatedMeeting);
+    }
+
+    res.json({
+      success: true,
+      message: `${newParticipantIds.length} participant(s) added`,
+      data: { added: newParticipantIds },
+    });
+  } catch (error) {
+    console.error("Add meeting participants error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to add participants",
+    });
   }
 };

@@ -4,8 +4,70 @@ import { createAdapter } from "@socket.io/redis-adapter";
 import { getRedisClient } from "./cache";
 import logger from "./logger";
 import { initMediasoup, getRouter, getOrCreateRoom } from "./mediasoup";
+import { query } from "../db";
+import { roomManager } from "./roomManager";
+import crypto from "crypto";
 
 let io: Server | null = null;
+
+// Function to end call/meeting automatically
+async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<void> {
+  try {
+    if (roomType === 'call') {
+      await query(
+        `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [roomId]
+      );
+    } else {
+      await query(
+        `UPDATE meetings SET status = 'completed', end_time = CURRENT_TIMESTAMP WHERE id = $1`,
+        [roomId]
+      );
+    }
+
+    // Emit to all participants in the room
+    const ioServer = getSocketServer();
+    if (ioServer) {
+      ioServer.to(`room:${roomId}`).emit("call:ended");
+    }
+
+    // Remove room from room manager
+    const participants = roomManager.getParticipants(roomId);
+    participants.forEach((participant) => {
+      roomManager.removeParticipant(roomId, participant.id);
+    });
+  } catch (error) {
+    logger.error("Error ending room:", error);
+  }
+}
+
+// Check for expired rooms every 10 seconds
+setInterval(async () => {
+  try {
+    const now = new Date();
+    
+    // Check all ongoing calls and meetings
+    const ongoingCalls = await query(
+      `SELECT id, ended_at, business_id FROM calls WHERE status = 'ongoing' AND ended_at IS NOT NULL AND ended_at < $1`,
+      [now.toISOString()]
+    );
+
+    for (const call of ongoingCalls.rows) {
+      await endRoom(call.id, 'call');
+    }
+
+    const ongoingMeetings = await query(
+      `SELECT id, end_time, business_id FROM meetings WHERE status = 'ongoing' AND end_time IS NOT NULL AND end_time < $1`,
+      [now.toISOString()]
+    );
+
+    for (const meeting of ongoingMeetings.rows) {
+      await endRoom(meeting.id, 'meeting');
+    }
+  } catch (error) {
+    logger.error("Error checking for expired rooms:", error);
+  }
+}, 10000); // Check every 10 seconds
 
 export function initSocketServer(server: http.Server): void {
   // Initialize mediasoup first
@@ -31,6 +93,161 @@ export function initSocketServer(server: http.Server): void {
 
   io.on("connection", (socket) => {
     logger.info(`Socket connected: ${socket.id}`);
+
+    // 1. Verify invitation token
+    socket.on("invitation:verify", async (data: { token: string; roomId: string }, callback) => {
+      try {
+        const result = await query(
+          `SELECT * FROM invitation_tokens WHERE token = $1 AND room_id = $2 AND used = FALSE AND expires_at > NOW()`,
+          [data.token, data.roomId]
+        );
+
+        if (result.rows.length === 0) {
+          callback({ valid: false, error: "Invalid or expired token" });
+          return;
+        }
+
+        // Mark token as used
+        await query(
+          `UPDATE invitation_tokens SET used = TRUE WHERE token = $1`,
+          [data.token]
+        );
+
+        callback({ valid: true });
+      } catch (error) {
+        logger.error("Error verifying token:", error);
+        callback({ valid: false, error: "Server error" });
+      }
+    });
+
+    // 2. Join call
+    socket.on("call:join", async (data: { roomId: string; userId: string; userName: string; isHost: boolean; audioEnabled: boolean; videoEnabled: boolean }) => {
+      try {
+        // Get call/meeting details to get endsAt and maxMeetingDuration
+        let endsAt: Date | null = null;
+        let maxMeetingDuration: number | null = null;
+
+        // Check if it's a call
+        const callResult = await query(
+          `SELECT c.ended_at as "endedAt", pp.max_meeting_duration as "maxMeetingDuration" 
+           FROM calls c
+           LEFT JOIN businesses b ON c.business_id = b.id
+           LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
+           WHERE c.id = $1`,
+          [data.roomId]
+        );
+
+        if (callResult.rows.length > 0) {
+          const callRow = callResult.rows[0];
+          endsAt = callRow.endedAt ? new Date(callRow.endedAt) : null;
+          maxMeetingDuration = callRow.maxMeetingDuration;
+        } else {
+          // Check if it's a meeting
+          const meetingResult = await query(
+            `SELECT m.end_time as "endedAt", pp.max_meeting_duration as "maxMeetingDuration" 
+             FROM meetings m
+             LEFT JOIN businesses b ON m.business_id = b.id
+             LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
+             WHERE m.id = $1`,
+            [data.roomId]
+          );
+          if (meetingResult.rows.length > 0) {
+            const meetingRow = meetingResult.rows[0];
+            endsAt = meetingRow.endedAt ? new Date(meetingRow.endedAt) : null;
+            maxMeetingDuration = meetingRow.maxMeetingDuration;
+          }
+        }
+
+        // Add to room manager
+        roomManager.addParticipant(data.roomId, {
+          id: data.userId,
+          name: data.userName,
+          isHost: data.isHost,
+          audioEnabled: data.audioEnabled,
+          videoEnabled: data.videoEnabled,
+          screenSharing: false,
+        }, endsAt, maxMeetingDuration);
+
+        // Join socket room
+        socket.join(`room:${data.roomId}`);
+
+        // Emit to others in the room
+        socket.to(`room:${data.roomId}`).emit("call:participant-joined", {
+          userId: data.userId,
+          userName: data.userName,
+          isHost: data.isHost,
+        });
+
+        // Emit participants list and room state to the new user
+        const roomState = roomManager.getRoomState(data.roomId);
+        socket.emit("call:participants-list", {
+          participants: roomManager.getParticipants(data.roomId),
+          endsAt: roomState?.endsAt?.toISOString() || null,
+          maxMeetingDuration: roomState?.maxMeetingDuration,
+        });
+      } catch (error) {
+        logger.error("Error joining call:", error);
+      }
+    });
+
+    // 3. Leave call
+    socket.on("call:leave", async (data: { roomId: string; userId: string; userName: string }) => {
+      try {
+        // Remove from room manager
+        roomManager.removeParticipant(data.roomId, data.userId);
+
+        // Leave socket room
+        socket.leave(`room:${data.roomId}`);
+
+        // Emit to others
+        socket.to(`room:${data.roomId}`).emit("call:participant-left", {
+          userId: data.userId,
+          userName: data.userName,
+        });
+      } catch (error) {
+        logger.error("Error leaving call:", error);
+      }
+    });
+
+    // 4. Get participants
+    socket.on("call:get-participants", async (data: { roomId: string }, callback) => {
+      try {
+        const participants = roomManager.getParticipants(data.roomId);
+        callback({ participants });
+      } catch (error) {
+        logger.error("Error getting participants:", error);
+        callback({ error: "Server error" });
+      }
+    });
+
+    // 5. Update media state
+    socket.on("call:participant-media-state", async (data: { roomId: string; userId: string; audioEnabled: boolean; videoEnabled: boolean; screenSharing: boolean }) => {
+      try {
+        roomManager.updateMediaState(data.roomId, data.userId, {
+          audioEnabled: data.audioEnabled,
+          videoEnabled: data.videoEnabled,
+          screenSharing: data.screenSharing,
+        });
+
+        // Emit to others
+        socket.to(`room:${data.roomId}`).emit("call:participant-media-state", data);
+      } catch (error) {
+        logger.error("Error updating media state:", error);
+      }
+    });
+
+    // 6. Invitation joined
+    socket.on("invitation:joined", async (data: { roomId: string; userId: string; userName: string }) => {
+      try {
+        // Emit to everyone in the room including the sender
+        io.to(`room:${data.roomId}`).emit("invitation:joined", {
+          userId: data.userId,
+          userName: data.userName,
+        });
+      } catch (error) {
+        logger.error("Error handling invitation joined:", error);
+      }
+    });
 
     // User presence
     socket.on("user-online", async (userId: string, businessId: string) => {

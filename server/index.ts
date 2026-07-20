@@ -73,9 +73,9 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall, addCallParticipants, generateCallInvite } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
@@ -581,6 +581,7 @@ export async function createServer() {
   mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
+  mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
 
   // Chat API routes
   mainRouter.get("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversations);
@@ -589,13 +590,15 @@ export async function createServer() {
   mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), sendMessage);
 
   // Calls API routes
-  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCalls);
-  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), getCallByCode);
-  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), createCall);
-  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), updateCall);
-  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), joinCall);
-  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), leaveCall);
-  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_calls"), deleteCall);
+  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCalls);
+  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallByCode);
+  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createCall);
+  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateCall);
+  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), joinCall);
+  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), leaveCall);
+  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), deleteCall);
+  mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), addCallParticipants);
+  mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), generateCallInvite);
 
   // Recordings API routes
   mainRouter.get("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordings);
@@ -623,7 +626,11 @@ export async function createServer() {
 
   // Redirect backend /accept-invite/:token to frontend
   app.get("/accept-invite/:token", (req, res) => {
-    const frontendUrl = process.env.APP_BASE_URL || 'https://metricorex-app.netlify.app';
+    const frontendUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
+    if (!frontendUrl) {
+      res.status(500).json({ error: "CLIENT_URL environment variable is not set" });
+      return;
+    }
     res.redirect(`${frontendUrl}/accept-invite/${req.params.token}`);
   });
 

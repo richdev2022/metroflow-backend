@@ -2257,7 +2257,7 @@ protectedRouter.post("/users/invite", requirePermission('manage_admins'), async 
     );
 
     // Send email
-    let baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+    let baseUrl = process.env.ADMIN_URL || process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
 
     // If no env var, try to infer from request origin (useful for dev/ngrok)
     if (!baseUrl && req.get('origin')) {
@@ -2265,7 +2265,7 @@ protectedRouter.post("/users/invite", requirePermission('manage_admins'), async 
     }
 
     if (!baseUrl) {
-      baseUrl = 'http://localhost:5173';
+      throw new Error('ADMIN_URL or CLIENT_URL environment variable is not set and no origin header available');
     }
 
     const loginLink = baseUrl.includes('/login') ? baseUrl : `${baseUrl}/login`;

@@ -4,11 +4,55 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
+import { createNotification } from "../services/notifications";
+import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import crypto from "crypto";
+
+interface CallUserFromDb {
+  id: string;
+  name: string | null;
+  email: string | null;
+}
+
+async function getBusinessUserIdsForCalls(userIds: string[], businessId: string): Promise<Map<string, CallUserFromDb>> {
+  if (userIds.length === 0) return new Map<string, CallUserFromDb>();
+
+  const placeholders = userIds.map((_, i) => `$${i + 1}`).join(',');
+  const result = await query(
+    `SELECT id, name, email FROM users WHERE business_id = $1 AND id IN (${placeholders})`,
+    [businessId, ...userIds],
+  );
+
+  return new Map<string, CallUserFromDb>(result.rows.map((row: CallUserFromDb) => [row.id, row]));
+}
+
+// Helper to check if string is valid UUID v4
+function isValidUUID(str: string): boolean {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(str);
+}
 
 // Helper to generate random call code
 function generateCallCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+// Helper to build a call link (for responses + emails)
+function buildCallLink(callCode: string): string {
+  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:8080';
+  return `${baseUrl}/calls/${callCode}`;
+}
+
+// Helper to attach callLink + normalized flags to a call object
+function enrichCall(call: any): any {
+  if (!call) return call;
+  call.callLink = buildCallLink(call.callCode || call.call_code);
+  call.hasPassword = !!call.password;
+  // Do NOT leak the actual password back to callers
+  if (call.password) {
+    delete call.password;
+  }
+  return call;
 }
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
@@ -113,9 +157,10 @@ export const getCalls: RequestHandler = async (
       [businessId, userId, limit, offset],
     );
 
+    const calls = result.rows.map(enrichCall);
     const response: ApiResponse<{ calls: any[]; total: number }> = {
       success: true,
-      data: { calls: result.rows, total },
+      data: { calls, total },
     };
     res.json(response);
   } catch (error) {
@@ -194,18 +239,25 @@ export const createCall: RequestHandler = async (
       });
     }
 
-    // Get pricing plan to check max meeting duration
     const planResult = await query(
-      `SELECT max_meeting_duration as "maxMeetingDuration" FROM businesses b 
+      `SELECT pp.max_meeting_duration as "maxMeetingDuration", pp.max_participants as "planMaxParticipants"
+       FROM businesses b 
        LEFT JOIN pricing_plans pp ON b.plan_id = pp.id 
        WHERE b.id = $1`,
       [businessId]
     );
-    const maxMeetingDuration = planResult.rows[0]?.maxMeetingDuration;
-    
-    // Calculate endsAt if max duration exists
+    const planMaxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
+    const planMaxParticipants = planResult.rows[0]?.planMaxParticipants || null;
+
     const now = new Date();
-    const endedAt = maxMeetingDuration ? new Date(now.getTime() + maxMeetingDuration * 60000) : null;
+    const endedAt = null;
+
+    if (planMaxParticipants && uniqueParticipantIds.length > planMaxParticipants) {
+      return res.status(400).json({
+        success: false,
+        error: `Plan allows maximum ${planMaxParticipants} participants per call`,
+      });
+    }
 
     // Generate unique call code
     let callCode;
@@ -220,14 +272,15 @@ export const createCall: RequestHandler = async (
 
     const result = await query(
       `INSERT INTO calls 
-        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at)
-       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants)
+       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+                 max_participants as "maxParticipants",
                  created_at as "createdAt", updated_at as "updatedAt"`,
-      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null],
+      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null, planMaxParticipants],
     );
 
     const call = result.rows[0];
@@ -245,6 +298,52 @@ export const createCall: RequestHandler = async (
     }
 
     call.participants = participants;
+    call.maxMeetingDuration = planMaxMeetingDuration;
+    enrichCall(call);
+
+    // Fetch current user name for notifications
+    const currentUserResult = await query(
+      `SELECT name FROM users WHERE id = $1`,
+      [userId]
+    );
+    const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
+
+    // Send in-app notifications and emails to invited participants
+    const invitedParticipantIds = (participantIds || []).filter((pid: string) => pid !== userId);
+    if (invitedParticipantIds.length > 0) {
+      const usersMap = await getBusinessUserIdsForCalls(invitedParticipantIds, businessId);
+      const callLink = buildCallLink(call.callCode);
+
+      for (const pid of invitedParticipantIds) {
+        await createNotification({
+          businessId: businessId,
+          userId: pid,
+          type: "call",
+          title: `${currentUserName} is calling`,
+          message: `You have an incoming ${type || 'video'} call from ${currentUserName}`,
+          actionUrl: `/calls/${call.callCode}`,
+          actionType: "join_call",
+          metadata: { callId: call.id, callCode: call.callCode },
+          isActionable: true,
+          expiresInHours: 1,
+        });
+
+        const user = usersMap.get(pid);
+        if (user?.email) {
+          const emailHtml = generateCallInvitationEmailHtml(
+            user.name || 'User',
+            (type || 'video') as 'audio' | 'video',
+            new Date(call.startedAt),
+            call.callCode,
+            currentUserName,
+            callLink,
+            password || null,
+            waitingRoomEnabled || false
+          );
+          await sendEmail(user.email, user.name || 'User', `📞 Incoming ${type === 'audio' ? 'Audio' : 'Video'} Call from ${currentUserName}`, emailHtml);
+        }
+      }
+    }
 
     // Log activity
     await logActivity({
@@ -268,12 +367,15 @@ export const createCall: RequestHandler = async (
         io.to(`user:${targetId}`).emit("call:created", call);
       });
       // Send invites to participants
-      participantIds?.forEach(targetId => {
+      participantIds?.forEach((targetId: string) => {
         io.to(`user:${targetId}`).emit("call:incoming", {
           callId: call.id,
           from: userId,
           type: call.type,
           callCode: call.callCode,
+          callLink: buildCallLink(call.callCode),
+          hasPassword: !!password,
+          waitingRoomEnabled: waitingRoomEnabled || false,
         });
       });
     }
@@ -345,6 +447,7 @@ export const getCallByCode: RequestHandler = async (
       [call.id],
     );
     call.participants = participantsResult.rows;
+    enrichCall(call);
 
     const response: ApiResponse<any> = {
       success: true,
@@ -428,15 +531,19 @@ export const updateCall: RequestHandler = async (
       }
     }
 
-    // First get the call's actual id (try UUID first, then code)
+    // First get the call's actual id (try UUID first if valid, then code)
     let actualId: string | undefined;
-    const idResult = await query(
-      `SELECT id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
-      [id, businessId, userId],
-    );
-    if (idResult.rows.length > 0) {
-      actualId = idResult.rows[0].id;
-    } else {
+    if (isValidUUID(id)) {
+      const idResult = await query(
+        `SELECT id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (idResult.rows.length > 0) {
+        actualId = idResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       const codeResult = await query(
         `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
@@ -509,6 +616,7 @@ export const updateCall: RequestHandler = async (
       [actualId],
     );
     call.participants = participantsResult.rows;
+    enrichCall(call);
 
     const io = getSocketServer();
     if (io) {
@@ -576,24 +684,26 @@ export const joinCall: RequestHandler = async (
       });
     }
 
-    // First get the actual call id (try UUID first, then code)
     let actualId: string | undefined;
-    let callPassword: string | undefined;
-    const idResult = await query(
-      `SELECT id, password FROM calls WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
-    );
-    if (idResult.rows.length > 0) {
-      actualId = idResult.rows[0].id;
-      callPassword = idResult.rows[0].password;
-    } else {
+    if (isValidUUID(id)) {
+      const idResult = await query(
+        `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
+         FROM calls WHERE id = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (idResult.rows.length > 0) {
+        actualId = idResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       const codeResult = await query(
-        `SELECT id, password FROM calls WHERE call_code = $1 AND business_id = $2`,
+        `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
+         FROM calls WHERE call_code = $1 AND business_id = $2`,
         [id, businessId],
       );
       if (codeResult.rows.length > 0) {
         actualId = codeResult.rows[0].id;
-        callPassword = codeResult.rows[0].password;
       }
     }
 
@@ -601,37 +711,102 @@ export const joinCall: RequestHandler = async (
       return res.status(404).json({
         success: false,
         error: "Call not found",
-      });
-    }
-    if (callPassword && callPassword !== password) {
-      return res.status(403).json({
-        success: false,
-        error: "Invalid password",
+        errorCode: 'call_not_found',
       });
     }
 
-    // Check if participant exists, if not add them
+    const lookupCol = isValidUUID(id) ? 'id' : 'call_code';
+    const validationResult = await query(
+      `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
+       FROM calls WHERE ${lookupCol} = $1 AND business_id = $2`,
+      [id, businessId],
+    );
+    const callState = validationResult.rows[0];
+    const now = new Date();
+
+    if (callState.status === 'cancelled') {
+      return res.status(410).json({
+        success: false,
+        error: "Call has been cancelled",
+        errorCode: 'call_cancelled',
+      });
+    }
+    if (callState.status === 'completed' || callState.status === 'missed') {
+      return res.status(410).json({
+        success: false,
+        error: "Call has already ended",
+        errorCode: 'call_completed',
+      });
+    }
+    if (callState.ended_at && new Date(callState.ended_at) < now) {
+      return res.status(410).json({
+        success: false,
+        error: "Call is no longer active",
+        errorCode: 'call_ended',
+      });
+    }
+
+    if (callState.password && callState.password !== password) {
+      return res.status(403).json({
+        success: false,
+        error: "Invalid password",
+        errorCode: 'invalid_password',
+        data: { hasPassword: true },
+      });
+    }
+
+    const isHost =
+      callState.host_id === userId ||
+      callState.co_host_id === userId ||
+      callState.created_by === userId;
+
+    if (!isHost && callState.max_participants) {
+      const countRes = await query(
+        `SELECT COUNT(*) FROM call_participants WHERE call_id = $1 AND status = 'joined'`,
+        [actualId],
+      );
+      const countJoined = parseInt(countRes.rows[0].count);
+      if (countJoined >= callState.max_participants) {
+        return res.status(409).json({
+          success: false,
+          error: "Call is at maximum capacity",
+          errorCode: 'max_participants_reached',
+          data: { maxParticipants: callState.max_participants },
+        });
+      }
+    }
+
+    const joiningAsHost = isHost;
+    const useWaitingRoom = !!callState.waiting_room_enabled && !joiningAsHost;
+    const effectiveStatus = useWaitingRoom ? 'waiting' : 'joined';
+
     const existingParticipant = await query(
       `SELECT id FROM call_participants WHERE call_id = $1 AND user_id = $2`,
       [actualId, userId],
     );
     if (existingParticipant.rows.length === 0) {
       await query(
-        `INSERT INTO call_participants (call_id, user_id, status) VALUES ($1, $2, 'joined')`,
-        [actualId, userId],
+        `INSERT INTO call_participants (call_id, user_id, status) VALUES ($1, $2, $3)`,
+        [actualId, userId, effectiveStatus],
+      );
+    } else if (effectiveStatus === 'joined') {
+      await query(
+        `UPDATE call_participants SET status = $1, joined_at = CURRENT_TIMESTAMP WHERE call_id = $2 AND user_id = $3`,
+        [effectiveStatus, actualId, userId],
       );
     } else {
       await query(
-        `UPDATE call_participants SET status = 'joined', joined_at = CURRENT_TIMESTAMP WHERE call_id = $1 AND user_id = $2`,
-        [actualId, userId],
+        `UPDATE call_participants SET status = $1 WHERE call_id = $2 AND user_id = $3`,
+        [effectiveStatus, actualId, userId],
       );
     }
 
     const callResult = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
               ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
-              co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+              co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              max_participants as "maxParticipants",
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls WHERE id = $1 AND business_id = $2`,
       [actualId, businessId],
@@ -645,18 +820,32 @@ export const joinCall: RequestHandler = async (
 
     const call = callResult.rows[0];
 
+    const planResult = await query(
+      `SELECT pp.max_meeting_duration as "maxMeetingDuration"
+       FROM businesses b 
+       LEFT JOIN pricing_plans pp ON b.plan_id = pp.id 
+       WHERE b.id = $1`,
+      [businessId]
+    );
+    call.maxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
+
     const participantsResult = await query(
       `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
        FROM call_participants WHERE call_id = $1`,
       [actualId],
     );
     call.participants = participantsResult.rows;
+    enrichCall(call);
+
+    call.inWaitingRoom = useWaitingRoom;
+    call.isHost = joiningAsHost;
 
     const io = getSocketServer();
     if (io) {
       io.to(`call:${actualId}`).emit("call:participantJoined", {
         callId: actualId,
         userId,
+        status: effectiveStatus,
       });
     }
 
@@ -712,15 +901,19 @@ export const leaveCall: RequestHandler = async (
       });
     }
 
-    // First get the actual call id (try UUID first, then code)
+    // First get the actual call id (try UUID first if valid, then code)
     let actualId: string | undefined;
-    const idResult = await query(
-      `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
-      [id, businessId],
-    );
-    if (idResult.rows.length > 0) {
-      actualId = idResult.rows[0].id;
-    } else {
+    if (isValidUUID(id)) {
+      const idResult = await query(
+        `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (idResult.rows.length > 0) {
+        actualId = idResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       const codeResult = await query(
         `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2`,
         [id, businessId],
@@ -761,6 +954,7 @@ export const leaveCall: RequestHandler = async (
       [actualId],
     );
     call.participants = participantsResult.rows;
+    enrichCall(call);
 
     const io = getSocketServer();
     if (io) {
@@ -822,17 +1016,21 @@ export const deleteCall: RequestHandler = async (
       });
     }
 
-    // Check if call exists (try UUID first, then code)
+    // Check if call exists (try UUID first if valid, then code)
     let actualId: string | undefined;
-    const idResult = await query(
-      `SELECT id FROM calls
-       WHERE id = $1 AND business_id = $2
-       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
-      [id, businessId, userId],
-    );
-    if (idResult.rows.length > 0) {
-      actualId = idResult.rows[0].id;
-    } else {
+    if (isValidUUID(id)) {
+      const idResult = await query(
+        `SELECT id FROM calls
+         WHERE id = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [id, businessId, userId],
+      );
+      if (idResult.rows.length > 0) {
+        actualId = idResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       const codeResult = await query(
         `SELECT id FROM calls
          WHERE call_code = $1 AND business_id = $2
@@ -921,15 +1119,18 @@ export const addCallParticipants: RequestHandler = async (
     }
 
     // Check if call exists and user has permission
-    let callResult = await query(
-      `SELECT id, type, call_code FROM calls
-       WHERE id = $1 AND business_id = $2
-       AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
-      [callId, businessId, userId],
-    );
+    let callResult;
+    if (isValidUUID(callId)) {
+      callResult = await query(
+        `SELECT id, type, call_code FROM calls
+         WHERE id = $1 AND business_id = $2
+         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        [callId, businessId, userId],
+      );
+    }
 
-    // If not found by UUID, try by call code
-    if (callResult.rows.length === 0) {
+    // If not found by UUID (or not a UUID), try by call code
+    if (!callResult || callResult.rows.length === 0) {
       callResult = await query(
         `SELECT id, type, call_code FROM calls
          WHERE call_code = $1 AND business_id = $2
@@ -978,6 +1179,20 @@ export const addCallParticipants: RequestHandler = async (
 
     // Add new participants
     const addedParticipants = [];
+
+    const currentUserResult = await query(
+      `SELECT name FROM users WHERE id = $1`,
+      [userId]
+    );
+    const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
+    const fullCallDetails = await query(
+      `SELECT type, started_at, password, waiting_room_enabled FROM calls WHERE id = $1`,
+      [actualCallId]
+    );
+    const callDetails = fullCallDetails.rows[0];
+    const usersMap = await getBusinessUserIdsForCalls(newParticipantIds, businessId);
+    const callLink = buildCallLink(call.call_code);
+
     for (const pid of newParticipantIds) {
       const participantResult = await query(
         `INSERT INTO call_participants (call_id, user_id, status)
@@ -986,6 +1201,34 @@ export const addCallParticipants: RequestHandler = async (
         [actualCallId, pid],
       );
       addedParticipants.push(participantResult.rows[0]);
+
+      await createNotification({
+        businessId: businessId,
+        userId: pid,
+        type: "call",
+        title: `${currentUserName} added you to a call`,
+        message: `You've been added to a ${callDetails?.type || 'video'} call by ${currentUserName}`,
+        actionUrl: `/calls/${call.call_code}`,
+        actionType: "join_call",
+        metadata: { callId: actualCallId, callCode: call.call_code },
+        isActionable: true,
+        expiresInHours: 1,
+      });
+
+      const user = usersMap.get(pid);
+      if (user?.email) {
+        const emailHtml = generateCallInvitationEmailHtml(
+          user.name || 'User',
+          (callDetails?.type || 'video') as 'audio' | 'video',
+          new Date(callDetails?.started_at || new Date()),
+          call.call_code,
+          currentUserName,
+          callLink,
+          callDetails?.password || null,
+          !!callDetails?.waiting_room_enabled
+        );
+        await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
+      }
     }
 
     // Log activity
@@ -1007,8 +1250,9 @@ export const addCallParticipants: RequestHandler = async (
       const updatedCallResult = await query(
         `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
                 ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
-                co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+                co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                 waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+                max_participants as "maxParticipants",
                 created_at as "createdAt", updated_at as "updatedAt"
          FROM calls WHERE id = $1`,
         [actualCallId],
@@ -1020,6 +1264,7 @@ export const addCallParticipants: RequestHandler = async (
         [actualCallId],
       );
       updatedCall.participants = participantsResult.rows;
+      enrichCall(updatedCall);
       
       io.to(`call:${actualCallId}`).emit("call:updated", updatedCall);
 
@@ -1028,8 +1273,11 @@ export const addCallParticipants: RequestHandler = async (
         io.to(`user:${targetId}`).emit("call:incoming", {
           callId: call.id,
           from: userId,
-          type: call.type,
+          type: callDetails?.type || 'video',
           callCode: call.call_code,
+          callLink: callLink,
+          hasPassword: !!callDetails?.password,
+          waitingRoomEnabled: !!callDetails?.waiting_room_enabled,
         });
       });
     }
@@ -1044,6 +1292,129 @@ export const addCallParticipants: RequestHandler = async (
     res.status(500).json({
       success: false,
       error: "Failed to add participants",
+    });
+  }
+};
+
+/**
+ * Pre-validation endpoint — what the frontend calls when a user clicks a call link.
+ * Returns: call state, security flags (password/waiting room), status info — without
+ * requiring a password unless one is set. The password itself is NEVER returned.
+ */
+export const validateCallAccess: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { code } = req.params;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    const result = await query(
+      `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+              ended_at as "endedAt", call_code as "callCode",
+              waiting_room_enabled as "waitingRoomEnabled",
+              max_participants as "maxParticipants", host_id as "hostId",
+              co_host_id as "coHostId", created_by as "createdById", password,
+              recording_enabled as "recordingEnabled", is_group_call as "isGroupCall"
+       FROM calls
+       WHERE (call_code = $1 OR id = $1) AND business_id = $2`,
+      [code, businessId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+        errorCode: 'call_not_found',
+      });
+    }
+
+    const raw = result.rows[0];
+    const now = new Date();
+    const isHost =
+      raw.hostId === userId ||
+      raw.coHostId === userId ||
+      raw.createdById === userId;
+
+    const hasPassword = !!raw.password;
+    delete raw.password;
+
+    let accessState: 'allowed' | 'password_required' | 'waiting_room' | 'ended' | 'cancelled' | 'completed' | 'missed' | 'full' = 'allowed';
+    const reasons: string[] = [];
+
+    if (raw.status === 'cancelled') {
+      accessState = 'cancelled';
+      reasons.push('Call has been cancelled');
+    } else if (raw.status === 'completed' || raw.status === 'missed') {
+      accessState = 'completed';
+      reasons.push('Call has already ended');
+    } else if (raw.endedAt && new Date(raw.endedAt) < now) {
+      accessState = 'ended';
+      reasons.push('Call is no longer active');
+    }
+
+    if (accessState === 'allowed' && hasPassword) {
+      accessState = 'password_required';
+      reasons.push('This call requires a password to join');
+    }
+    if (accessState !== 'password_required' && !isHost && raw.waitingRoomEnabled) {
+      accessState = 'waiting_room';
+      reasons.push('This call has waiting room enabled. You will be admitted by the host.');
+    }
+
+    let joinedCount = 0;
+    let maxParticipants = raw.maxParticipants;
+    if (!isHost && raw.maxParticipants) {
+      const countRes = await query(
+        `SELECT COUNT(*) FROM call_participants WHERE call_id = $1 AND status = 'joined'`,
+        [raw.id],
+      );
+      joinedCount = parseInt(countRes.rows[0].count);
+      if (accessState === 'allowed' || accessState === 'password_required' || accessState === 'waiting_room') {
+        if (joinedCount >= raw.maxParticipants) {
+          accessState = 'full';
+          reasons.push('Call is currently at maximum capacity');
+        }
+      }
+    }
+
+    const callLink = buildCallLink(raw.callCode);
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        id: raw.id,
+        type: raw.type,
+        status: raw.status,
+        startedAt: raw.startedAt,
+        endedAt: raw.endedAt,
+        callCode: raw.callCode,
+        callLink,
+        isGroupCall: raw.isGroupCall,
+        waitingRoomEnabled: raw.waitingRoomEnabled,
+        recordingEnabled: raw.recordingEnabled,
+        maxParticipants,
+        currentParticipants: joinedCount,
+        hasPassword,
+        isHost,
+        accessState,
+        reasons,
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Validate call access error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to validate call access",
     });
   }
 };

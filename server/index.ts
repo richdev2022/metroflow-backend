@@ -73,9 +73,9 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall, addCallParticipants, generateCallInvite } from "./routes/calls";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants, joinMeeting, validateMeetingAccess } from "./routes/meetings";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
@@ -578,9 +578,11 @@ export async function createServer() {
   // Meetings API routes
   mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
   mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingByCode);
+  mainRouter.get("/meetings/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), validateMeetingAccess);
   mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
+  mainRouter.post("/meetings/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), joinMeeting);
   mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
 
   // Chat API routes
@@ -588,10 +590,13 @@ export async function createServer() {
   mainRouter.post("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createConversation);
   mainRouter.get("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversationMessages);
   mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), sendMessage);
+  mainRouter.put("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
+  mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCalls);
   mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallByCode);
+  mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), validateCallAccess);
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), joinCall);

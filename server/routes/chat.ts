@@ -64,11 +64,26 @@ export const getConversations: RequestHandler = async (
       `SELECT 
         cc.id, cc.business_id as "businessId", cc.name, cc.type, 
         cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
-        json_agg(json_build_object(
-          'id', cp.id,
-          'userId', cp.user_id,
-          'lastReadAt', cp.last_read_at
-        )) FILTER (WHERE cp.id IS NOT NULL) as participants,
+        (
+          SELECT json_agg(json_build_object(
+            'id', cp.id,
+            'userId', cp.user_id,
+            'lastReadAt', cp.last_read_at,
+            'lastSeen', (
+              SELECT us.last_activity_at
+              FROM user_sessions us
+              WHERE us.user_id = cp.user_id
+              ORDER BY us.last_activity_at DESC
+              LIMIT 1
+            ),
+            'name', u.name,
+            'email', u.email,
+            'avatarUrl', u.avatar_url
+          ))
+          FROM chat_participants cp
+          LEFT JOIN users u ON cp.user_id = u.id
+          WHERE cp.conversation_id = cc.id
+        ) as participants,
         (SELECT cm.content FROM chat_messages cm 
          WHERE cm.conversation_id = cc.id 
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessage,
@@ -76,10 +91,10 @@ export const getConversations: RequestHandler = async (
          WHERE cm.conversation_id = cc.id 
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt
       FROM chat_conversations cc
-      JOIN chat_participants cp_current ON cc.id = cp_current.conversation_id
-      LEFT JOIN chat_participants cp ON cc.id = cp.conversation_id
-      WHERE cc.business_id = $1 AND cp_current.user_id = $2
-      GROUP BY cc.id
+      WHERE cc.business_id = $1 AND EXISTS (
+        SELECT 1 FROM chat_participants cp_current 
+        WHERE cp_current.conversation_id = cc.id AND cp_current.user_id = $2
+      )
       ORDER BY cc.updated_at DESC`,
       [businessId, userId],
     );
@@ -161,6 +176,13 @@ export const getConversationMessages: RequestHandler = async (
       [conversationId],
     );
     const total = parseInt(countResult.rows[0].total);
+
+    await query(
+      `UPDATE chat_participants 
+       SET last_read_at = CURRENT_TIMESTAMP 
+       WHERE conversation_id = $1 AND user_id = $2`,
+      [conversationId, userId],
+    );
 
     const result = await query(
       `SELECT 
@@ -405,10 +427,17 @@ export const sendMessage: RequestHandler = async (
     ]);
     message.senderName = userResult.rows[0]?.name;
 
-    // Update conversation updated_at
+    // Update conversation updated_at and mark sender as read
     await query(
       `UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [conversationId],
+    );
+
+    await query(
+      `UPDATE chat_participants 
+       SET last_read_at = CURRENT_TIMESTAMP 
+       WHERE conversation_id = $1 AND user_id = $2`,
+      [conversationId, userId],
     );
 
     // Get participants in conversation
@@ -433,6 +462,116 @@ export const sendMessage: RequestHandler = async (
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to send message",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /chat/conversations/{conversationId}/read:
+ *   put:
+ *     summary: Mark conversation as read
+ *     description: Updates the authenticated user's last_read_at timestamp for the conversation.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Conversation marked as read successfully
+ *       404:
+ *         description: Conversation not found
+ *   post:
+ *     summary: Mark conversation as read
+ *     description: Updates the authenticated user's last_read_at timestamp for the conversation.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Conversation marked as read successfully
+ *       404:
+ *         description: Conversation not found
+ */
+export const markConversationAsRead: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { conversationId } = req.params;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({
+        success: false,
+        error: "Conversation not found",
+      });
+    }
+
+    const updateResult = await query(
+      `UPDATE chat_participants 
+       SET last_read_at = CURRENT_TIMESTAMP 
+       WHERE conversation_id = $1 AND user_id = $2
+       RETURNING last_read_at as "lastReadAt"`,
+      [conversationId, userId],
+    );
+
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Participant record not found",
+      });
+    }
+
+    await query(
+      `UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [conversationId],
+    );
+
+    const lastReadAt = updateResult.rows[0].lastReadAt;
+
+    const io = getSocketServer();
+    if (io) {
+      io.to(`conversation:${conversationId}`).emit("conversation:read", {
+        conversationId,
+        userId,
+        lastReadAt,
+      });
+    }
+
+    const response: ApiResponse<{ lastReadAt: Date; conversationId: string }> = {
+      success: true,
+      data: { lastReadAt, conversationId },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Mark conversation as read error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to mark conversation as read",
     };
     res.status(500).json(response);
   }

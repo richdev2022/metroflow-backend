@@ -819,6 +819,7 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45)`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_user_agent TEXT`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`);
     
     // Create audit logs table
     await query(`
@@ -1035,6 +1036,7 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
     await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
     await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+    await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS fee DECIMAL(12, 2) DEFAULT 0`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50) DEFAULT 'squad'`);
     await query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_preference VARCHAR(20) DEFAULT 'email'`);

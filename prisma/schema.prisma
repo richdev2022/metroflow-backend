@@ -890,3 +890,16 @@ model Notification {
   @@index([businessId, userId, isRead, createdAt])
   @@map("notifications")
 }
+
+// Invitation tokens for calls/meetings
+model InvitationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  roomId    String   @map("room_id")
+  expiresAt DateTime @map("expires_at")
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([roomId])
+  @@map("invitation_tokens")
+}

@@ -28,28 +28,35 @@ class R2Storage {
   }
 
   private init(): void {
+    console.log("R2 config values:", {
+      accountId: this.config.accountId ? "(set)" : "(missing)",
+      accessKeyId: this.config.accessKeyId ? "(set)" : "(missing)",
+      secretAccessKey: this.config.secretAccessKey ? "(set)" : "(missing)",
+      bucketName: this.config.bucketName ? "(set)" : "(missing)",
+    });
+
     if (
       !this.config.accountId ||
       !this.config.accessKeyId ||
       !this.config.secretAccessKey ||
       !this.config.bucketName
     ) {
-      logger.warn('Cloudflare R2 credentials not fully configured, R2 storage unavailable');
+      logger.warn("Cloudflare R2 credentials not fully configured, R2 storage unavailable");
       return;
     }
 
     try {
       this.client = new S3Client({
-        region: 'auto',
+        region: "auto",
         endpoint: `https://${this.config.accountId}.r2.cloudflarestorage.com`,
         credentials: {
           accessKeyId: this.config.accessKeyId,
           secretAccessKey: this.config.secretAccessKey,
         },
       });
-      logger.info('✅ Cloudflare R2 storage initialized');
+      logger.info("✅ Cloudflare R2 storage initialized");
     } catch (error) {
-      logger.error('❌ Failed to initialize Cloudflare R2:', error);
+      logger.error("❌ Failed to initialize Cloudflare R2:", error);
     }
   }
 
@@ -63,23 +70,38 @@ class R2Storage {
     contentType?: string,
   ): Promise<string> {
     if (!this.client) {
-      throw new Error('R2 storage is not available');
+      throw new Error("R2 storage is not available");
     }
 
-    const command = new PutObjectCommand({
-      Bucket: this.config.bucketName,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
+    console.log("Uploading to R2:", {
+      bucket: this.config.bucketName,
+      key,
+      accountId: this.config.accountId,
+      accessKeyId: this.config.accessKeyId ? "(set)" : "(not set)",
+      secretAccessKey: this.config.secretAccessKey ? "(set)" : "(not set)",
+      publicUrl: this.config.publicUrl
     });
 
-    await this.client.send(command);
+    try {
+      const command = new PutObjectCommand({
+        Bucket: this.config.bucketName,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      });
 
-    if (this.config.publicUrl) {
-      return `${this.config.publicUrl}/${key}`;
+      const response = await this.client.send(command);
+      console.log("R2 upload response:", response);
+
+      if (this.config.publicUrl) {
+        return `${this.config.publicUrl}/${key}`;
+      }
+
+      return key;
+    } catch (error) {
+      console.error("R2 upload error details:", error);
+      throw error;
     }
-
-    return key;
   }
 
   async getFile(key: string): Promise<Buffer> {

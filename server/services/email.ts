@@ -503,11 +503,13 @@ export function generateMeetingInvitationEmailHtml(
   meetingStartTime: Date,
   meetingEndTime: Date,
   meetingCode: string,
-  inviterName: string
+  inviterName: string,
+  meetingLink: string,
+  password: string | null,
+  waitingRoomEnabled: boolean
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
   const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
-  const meetingLink = baseUrl ? `${baseUrl}/meetings/${meetingCode}` : `http://localhost:8080/meetings/${meetingCode}`;
 
   const formatDateTime = (date: Date) => {
     return date.toLocaleString('en-NG', {
@@ -549,10 +551,22 @@ export function generateMeetingInvitationEmailHtml(
               <span style="color: #6b7280; font-weight: 600;">End:</span>
               <span style="color: #111827; margin-left: 8px;">${formatDateTime(meetingEndTime)}</span>
             </div>
-            <div style="background-color: #eff6ff; padding: 12px; border-radius: 6px;">
+            <div style="background-color: #eff6ff; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
               <span style="color: #1e40af; font-weight: 600;">Meeting Code:</span>
               <span style="color: #1e40af; font-family: monospace; margin-left: 8px; font-size: 18px;">${meetingCode}</span>
             </div>
+            ${password ? `
+            <div style="background-color: #fef3c7; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
+              <span style="color: #92400e; font-weight: 600;">Meeting Password:</span>
+              <code style="color: #92400e; font-family: monospace; margin-left: 8px; font-size: 16px; font-weight: 600;">${password}</code>
+            </div>
+            ` : ''}
+            ${waitingRoomEnabled ? `
+            <div style="background-color: #f0fdf4; padding: 12px; border-radius: 6px;">
+              <span style="color: #166534; font-weight: 600;">ℹ️ Waiting Room:</span>
+              <span style="color: #166534; margin-left: 8px; font-size: 14px;">This meeting has waiting room enabled. You will be admitted by the host.</span>
+            </div>
+            ` : ''}
           </div>
 
           <div style="text-align: center; margin-bottom: 32px;">
@@ -560,6 +574,103 @@ export function generateMeetingInvitationEmailHtml(
               Join Meeting
             </a>
           </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 12px; margin-bottom: 24px;">
+            If the button doesn't work, copy this link: <br/>
+            <span style="word-break: break-all; color: #2563eb;">${meetingLink}</span>
+          </p>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+          </p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+export function generateCallInvitationEmailHtml(
+  userName: string,
+  callType: 'audio' | 'video',
+  callStartTime: Date,
+  callCode: string,
+  inviterName: string,
+  callLink: string,
+  password: string | null,
+  waitingRoomEnabled: boolean
+): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  const formatDateTime = (date: Date) => {
+    return date.toLocaleString('en-NG', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const callTypeLabel = callType === 'video' ? 'Video Call' : 'Audio Call';
+  const callTypeEmoji = callType === 'video' ? '📹' : '📞';
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+          
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">${callTypeEmoji} Incoming ${callTypeLabel}</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hi ${userName},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            <strong>${inviterName}</strong> is calling you:
+          </p>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <div style="margin-bottom: 12px;">
+              <span style="color: #6b7280; font-weight: 600;">Call Type:</span>
+              <span style="color: #111827; margin-left: 8px; font-weight: 600;">${callTypeLabel}</span>
+            </div>
+            <div style="margin-bottom: 12px;">
+              <span style="color: #6b7280; font-weight: 600;">Started At:</span>
+              <span style="color: #111827; margin-left: 8px;">${formatDateTime(callStartTime)}</span>
+            </div>
+            <div style="background-color: #eff6ff; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
+              <span style="color: #1e40af; font-weight: 600;">Call Code:</span>
+              <span style="color: #1e40af; font-family: monospace; margin-left: 8px; font-size: 18px;">${callCode}</span>
+            </div>
+            ${password ? `
+            <div style="background-color: #fef3c7; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
+              <span style="color: #92400e; font-weight: 600;">Call Password:</span>
+              <code style="color: #92400e; font-family: monospace; margin-left: 8px; font-size: 16px; font-weight: 600;">${password}</code>
+            </div>
+            ` : ''}
+            ${waitingRoomEnabled ? `
+            <div style="background-color: #f0fdf4; padding: 12px; border-radius: 6px;">
+              <span style="color: #166534; font-weight: 600;">ℹ️ Waiting Room:</span>
+              <span style="color: #166534; margin-left: 8px; font-size: 14px;">This call has waiting room enabled. You will be admitted by the host.</span>
+            </div>
+            ` : ''}
+          </div>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${callLink}" style="background-color: #10b981; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(16, 185, 129, 0.2);">
+              ⚡ Join ${callTypeLabel}
+            </a>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 12px; margin-bottom: 24px;">
+            If the button doesn't work, copy this link: <br/>
+            <span style="word-break: break-all; color: #10b981;">${callLink}</span>
+          </p>
 
           <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
             &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.

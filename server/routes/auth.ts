@@ -356,8 +356,11 @@ export const verifyOTP: RequestHandler = async (req, res) => {
     const business = businessResult.rows[0];
 
     // Send welcome email
-    const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-    const loginLink = baseUrl ? `${baseUrl}/login` : 'http://localhost:8080/login';
+    const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
+    if (!baseUrl) {
+      throw new Error('CLIENT_URL environment variable is not set');
+    }
+    const loginLink = `${baseUrl}/login`;
     const welcomeEmailHtml = generateBusinessRegistrationEmailHtml(
       user.name,
       business.name,

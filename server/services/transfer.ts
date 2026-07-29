@@ -324,22 +324,45 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
   return transfer;
 }
 
-// Background service to check processing transfers
+// Background service to check processing transfers AND stuck pending transfers
 export async function checkProcessingTransfers() {
     try {
-        console.log("[TransferMonitor] Checking processing transfers...");
+        console.log("[TransferMonitor] Checking processing and stuck pending transfers...");
         
-        // Get all processing transfers
+        // 1. Get all processing transfers
         const processingTransfers = await query(
             `SELECT * FROM transfer_queue WHERE status = 'processing' ORDER BY updated_at ASC`
         );
 
-        if (processingTransfers.rows.length === 0) {
-            console.log("[TransferMonitor] No processing transfers found");
+        // 2. Get pending transfers older than 2 minutes (stuck)
+        const stuckPendingTransfers = await query(
+            `SELECT * FROM transfer_queue 
+             WHERE status = 'pending' 
+               AND created_at < NOW() - INTERVAL '2 minutes' 
+             ORDER BY created_at ASC`
+        );
+
+        if (processingTransfers.rows.length === 0 && stuckPendingTransfers.rows.length === 0) {
+            console.log("[TransferMonitor] No processing or stuck pending transfers found");
             return;
         }
 
-        console.log(`[TransferMonitor] Found ${processingTransfers.rows.length} processing transfers`);
+        console.log(`[TransferMonitor] Found ${processingTransfers.rows.length} processing transfers and ${stuckPendingTransfers.rows.length} stuck pending transfers`);
+
+        // Process stuck pending transfers by triggering processAllPending for each unique business
+        if (stuckPendingTransfers.rows.length > 0) {
+            const uniqueBusinessIds = Array.from(new Set(stuckPendingTransfers.rows.map(t => t.business_id)));
+            console.log(`[TransferMonitor] Processing stuck pending for ${uniqueBusinessIds.length} businesses`);
+            
+            for (const businessId of uniqueBusinessIds as string[]) {
+                try {
+                    console.log(`[TransferMonitor] Running processAllPending for stuck business: ${businessId}`);
+                    await processAllPending(businessId);
+                } catch (bizError) {
+                    console.error(`[TransferMonitor] Error processing stuck pending for business ${businessId}:`, bizError);
+                }
+            }
+        }
 
         // Timeout after 24 hours
         const timeoutMs = 24 * 60 * 60 * 1000; // 24 hours
@@ -471,37 +494,65 @@ export async function processAllPending(businessId: string) {
               await creditRevenueWallet(fee, transfer.currency || 'NGN');
           }
 
-          // Record Transaction (Amount)
-          await query(
-            `INSERT INTO transactions 
-             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-             VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
-            [
-                transfer.business_id, 
-                amount, 
-                transfer.currency || 'NGN', 
-                transfer.reference, 
-                `Transfer to ${transfer.recipient_name || 'Account'}`,
-                transfer.wallet_id
-            ]
+          // Record Transaction (Amount) - Idempotent: Check if exists first, UPDATE if so
+          const existingTxn = await query(
+            `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit' AND transaction_type = 'transfer'`,
+            [transfer.reference]
           );
 
-          // Record Transaction (Fee)
-          if (fee > 0) {
+          if (existingTxn.rows.length === 0) {
             await query(
               `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
               [
                   transfer.business_id, 
-                  fee, 
+                  amount, 
                   transfer.currency || 'NGN', 
-                  transfer.reference + '-FEE', 
-                  `Fee for transfer: ${transfer.reference}`,
-                  transfer.wallet_id,
-                  fee
+                  transfer.reference, 
+                  `Transfer to ${transfer.recipient_name || 'Account'}`,
+                  transfer.wallet_id
               ]
             );
+          } else {
+            await query(
+              `UPDATE transactions 
+               SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+               WHERE id = $1`,
+              [existingTxn.rows[0].id]
+            );
+          }
+
+          // Record Transaction (Fee) - Idempotent: Check if exists first
+          if (fee > 0) {
+            const existingFeeTxn = await query(
+              `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit' AND transaction_type = 'fee'`,
+              [transfer.reference + '-FEE']
+            );
+
+            if (existingFeeTxn.rows.length === 0) {
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+                [
+                    transfer.business_id, 
+                    fee, 
+                    transfer.currency || 'NGN', 
+                    transfer.reference + '-FEE', 
+                    `Fee for transfer: ${transfer.reference}`,
+                    transfer.wallet_id,
+                    fee
+                ]
+              );
+            } else {
+              await query(
+                `UPDATE transactions 
+                 SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+                 WHERE id = $1`,
+                [existingFeeTxn.rows[0].id]
+              );
+            }
           }
       }
 
@@ -521,34 +572,209 @@ export async function processAllPending(businessId: string) {
 
       const response = await provider.initiateTransfer(payload);
 
-      // Handle success for both Squad and Monnify
+      // Parse provider response directly to determine status
+      let immediateStatus: 'success' | 'failed' | 'processing' = 'processing';
       let isSuccess = false;
-      let failureReason = "Unknown error from provider";
+      let isFailed = false;
+      let failureReason: string | null = null;
+      const providerMetadata = response.responseBody || response.data || response || null;
 
       if (provider.name === 'squad') {
-        isSuccess = response.status === 200 && response.success;
-        failureReason = response.message || "Unknown error from Squad";
+        const squadStatus = providerMetadata?.status || providerMetadata?.transaction_status;
+        isSuccess = !!response.success && (
+          squadStatus === 'success' ||
+          response.status === 'success' ||
+          (response.success === true && squadStatus === undefined)
+        );
+        isFailed = !isSuccess && (
+          response.success === false ||
+          squadStatus === 'failed' ||
+          squadStatus === 'failure' ||
+          response.status === 'failed'
+        );
+        failureReason = response.message ||
+                        providerMetadata?.failure_reason ||
+                        providerMetadata?.error_message ||
+                        (isFailed ? "Transfer rejected by Squad" : null);
       } else if (provider.name === 'monnify') {
-        isSuccess = response.requestSuccessful;
-        failureReason = response.responseMessage || "Unknown error from Monnify";
+        const monnifyStatus = providerMetadata?.status || providerMetadata?.transactionStatus;
+        isSuccess = !!response.requestSuccessful && (
+          monnifyStatus === 'SUCCESS' ||
+          response.status === 'SUCCESS' ||
+          (response.requestSuccessful === true && monnifyStatus === undefined)
+        );
+        isFailed = !isSuccess && (
+          response.requestSuccessful === false ||
+          monnifyStatus === 'FAILED' ||
+          monnifyStatus === 'FAILURE' ||
+          response.status === 'FAILED'
+        );
+        failureReason = response.responseMessage ||
+                        providerMetadata?.failureReason ||
+                        providerMetadata?.errorMessage ||
+                        (isFailed ? "Transfer rejected by Monnify" : null);
       }
 
-      // Always mark as processing first, then verify immediately
+      if (isSuccess) immediateStatus = 'success';
+      else if (isFailed) immediateStatus = 'failed';
+
+      // Update with the provider-determined status immediately
       await query(
         `UPDATE transfer_queue 
-         SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
+         SET status = $2, failure_reason = $3, updated_at = CURRENT_TIMESTAMP, meta_data = $4, payment_provider = $5, provider_metadata = $6
          WHERE id = $1`,
-        [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
+        [transfer.id, immediateStatus, failureReason, JSON.stringify(response), provider.name, JSON.stringify(providerMetadata)]
       );
       
       // Debit Platform Wallet (Amount only) if initial response was success
       if (isSuccess) {
         const amount = parseFloat(transfer.amount);
         await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+        // Send email notification on success
+        if (transfer.wallet_id) {
+          const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
+          if (walletRes.rows.length > 0 && walletRes.rows[0].user_id) {
+            const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [walletRes.rows[0].user_id]);
+            if (userRes.rows.length > 0) {
+              const user = userRes.rows[0];
+              await sendTransactionAlert(
+                user.email,
+                user.name || 'User',
+                'debit',
+                parseFloat(transfer.amount),
+                transfer.currency || 'NGN',
+                parseFloat(walletRes.rows[0].balance),
+                'success',
+                transfer.reference,
+                `Transfer to ${transfer.recipient_name || 'Account'}`
+              );
+            }
+          }
+        }
+
+        // Log audit event for success
+        await logAuditEvent({
+          businessId: transfer.business_id,
+          userId: transfer.initiated_by,
+          action: 'transfer_completed',
+          entityType: 'transfer',
+          entityId: transfer.id,
+          newValues: {
+            reference: transfer.reference,
+            status: 'success',
+            amount: transfer.amount,
+          },
+        });
+      } else if (isFailed && transfer.wallet_id) {
+        // If provider rejected immediately, refund the wallet
+        const amount = parseFloat(transfer.amount);
+        const fee = parseFloat(transfer.fee || '0');
+        const totalRefund = amount + fee;
+
+        const txnCheck = await query(
+          `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+          [transfer.reference]
+        );
+        if (txnCheck.rows.length > 0) {
+          console.log(`[TransferService] Immediate refund for transfer ${transfer.reference} - Amount: ${totalRefund}, Reason: ${failureReason}`);
+          
+          await query(
+            `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+            [totalRefund, transfer.wallet_id]
+          );
+          
+          await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+          if (fee > 0) {
+            await debitRevenueWallet(fee, transfer.currency || 'NGN');
+          }
+
+          const refundTxnCheck = await query(
+            `SELECT id FROM transactions WHERE reference = $1`,
+            [transfer.reference + '-REFUND']
+          );
+          
+          if (refundTxnCheck.rows.length === 0) {
+            await query(
+              `INSERT INTO transactions 
+               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+              [
+                transfer.business_id, 
+                amount, 
+                transfer.currency || 'NGN', 
+                transfer.reference + '-REFUND', 
+                `Refund for failed transfer: ${transfer.reference}`,
+                transfer.wallet_id
+              ]
+            );
+          }
+
+          if (fee > 0) {
+            const feeRefundTxnCheck = await query(
+              `SELECT id FROM transactions WHERE reference = $1`,
+              [transfer.reference + '-FEE-REFUND']
+            );
+            
+            if (feeRefundTxnCheck.rows.length === 0) {
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+                [
+                  transfer.business_id, 
+                  fee, 
+                  transfer.currency || 'NGN', 
+                  transfer.reference + '-FEE-REFUND', 
+                  `Refund fee for failed transfer: ${transfer.reference}`,
+                  transfer.wallet_id
+                ]
+              );
+            }
+          }
+
+          // Send email notification on failure
+          const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
+          if (walletRes.rows.length > 0 && walletRes.rows[0].user_id) {
+            const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [walletRes.rows[0].user_id]);
+            if (userRes.rows.length > 0) {
+              const user = userRes.rows[0];
+              await sendTransactionAlert(
+                user.email,
+                user.name || 'User',
+                'debit',
+                parseFloat(transfer.amount),
+                transfer.currency || 'NGN',
+                parseFloat(walletRes.rows[0].balance),
+                'failed',
+                transfer.reference,
+                `Transfer failed: ${failureReason || 'Unknown reason'}`
+              );
+            }
+          }
+        }
+
+        // Log audit event for failure
+        await logAuditEvent({
+          businessId: transfer.business_id,
+          userId: transfer.initiated_by,
+          action: 'transfer_failed',
+          entityType: 'transfer',
+          entityId: transfer.id,
+          newValues: {
+            reference: transfer.reference,
+            status: 'failed',
+            amount: transfer.amount,
+            failureReason,
+          },
+        });
       }
       
-      // Try immediate verification
-      await verifySingleTransfer(transfer);
+      // If status is still processing (provider didn't give definitive answer), verify immediately
+      if (immediateStatus === 'processing') {
+        await verifySingleTransfer(transfer);
+      }
 
     } catch (error: any) {
       // 5. Handle Exception
@@ -709,36 +935,65 @@ export async function processTransfer(transferId: string) {
             await creditRevenueWallet(fee, transfer.currency || 'NGN');
         }
 
-        // Record Transaction
-        await query(
-          `INSERT INTO transactions 
-           (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-           VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
-          [
-              transfer.business_id, 
-              amount, 
-              transfer.currency || 'NGN', 
-              transfer.reference, 
-              `Transfer to ${transfer.recipient_name || 'Account'}`,
-              transfer.wallet_id
-          ]
+        // Record Transaction (Amount) - Idempotent: Check if exists first, UPDATE if so
+        const existingTxn = await query(
+          `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit' AND transaction_type = 'transfer'`,
+          [transfer.reference]
         );
 
+        if (existingTxn.rows.length === 0) {
+          await query(
+            `INSERT INTO transactions 
+             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+             VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
+            [
+                transfer.business_id, 
+                amount, 
+                transfer.currency || 'NGN', 
+                transfer.reference, 
+                `Transfer to ${transfer.recipient_name || 'Account'}`,
+                transfer.wallet_id
+            ]
+          );
+        } else {
+          await query(
+            `UPDATE transactions 
+             SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $1`,
+            [existingTxn.rows[0].id]
+          );
+        }
+
+        // Record Transaction (Fee) - Idempotent: Check if exists first
         if (fee > 0) {
-            await query(
-              `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
-              [
-                  transfer.business_id, 
-                  fee, 
-                  transfer.currency || 'NGN', 
-                  transfer.reference + '-FEE', 
-                  `Fee for transfer: ${transfer.reference}`,
-                  transfer.wallet_id,
-                  fee
-              ]
+            const existingFeeTxn = await query(
+              `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit' AND transaction_type = 'fee'`,
+              [transfer.reference + '-FEE']
             );
+
+            if (existingFeeTxn.rows.length === 0) {
+              await query(
+                `INSERT INTO transactions 
+                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+                [
+                    transfer.business_id, 
+                    fee, 
+                    transfer.currency || 'NGN', 
+                    transfer.reference + '-FEE', 
+                    `Fee for transfer: ${transfer.reference}`,
+                    transfer.wallet_id,
+                    fee
+                ]
+              );
+            } else {
+              await query(
+                `UPDATE transactions 
+                 SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+                 WHERE id = $1`,
+                [existingFeeTxn.rows[0].id]
+              );
+            }
         }
     }
 
@@ -758,42 +1013,223 @@ export async function processTransfer(transferId: string) {
 
     const response = await provider.initiateTransfer(payload);
 
-    // Handle success for both Squad and Monnify
+    // Parse provider response directly to determine status
+    let immediateStatus: 'success' | 'failed' | 'processing' = 'processing';
     let isSuccess = false;
-    let failureReason = "Unknown error from provider";
+    let isFailed = false;
+    let failureReason: string | null = null;
+    const providerMetadata = response.responseBody || response.data || response || null;
 
     if (provider.name === 'squad') {
-      isSuccess = response.status === 200 && response.success;
-      failureReason = response.message || "Unknown error from Squad";
+      const squadStatus = providerMetadata?.status || providerMetadata?.transaction_status;
+      isSuccess = !!response.success && (
+        squadStatus === 'success' ||
+        response.status === 'success' ||
+        (response.success === true && squadStatus === undefined)
+      );
+      isFailed = !isSuccess && (
+        response.success === false ||
+        squadStatus === 'failed' ||
+        squadStatus === 'failure' ||
+        response.status === 'failed'
+      );
+      failureReason = response.message ||
+                      providerMetadata?.failure_reason ||
+                      providerMetadata?.error_message ||
+                      (isFailed ? "Transfer rejected by Squad" : null);
     } else if (provider.name === 'monnify') {
-      isSuccess = response.requestSuccessful;
-      failureReason = response.responseMessage || "Unknown error from Monnify";
+      const monnifyStatus = providerMetadata?.status || providerMetadata?.transactionStatus;
+      isSuccess = !!response.requestSuccessful && (
+        monnifyStatus === 'SUCCESS' ||
+        response.status === 'SUCCESS' ||
+        (response.requestSuccessful === true && monnifyStatus === undefined)
+      );
+      isFailed = !isSuccess && (
+        response.requestSuccessful === false ||
+        monnifyStatus === 'FAILED' ||
+        monnifyStatus === 'FAILURE' ||
+        response.status === 'FAILED'
+      );
+      failureReason = response.responseMessage ||
+                      providerMetadata?.failureReason ||
+                      providerMetadata?.errorMessage ||
+                      (isFailed ? "Transfer rejected by Monnify" : null);
     }
 
-    // Always mark as processing first, then verify immediately
+    if (isSuccess) immediateStatus = 'success';
+    else if (isFailed) immediateStatus = 'failed';
+
+    // Update with the provider-determined status immediately
     await query(
       `UPDATE transfer_queue 
-       SET status = 'processing', updated_at = CURRENT_TIMESTAMP, meta_data = $2, payment_provider = $3, provider_metadata = $4
+       SET status = $2, failure_reason = $3, updated_at = CURRENT_TIMESTAMP, meta_data = $4, payment_provider = $5, provider_metadata = $6
        WHERE id = $1`,
-      [transfer.id, JSON.stringify(response), provider.name, JSON.stringify(response.responseBody || response.data || null)]
+      [transfer.id, immediateStatus, failureReason, JSON.stringify(response), provider.name, JSON.stringify(providerMetadata)]
     );
     
     // Debit Platform Wallet (Amount only) as it has been sent out
     if (isSuccess) {
       const amount = parseFloat(transfer.amount);
       await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+      // Send email notification on success
+      if (transfer.wallet_id) {
+        const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
+        if (walletRes.rows.length > 0 && walletRes.rows[0].user_id) {
+          const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [walletRes.rows[0].user_id]);
+          if (userRes.rows.length > 0) {
+            const user = userRes.rows[0];
+            await sendTransactionAlert(
+              user.email,
+              user.name || 'User',
+              'debit',
+              parseFloat(transfer.amount),
+              transfer.currency || 'NGN',
+              parseFloat(walletRes.rows[0].balance),
+              'success',
+              transfer.reference,
+              `Transfer to ${transfer.recipient_name || 'Account'}`
+            );
+          }
+        }
+      }
+
+      // Log audit event for success
+      await logAuditEvent({
+        businessId: transfer.business_id,
+        userId: transfer.initiated_by,
+        action: 'transfer_completed',
+        entityType: 'transfer',
+        entityId: transfer.id,
+        newValues: {
+          reference: transfer.reference,
+          status: 'success',
+          amount: transfer.amount,
+        },
+      });
+    } else if (isFailed && transfer.wallet_id) {
+      // If provider rejected immediately, refund the wallet
+      const amount = parseFloat(transfer.amount);
+      const fee = parseFloat(transfer.fee || '0');
+      const totalRefund = amount + fee;
+
+      const txnCheck = await query(
+        `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+        [transfer.reference]
+      );
+      if (txnCheck.rows.length > 0) {
+        console.log(`[TransferService] Immediate refund for transfer ${transfer.reference} - Amount: ${totalRefund}, Reason: ${failureReason}`);
+        
+        await query(
+          `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+          [totalRefund, transfer.wallet_id]
+        );
+        
+        await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+        if (fee > 0) {
+          await debitRevenueWallet(fee, transfer.currency || 'NGN');
+        }
+
+        const refundTxnCheck = await query(
+          `SELECT id FROM transactions WHERE reference = $1`,
+          [transfer.reference + '-REFUND']
+        );
+        
+        if (refundTxnCheck.rows.length === 0) {
+          await query(
+            `INSERT INTO transactions 
+             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+            [
+              transfer.business_id, 
+              amount, 
+              transfer.currency || 'NGN', 
+              transfer.reference + '-REFUND', 
+              `Refund for failed transfer: ${transfer.reference}`,
+              transfer.wallet_id
+            ]
+          );
+        }
+
+        if (fee > 0) {
+          const feeRefundTxnCheck = await query(
+            `SELECT id FROM transactions WHERE reference = $1`,
+            [transfer.reference + '-FEE-REFUND']
+          );
+          
+          if (feeRefundTxnCheck.rows.length === 0) {
+            await query(
+              `INSERT INTO transactions 
+               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+              [
+                transfer.business_id, 
+                fee, 
+                transfer.currency || 'NGN', 
+                transfer.reference + '-FEE-REFUND', 
+                `Refund fee for failed transfer: ${transfer.reference}`,
+                transfer.wallet_id
+              ]
+            );
+          }
+        }
+
+        // Send email notification on failure
+        const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
+        if (walletRes.rows.length > 0 && walletRes.rows[0].user_id) {
+          const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [walletRes.rows[0].user_id]);
+          if (userRes.rows.length > 0) {
+            const user = userRes.rows[0];
+            await sendTransactionAlert(
+              user.email,
+              user.name || 'User',
+              'debit',
+              parseFloat(transfer.amount),
+              transfer.currency || 'NGN',
+              parseFloat(walletRes.rows[0].balance),
+              'failed',
+              transfer.reference,
+              `Transfer failed: ${failureReason || 'Unknown reason'}`
+            );
+          }
+        }
+      }
+
+      // Log audit event for failure
+      await logAuditEvent({
+        businessId: transfer.business_id,
+        userId: transfer.initiated_by,
+        action: 'transfer_failed',
+        entityType: 'transfer',
+        entityId: transfer.id,
+        newValues: {
+          reference: transfer.reference,
+          status: 'failed',
+          amount: transfer.amount,
+          failureReason,
+        },
+      });
     }
     
-    // Try immediate verification
-    const updatedTransfer = await verifySingleTransfer(transfer);
-    
-    if (updatedTransfer.status === 'success') {
-      return { success: true, message: "Transfer processed successfully", data: response.responseBody || response.data };
-    } else if (updatedTransfer.status === 'failed') {
-      throw new Error(updatedTransfer.failure_reason || "Transfer failed");
+    // If status is still processing (provider didn't give definitive answer), verify immediately
+    let finalStatus = immediateStatus;
+    if (immediateStatus === 'processing') {
+      const updatedTransfer = await verifySingleTransfer(transfer);
+      finalStatus = updatedTransfer.status;
+    } else {
+      const finalRes = await query(`SELECT * FROM transfer_queue WHERE id = $1`, [transfer.id]);
+      const finalTransfer = finalRes.rows[0];
+      if (finalTransfer) finalStatus = finalTransfer.status;
     }
     
-    return { success: true, message: "Transfer is being processed", data: response.responseBody || response.data };
+    if (finalStatus === 'success') {
+      return { success: true, message: "Transfer processed successfully", data: providerMetadata };
+    } else if (finalStatus === 'failed') {
+      throw new Error(failureReason || "Transfer failed");
+    }
+    
+    return { success: true, message: "Transfer is being processed", data: providerMetadata };
 
   } catch (error: any) {
     const reason = error.message || "Internal processing error";

@@ -375,7 +375,10 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
     const member = result.rows[0];
 
     // Send invitation email
-    const baseUrl = process.env.APP_BASE_URL || 'https://metricorex-app.netlify.app';
+    const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
+    if (!baseUrl) {
+      throw new Error('CLIENT_URL environment variable is not set');
+    }
     const inviteLink = `${baseUrl}/accept-invite/${inviteToken}`;
     const emailHtml = generateInviteEmailHtml(input.name, inviteLink);
 

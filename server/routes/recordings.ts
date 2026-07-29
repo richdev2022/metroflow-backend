@@ -6,6 +6,97 @@ import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { upload } from "../middleware/upload";
 import { r2Storage } from "../lib/storage";
+import fs from "fs";
+import path from "path";
+
+type UploadedRecordingRequest = AuthenticatedRequest & {
+  file?: Express.Multer.File;
+  files?: Express.Multer.File[] | Record<string, Express.Multer.File[]>;
+};
+
+const recordingFileFields = [
+  { name: "file", maxCount: 1 },
+  { name: "recording", maxCount: 1 },
+  { name: "video", maxCount: 1 },
+  { name: "audio", maxCount: 1 },
+];
+
+function getUploadedRecordingFile(req: UploadedRecordingRequest) {
+  if (req.file) {
+    return req.file;
+  }
+
+  if (Array.isArray(req.files)) {
+    return req.files[0];
+  }
+
+  if (req.files) {
+    for (const field of recordingFileFields) {
+      const file = req.files[field.name]?.[0];
+      if (file) {
+        return file;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function getExtensionFromMimeType(mimeType: string | undefined) {
+  if (!mimeType) {
+    return "webm";
+  }
+
+  const subtype = mimeType.split("/")[1]?.split(";")[0];
+  return subtype || "webm";
+}
+
+const normalizeRecordingUpload: RequestHandler = (req: UploadedRecordingRequest, res, next) => {
+  const contentType = req.headers["content-type"] || "";
+
+  if (contentType.includes("multipart/form-data")) {
+    const uploadFields = upload.fields(recordingFileFields);
+    uploadFields(req, res, (err) => {
+      if (err) {
+        console.error("Multer error:", err);
+        return res.status(400).json({
+          success: false,
+          error: err.message || "File upload error",
+        });
+      }
+      next();
+    });
+    return;
+  }
+
+  if (
+    contentType.startsWith("video/") ||
+    contentType.startsWith("audio/") ||
+    contentType.startsWith("application/octet-stream")
+  ) {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    req.on("end", () => {
+      const buffer = Buffer.concat(chunks);
+      if (buffer.length > 0) {
+        const extension = getExtensionFromMimeType(contentType);
+        req.file = {
+          fieldname: "file",
+          originalname: `recording.${extension}`,
+          encoding: "7bit",
+          mimetype: contentType,
+          size: buffer.length,
+          buffer,
+        } as Express.Multer.File;
+      }
+      next();
+    });
+    req.on("error", next);
+    return;
+  }
+
+  next();
+};
 
 async function canAccessMeeting(meetingId: string, businessId: string, userId: string) {
   const result = await query(
@@ -150,7 +241,7 @@ export const getRecordings: RequestHandler = async (
     // Generate presigned URLs for recordings if needed
     const recordings = await Promise.all(
       result.rows.map(async (recording) => {
-        if (recording.storageUrl && !recording.storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+        if (recording.storageUrl && !recording.storageUrl.startsWith('http') && !recording.storageUrl.startsWith('/uploads/') && !recording.storageUrl.startsWith('data:') && r2Storage.isAvailable()) {
           try {
             recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
           } catch (err) {
@@ -446,11 +537,21 @@ export const deleteRecording: RequestHandler = async (
 
     // Delete from storage if exists
     const storageUrl = result.rows[0].storage_url;
-    if (storageUrl && !storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+    if (storageUrl && !storageUrl.startsWith('http') && !storageUrl.startsWith('/uploads/') && !storageUrl.startsWith('data:') && r2Storage.isAvailable()) {
       try {
         await r2Storage.deleteFile(storageUrl);
       } catch (err) {
         console.error("Failed to delete recording from storage:", err);
+      }
+    } else if (storageUrl && storageUrl.startsWith('/uploads/')) {
+      // Delete local file
+      const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+      const baseDir = isLambda ? path.join("/tmp") : process.cwd();
+      const filePath = path.join(baseDir, "uploads", storageUrl.replace('/uploads/', ''));
+      try {
+        fs.unlinkSync(filePath);
+      } catch (err) {
+        console.error("Failed to delete local recording file:", err);
       }
     }
 
@@ -512,25 +613,14 @@ export const deleteRecording: RequestHandler = async (
  */
 // Upload recording file endpoint
 export const uploadRecording: RequestHandler[] = [
-  (req, res, next) => {
-    const uploadSingle = upload.single('file');
-    uploadSingle(req, res, (err) => {
-      if (err) {
-        console.error("Multer error:", err);
-        return res.status(400).json({
-          success: false,
-          error: err.message || "File upload error",
-        });
-      }
-      next();
-    });
-  },
-  async (req: AuthenticatedRequest & { file?: Express.Multer.File }, res) => {
+  normalizeRecordingUpload,
+  async (req: UploadedRecordingRequest, res) => {
     try {
       const { id } = req.params;
-      const { duration } = req.body;
+      const duration = req.body?.duration ?? req.query.duration;
       const businessId = req.user?.businessId;
       const userId = req.user?.userId;
+      const uploadedFile = getUploadedRecordingFile(req);
 
       if (!businessId || !userId) {
         return res.status(400).json({
@@ -539,10 +629,10 @@ export const uploadRecording: RequestHandler[] = [
         });
       }
 
-      if (!req.file) {
+      if (!uploadedFile) {
         return res.status(400).json({
           success: false,
-          error: "No file uploaded",
+          error: "No file uploaded. Send multipart/form-data with a file field named file, recording, video, or audio.",
         });
       }
 
@@ -559,15 +649,55 @@ export const uploadRecording: RequestHandler[] = [
         });
       }
 
-      // Upload to R2 if available
+      // Upload to R2 if available, otherwise use local storage
       let storageUrl = '';
+      let useLocalStorage = false;
       if (r2Storage.isAvailable()) {
-        const fileExt = req.file.originalname.split('.').pop() || 'webm';
-        const key = `recordings/${businessId}/${id}.${fileExt}`;
-        storageUrl = await r2Storage.uploadFile(key, req.file.buffer, req.file.mimetype);
+        try {
+          const fileExt = uploadedFile.originalname.includes(".")
+            ? uploadedFile.originalname.split(".").pop() || "webm"
+            : getExtensionFromMimeType(uploadedFile.mimetype);
+          const key = `recordings/${businessId}/${id}.${fileExt}`;
+          storageUrl = await r2Storage.uploadFile(key, uploadedFile.buffer, uploadedFile.mimetype);
+        } catch (error) {
+          console.error("R2 upload failed, falling back to local storage:", error);
+          useLocalStorage = true;
+        }
       } else {
-        // If R2 not available, maybe handle differently, but for now just log
-        console.warn("R2 storage not available, recording not saved to storage");
+        useLocalStorage = true;
+      }
+
+      if (useLocalStorage) {
+        const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+        const baseDir = isLambda ? path.join("/tmp") : process.cwd();
+        const uploadDir = path.join(baseDir, "uploads");
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        
+        const fileExt = uploadedFile.originalname.includes(".")
+          ? uploadedFile.originalname.split(".").pop() || "webm"
+          : getExtensionFromMimeType(uploadedFile.mimetype);
+        const filename = `recording-${id}-${Date.now()}.${fileExt}`;
+        const filePath = path.join(uploadDir, filename);
+        
+        fs.writeFileSync(filePath, uploadedFile.buffer);
+        
+        if (isLambda) {
+          const { getStore } = require("@netlify/blobs");
+          const store = getStore("uploads");
+          try {
+            await store.set(filename, uploadedFile.buffer.buffer.slice(uploadedFile.buffer.byteOffset, uploadedFile.buffer.byteOffset + uploadedFile.buffer.byteLength) as any);
+            storageUrl = `/uploads/${filename}`;
+          } catch (e) {
+            console.error("Netlify Blobs upload failed, using base64:", e);
+            const mime = uploadedFile.mimetype || "application/octet-stream";
+            storageUrl = `data:${mime};base64,${uploadedFile.buffer.toString("base64")}`;
+            try { fs.unlinkSync(filePath); } catch {}
+          }
+        } else {
+          storageUrl = `/uploads/${filename}`;
+        }
       }
 
       // Update recording in database
@@ -582,13 +712,13 @@ export const uploadRecording: RequestHandler[] = [
          RETURNING id, business_id as "businessId", meeting_id as "meetingId", 
                    call_id as "callId", recorded_by as "recordedById", storage_url as "storageUrl",
                    duration, status, size, created_at as "createdAt", updated_at as "updatedAt"`,
-        [storageUrl, duration ? parseInt(duration) : null, req.file.size, id, businessId, userId]
+        [storageUrl, duration ? parseInt(duration as string) : null, uploadedFile.size, id, businessId, userId]
       );
 
       const recording = updateResult.rows[0];
 
       // Generate presigned URL if needed
-      if (recording.storageUrl && !recording.storageUrl.startsWith('http') && r2Storage.isAvailable()) {
+      if (recording.storageUrl && !recording.storageUrl.startsWith('http') && !recording.storageUrl.startsWith('/uploads/') && !recording.storageUrl.startsWith('data:') && r2Storage.isAvailable()) {
         recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
       }
 

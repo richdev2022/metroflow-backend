@@ -1,10 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { processAllPending } from './transfer';
 import * as db from '../db';
+import * as fees from './fees';
+import * as audit from './audit';
+import * as email from './email';
 
 // Mock DB
 vi.mock('../db', () => ({
-  query: vi.fn(),
+  query: vi.fn().mockImplementation(async () => {
+    return { rows: [] };
+  }),
+}));
+
+// Mock audit service
+vi.mock('./audit', () => ({
+  logAuditEvent: vi.fn().mockResolvedValue(undefined),
+  generateTransactionHash: vi.fn().mockReturnValue('fakehash123'),
+}));
+
+// Mock email service
+vi.mock('./email', () => ({
+  sendTransactionAlert: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock fees module functions
+vi.mock('./fees', () => ({
+  creditPlatformWallet: vi.fn().mockResolvedValue(undefined),
+  debitPlatformWallet: vi.fn().mockResolvedValue(undefined),
+  creditRevenueWallet: vi.fn().mockResolvedValue(undefined),
+  debitRevenueWallet: vi.fn().mockResolvedValue(undefined),
+  calculateFee: vi.fn().mockResolvedValue(0),
 }));
 
 // Mock the providers factory to return a mock squad provider
@@ -86,74 +111,57 @@ describe('processAllPending', () => {
         // 4. Debit User Wallet (Amount + Fee = 110)
         mockQuery.mockResolvedValueOnce({ rows: [] });
 
-        // 5. Credit Platform Wallet (Operational - Amount = 100)
-        // inside creditPlatformWallet:
-        //   a. Select Operational Wallet (no existing)
-        mockQuery.mockResolvedValueOnce({ rows: [] }); 
-        //   b. Create Operational Wallet
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] });
-        //   c. Update Operational Wallet
+        // 5-6. Platform/Revenue wallet credit functions are now mocked, skip internal queries
+        // 7. Idempotency check for amount transaction (SELECT existing - none found)
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 8. Record Transaction (Amount) - INSERT
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 9. Idempotency check for fee transaction (SELECT existing - none found)
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 10. Record Transaction (Fee) - INSERT
         mockQuery.mockResolvedValueOnce({ rows: [] });
 
-        // 6. Credit Revenue Wallet (Fee = 10)
-        // inside creditRevenueWallet:
-        //   a. Select Revenue Wallet (no existing)
-        mockQuery.mockResolvedValueOnce({ rows: [] }); 
-        //   b. Create Revenue Wallet
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'rev_1' }] });
-        //   c. Update Revenue Wallet
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 7. Record Transaction (Amount)
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 8. Record Transaction (Fee)
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 9. Mock Squad Success
+        // 11. Mock Squad Success - returns success=true, which our code will now detect as immediate success
         mockInitiateTransfer.mockResolvedValue({ 
             status: 200, 
             success: true, 
             data: { id: 'sq_1' } 
         });
 
-        // 10. Update transfer_queue to processing (new step added)
+        // 12. Update transfer_queue status (to 'success' immediately now)
         mockQuery.mockResolvedValueOnce({ rows: [] });
 
-        // 11. Debit Platform Wallet (Success) - Amount only = 100
-        // inside debitPlatformWallet -> creditPlatformWallet:
-        //   a. Select Operational Wallet (returns existing one)
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] });
-        //   b. Update Operational Wallet (-100)
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 12. Mock verifyTransfer success
-        mockVerifyTransfer.mockResolvedValue({
-            success: true,
-            data: {
-                status: 'success',
-                transaction_status: 'success'
-            }
-        });
-
-        // 13. verifySingleTransfer calls:
-        //   a. Update transfer_queue to success
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-        //   b. Get updated transfer
-        mockQuery.mockResolvedValueOnce({ rows: [{ ...transfer, status: 'success' }] });
+        // 11-13. Debit platform wallet is mocked, and verifySingleTransfer is skipped when status is already 'success'.
+        // Provide defaults for remaining direct queries (notifications/audit are mocked, SELECTs use defaults)
 
         await processAllPending(businessId);
 
-        // Verifications
-        const updateWalletCalls = mockQuery.mock.calls.filter((call: any[]) => 
-            call[0].includes('UPDATE wallets') && !call[0].includes('INSERT')
+        // Verifications via mocked modules
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
+        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+        expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
+        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
+
+        // verifySingleTransfer should NOT have been called since we determined immediate status = success
+        // (mockVerifyTransfer is the provider.verifyTransfer call)
+        expect(mockVerifyTransfer).not.toHaveBeenCalled();
+
+        // Audit log for success should be called
+        expect(audit.logAuditEvent).toHaveBeenCalledWith(
+            expect.objectContaining({
+                action: 'transfer_completed',
+                entityType: 'transfer',
+                entityId: transfer.id,
+            })
         );
-        
-        // Expected Wallet Updates:
-        // 1. Debit User 110 (User Wallet)
-        // 2. Credit Operational 100 (Operational Wallet)
-        // 3. Debit Operational 100 (Operational Wallet)
-        expect(updateWalletCalls.length).toBe(3);
+
+        // Direct query-based verification
+        const userWalletDebitCall = mockQuery.mock.calls.find((call: any[]) => 
+            call[0].includes('UPDATE wallets SET balance = balance') && 
+            call[1][1] === transfer.wallet_id
+        );
+        expect(userWalletDebitCall).toBeDefined();
+        expect(userWalletDebitCall[1][0]).toEqual(110); // amount + fee = 100 + 10
     });
 
     it('should debit user, credit platform & revenue, fail provider, and reverse all', async () => {
@@ -170,7 +178,8 @@ describe('processAllPending', () => {
             recipient_name: 'John Doe',
             reference: 'REF123',
             currency: 'NGN',
-            status: 'pending'
+            status: 'pending',
+            initiated_by: 'user_123',
         };
 
         const mockQuery = db.query as any;
@@ -180,56 +189,51 @@ describe('processAllPending', () => {
         mockQuery.mockResolvedValueOnce({ rows: [] }); // 2. Processing
         mockQuery.mockResolvedValueOnce({ rows: [{ balance: '1000' }] }); // 3. Check Balance
         mockQuery.mockResolvedValueOnce({ rows: [] }); // 4. Debit User
-        
-        // 5. Credit Operational Wallet
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // a. Select Op
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] }); // b. Create Op
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // c. Update Op (+100)
-        
-        // 6. Credit Revenue Wallet
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // a. Select Rev
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'rev_1' }] }); // b. Create Rev
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // c. Update Rev (+10)
-        
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // 7. Txn 1
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // 8. Txn 2
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // 5. Idempotency SELECT amount txn
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // 6. INSERT amount txn
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // 7. Idempotency SELECT fee txn
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // 8. INSERT fee txn
 
-        // 9. Squad Fails
-        mockInitiateTransfer.mockResolvedValue({ success: false, message: 'Failed' });
+        // 9. Squad returns failed (success=false) - our code will detect as immediate failure
+        mockInitiateTransfer.mockResolvedValue({ success: false, message: 'Insufficient funds at provider' });
 
-        // 10. Update transfer_queue to processing (new step added)
+        // 10. Update transfer_queue to 'failed' immediately
         mockQuery.mockResolvedValueOnce({ rows: [] });
-
-        // 11. Mock verifyTransfer failed
-        mockVerifyTransfer.mockResolvedValue({
-            success: false,
-            message: 'Failed',
-            data: {
-                status: 'failed',
-                failure_reason: 'Failed'
-            }
-        });
-
-        // 12. verifySingleTransfer calls:
-        //   a. Update transfer_queue to failed
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-        //   b. Check if we debited (txnCheck)
+        // 11. SELECT transactions to check if debited (for refund)
         mockQuery.mockResolvedValueOnce({ rows: [{ id: 'txn_1' }] });
-        //   c. Refund user wallet
-        mockQuery.mockResolvedValueOnce({ rows: [] }); 
-        //   d. Reverse Platform Wallet (Debit 100)
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'op_1' }] }); // a. Get Op
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // b. Update Op (-100)
-        //   e. Reverse Revenue Wallet (Debit 10)
-        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'rev_1' }] }); // a. Get Rev
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // b. Update Rev (-10)
-        //   f. Record Refund Txn 1
+        // 12. Refund user wallet (+110)
         mockQuery.mockResolvedValueOnce({ rows: [] });
-        //   g. Record Refund Txn 2
-        mockQuery.mockResolvedValueOnce({ rows: [] });
-        //   h. Get updated transfer
-        mockQuery.mockResolvedValueOnce({ rows: [{ ...transfer, status: 'failed' }] });
+        // 13+ Remaining direct queries use default fallback
 
         await processAllPending(businessId);
+
+        // Verifications: Debit side should have been called
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
+        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+        expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
+
+        // Refund side should reverse everything
+        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
+        expect(fees.debitRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+
+        // verifySingleTransfer should NOT have been called since we determined immediate status = failed
+        expect(mockVerifyTransfer).not.toHaveBeenCalled();
+
+        // Audit log for failure should be called
+        expect(audit.logAuditEvent).toHaveBeenCalledWith(
+            expect.objectContaining({
+                action: 'transfer_failed',
+                entityType: 'transfer',
+                entityId: transfer.id,
+            })
+        );
+
+        // Direct refund verification
+        const userWalletRefundCall = mockQuery.mock.calls.find((call: any[]) => 
+            call[0].includes('UPDATE wallets SET balance = balance +') && 
+            call[1][1] === transfer.wallet_id
+        );
+        expect(userWalletRefundCall).toBeDefined();
+        expect(userWalletRefundCall[1][0]).toEqual(110); // amount + fee = 100 + 10
     });
 });

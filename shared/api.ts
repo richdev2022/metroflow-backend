@@ -362,6 +362,19 @@ export interface InitiateSingleTransferInput {
   walletId?: string;
 }
 
+export interface AddParticipantsInput {
+  participantIds: string[];
+}
+
+export interface AddParticipantsResponse {
+  success: boolean;
+  message: string;
+  data: {
+    added: string[];
+  };
+  error?: string;
+}
+
 export interface InitiateBulkTransferInput {
   type: 'Salary' | 'Epic';
   otp?: string;

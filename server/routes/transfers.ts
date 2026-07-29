@@ -3,7 +3,7 @@ import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
-import { accountLookup } from "../services/transfer";
+import { accountLookup, processAllPending } from "../services/transfer";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
@@ -475,31 +475,73 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
 
     const queuedTransfer = insertRes.rows[0];
 
-    // Trigger processing via BullMQ
-    if (transferQueue) {
-      await transferQueue.add('process-transfers', { businessId: businessId! });
+    // Trigger processing via BullMQ AND process synchronously for immediate result
+    let syncProcessingError: any = null;
+    try {
+      await processAllPending(businessId!);
+    } catch (syncErr) {
+      console.error("[Sync] Error processing pending transfers inline:", syncErr);
+      syncProcessingError = syncErr;
     }
 
-    res.json({ 
-      success: true, 
-      message: "Transfer initiated successfully",
+    // BullMQ fallback (retry via background worker if sync processing failed or as redundancy)
+    if (transferQueue) {
+      try {
+        await transferQueue.add('process-transfers', { businessId: businessId! });
+      } catch (qErr) {
+        console.error("[Queue] Failed to enqueue transfer job:", qErr);
+      }
+    }
+
+    // Re-query to get the actual final status after sync processing
+    let finalTransfer = queuedTransfer;
+    try {
+      const updatedRes = await query(
+        `SELECT * FROM transfer_queue WHERE id = $1`,
+        [queuedTransfer.id]
+      );
+      if (updatedRes.rows.length > 0) {
+        finalTransfer = updatedRes.rows[0];
+      }
+    } catch (qErr) {
+      console.error("Error re-querying transfer status:", qErr);
+    }
+
+    // If sync processing failed and status is still pending, surface the error
+    let responseMessage = "Transfer initiated successfully";
+    if (syncProcessingError && finalTransfer.status === 'pending') {
+      responseMessage = `Transfer queued: ${syncProcessingError.message || 'Background processing will retry shortly'}`;
+    } else if (finalTransfer.status === 'success') {
+      responseMessage = "Transfer completed successfully";
+    } else if (finalTransfer.status === 'failed') {
+      responseMessage = finalTransfer.failure_reason || "Transfer failed";
+    } else if (finalTransfer.status === 'processing') {
+      responseMessage = "Transfer is being processed";
+    }
+
+    const statusCode = finalTransfer.status === 'failed' ? 200 : 200;
+
+    res.status(statusCode).json({ 
+      success: finalTransfer.status !== 'failed', 
+      message: responseMessage,
       data: {
-        id: queuedTransfer.id,
-        reference: queuedTransfer.reference,
-        amount: queuedTransfer.amount,
-        currency: queuedTransfer.currency,
-        fee: queuedTransfer.fee,
-        total: parseFloat(queuedTransfer.amount) + parseFloat(queuedTransfer.fee),
+        id: finalTransfer.id,
+        reference: finalTransfer.reference,
+        amount: finalTransfer.amount,
+        currency: finalTransfer.currency,
+        fee: finalTransfer.fee,
+        total: parseFloat(finalTransfer.amount) + parseFloat(finalTransfer.fee),
         recipient: {
-          accountNumber: queuedTransfer.recipient_account,
-          bankCode: queuedTransfer.recipient_bank,
-          accountName: queuedTransfer.recipient_name
+          accountNumber: finalTransfer.recipient_account,
+          bankCode: finalTransfer.recipient_bank,
+          accountName: finalTransfer.recipient_name
         },
-        status: queuedTransfer.status,
-        walletId: queuedTransfer.wallet_id,
-        paymentProvider: queuedTransfer.payment_provider,
-        createdAt: queuedTransfer.created_at,
-        updatedAt: queuedTransfer.updated_at
+        status: finalTransfer.status,
+        failureReason: finalTransfer.failure_reason || null,
+        walletId: finalTransfer.wallet_id,
+        paymentProvider: finalTransfer.payment_provider,
+        createdAt: finalTransfer.created_at,
+        updatedAt: finalTransfer.updated_at
       }
     });
 
@@ -873,28 +915,86 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       }
     }
 
-    // 3. Trigger processing via BullMQ
-    if (transferQueue) {
-      await transferQueue.add('process-transfers', { businessId: businessId! });
+    // 3. Trigger processing via BullMQ AND process synchronously for immediate result
+    let syncProcessingError: any = null;
+    try {
+      await processAllPending(businessId!);
+    } catch (syncErr) {
+      console.error("[Sync] Error processing bulk pending transfers inline:", syncErr);
+      syncProcessingError = syncErr;
     }
 
+    // BullMQ fallback (retry via background worker if sync processing failed or as redundancy)
+    if (transferQueue) {
+      try {
+        await transferQueue.add('process-transfers', { businessId: businessId! });
+      } catch (qErr) {
+        console.error("[Queue] Failed to enqueue bulk transfer job:", qErr);
+      }
+    }
+
+    // Re-query to get actual final statuses after sync processing
+    let finalTransfers = queuedTransfers;
+    try {
+      if (queuedTransfers.length > 0) {
+        const ids = queuedTransfers.map(t => t.id);
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
+        const updatedRes = await query(
+          `SELECT * FROM transfer_queue WHERE id = ANY(ARRAY[${placeholders}]::uuid[]) ORDER BY created_at ASC`,
+          ids
+        );
+        if (updatedRes.rows.length > 0) {
+          finalTransfers = updatedRes.rows;
+        }
+      }
+    } catch (qErr) {
+      console.error("Error re-querying bulk transfer statuses:", qErr);
+    }
+
+    // Aggregate status summary
+    const statusCounts = finalTransfers.reduce((acc: any, t) => {
+      acc[t.status] = (acc[t.status] || 0) + 1;
+      return acc;
+    }, {});
+
     // Calculate totals
-    const totalAmount = queuedTransfers.reduce((sum, t) => sum + parseFloat(t.amount), 0);
-    const totalFee = queuedTransfers.reduce((sum, t) => sum + parseFloat(t.fee || 0), 0);
+    const totalAmount = finalTransfers.reduce((sum, t) => sum + parseFloat(t.amount), 0);
+    const totalFee = finalTransfers.reduce((sum, t) => sum + parseFloat(t.fee || 0), 0);
+
+    let responseMessage = `Queued ${finalTransfers.length} transfers for processing`;
+    let overallSuccess = true;
+
+    if (syncProcessingError && statusCounts.pending === finalTransfers.length) {
+      responseMessage = `Transfers queued (sync processing delayed): ${syncProcessingError.message || 'Background processing will retry shortly'}`;
+    } else if (statusCounts.success > 0 && statusCounts.failed === 0 && statusCounts.processing === 0 && statusCounts.pending === 0) {
+      responseMessage = `All ${statusCounts.success} transfers completed successfully`;
+    } else if (statusCounts.failed > 0 && statusCounts.success === 0 && statusCounts.processing === 0 && statusCounts.pending === 0) {
+      responseMessage = `All ${statusCounts.failed} transfers failed`;
+      overallSuccess = false;
+    } else {
+      const parts: string[] = [];
+      if (statusCounts.success) parts.push(`${statusCounts.success} completed`);
+      if (statusCounts.failed) parts.push(`${statusCounts.failed} failed`);
+      if (statusCounts.processing) parts.push(`${statusCounts.processing} processing`);
+      if (statusCounts.pending) parts.push(`${statusCounts.pending} pending`);
+      responseMessage = `Transfers: ${parts.join(', ')}`;
+      overallSuccess = statusCounts.failed ? statusCounts.success > 0 : true;
+    }
 
     res.json({ 
-      success: true, 
-      message: `Queued ${queuedTransfers.length} transfers for processing`,
+      success: overallSuccess, 
+      message: responseMessage,
       data: {
-        queued: queuedTransfers.length,
+        queued: finalTransfers.length,
         type,
         walletId,
+        summary: statusCounts,
         totals: {
           amount: totalAmount,
           fee: totalFee,
           total: totalAmount + totalFee
         },
-        transfers: queuedTransfers.map(t => ({
+        transfers: finalTransfers.map(t => ({
           id: t.id,
           reference: t.reference,
           amount: t.amount,
@@ -906,8 +1006,10 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
             accountName: t.recipient_name
           },
           status: t.status,
+          failureReason: t.failure_reason || null,
           paymentProvider: t.payment_provider,
-          createdAt: t.created_at
+          createdAt: t.created_at,
+          updatedAt: t.updated_at
         }))
       }
     });
@@ -994,59 +1096,189 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     const { search, status, startDate, endDate, page = 1, limit = 20 } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
-    let queryText = `SELECT * FROM transfer_queue WHERE business_id = $1`;
-    let countQueryText = `SELECT COUNT(*) FROM transfer_queue WHERE business_id = $1`;
-    const params: any[] = [businessId];
-    let paramIdx = 2;
+    // Build query for transfer_queue (existing)
+    let tqQueryText = `SELECT 
+        id,
+        business_id,
+        wallet_id,
+        reference,
+        recipient_account,
+        recipient_bank,
+        recipient_name,
+        amount,
+        currency,
+        remark,
+        status,
+        failure_reason,
+        source_type,
+        source_id,
+        transaction_hash,
+        initiated_by,
+        payment_provider,
+        provider_metadata,
+        created_at,
+        updated_at,
+        'transfer' as type
+      FROM transfer_queue 
+      WHERE business_id = $1`;
+    let tqParams: any[] = [businessId];
+    let tqParamIdx = 2;
 
+    // Build query for transactions (credits, and other transactions)
+    let txQueryText = `SELECT 
+        id,
+        business_id,
+        wallet_id,
+        reference,
+        amount,
+        currency,
+        status,
+        description,
+        transaction_type,
+        direction,
+        fee,
+        payment_provider,
+        provider_metadata,
+        created_at,
+        updated_at,
+        'transaction' as type
+      FROM transactions 
+      WHERE business_id = $1`;
+    let txParams: any[] = [businessId];
+    let txParamIdx = 2;
+
+    // Apply filters to both queries
     if (search) {
-      const searchClause = ` AND (recipient_name ILIKE $${paramIdx} OR recipient_account ILIKE $${paramIdx} OR reference ILIKE $${paramIdx})`;
-      queryText += searchClause;
-      countQueryText += searchClause;
-      params.push(`%${search}%`);
-      paramIdx++;
+      // Transfer Queue: search by recipient_name, recipient_account, reference
+      const tqSearch = ` AND (recipient_name ILIKE $${tqParamIdx} OR recipient_account ILIKE $${tqParamIdx} OR reference ILIKE $${tqParamIdx})`;
+      tqQueryText += tqSearch;
+      tqParams.push(`%${search}%`);
+      tqParamIdx++;
+
+      // Transactions: search by description, reference
+      const txSearch = ` AND (description ILIKE $${txParamIdx} OR reference ILIKE $${txParamIdx})`;
+      txQueryText += txSearch;
+      txParams.push(`%${search}%`);
+      txParamIdx++;
     }
 
     if (status) {
-      const statusClause = ` AND status = $${paramIdx}`;
-      queryText += statusClause;
-      countQueryText += statusClause;
-      params.push(status);
-      paramIdx++;
+      // Transfer Queue: exact status match
+      tqQueryText += ` AND status = $${tqParamIdx}`;
+      tqParams.push(status);
+      tqParamIdx++;
+
+      // Transactions: exact status match
+      txQueryText += ` AND status = $${txParamIdx}`;
+      txParams.push(status);
+      txParamIdx++;
     }
 
     if (startDate) {
-      const startDateClause = ` AND created_at >= $${paramIdx}`;
-      queryText += startDateClause;
-      countQueryText += startDateClause;
-      params.push(startDate);
-      paramIdx++;
+      tqQueryText += ` AND created_at >= $${tqParamIdx}`;
+      tqParams.push(startDate);
+      tqParamIdx++;
+
+      txQueryText += ` AND created_at >= $${txParamIdx}`;
+      txParams.push(startDate);
+      txParamIdx++;
     }
 
     if (endDate) {
-      const endDateClause = ` AND created_at <= $${paramIdx}`;
-      queryText += endDateClause;
-      countQueryText += endDateClause;
-      params.push(endDate);
-      paramIdx++;
+      tqQueryText += ` AND created_at <= $${tqParamIdx}`;
+      tqParams.push(endDate);
+      tqParamIdx++;
+
+      txQueryText += ` AND created_at <= $${txParamIdx}`;
+      txParams.push(endDate);
+      txParamIdx++;
     }
 
-    queryText += ` ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
-    
-    const result = await query(queryText, [...params, Number(limit), offset]);
-    const countRes = await query(countQueryText, params);
-    
+    // Execute both queries
+    const [tqResult, txResult] = await Promise.all([
+      query(tqQueryText, tqParams),
+      query(txQueryText, txParams)
+    ]);
+
+    // Build a set of references to exclude from transactions (to avoid duplicates with transfer_queue)
+    // This includes the transfer references themselves and their corresponding fee suffixes
+    const excludedTxReferences = new Set<string>();
+    for (const tqRow of tqResult.rows) {
+      excludedTxReferences.add(tqRow.reference);
+      excludedTxReferences.add(tqRow.reference + '-FEE');
+      excludedTxReferences.add(tqRow.reference + '-REFUND');
+      excludedTxReferences.add(tqRow.reference + '-FEE-REFUND');
+    }
+
+    // Filter out transactions that are already represented in transfer_queue (by reference)
+    // Only keep non-transfer transactions: wallet_funding, manual adjustments, etc.
+    const filteredTxResult = txResult.rows.filter(txRow => {
+      if (excludedTxReferences.has(txRow.reference)) {
+        return false;
+      }
+      return true;
+    });
+
+    // Combine results and sort by created_at descending
+    const allItems = [
+      ...tqResult.rows.map(row => ({ ...row, source: 'transfer_queue' })),
+      ...filteredTxResult.map(row => ({ ...row, source: 'transaction' }))
+    ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    // Calculate total for pagination
+    const total = allItems.length;
+
+    // Apply pagination manually
+    const paginatedItems = allItems.slice(offset, offset + Number(limit));
+
+    // Format response to be backwards compatible
+    const formattedData = paginatedItems.map(item => {
+      if (item.source === 'transfer_queue') {
+        // Return as before for backwards compatibility
+        return item;
+      } else {
+        // Format transaction to look similar to transfer for consistency
+        return {
+          id: item.id,
+          business_id: item.business_id,
+          wallet_id: item.wallet_id,
+          reference: item.reference,
+          recipient_account: null,
+          recipient_bank: null,
+          recipient_name: item.description,
+          amount: item.amount,
+          currency: item.currency,
+          remark: item.description,
+          status: item.status,
+          failure_reason: null,
+          source_type: item.transaction_type,
+          source_id: null,
+          transaction_hash: null,
+          initiated_by: null,
+          payment_provider: item.payment_provider,
+          provider_metadata: item.provider_metadata,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          type: 'transaction',
+          direction: item.direction,
+          transaction_type: item.transaction_type,
+          fee: item.fee
+        };
+      }
+    });
+
     res.json({
       success: true,
-      data: result.rows,
+      data: formattedData,
       pagination: {
-        total: parseInt(countRes.rows[0].count),
+        total,
         page: Number(page),
         limit: Number(limit),
-        totalPages: Math.ceil(parseInt(countRes.rows[0].count) / Number(limit))
+        totalPages: Math.ceil(total / Number(limit))
       }
     });
   } catch (error) {
+    console.error("Get transfers error:", error);
     res.status(500).json({ success: false, error: "Failed to fetch transfers" });
   }
 });

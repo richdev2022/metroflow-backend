@@ -38,15 +38,15 @@ export async function initMediasoup() {
   }
 
   try {
+    // Allow configuration via environment variables for production readiness
+    const rtcMinPort = process.env.MEDIASOUP_RTC_MIN_PORT ? Number(process.env.MEDIASOUP_RTC_MIN_PORT) : undefined;
+    const rtcMaxPort = process.env.MEDIASOUP_RTC_MAX_PORT ? Number(process.env.MEDIASOUP_RTC_MAX_PORT) : undefined;
+
     worker = await mediasoup.createWorker({
       logLevel: "warn",
-      logTags: [
-        "ice",
-        "dtls",
-        "rtp",
-        "srtp",
-        "rtcp",
-      ],
+      logTags: ["ice", "dtls", "rtp", "srtp", "rtcp"],
+      rtcMinPort,
+      rtcMaxPort,
     });
 
     logger.info("Mediasoup worker created");
@@ -98,4 +98,26 @@ export function getOrCreateRoom(roomId: string): Room {
 
 export function removeRoom(roomId: string) {
   rooms.delete(roomId);
+}
+
+// Helper utilities to find the room that contains a transport/producer/consumer
+export function findRoomByTransportId(transportId: string): { roomId: string; room: Room } | null {
+  for (const [roomId, room] of rooms.entries()) {
+    if (room.transports.has(transportId)) return { roomId, room };
+  }
+  return null;
+}
+
+export function findRoomByProducerId(producerId: string): { roomId: string; room: Room } | null {
+  for (const [roomId, room] of rooms.entries()) {
+    if (room.producers.has(producerId)) return { roomId, room };
+  }
+  return null;
+}
+
+export function findRoomByConsumerId(consumerId: string): { roomId: string; room: Room } | null {
+  for (const [roomId, room] of rooms.entries()) {
+    if (room.consumers.has(consumerId)) return { roomId, room };
+  }
+  return null;
 }

@@ -1405,3 +1405,102 @@ export const validateMeetingAccess: RequestHandler = async (
     });
   }
 };
+
+// ==================== GUEST ACCESS ====================
+// Guests (no account) join via public meeting links using a short-lived
+// guest token scoped to a single meeting room.
+
+export const guestJoinMeeting: RequestHandler = async (req, res) => {
+  try {
+    const { code } = req.params;
+    const { name, password } = req.body || {};
+
+    if (!code) {
+      return res.status(400).json({ success: false, error: "Meeting code is required" });
+    }
+    const guestName = (name || "").toString().trim().slice(0, 60);
+    if (!guestName) {
+      return res.status(400).json({ success: false, error: "Your name is required to join as a guest" });
+    }
+
+    // Look up meeting globally by code (guests are not business-scoped)
+    const meetingRes = await query(
+      `SELECT m.id, m.title, m.status, m.start_time, m.end_time, m.password, m.waiting_room_enabled,
+              m.max_participants, m.meeting_code, m.business_id, m.recording_enabled, m.screen_sharing_enabled,
+              u.name AS host_name
+       FROM meetings m
+       LEFT JOIN users u ON m.host_id = u.id
+       WHERE m.meeting_code = $1`,
+      [code]
+    );
+
+    if (meetingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, errorCode: "MEETING_NOT_FOUND", error: "Meeting not found" });
+    }
+
+    const meeting = meetingRes.rows[0];
+
+    if (meeting.status === "cancelled") {
+      return res.status(410).json({ success: false, errorCode: "MEETING_CANCELLED", error: "This meeting has been cancelled" });
+    }
+    if (meeting.status === "completed") {
+      return res.status(410).json({ success: false, errorCode: "MEETING_COMPLETED", error: "This meeting has already ended" });
+    }
+    if (meeting.end_time && new Date(meeting.end_time).getTime() < Date.now() - 60 * 60 * 1000) {
+      return res.status(410).json({ success: false, errorCode: "MEETING_ENDED", error: "This meeting has ended" });
+    }
+
+    // Password check
+    if (meeting.password && meeting.password !== password) {
+      return res.status(403).json({ success: false, errorCode: "PASSWORD_REQUIRED", error: "Incorrect meeting password" });
+    }
+
+    // Capacity check (count of joined attendees)
+    if (meeting.max_participants) {
+      const countRes = await query(
+        `SELECT COUNT(*)::int AS joined FROM meeting_attendees WHERE meeting_id = $1 AND status = 'joined'`,
+        [meeting.id]
+      );
+      if (countRes.rows[0].joined >= meeting.max_participants) {
+        return res.status(409).json({ success: false, errorCode: "MAX_PARTICIPANTS_REACHED", error: "Meeting is full" });
+      }
+    }
+
+    const { generateGuestToken } = await import("../utils/guestTokens");
+    const { token, payload } = generateGuestToken({
+      name: guestName,
+      scope: "meeting",
+      roomId: meeting.id,
+      businessId: meeting.business_id,
+      ttlMinutes: 6 * 60,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        meeting: {
+          id: meeting.id,
+          title: meeting.title,
+          meetingCode: meeting.meeting_code,
+          status: meeting.status,
+          startTime: meeting.start_time,
+          endTime: meeting.end_time,
+          hostName: meeting.host_name,
+          waitingRoomEnabled: meeting.waiting_room_enabled,
+          recordingEnabled: meeting.recording_enabled,
+          screenSharingEnabled: meeting.screen_sharing_enabled,
+          hasPassword: Boolean(meeting.password),
+        },
+        guestToken: token,
+        guestId: payload.guestId,
+        guestName,
+        roomId: meeting.id,
+        socketRoom: `meeting:${meeting.id}`,
+        expiresAt: new Date(payload.exp * 1000).toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Guest join meeting error:", error);
+    res.status(500).json({ success: false, error: "Failed to join meeting as guest" });
+  }
+};

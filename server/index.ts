@@ -26,6 +26,10 @@ import {
   forgotPassword,
   verifyResetOTP,
   resetPassword,
+  googleAuth,
+  setPassword,
+  changePassword,
+  getMe,
 } from "./routes/auth";
 import {
   getTasks,
@@ -73,7 +77,7 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants, joinMeeting, validateMeetingAccess } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants, joinMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
@@ -466,6 +470,10 @@ export async function createServer() {
   mainRouter.post("/auth/forgot-password", forgotPassword);
   mainRouter.post("/auth/verify-reset-otp", verifyResetOTP);
   mainRouter.post("/auth/reset-password", resetPassword);
+  mainRouter.post("/auth/google", googleAuth);
+  mainRouter.post("/auth/set-password", authenticateToken, setPassword);
+  mainRouter.post("/auth/change-password", authenticateToken, changePassword);
+  mainRouter.get("/auth/me", authenticateToken, getMe);
 
   // Tasks API routes
   mainRouter.get("/board", authenticateToken, checkSubscriptionStatus, getBoard);
@@ -584,6 +592,9 @@ export async function createServer() {
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
   mainRouter.post("/meetings/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), joinMeeting);
   mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
+  mainRouter.post("/meetings/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingInvite);
+  // Public guest access (must be before any conflicting authenticated routes)
+  mainRouter.get("/meetings/guest/validate/:code", guestValidateMeeting);
 
   // Chat API routes
   mainRouter.get("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversations);

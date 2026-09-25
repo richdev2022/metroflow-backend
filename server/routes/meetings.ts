@@ -1405,3 +1405,224 @@ export const validateMeetingAccess: RequestHandler = async (
     });
   }
 };
+
+/**
+ * @swagger
+ * /meetings/guest/validate/{code}:
+ *   get:
+ *     summary: Validate guest access to a meeting (public - no auth required)
+ *     description: Lets a guest (or any user) check whether a meeting code exists and whether they can join. Used by the join-by-link experience.
+ *     tags: [Meetings]
+ *     parameters:
+ *       - in: path
+ *         name: code
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: token
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Optional invitation token for private meetings
+ *     responses:
+ *       200:
+ *         description: Meeting access validation result
+ */
+export const guestValidateMeeting: RequestHandler = async (req, res) => {
+  try {
+    const { code } = req.params;
+    const inviteToken = (req.query.token as string) || null;
+
+    // NOTE: intentionally NOT scoped to a business - guests join cross-business by code
+    const result = await query(
+      `SELECT id, title, description, status, start_time as "startTime",
+              end_time as "endTime", timezone, meeting_code as "meetingCode",
+              is_instant as "isInstant", waiting_room_enabled as "waitingRoomEnabled",
+              max_participants as "maxParticipants", host_id as "hostId",
+              co_host_id as "coHostId", created_by as "createdById", password,
+              recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled"
+       FROM meetings
+       WHERE meeting_code = $1 OR id = $1`,
+      [code],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+        errorCode: "meeting_not_found",
+      });
+    }
+
+    const raw = result.rows[0];
+    const now = new Date();
+
+    // If an invite token was provided, check whether it is still usable
+    let inviteValid = false;
+    if (inviteToken) {
+      const tokenRes = await query(
+        `SELECT 1 FROM invitation_tokens
+         WHERE token = $1 AND room_id = $2 AND used = FALSE AND expires_at > NOW()`,
+        [inviteToken, raw.id],
+      );
+      inviteValid = tokenRes.rows.length > 0;
+    }
+
+    const hasPassword = !!raw.password;
+
+    let accessState:
+      | "allowed"
+      | "password_required"
+      | "waiting_room"
+      | "not_started"
+      | "ended"
+      | "cancelled"
+      | "completed"
+      | "full" = "allowed";
+    const reasons: string[] = [];
+
+    if (raw.status === "cancelled") {
+      accessState = "cancelled";
+      reasons.push("Meeting has been cancelled");
+    } else if (raw.status === "completed") {
+      accessState = "completed";
+      reasons.push("Meeting has been completed");
+    } else if (raw.endTime && new Date(raw.endTime) < now) {
+      accessState = "ended";
+      reasons.push("Meeting end time has passed");
+    } else if (!raw.isInstant && raw.startTime) {
+      const startTime = new Date(raw.startTime);
+      const fifteenMinBefore = new Date(startTime.getTime() - 15 * 60 * 1000);
+      if (now < fifteenMinBefore) {
+        accessState = "not_started";
+        reasons.push(
+          `Meeting hasn't started yet (starts in ${Math.ceil((startTime.getTime() - now.getTime()) / 60000)} min)`,
+        );
+      }
+    }
+
+    if (accessState === "allowed" && hasPassword && !inviteValid) {
+      accessState = "password_required";
+      reasons.push("This meeting requires a password to join");
+    }
+    if (accessState === "allowed" && raw.waitingRoomEnabled) {
+      accessState = "waiting_room";
+      reasons.push("The host will admit you shortly");
+    }
+
+    // Capacity check (joined attendees vs max)
+    let joinedCount = 0;
+    if (raw.maxParticipants) {
+      const countRes = await query(
+        `SELECT COUNT(*) FROM meeting_attendees WHERE meeting_id = $1 AND status = 'joined'`,
+        [raw.id],
+      );
+      joinedCount = parseInt(countRes.rows[0].count);
+      if (
+        (accessState === "allowed" || accessState === "password_required" || accessState === "waiting_room") &&
+        joinedCount >= raw.maxParticipants
+      ) {
+        accessState = "full";
+        reasons.push("Meeting is currently at maximum capacity");
+      }
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        id: raw.id,
+        title: raw.title,
+        description: raw.description,
+        status: raw.status,
+        startTime: raw.startTime,
+        endTime: raw.endTime,
+        timezone: raw.timezone,
+        meetingCode: raw.meetingCode,
+        meetingLink: buildMeetingLink(raw.meetingCode),
+        isInstant: raw.isInstant,
+        waitingRoomEnabled: raw.waitingRoomEnabled,
+        recordingEnabled: raw.recordingEnabled,
+        screenSharingEnabled: raw.screenSharingEnabled,
+        maxParticipants: raw.maxParticipants,
+        currentParticipants: joinedCount,
+        hasPassword,
+        isHost: false,
+        isGuest: true,
+        inviteValid,
+        accessState,
+        reasons,
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Guest validate meeting error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to validate meeting access",
+    });
+  }
+};
+
+/**
+ * @swagger
+ * /meetings/generate-invite:
+ *   post:
+ *     summary: Generate a guest invite link for a meeting
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ */
+export const generateMeetingInvite: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { roomId, participantName } = req.body || {};
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(401).json({ success: false, error: "Authentication required" });
+    }
+    if (!roomId) {
+      return res.status(400).json({ success: false, error: "roomId is required" });
+    }
+
+    // Resolve meeting (id or code) inside the host's business
+    const meetingRes = await query(
+      `SELECT id, meeting_code as "meetingCode", title FROM meetings
+       WHERE (id = $1 OR meeting_code = $1) AND business_id = $2`,
+      [roomId, businessId],
+    );
+    if (meetingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Meeting not found" });
+    }
+    const meeting = meetingRes.rows[0];
+
+    // Create a reusable-ish invite token (24h validity, single use)
+    const token = crypto.randomBytes(32).toString("hex");
+    await query(
+      `INSERT INTO invitation_tokens (token, room_id, expires_at, used)
+       VALUES ($1, $2, NOW() + INTERVAL '24 hours', FALSE)`,
+      [token, meeting.id],
+    );
+
+    const meetingLink = buildMeetingLink(meeting.meetingCode);
+    const separator = meetingLink.includes("?") ? "&" : "?";
+    const inviteLink = `${meetingLink}${separator}token=${token}&guest=1`;
+
+    res.json({
+      success: true,
+      data: {
+        inviteLink,
+        token,
+        meetingCode: meeting.meetingCode,
+        expiresInHours: 24,
+      },
+    });
+  } catch (error) {
+    console.error("Generate meeting invite error:", error);
+    res.status(500).json({ success: false, error: "Failed to generate invite link" });
+  }
+};

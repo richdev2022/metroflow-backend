@@ -140,6 +140,9 @@ model User {
   businessId          String    @map("business_id")
   email               String
   passwordHash        String?   @map("password_hash")
+  googleId            String?   @unique @map("google_id")
+  authProvider        String    @default("email") @map("auth_provider")
+  avatarUrl           String?   @map("avatar_url")
   name                String
   role                String    @default("member")
   status              String    @default("active")

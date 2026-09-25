@@ -94,7 +94,7 @@ export interface Provider {
   chargeCard(data: ChargeCardRequest): Promise<any>;
   cancelRecurring(token: string): Promise<any>;
   initiateTransfer(data: SingleTransferRequest): Promise<any>;
-  verifyTransfer(reference: string): Promise<any>;
+  verifyTransfer(reference: string, providerMetadata?: any): Promise<any>;
   authorizeTransfer(reference: string, authorizationCode: string): Promise<any>;
   resendTransferOTP(reference: string): Promise<any>;
   getAllTransfers(pageNo?: number, pageSize?: number): Promise<any>;

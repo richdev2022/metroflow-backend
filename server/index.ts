@@ -234,6 +234,19 @@ export async function createServer() {
     startTransferMonitor();
   }
 
+  // Security configuration diagnostics (once at boot, mirrors the Flutterwave
+  // key warnings). These secrets silently fall back to public defaults when
+  // unset, which is only acceptable for local development.
+  if (!process.env.CRON_SECRET) {
+    console.warn("CRON_SECRET is not set - cron endpoints fall back to a public default (set it before going live).");
+  }
+  if (!process.env.JOBS_SECRET) {
+    console.warn("JOBS_SECRET is not set - /internal/jobs endpoints accept unauthenticated calls (set it before going live).");
+  }
+  if (!process.env.TRANSACTION_HASH_SECRET) {
+    console.warn("TRANSACTION_HASH_SECRET is not set - transaction hashes are signed with a public default (set it before going live).");
+  }
+
   // Serverless fallback: in serverless environments there is no persistent
   // process, so a per-minute cron stands in for the poller. On a persistent
   // server (PM2/VPS) this MUST NOT run - the poller above already covers it,

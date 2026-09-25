@@ -847,7 +847,7 @@ export async function initializeDatabase() {
         `);
         
         for (const wallet of walletsRes.rows) {
-            const provider = wallet.payment_provider || 'squad';
+            const provider = wallet.payment_provider || 'flutterwave';
             // Check if VA already exists for this provider
             const existingVaRes = await query(
                 `SELECT id FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,

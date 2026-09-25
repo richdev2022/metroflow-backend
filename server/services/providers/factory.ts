@@ -11,7 +11,7 @@ const providers: Record<string, Provider> = {
   flutterwave: flutterwaveProvider,
 };
 
-const DEFAULT_PROVIDER = process.env.DEFAULT_PAYMENT_PROVIDER || "squad";
+const DEFAULT_PROVIDER = process.env.DEFAULT_PAYMENT_PROVIDER || "flutterwave";
 
 // Global active provider (managed by admins) is stored in system_settings.
 // Cached in-memory briefly to avoid a DB hit on every payment call.

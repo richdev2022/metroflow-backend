@@ -89,7 +89,16 @@ export const getConversations: RequestHandler = async (
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessage,
         (SELECT cm.created_at FROM chat_messages cm 
          WHERE cm.conversation_id = cc.id 
-         ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt
+         ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt,
+        (
+          SELECT COUNT(*)::int
+          FROM chat_messages cm
+          JOIN chat_participants cp_me
+            ON cp_me.conversation_id = cm.conversation_id AND cp_me.user_id = $2
+          WHERE cm.conversation_id = cc.id
+            AND cm.sender_id <> $2
+            AND cm.created_at > COALESCE(cp_me.last_read_at, cp_me.created_at, to_timestamp(0))
+        ) as "unreadCount"
       FROM chat_conversations cc
       WHERE cc.business_id = $1 AND EXISTS (
         SELECT 1 FROM chat_participants cp_current 

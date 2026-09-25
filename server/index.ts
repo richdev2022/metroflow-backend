@@ -77,9 +77,9 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, addMeetingParticipants, joinMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
@@ -603,6 +603,8 @@ export async function createServer() {
   mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
   mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingByCode);
   mainRouter.get("/meetings/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), validateMeetingAccess);
+  // Get meeting by UUID or code (must be registered after the more specific GET routes above)
+  mainRouter.get("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingById);
   mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
@@ -626,6 +628,8 @@ export async function createServer() {
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCalls);
   mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallByCode);
   mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), validateCallAccess);
+  // Get call by UUID or code (must be registered after the more specific GET routes above)
+  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallById);
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), joinCall);
@@ -640,6 +644,8 @@ export async function createServer() {
   mainRouter.get("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordings);
   mainRouter.post("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), createRecording);
   mainRouter.put("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), updateRecording);
+  // PATCH alias: the web client patches recording status on failure
+  mainRouter.patch("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), updateRecording);
   mainRouter.post("/recordings/:id/upload", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), ...uploadRecording);
   mainRouter.delete("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), deleteRecording);
 

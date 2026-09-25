@@ -341,129 +341,210 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
   return transfer;
 }
 
-// Background service to check processing transfers AND stuck pending transfers
-export async function checkProcessingTransfers() {
-    try {
-        console.log("[TransferMonitor] Checking processing and stuck pending transfers...");
-        
-        // 1. Get all processing transfers
-        const processingTransfers = await query(
-            `SELECT * FROM transfer_queue WHERE status = 'processing' ORDER BY updated_at ASC`
-        );
+// ============================================================
+// Transfer Reconciliation Service (safety net)
+// ------------------------------------------------------------
+// Flutterwave webhooks (`transfer.completed`) are the PRIMARY
+// mechanism for transfer status changes. This poller is only a
+// fallback for missed/late webhooks and is intentionally cheap:
+//   1. Probe-first: a single indexed `LIMIT 1` existence query
+//      per idle cycle - no row fetching when there is no work.
+//   2. Bounded batch (LIMIT) when there IS work.
+//   3. Self-scheduling loop: the next run is scheduled only
+//      after the current one finishes, so runs can NEVER overlap
+//      (the old setInterval stacked up when runs were slow).
+//   4. Exponential backoff (1 -> 15 min) when the DB is
+//      unhealthy (e.g. quota exceeded), instead of hammering it.
+//   5. Quiet logging: nothing is logged while idle; errors are
+//      rate-limited to one concise line per 5 minutes.
+// ============================================================
 
-        // 2. Get pending transfers older than 2 minutes (stuck)
-        const stuckPendingTransfers = await query(
-            `SELECT * FROM transfer_queue 
-             WHERE status = 'pending' 
-               AND created_at < NOW() - INTERVAL '2 minutes' 
-             ORDER BY created_at ASC`
-        );
+const RECONCILE_BATCH_SIZE = 25;
+// Only re-verify 'processing' transfers whose last update is older than this
+const PROCESSING_STALE_SECONDS = 90;
+// 'pending' transfers older than this are considered stuck and re-driven
+const PENDING_STUCK_MINUTES = 2;
+// A processing transfer older than this is marked failed and refunded
+const TRANSFER_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-        if (processingTransfers.rows.length === 0 && stuckPendingTransfers.rows.length === 0) {
-            console.log("[TransferMonitor] No processing or stuck pending transfers found");
-            return;
-        }
+const IDLE_INTERVAL_MS = 60_000;        // 1 min idle cadence
+const MAX_BACKOFF_MS = 15 * 60_000;     // 15 min max backoff
+const ERROR_LOG_INTERVAL_MS = 5 * 60_000;
 
-        console.log(`[TransferMonitor] Found ${processingTransfers.rows.length} processing transfers and ${stuckPendingTransfers.rows.length} stuck pending transfers`);
+let monitorTimer: ReturnType<typeof setTimeout> | null = null;
+let monitorRunning = false;
+let consecutiveFailures = 0;
+let lastErrorLogAt = 0;
 
-        // Process stuck pending transfers by triggering processAllPending for each unique business
-        if (stuckPendingTransfers.rows.length > 0) {
-            const uniqueBusinessIds = Array.from(new Set(stuckPendingTransfers.rows.map(t => t.business_id)));
-            console.log(`[TransferMonitor] Processing stuck pending for ${uniqueBusinessIds.length} businesses`);
-            
-            for (const businessId of uniqueBusinessIds as string[]) {
-                try {
-                    console.log(`[TransferMonitor] Running processAllPending for stuck business: ${businessId}`);
-                    await processAllPending(businessId);
-                } catch (bizError) {
-                    console.error(`[TransferMonitor] Error processing stuck pending for business ${businessId}:`, bizError);
-                }
-            }
-        }
-
-        // Timeout after 24 hours
-        const timeoutMs = 24 * 60 * 60 * 1000; // 24 hours
-
-        for (const transfer of processingTransfers.rows) {
-            const updatedAt = new Date(transfer.updated_at);
-            const now = new Date();
-            const timeSinceUpdate = now.getTime() - updatedAt.getTime();
-            
-            if (timeSinceUpdate > timeoutMs) {
-                console.log(`[TransferMonitor] Transfer ${transfer.reference} has been processing for too long, marking as failed`);
-                
-                // Mark as failed
-                await query(
-                    `UPDATE transfer_queue 
-                     SET status = 'failed', 
-                         failure_reason = 'Transfer timed out after 24 hours', 
-                         updated_at = CURRENT_TIMESTAMP 
-                     WHERE id = $1`,
-                    [transfer.id]
-                );
-                
-                // Handle refund
-                if (transfer.wallet_id) {
-                    const amount = parseFloat(transfer.amount);
-                    const fee = parseFloat(transfer.fee || '0');
-                    const totalRefund = amount + fee;
-                    
-                    const txnCheck = await query(
-                        `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
-                        [transfer.reference]
-                    );
-                    
-                    if (txnCheck.rows.length > 0) {
-                        console.log(`[TransferMonitor] Refunding transfer ${transfer.reference} - Amount: ${totalRefund}`);
-                        
-                        await query(
-                            `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
-                            [totalRefund, transfer.wallet_id]
-                        );
-                        
-                        await debitPlatformWallet(amount, transfer.currency || 'NGN');
-                        
-                        if (fee > 0) {
-                            await debitRevenueWallet(fee, transfer.currency || 'NGN');
-                        }
-                        
-                        // Check if refund transaction already exists
-                        const refundTxnCheck = await query(
-                            `SELECT id FROM transactions WHERE reference = $1`,
-                            [transfer.reference + '-REFUND']
-                        );
-                        
-                        if (refundTxnCheck.rows.length === 0) {
-                            await query(
-                                `INSERT INTO transactions 
-                                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                                [
-                                    transfer.business_id, 
-                                    amount, 
-                                    transfer.currency || 'NGN', 
-                                    transfer.reference + '-REFUND', 
-                                    `Refund for timed out transfer: ${transfer.reference}`,
-                                    transfer.wallet_id
-                                ]
-                            );
-                        }
-                    }
-                }
-            } else {
-                // Only verify if not timed out
-                await verifySingleTransfer(transfer);
-            }
-        }
-    } catch (error: any) {
-        console.error("[TransferMonitor] Error in checkProcessingTransfers:", error);
-    }
+function nextDelayMs(): number {
+  if (consecutiveFailures === 0) return IDLE_INTERVAL_MS;
+  // 1 -> 2 -> 4 -> 8 -> 15 min (capped) after consecutive failures
+  const backoff = IDLE_INTERVAL_MS * Math.pow(2, Math.min(consecutiveFailures - 1, 4));
+  return Math.min(backoff, MAX_BACKOFF_MS);
 }
 
-// Start the background service
-export function startTransferMonitor(intervalMs: number = 60000) { // Default: check every minute
-  console.log(`[TransferMonitor] Starting transfer monitor with interval ${intervalMs}ms`);
-  setInterval(checkProcessingTransfers, intervalMs);
+// Log at most one concise line per ERROR_LOG_INTERVAL_MS - prevents
+// multi-hundred-MB log files when the database is unreachable.
+function logRateLimited(context: string, error: any) {
+  const now = Date.now();
+  if (now - lastErrorLogAt < ERROR_LOG_INTERVAL_MS) return;
+  lastErrorLogAt = now;
+  const msg = error?.message || String(error);
+  const code = error?.code ? ` [pg ${error.code}]` : "";
+  console.error(`[TransferMonitor] ${context}: ${msg}${code}`);
+}
+
+// Refund a timed-out transfer back to the source wallet
+async function refundTimedOutTransfer(transfer: any) {
+  const amount = parseFloat(transfer.amount);
+  const fee = parseFloat(transfer.fee || '0');
+  const totalRefund = amount + fee;
+
+  await query(
+    `UPDATE transfer_queue
+     SET status = 'failed',
+         failure_reason = 'Transfer timed out after 24 hours',
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [transfer.id]
+  );
+
+  if (!transfer.wallet_id) return;
+
+  const txnCheck = await query(
+    `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+    [transfer.reference]
+  );
+  if (txnCheck.rows.length === 0) return;
+
+  await query(
+    `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+    [totalRefund, transfer.wallet_id]
+  );
+
+  await debitPlatformWallet(amount, transfer.currency || 'NGN');
+
+  if (fee > 0) {
+    await debitRevenueWallet(fee, transfer.currency || 'NGN');
+  }
+
+  // Check if refund transaction already exists
+  const refundTxnCheck = await query(
+    `SELECT id FROM transactions WHERE reference = $1`,
+    [transfer.reference + '-REFUND']
+  );
+
+  if (refundTxnCheck.rows.length === 0) {
+    await query(
+      `INSERT INTO transactions
+       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
+      [
+        transfer.business_id,
+        amount,
+        transfer.currency || 'NGN',
+        transfer.reference + '-REFUND',
+        `Refund for timed out transfer: ${transfer.reference}`,
+        transfer.wallet_id
+      ]
+    );
+  }
+}
+
+/**
+ * One reconciliation pass. Safe to call from anywhere (scheduler,
+ * cron, BullMQ worker) - concurrent calls are collapsed into a
+ * no-op while a pass is already running.
+ */
+export async function checkProcessingTransfers(): Promise<void> {
+  if (monitorRunning) return; // single-flight guard
+  monitorRunning = true;
+  try {
+    // --- Probe first: ONE tiny indexed query when idle ---
+    const probe = await query(
+      `SELECT 1 FROM transfer_queue
+       WHERE (status = 'processing' AND updated_at < NOW() - INTERVAL '${PROCESSING_STALE_SECONDS} seconds')
+          OR (status = 'pending' AND created_at < NOW() - INTERVAL '${PENDING_STUCK_MINUTES} minutes')
+       LIMIT 1`
+    );
+
+    if (probe.rows.length === 0) {
+      consecutiveFailures = 0; // DB healthy, nothing to reconcile
+      return; // silent: no work, no logs
+    }
+
+    // --- There IS work: fetch a bounded batch ---
+    const staleRows = await query(
+      `SELECT * FROM transfer_queue
+       WHERE (status = 'processing' AND updated_at < NOW() - INTERVAL '${PROCESSING_STALE_SECONDS} seconds')
+          OR (status = 'pending' AND created_at < NOW() - INTERVAL '${PENDING_STUCK_MINUTES} minutes')
+       ORDER BY updated_at ASC
+       LIMIT ${RECONCILE_BATCH_SIZE}`
+    );
+
+    const transfers = staleRows.rows;
+    console.log(`[TransferMonitor] Reconciling ${transfers.length} stale transfer(s)`);
+
+    // 1. Re-drive stuck pending transfers through the normal pipeline
+    const stuckPending = transfers.filter(t => t.status === 'pending');
+    const uniqueBusinessIds = Array.from(new Set(stuckPending.map(t => t.business_id)));
+    for (const businessId of uniqueBusinessIds as string[]) {
+      try {
+        await processAllPending(businessId);
+      } catch (bizError: any) {
+        logRateLimited(`Error processing stuck pending for business ${businessId}`, bizError);
+      }
+    }
+
+    // 2. Verify stale processing transfers (webhook may have been missed)
+    const now = Date.now();
+    for (const transfer of transfers.filter(t => t.status === 'processing')) {
+      const timeSinceUpdate = now - new Date(transfer.updated_at).getTime();
+
+      if (timeSinceUpdate > TRANSFER_TIMEOUT_MS) {
+        console.log(`[TransferMonitor] Transfer ${transfer.reference} timed out after 24h, marking failed + refunding`);
+        try {
+          await refundTimedOutTransfer(transfer);
+        } catch (refundError: any) {
+          logRateLimited(`Error refunding timed out transfer ${transfer.reference}`, refundError);
+        }
+      } else {
+        try {
+          await verifySingleTransfer(transfer);
+        } catch (verifyError: any) {
+          logRateLimited(`Error verifying transfer ${transfer.reference}`, verifyError);
+        }
+      }
+    }
+
+    consecutiveFailures = 0;
+  } catch (error: any) {
+    consecutiveFailures++;
+    logRateLimited("Transfer reconciliation skipped (will retry with backoff)", error);
+  } finally {
+    monitorRunning = false;
+  }
+}
+
+// Start the reconciliation loop.
+// NOTE: intentionally self-scheduling via setTimeout (NOT setInterval)
+// so that a slow pass can never overlap the next one.
+export function startTransferMonitor(firstRunDelayMs: number = IDLE_INTERVAL_MS) {
+  if (monitorTimer) return; // idempotent: never double-start
+  console.log(
+    `[TransferMonitor] Reconciliation poller started ` +
+    `(idle cadence ${IDLE_INTERVAL_MS / 1000}s, backoff up to ${MAX_BACKOFF_MS / 60000}min on DB errors, webhook-first)`
+  );
+
+  const tick = async () => {
+    try {
+      await checkProcessingTransfers();
+    } finally {
+      monitorTimer = setTimeout(tick, nextDelayMs());
+    }
+  };
+
+  monitorTimer = setTimeout(tick, firstRunDelayMs);
 }
 
 export async function processAllPending(businessId: string) {

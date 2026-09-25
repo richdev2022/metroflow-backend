@@ -226,21 +226,28 @@ export async function createServer() {
   }
   await updateOverdueTasks();
   
-  // Start transfer monitor in local environment
+  // Start transfer reconciliation poller (non-serverless only).
+  // Webhook-first design: Flutterwave `transfer.completed` webhooks drive
+  // status changes; the poller is a cheap safety net (probe-first query,
+  // bounded batch, self-scheduling loop, exponential backoff on DB errors).
   if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
-    startTransferMonitor(10000); // Check every 10 seconds
+    startTransferMonitor();
   }
-  
-  // Also add a cron job for serverless environments (though it may not run as frequently)
-  cron.schedule("* * * * *", async () => {
-    try {
-      console.log("[Cron] Checking processing transfers...");
-      const { checkProcessingTransfers } = await import("./services/transfer");
-      await checkProcessingTransfers();
-    } catch (error) {
-      console.error("[Cron] Error checking processing transfers:", error);
-    }
-  });
+
+  // Serverless fallback: in serverless environments there is no persistent
+  // process, so a per-minute cron stands in for the poller. On a persistent
+  // server (PM2/VPS) this MUST NOT run - the poller above already covers it,
+  // and a second scheduler would double the database load.
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) {
+    cron.schedule("* * * * *", async () => {
+      try {
+        const { checkProcessingTransfers } = await import("./services/transfer");
+        await checkProcessingTransfers();
+      } catch (error) {
+        console.error("[Cron] Error checking processing transfers:", error);
+      }
+    });
+  }
 
   // Logging Middleware
   app.use((req, res, next) => {
@@ -320,27 +327,19 @@ export async function createServer() {
   });
 
   let lastDocJobRun = 0;
-  app.use((req, res, next) => {
-    const now = Date.now();
-    if (now - lastDocJobRun > 15000) {
-      lastDocJobRun = now;
-      processPendingProductDocJobs(1).catch((e) => console.error("Doc job tick error:", e));
-    }
-    next();
-  });
-
-  // Local-only cron to process product documentation jobs frequently
-  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
-    cron.schedule("* * * * *", async () => {
-      try {
-        const result = await processPendingProductDocJobs(5);
-        console.log("Product doc jobs processed by local cron:", result);
-      } catch (error) {
-        console.error("Product doc job cron error:", error);
+  // Serverless-only: crons cannot run in serverless, so HTTP traffic drives
+  // product doc job processing there (throttled to one tick per 15s).
+  // On persistent servers the dedicated cron below handles it instead.
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) {
+    app.use((req, res, next) => {
+      const now = Date.now();
+      if (now - lastDocJobRun > 15000) {
+        lastDocJobRun = now;
+        processPendingProductDocJobs(1).catch((e) => console.error("Doc job tick error:", e));
       }
+      next();
     });
   }
-
 
   // Fix for potential body parsing issues in serverless environment
   app.use((req, res, next) => {
@@ -382,10 +381,11 @@ export async function createServer() {
     next();
   });
 
-  if (!isLambda) {
+  // Single local cron for product documentation jobs (non-serverless only).
+  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
     cron.schedule("* * * * *", async () => {
       try {
-        await processPendingProductDocJobs(3);
+        await processPendingProductDocJobs(5);
       } catch (error) {
         console.error("Product doc cron error:", error);
       }

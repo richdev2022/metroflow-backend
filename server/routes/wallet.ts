@@ -5,6 +5,7 @@ import { getProvider, resolveProvider, getActiveProviderName, getAvailableProvid
 import { toMinorUnit } from "../services/transfer";
 import { calculateFee } from "../services/fees";
 import { generateToken } from "../services/auth";
+import { getBankNameByCode } from "../utils/bank-codes";
 
 const router = express.Router();
 
@@ -221,6 +222,13 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, async 
         }
 
         if (isSuccess && vaNumber) {
+            // Capture the provider-reported bank name/code when available so the
+            // wallet endpoint can surface an accurate bank name to clients.
+            let resolvedBankCode = bankCode;
+            if (provider.name === 'flutterwave' && vaResponse.data?.bank_code) {
+                resolvedBankCode = vaResponse.data.bank_code;
+            }
+
             // Check if VA record exists for this provider, update or insert
             const existingVaRes = await query(
                 `SELECT * FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
@@ -239,14 +247,14 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, async 
                         provider_metadata = $6,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $7
-                `, [vaNumber, bankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse), existingVaRes.rows[0].id]);
+                `, [vaNumber, resolvedBankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse), existingVaRes.rows[0].id]);
             } else {
                 // Insert new VA
                 await query(`
                     INSERT INTO virtual_accounts 
                     (wallet_id, payment_provider, virtual_account_number, bank_code, account_name, customer_identifier, beneficiary_account, provider_metadata)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                `, [wallet.id, provider.name, vaNumber, bankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse)]);
+                `, [wallet.id, provider.name, vaNumber, resolvedBankCode, accountName, customerIdentifier, "0000000000", JSON.stringify(vaResponse)]);
             }
 
             return res.json({ 
@@ -291,10 +299,25 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
         // Function to fetch wallet with virtual accounts
         const getWalletWithVAs = async (walletId: string) => {
             const vas = await query(`SELECT * FROM virtual_accounts WHERE wallet_id = $1`, [walletId]);
-            return vas.rows.map(va => ({
-                ...va,
-                is_active: va.payment_provider === activeProviderName
-            }));
+            return vas.rows.map(va => {
+                // Resolve a human-readable bank name for display. Provider metadata
+                // carries the bank name from the provisioning response:
+                //  - Flutterwave: data.bank_name
+                //  - Monnify:     responseBody.accounts[0].bankName
+                //  - Squad:       only bank_code (NIBSS) -> resolved via lookup
+                const meta = (va.provider_metadata || {}) as Record<string, any>;
+                let bankName: string | null = null;
+                if (meta?.data?.bank_name) bankName = meta.data.bank_name;
+                else if (meta?.responseBody?.accounts?.[0]?.bankName) bankName = meta.responseBody.accounts[0].bankName;
+                else if (meta?.bank_name) bankName = meta.bank_name;
+                else if (meta?.bankName) bankName = meta.bankName;
+                if (!bankName) bankName = getBankNameByCode(va.bank_code);
+                return {
+                    ...va,
+                    is_active: va.payment_provider === activeProviderName,
+                    bank_name: bankName
+                };
+            });
         };
         
         // Return User Wallet AND Business Wallet (if user is admin/owner)
@@ -673,6 +696,25 @@ router.get("/verify", async (req, res) => {
             `);
         }
 
+        // Build the client-facing redirect URL. The client may pass either:
+        //  - a bare origin (https://app.example.com)  -> we append /wallet + params
+        //  - a specific landing path (https://app.example.com/payment/callback) -> we only append params
+        const buildClientRedirect = (status: string, withToken: boolean, token?: string) => {
+            let base = clientAppUrl.replace(/\/+$/, "");
+            let hasLandingPath = false;
+            try {
+                const parsed = new URL(clientAppUrl);
+                hasLandingPath = parsed.pathname && parsed.pathname !== "/";
+            } catch {
+                // Not an absolute URL (e.g. relative base) - treat as origin
+                hasLandingPath = false;
+            }
+            if (!hasLandingPath) base += `/wallet`;
+            const params = new URLSearchParams({ status, reference });
+            if (withToken && token) params.set("token", token);
+            return `${base}?${params.toString()}`;
+        };
+
         // 1. Check local transaction status first
         const txRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
         
@@ -699,10 +741,11 @@ router.get("/verify", async (req, res) => {
              // If settlement is also settled (or missing and we assume success), redirect
              if (!settlement || settlement.status === 'settled') {
                  const token = await generateToken(transaction.user_id, transaction.business_id);
+                 const redirectTarget = buildClientRedirect('success', true, token);
                  return res.send(`
                     <html>
                         <head>
-                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" />
+                            <meta http-equiv="refresh" content="3;url=${redirectTarget}" />
                         </head>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <div style="margin-bottom: 20px;">
@@ -711,7 +754,7 @@ router.get("/verify", async (req, res) => {
                             <h1 style="color: green;">Payment Successful</h1>
                             <p>Your wallet has been funded.</p>
                             <p>Redirecting you back to the app...</p>
-                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                            <a href="${redirectTarget}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                             <style>
                                 @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             </style>
@@ -826,10 +869,11 @@ router.get("/verify", async (req, res) => {
                 // sendEmail(...)
                 
                 const token = await generateToken(transaction.user_id, transaction.business_id);
+                const redirectTarget = buildClientRedirect('success', true, token);
                 return res.send(`
                     <html>
                         <head>
-                            <meta http-equiv="refresh" content="3;url=${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" />
+                            <meta http-equiv="refresh" content="3;url=${redirectTarget}" />
                         </head>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <div style="margin-bottom: 20px;">
@@ -838,7 +882,7 @@ router.get("/verify", async (req, res) => {
                             <h1 style="color: green;">Payment Successful</h1>
                             <p>Your wallet has been funded.</p>
                             <p>Redirecting you back to the app...</p>
-                            <a href="${clientAppUrl}/wallet?status=success&reference=${reference}&token=${encodeURIComponent(token)}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                            <a href="${redirectTarget}" style="display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                             <style>
                                 @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             </style>
@@ -850,13 +894,14 @@ router.get("/verify", async (req, res) => {
                 await client.query('ROLLBACK');
                 console.error("Settlement Transaction Failed:", err);
                 
+                const pendingTarget = buildClientRedirect('pending_settlement', false);
                 return res.send(`
                     <html>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <h1 style="color: orange;">Payment Successful, Settlement Pending</h1>
                             <p>We received your payment, but there was a delay in crediting your wallet.</p>
                             <p>The system will retry automatically, or an admin will process it shortly.</p>
-                            <a href="${clientAppUrl}/dashboard/wallet?status=pending_settlement&reference=${reference}" style="display: inline-block; padding: 10px 20px; background: #ffc107; color: black; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                            <a href="${pendingTarget}" style="display: inline-block; padding: 10px 20px; background: #ffc107; color: black; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                         </body>
                     </html>
                 `);
@@ -866,12 +911,13 @@ router.get("/verify", async (req, res) => {
 
         } else {
              // Verification failed or status is not success
+             const failedTarget = buildClientRedirect('failed', false);
              return res.send(`
                 <html>
                     <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                         <h1 style="color: red;">Verification Failed</h1>
                         <p>We could not verify your payment. Please contact support if you have been debited.</p>
-                        <a href="${clientAppUrl}/dashboard/wallet?status=failed&reference=${reference}" style="display: inline-block; padding: 10px 20px; background: #dc3545; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                        <a href="${failedTarget}" style="display: inline-block; padding: 10px 20px; background: #dc3545; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
                     </body>
                 </html>
             `);

@@ -1664,3 +1664,84 @@ export const guestJoinCall: RequestHandler = async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to join call as guest" });
   }
 };
+
+/**
+ * GET /calls/guest/validate/:code (public)
+ * Pre-join check for guests opening a call link. Mirrors the meeting
+ * guest validate endpoint so clients can preview call info + access state
+ * before asking for a name/password.
+ */
+export const guestValidateCall: RequestHandler = async (req, res) => {
+  try {
+    const { code } = req.params;
+    const { token } = req.query as { token?: string };
+
+    if (!code) {
+      return res.status(400).json({ success: false, errorCode: "CALL_NOT_FOUND", error: "Call code is required" });
+    }
+
+    // Look up call globally by code (guests are not business-scoped)
+    const callRes = await query(
+      `SELECT c.id, c.type, c.status, c.call_code, c.password, c.waiting_room_enabled,
+              c.max_participants, c.recording_enabled, c.screen_sharing_enabled, c.is_group_call,
+              u.name AS host_name, c.started_at, c.ended_at
+       FROM calls c
+       LEFT JOIN users u ON c.host_id = u.id
+       WHERE c.call_code = $1`,
+      [code]
+    );
+
+    if (callRes.rows.length === 0) {
+      return res.status(404).json({ success: false, errorCode: "CALL_NOT_FOUND", error: "Call not found" });
+    }
+
+    const call = callRes.rows[0];
+
+    let accessState = "allowed";
+    const reasons: string[] = [];
+    if (call.password) {
+      accessState = "password_required";
+      reasons.push("Password required");
+    }
+    if (call.status === "cancelled") {
+      accessState = "cancelled";
+      reasons.push("This call has been cancelled");
+    } else if (call.status === "completed" || call.status === "missed") {
+      accessState = "ended";
+      reasons.push("This call has already ended");
+    }
+
+    let inviteValid = true;
+    if (token) {
+      const tokenRes = await query(
+        `SELECT id FROM invitation_tokens WHERE token = $1 AND room_id = $2 AND used = FALSE AND expires_at > NOW()`,
+        [token, call.id]
+      );
+      inviteValid = tokenRes.rows.length > 0;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: call.id,
+        type: call.type,
+        callCode: call.call_code,
+        status: call.status,
+        hostName: call.host_name,
+        waitingRoomEnabled: call.waiting_room_enabled,
+        recordingEnabled: call.recording_enabled,
+        screenSharingEnabled: call.screen_sharing_enabled,
+        isGroupCall: call.is_group_call,
+        hasPassword: Boolean(call.password),
+        accessState,
+        reasons,
+        isGuest: true,
+        isHost: false,
+        inviteValid,
+      },
+    });
+  } catch (error) {
+    console.error("Guest validate call error:", error);
+    res.status(500).json({ success: false, error: "Failed to validate call link" });
+  }
+};

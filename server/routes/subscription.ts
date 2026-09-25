@@ -1,6 +1,6 @@
 import express from "express";
 import { authenticateToken, AuthenticatedRequest, checkFeaturePermission } from "../middleware/auth";
-import { query } from "../db";
+import { query, pool } from "../db";
 import { getProvider } from "../services/providers/factory";
 import { processSubscriptionRenewals } from "../services/subscription";
 import { creditRevenueWallet } from "../services/fees";
@@ -905,6 +905,100 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
 
     const providerName = transaction.payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'flutterwave';
     const provider = getProvider(providerName);
+
+    // -----------------------------------------------------------------
+    // Wallet funding transactions must NOT flow through the subscription
+    // update path below - they need an atomic wallet credit instead.
+    // -----------------------------------------------------------------
+    if (transaction.transaction_type === 'wallet_funding') {
+        let walletVerified = false;
+        try {
+            const verifyResponse = await provider.verifyPayment(reference);
+            if (providerName === 'squad') {
+                walletVerified = verifyResponse && verifyResponse.success && verifyResponse.data?.transaction_status === 'success';
+            } else if (providerName === 'flutterwave') {
+                walletVerified = verifyResponse && verifyResponse.success &&
+                    ['successful', 'success'].includes(verifyResponse.data?.status);
+                if (walletVerified && verifyResponse.data) {
+                    const verifiedAmount = parseFloat(verifyResponse.data.amount);
+                    const expectedAmount = parseFloat(transaction.amount) + parseFloat(transaction.fee || 0);
+                    if (!Number.isNaN(verifiedAmount) && verifiedAmount + 0.01 < expectedAmount) {
+                        walletVerified = false;
+                    }
+                    const verifiedCurrency = verifyResponse.data.currency || 'NGN';
+                    if (transaction.currency && verifiedCurrency !== transaction.currency) {
+                        walletVerified = false;
+                    }
+                }
+            } else if (providerName === 'monnify') {
+                walletVerified = verifyResponse && verifyResponse.success && verifyResponse.data?.paymentStatus === 'PAID';
+            }
+        } catch (verifyErr) {
+            console.error("Wallet funding verification failed:", verifyErr);
+        }
+
+        if (!walletVerified) {
+            return res.status(400).json({ success: false, error: "Payment verification failed" });
+        }
+
+        // Atomic credit: wallet balance + transaction + settlement + platform fee
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            await client.query(
+                `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
+                [transaction.amount, transaction.wallet_id]
+            );
+            await client.query(
+                `UPDATE transactions SET status = 'success', updated_at = NOW() WHERE id = $1`,
+                [transaction.id]
+            );
+
+            const settlementCheck = await client.query(`SELECT id, status FROM settlements WHERE transaction_id = $1`, [transaction.id]);
+            if (settlementCheck.rows.length === 0) {
+                await client.query(
+                    `INSERT INTO settlements (transaction_id, business_id, user_id, amount, status)
+                     VALUES ($1, $2, $3, $4, 'settled')`,
+                    [transaction.id, transaction.business_id, transaction.user_id, transaction.amount]
+                );
+            } else {
+                await client.query(
+                    `UPDATE settlements SET status = 'settled', updated_at = NOW() WHERE id = $1`,
+                    [settlementCheck.rows[0].id]
+                );
+            }
+
+            if (transaction.fee > 0) {
+                const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
+                if (platformWalletRes.rows.length > 0) {
+                    const platformWalletId = platformWalletRes.rows[0].id;
+                    const platTxCheck = await client.query(
+                        `SELECT id FROM transactions WHERE reference = $1 AND type = 'credit' AND wallet_id = $2`,
+                        [`${reference}-PLATFORM-FEE`, platformWalletId]
+                    );
+                    if (platTxCheck.rows.length === 0) {
+                        await client.query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [transaction.fee, platformWalletId]);
+                        await client.query(
+                            `INSERT INTO transactions
+                             (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                             VALUES ($1, 'NGN', 'success', $2, 'credit', 'Fee for Wallet Funding', 'fee', $3, 'credit')`,
+                            [transaction.fee, `${reference}-PLATFORM-FEE`, platformWalletId]
+                        );
+                    }
+                }
+            }
+
+            await client.query('COMMIT');
+            return res.json({ success: true, message: "Wallet funded successfully" });
+        } catch (creditErr) {
+            await client.query('ROLLBACK');
+            console.error("Wallet funding credit failed:", creditErr);
+            return res.status(500).json({ success: false, error: "Payment verified but wallet credit failed. It will be retried automatically." });
+        } finally {
+            client.release();
+        }
+    }
 
     // Verify with the provider that initiated the transaction
     const verifyResponse = await provider.verifyPayment(reference);

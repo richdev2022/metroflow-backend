@@ -3270,6 +3270,182 @@ protectedRouter.put("/kyc/business/:id", requirePermission('manage_businesses'),
     }
 });
 
+// ==================== PAYMENT PROVIDER MANAGEMENT ====================
 
+// Get payment providers overview (active provider, config status, stats)
+protectedRouter.get("/payment-providers", async (req, res) => {
+    try {
+        const { getActiveProviderName, getAvailableProviders, getProviderConfigStatus } = await import("../services/providers/factory");
+        const activeProvider = await getActiveProviderName();
+        const configStatus = getProviderConfigStatus();
+
+        // Stats per provider: transaction counts + volume + webhook log counts
+        const txStats = await query(
+            `SELECT payment_provider, COUNT(*)::int AS transactions,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) AS successful_volume
+             FROM transactions
+             WHERE payment_provider IS NOT NULL
+             GROUP BY payment_provider`
+        );
+        const webhookStats = await query(
+            `SELECT provider, COUNT(*)::int AS events FROM squad_webhooks GROUP BY provider`
+        );
+        const transferStats = await query(
+            `SELECT payment_provider, COUNT(*)::int AS transfers FROM transfer_queue GROUP BY payment_provider`
+        );
+
+        const providers = getAvailableProviders().map((name) => {
+            const tx = txStats.rows.find((r) => r.payment_provider === name) || {};
+            const wh = webhookStats.rows.find((r) => r.provider === name) || {};
+            const tr = transferStats.rows.find((r) => r.payment_provider === name) || {};
+            return {
+                name,
+                isActive: name === activeProvider,
+                configured: configStatus[name]?.configured ?? false,
+                requiredEnv: configStatus[name]?.requiredEnv ?? [],
+                transactionCount: tx.transactions || 0,
+                successfulVolume: tx.successful_volume || 0,
+                transferCount: tr.transfers || 0,
+                webhookEventCount: wh.events || 0,
+            };
+        });
+
+        res.json({ success: true, data: { activeProvider, providers } });
+    } catch (error) {
+        console.error("Admin get payment providers error:", error);
+        res.status(500).json({ success: false, error: "Failed to load payment providers" });
+    }
+});
+
+// Toggle the globally active payment provider
+protectedRouter.put("/payment-providers/active", async (req, res) => {
+    try {
+        const { provider } = req.body || {};
+        const { getAvailableProviders, invalidateActiveProviderCache } = await import("../services/providers/factory");
+
+        if (!provider || !getAvailableProviders().includes(provider)) {
+            return res.status(400).json({
+                success: false,
+                error: `Invalid provider. Must be one of: ${getAvailableProviders().join(", ")}`,
+            });
+        }
+
+        await query(
+            `INSERT INTO system_settings (key, value, description)
+             VALUES ('active_payment_provider', $1, 'Globally active payment provider (managed by platform admins)')
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+            [provider]
+        );
+
+        invalidateActiveProviderCache();
+
+        try {
+            const { logAuditEvent } = await import("../services/audit");
+            await logAuditEvent({
+                action: 'payment_provider_changed',
+                entityType: 'system_settings',
+                entityId: 'active_payment_provider',
+                newValues: { provider },
+            });
+        } catch (auditErr) {
+            console.warn("Failed to audit log provider change:", auditErr);
+        }
+
+        res.json({ success: true, message: `Active payment provider set to ${provider}`, data: { provider } });
+    } catch (error) {
+        console.error("Admin set active payment provider error:", error);
+        res.status(500).json({ success: false, error: "Failed to set active payment provider" });
+    }
+});
+
+// List all virtual accounts (per provider) with wallet ownership context
+protectedRouter.get("/virtual-accounts", async (req, res) => {
+    try {
+        const page = parseInt(req.query.page as string) || 1;
+        const limit = parseInt(req.query.limit as string) || 20;
+        const provider = req.query.provider as string;
+        const offset = (page - 1) * limit;
+
+        const params: any[] = [];
+        let where = `WHERE 1=1`;
+        if (provider) {
+            params.push(provider);
+            where += ` AND va.payment_provider = $${params.length}`;
+        }
+
+        const countRes = await query(`SELECT COUNT(*)::int AS total FROM virtual_accounts va ${where}`, params);
+        const rows = await query(
+            `SELECT va.id, va.virtual_account_number, va.bank_code, va.account_name,
+                    va.payment_provider, va.customer_identifier, va.is_active, va.created_at,
+                    w.id AS wallet_id, w.balance, w.currency,
+                    u.name AS user_name, u.email AS user_email,
+                    b.name AS business_name, b.id AS business_id
+             FROM virtual_accounts va
+             LEFT JOIN wallets w ON va.wallet_id = w.id
+             LEFT JOIN users u ON w.user_id = u.id
+             LEFT JOIN businesses b ON w.business_id = b.id
+             ${where}
+             ORDER BY va.created_at DESC
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+        );
+
+        res.json({
+            success: true,
+            data: rows.rows,
+            pagination: { page, limit, total: countRes.rows[0]?.total || 0 },
+        });
+    } catch (error) {
+        console.error("Admin list virtual accounts error:", error);
+        res.status(500).json({ success: false, error: "Failed to list virtual accounts" });
+    }
+});
+
+// Verify a pending transaction against its provider (manual re-verification tool)
+protectedRouter.post("/transactions/verify", async (req, res) => {
+    try {
+        const { reference } = req.body || {};
+        if (!reference) {
+            return res.status(400).json({ success: false, error: "reference is required" });
+        }
+
+        const txRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
+        if (txRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Transaction not found" });
+        }
+        const transaction = txRes.rows[0];
+        if (!transaction.payment_provider) {
+            return res.status(400).json({ success: false, error: "Transaction has no payment provider recorded" });
+        }
+
+        const { getProvider } = await import("../services/providers/factory");
+        const provider = getProvider(transaction.payment_provider);
+        const verifyResponse = await provider.verifyPayment(reference);
+
+        // Normalized success detection across providers
+        let providerSuccess = false;
+        if (provider.name === 'squad') {
+            providerSuccess = verifyResponse?.success && verifyResponse?.data?.transaction_status === 'success';
+        } else if (provider.name === 'flutterwave') {
+            providerSuccess = verifyResponse?.success && ['successful', 'success'].includes(verifyResponse?.data?.status);
+        } else if (provider.name === 'monnify') {
+            providerSuccess = verifyResponse?.success && verifyResponse?.data?.paymentStatus === 'PAID';
+        }
+
+        res.json({
+            success: true,
+            data: {
+                reference,
+                localStatus: transaction.status,
+                provider: provider.name,
+                providerSuccess,
+                providerResponse: verifyResponse,
+            },
+        });
+    } catch (error: any) {
+        console.error("Admin verify transaction error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to verify transaction" });
+    }
+});
 
 export default router;

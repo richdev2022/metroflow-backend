@@ -1,7 +1,7 @@
 import express from "express";
 import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest, checkKycStatus } from "../middleware/auth";
 import { query, pool } from "../db";
-import { getProvider } from "../services/providers/factory";
+import { getProvider, resolveProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
 import { toMinorUnit } from "../services/transfer";
 import { calculateFee } from "../services/fees";
 import { generateToken } from "../services/auth";
@@ -59,7 +59,7 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, async 
         let bankCode = '058';
         let accountName;
 
-        const provider = getProvider();
+        const provider = await resolveProvider();
 
         if (accountType === 'Personal') {
             // Check if user wallet exists
@@ -114,6 +114,12 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, async 
                 isSuccess = vaResponse.success;
                 vaNumber = vaResponse.data.virtual_account_number;
                 accountName = `${vaData.firstName} ${vaData.lastName}`;
+            } else if (provider.name === 'flutterwave') {
+                isSuccess = vaResponse.status === 'success' && !!vaResponse.data;
+                if (isSuccess) {
+                    vaNumber = vaResponse.data.account_number;
+                    accountName = `${vaData.firstName} ${vaData.lastName}`.trim();
+                }
             } else if (provider.name === 'monnify') {
                 isSuccess = vaResponse.requestSuccessful;
                 const accounts = vaResponse.responseBody?.accounts;
@@ -195,6 +201,12 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, async 
                         ? `${vaResponse.data.first_name} ${vaResponse.data.last_name}` 
                         : business.name;
                 }
+            } else if (provider.name === 'flutterwave') {
+                isSuccess = vaResponse.status === 'success' && !!vaResponse.data;
+                if (isSuccess) {
+                    vaNumber = vaResponse.data.account_number;
+                    accountName = business.name;
+                }
             } else if (provider.name === 'monnify') {
                 isSuccess = vaResponse.requestSuccessful;
                 if (isSuccess) {
@@ -274,7 +286,7 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
-        const activeProviderName = getProvider().name;
+        const activeProviderName = await getActiveProviderName();
         
         // Function to fetch wallet with virtual accounts
         const getWalletWithVAs = async (walletId: string) => {
@@ -378,13 +390,18 @@ router.post("/fund/card", authenticateToken, checkKycStatus, async (req: Authent
         // If not, we might need to fetch it.
         // But for now, let's stick to what was there, just fixing userId/businessId.
         
-        const { amount, wallet_id, redirect_url } = req.body;
+        const { amount, wallet_id, redirect_url, provider: requestedProvider } = req.body;
 
         if (!amount || amount <= 0) {
             return res.status(400).json({ success: false, error: "Invalid amount" });
         }
         if (!wallet_id) {
             return res.status(400).json({ success: false, error: "wallet_id is required" });
+        }
+
+        // Validate requested provider (allows the client to toggle e.g. to Flutterwave)
+        if (requestedProvider && !getAvailableProviders().includes(requestedProvider)) {
+            return res.status(400).json({ success: false, error: `Unsupported payment provider: ${requestedProvider}` });
         }
 
         // Check wallet exists and user has access
@@ -425,11 +442,18 @@ router.post("/fund/card", authenticateToken, checkKycStatus, async (req: Authent
              callbackUrl += `?redirect_url=${encodeURIComponent(clientRedirectUrl)}`;
         }
         
-        const provider = getProvider();
+        const provider = await resolveProvider(requestedProvider);
+        
+        // Resolve the real user email (token payload does not carry it)
+        let userEmail = email || null;
+        if (!userEmail) {
+            const userRes = await query(`SELECT email FROM users WHERE id = $1`, [userId]);
+            userEmail = userRes.rows[0]?.email || null;
+        }
         
         // Use object parameter for initiatePayment
         const paymentResponse = await provider.initiatePayment({
-            email: email || "user@example.com", // Fallback or fetch from DB if missing
+            email: userEmail || "customer@metroflow.app",
             amount: amountMinor,
             reference,
             callbackUrl
@@ -441,6 +465,9 @@ router.post("/fund/card", authenticateToken, checkKycStatus, async (req: Authent
         if (provider.name === 'squad') {
             isSuccess = paymentResponse.status === 200 && paymentResponse.success;
             paymentUrl = paymentResponse.data.checkout_url;
+        } else if (provider.name === 'flutterwave') {
+            isSuccess = !!paymentResponse.success && !!(paymentResponse.data?.checkout_url || paymentResponse.data?.link);
+            paymentUrl = paymentResponse.data?.checkout_url || paymentResponse.data?.link;
         } else if (provider.name === 'monnify') {
             isSuccess = paymentResponse.success;
             paymentUrl = paymentResponse.data?.checkout_url;
@@ -695,9 +722,9 @@ router.get("/verify", async (req, res) => {
         }
 
         // 2. Get provider from transaction or use default
-        const provider = getProvider(transaction.payment_provider);
+        const provider = await resolveProvider(transaction.payment_provider);
         
-        // 3. Verify with provider
+        // 3. Verify with provider (verification MUST succeed before crediting)
         let verifyResponse;
         try {
             verifyResponse = await provider.verifyPayment(reference);
@@ -709,6 +736,24 @@ router.get("/verify", async (req, res) => {
         let isSuccess = false;
         if (provider.name === 'squad') {
             isSuccess = verifyResponse && verifyResponse.success && verifyResponse.data.transaction_status === 'success';
+        } else if (provider.name === 'flutterwave') {
+            // Flutterwave returns data.status === 'successful' for completed charges
+            isSuccess = verifyResponse && verifyResponse.success &&
+                ['successful', 'success'].includes(verifyResponse.data?.status);
+            // Additional sanity check: amount/currency must match the recorded transaction
+            if (isSuccess && verifyResponse.data) {
+                const verifiedAmount = parseFloat(verifyResponse.data.amount);
+                const expectedAmount = parseFloat(transaction.amount) + parseFloat(transaction.fee || 0);
+                const verifiedCurrency = verifyResponse.data.currency || 'NGN';
+                if (!Number.isNaN(verifiedAmount) && verifiedAmount + 0.01 < expectedAmount) {
+                    console.error(`Flutterwave verify amount mismatch for ${reference}: expected >= ${expectedAmount}, got ${verifiedAmount}`);
+                    isSuccess = false;
+                }
+                if (transaction.currency && verifiedCurrency !== transaction.currency) {
+                    console.error(`Flutterwave verify currency mismatch for ${reference}: expected ${transaction.currency}, got ${verifiedCurrency}`);
+                    isSuccess = false;
+                }
+            }
         } else if (provider.name === 'monnify') {
             isSuccess = verifyResponse && verifyResponse.success && verifyResponse.data?.paymentStatus === 'PAID';
         }

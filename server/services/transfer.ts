@@ -10,6 +10,10 @@ export async function accountLookup(bankCode: string, accountNumber: string) {
   return provider.accountLookup(bankCode, accountNumber);
 }
 
+// Flutterwave transfer status buckets
+const FLW_SUCCESS_STATUSES = ['SUCCESSFUL'];
+const FLW_PENDING_STATUSES = ['NEW', 'PENDING', 'QUEUED', 'ONGOING', 'PROCESSING', 'CREATED'];
+
 // Helper function to convert amount to minor units for both providers
 export function toMinorUnit(amount: number | string): string {
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
@@ -25,7 +29,7 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
       console.log(`[TransferMonitor] Verifying transfer ${transfer.reference} (ID: ${transfer.id}, Provider: ${transfer.payment_provider}) - Attempt ${currentRetry + 1}/${maxRetries}`);
       
       const provider = getProvider(transfer.payment_provider);
-      const verificationResponse = await provider.verifyTransfer(transfer.reference);
+      const verificationResponse = await provider.verifyTransfer(transfer.reference, transfer.provider_metadata);
       
       let isSuccess = false;
       let isPending = false;
@@ -46,6 +50,19 @@ export async function verifySingleTransfer(transfer: any, maxRetries: number = 3
                         verificationResponse.data?.failure_reason || 
                         verificationResponse.data?.error_message || 
                         "Transfer failed at provider";
+      } else if (provider.name === 'flutterwave') {
+        // Flutterwave transfer statuses: SUCCESSFUL | FAILED | REVERTED | NEW | PENDING | QUEUED | ONGOING
+        const flwStatus = (verificationResponse?.data?.status || verificationResponse?.data?.transactionStatus || '').toUpperCase();
+        isSuccess = verificationResponse?.status === 'success' && FLW_SUCCESS_STATUSES.includes(flwStatus);
+        isPending = !isSuccess && FLW_PENDING_STATUSES.includes(flwStatus);
+        failureReason = verificationResponse?.data?.complete_message ||
+                        verificationResponse?.message || 
+                        "Transfer failed at Flutterwave";
+        // If the lookup itself failed (no status present), don't retry
+        if (!flwStatus && verificationResponse?.status !== 'success') {
+          isPending = false;
+          console.log(`[TransferMonitor] Flutterwave verify failed for ${transfer.reference}: ${verificationResponse?.message}`);
+        }
       } else if (provider.name === 'monnify') {
         isSuccess = verificationResponse.requestSuccessful && (
           verificationResponse.responseBody?.status === 'SUCCESS' ||
@@ -613,6 +630,17 @@ export async function processAllPending(businessId: string) {
                         providerMetadata?.failureReason ||
                         providerMetadata?.errorMessage ||
                         (isFailed ? "Transfer rejected by Monnify" : null);
+      } else if (provider.name === 'flutterwave') {
+        // POST /v3/transfers response: { status: 'success', data: { id, status: 'NEW'|'SUCCESSFUL'|..., ... } }
+        const flwStatus = (providerMetadata?.status || providerMetadata?.transactionStatus || '').toUpperCase();
+        isSuccess = response?.status === 'success' && FLW_SUCCESS_STATUSES.includes(flwStatus);
+        isFailed = !isSuccess && (
+          response?.status === 'error' ||
+          ["FAILED", "REVERTED", "CANCELED", "CANCELLED"].includes(flwStatus)
+        );
+        failureReason = providerMetadata?.complete_message ||
+                        response?.message ||
+                        (isFailed ? "Transfer rejected by Flutterwave" : null);
       }
 
       if (isSuccess) immediateStatus = 'success';

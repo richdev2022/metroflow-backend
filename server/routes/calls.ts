@@ -1437,7 +1437,10 @@ async function generateInviteLink(
   const encodedUserName = encodeURIComponent(participantName);
   const waitingRoomParam = (!isHost && waitingRoomEnabled) ? 'true' : 'false';
 
-  return `https://myapp.com/call?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}`;
+  // Build the invite URL from the configured client origin so links stay valid
+  const clientOrigin = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || process.env.CLIENT_APP_URL || "http://localhost:8080";
+
+  return `${clientOrigin}/calls?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}`;
 }
 
 // Generate invite link endpoint
@@ -1481,5 +1484,99 @@ export const generateCallInvite: RequestHandler = async (
       success: false,
       error: "Failed to generate invite link",
     });
+  }
+};
+
+// ==================== GUEST ACCESS ====================
+// Guests (no account) join via public call links using a short-lived
+// guest token scoped to a single call room.
+
+export const guestJoinCall: RequestHandler = async (req, res) => {
+  try {
+    const { code } = req.params;
+    const { name, password } = req.body || {};
+
+    if (!code) {
+      return res.status(400).json({ success: false, error: "Call code is required" });
+    }
+    const guestName = (name || "").toString().trim().slice(0, 60);
+    if (!guestName) {
+      return res.status(400).json({ success: false, error: "Your name is required to join as a guest" });
+    }
+
+    // Look up call globally by code (guests are not business-scoped)
+    const callRes = await query(
+      `SELECT c.id, c.type, c.status, c.call_code, c.password, c.waiting_room_enabled,
+              c.max_participants, c.business_id, c.recording_enabled, c.is_group_call,
+              u.name AS host_name
+       FROM calls c
+       LEFT JOIN users u ON c.host_id = u.id
+       WHERE c.call_code = $1`,
+      [code]
+    );
+
+    if (callRes.rows.length === 0) {
+      return res.status(404).json({ success: false, errorCode: "CALL_NOT_FOUND", error: "Call not found" });
+    }
+
+    const call = callRes.rows[0];
+
+    if (call.status === "cancelled") {
+      return res.status(410).json({ success: false, errorCode: "CALL_CANCELLED", error: "This call has been cancelled" });
+    }
+    if (call.status === "completed" || call.status === "missed") {
+      return res.status(410).json({ success: false, errorCode: "CALL_ENDED", error: "This call has already ended" });
+    }
+
+    // Password check
+    if (call.password && call.password !== password) {
+      return res.status(403).json({ success: false, errorCode: "PASSWORD_REQUIRED", error: "Incorrect call password" });
+    }
+
+    // Capacity check
+    if (call.max_participants) {
+      const countRes = await query(
+        `SELECT COUNT(*)::int AS joined FROM call_participants WHERE call_id = $1 AND status = 'joined'`,
+        [call.id]
+      );
+      if (countRes.rows[0].joined >= call.max_participants) {
+        return res.status(409).json({ success: false, errorCode: "MAX_PARTICIPANTS_REACHED", error: "Call is full" });
+      }
+    }
+
+    const { generateGuestToken } = await import("../utils/guestTokens");
+    const { token, payload } = generateGuestToken({
+      name: guestName,
+      scope: "call",
+      roomId: call.id,
+      businessId: call.business_id,
+      ttlMinutes: 6 * 60,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        call: {
+          id: call.id,
+          type: call.type,
+          callCode: call.call_code,
+          status: call.status,
+          hostName: call.host_name,
+          waitingRoomEnabled: call.waiting_room_enabled,
+          recordingEnabled: call.recording_enabled,
+          isGroupCall: call.is_group_call,
+          hasPassword: Boolean(call.password),
+        },
+        guestToken: token,
+        guestId: payload.guestId,
+        guestName,
+        roomId: call.id,
+        socketRoom: `call:${call.id}`,
+        expiresAt: new Date(payload.exp * 1000).toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Guest join call error:", error);
+    res.status(500).json({ success: false, error: "Failed to join call as guest" });
   }
 };

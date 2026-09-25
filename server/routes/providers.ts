@@ -1,6 +1,11 @@
 
 import express from "express";
-import { getProvider, getAvailableProviders } from "../services/providers/factory";
+import {
+  getProvider,
+  getAvailableProviders,
+  getActiveProviderName,
+  getProviderConfigStatus,
+} from "../services/providers/factory";
 
 const router = express.Router();
 
@@ -58,14 +63,21 @@ router.get("/requirements", (req, res) => {
  *       200:
  *         description: List of providers
  */
-router.get("/list", (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      providers: getAvailableProviders(),
-      defaultProvider: process.env.DEFAULT_PAYMENT_PROVIDER || "squad",
-    },
-  });
+router.get("/list", async (req, res) => {
+  try {
+    const activeProvider = await getActiveProviderName();
+    res.json({
+      success: true,
+      data: {
+        providers: getAvailableProviders(),
+        defaultProvider: activeProvider,
+        activeProvider,
+        configStatus: getProviderConfigStatus(),
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 export default router;

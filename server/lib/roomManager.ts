@@ -5,6 +5,7 @@ export interface Participant {
   audioEnabled: boolean;
   videoEnabled: boolean;
   screenSharing: boolean;
+  isGuest?: boolean;
   joinedAt: Date;
 }
 

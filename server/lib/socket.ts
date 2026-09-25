@@ -6,6 +6,8 @@ import logger from "./logger";
 import { initMediasoup, getRouter, getOrCreateRoom } from "./mediasoup";
 import { query } from "../db";
 import { roomManager } from "./roomManager";
+import { verifyToken } from "../services/auth";
+import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
 import crypto from "crypto";
 
 let io: Server | null = null;
@@ -205,6 +207,57 @@ export function initSocketServer(server: http.Server): void {
   io.on("connection", (socket) => {
     logger.info(`Socket connected: ${socket.id}`);
 
+    // -----------------------------------------------------------------
+    // Socket identity (set during handshake):
+    //  - handshake.auth.token      -> authenticated business user
+    //  - handshake.auth.guestToken -> guest scoped to a single room
+    // Both are optional for backward compatibility with older clients,
+    // but user-scoped events prefer the server-verified identity.
+    // -----------------------------------------------------------------
+    (async () => {
+      try {
+        const auth = (socket.handshake.auth || {}) as { token?: string; guestToken?: string };
+        if (auth.token) {
+          const decoded = await verifyToken(auth.token);
+          if (decoded?.userId && decoded?.businessId) {
+            socket.data.authUser = { userId: decoded.userId, businessId: decoded.businessId };
+            logger.info(`Socket ${socket.id} authenticated as user ${decoded.userId}`);
+          }
+        }
+        if (auth.guestToken) {
+          const guest = verifyGuestToken(auth.guestToken);
+          if (guest) {
+            socket.data.guest = guest;
+            logger.info(`Socket ${socket.id} authenticated as guest ${guest.guestId} for room ${guest.roomId}`);
+          }
+        }
+      } catch (error) {
+        logger.warn(`Socket ${socket.id} auth handshake failed:`, error);
+      }
+    })();
+
+    // Verify a room password without exposing the stored password
+    socket.on("room:verifyPassword", async (data: { roomId: string; password: string; roomType?: "meeting" | "call" | "auto" }, callback) => {
+      try {
+        if (!data?.roomId) {
+          callback({ valid: false, error: "roomId is required" });
+          return;
+        }
+        const resolved = await resolveRoomId(data.roomId);
+        if (!resolved) {
+          callback({ valid: false, error: "Room not found" });
+          return;
+        }
+        const table = resolved.type === "call" ? "calls" : "meetings";
+        const result = await query(`SELECT password FROM ${table} WHERE id = $1`, [resolved.id]);
+        const stored = result.rows[0]?.password;
+        callback({ valid: !stored || stored === data.password, roomType: resolved.type, roomId: resolved.id });
+      } catch (error) {
+        logger.error("Error verifying room password:", error);
+        callback({ valid: false, error: "Server error" });
+      }
+    });
+
     // 1. Verify invitation token
     socket.on("invitation:verify", async (data: { token: string; roomId: string }, callback) => {
       try {
@@ -289,6 +342,7 @@ export function initSocketServer(server: http.Server): void {
           audioEnabled: data.audioEnabled,
           videoEnabled: data.videoEnabled,
           screenSharing: false,
+          isGuest: Boolean(socket.data.guest),
         }, endsAt, maxMeetingDuration);
 
         const participantCount = roomManager.getParticipants(resolvedRoomId).length;
@@ -875,34 +929,51 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    // In-meeting chat
-    socket.on("meeting-chat:message", async (data: { meetingId?: string; callId?: string; message: string }) => {
-      if (data.meetingId) {
-        const resolved = await resolveMeetingId(data.meetingId);
-        if (resolved) {
-          const payload = {
-            userId: socket.data.userId,
-            meetingId: resolved,
-            message: data.message,
-            timestamp: new Date(),
-          };
-          socket.to(`meeting:${resolved}`).emit("meeting-chat:message", payload);
-          socket.to(`room:${resolved}`).emit("meeting-chat:message", payload);
+    // In-meeting chat (primary event) - shared implementation
+    const handleMeetingChat = async (data: { meetingId?: string; callId?: string; roomId?: string; message: string; senderName?: string; userId?: string }) => {
+      try {
+        // Resolve the room from whichever identifier the client sent
+        let resolvedId: string | null = null;
+        let resolvedType: "meeting" | "call" = "meeting";
+        if (data.meetingId) {
+          resolvedId = await resolveMeetingId(data.meetingId);
+          resolvedType = "meeting";
+        } else if (data.callId) {
+          resolvedId = await resolveCallId(data.callId);
+          resolvedType = "call";
+        } else if (data.roomId) {
+          const resolved = await resolveRoomId(data.roomId);
+          if (resolved) {
+            resolvedId = resolved.id;
+            resolvedType = resolved.type;
+          }
         }
-      } else if (data.callId) {
-        const resolved = await resolveCallId(data.callId);
-        if (resolved) {
-          const payload = {
-            userId: socket.data.userId,
-            callId: resolved,
-            message: data.message,
-            timestamp: new Date(),
-          };
-          socket.to(`call:${resolved}`).emit("meeting-chat:message", payload);
-          socket.to(`room:${resolved}`).emit("meeting-chat:message", payload);
-        }
+        if (!resolvedId) return;
+
+        // Identity: authenticated user first, then client-provided, then guest
+        const senderId = socket.data.authUser?.userId || data.userId || socket.data.guest?.guestId || socket.id;
+        const senderName = data.senderName || socket.data.guest?.name || "User";
+
+        const payload = {
+          userId: senderId,
+          senderName,
+          isGuest: Boolean(socket.data.guest),
+          meetingId: resolvedType === "meeting" ? resolvedId : undefined,
+          callId: resolvedType === "call" ? resolvedId : undefined,
+          roomId: resolvedId,
+          message: data.message,
+          timestamp: new Date(),
+        };
+        // Broadcast to everyone in the room (including sender for consistency)
+        io.to(`room:${resolvedId}`).emit("meeting-chat:message", payload);
+      } catch (error) {
+        logger.error("Error handling meeting chat:", error);
       }
-    });
+    };
+
+    socket.on("meeting-chat:message", handleMeetingChat);
+    // Alias event used by some clients
+    socket.on("meeting-chat:send", handleMeetingChat);
 
     // Disconnect
     socket.on("disconnect", async () => {

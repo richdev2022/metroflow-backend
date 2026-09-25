@@ -4,7 +4,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, check
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
 import { accountLookup, processAllPending } from "../services/transfer";
-import { getProvider } from "../services/providers/factory";
+import { getProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
@@ -376,7 +376,7 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  */
 router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { bankCode, accountNumber, accountName, amount, remark, otp, pin, wallet_id } = req.body;
+    const { bankCode, accountNumber, accountName, amount, remark, otp, pin, wallet_id, walletId: camelWalletId } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -429,8 +429,8 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       isOtpValidated = true;
     }
 
-    // Validate Wallet
-    let walletId = wallet_id;
+    // Validate Wallet (accept both snake_case and camelCase wallet id)
+    let walletId = wallet_id || camelWalletId;
     if (!walletId) {
       const wRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
       if (wRes.rows.length > 0) walletId = wRes.rows[0].id;
@@ -440,7 +440,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // Calculate Fee
     const fee = await calculateFee(amount, 'transfer');
     const reference = genRef();
-    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const defaultProvider = await getActiveProviderName();
 
     // Generate transaction hash for integrity
     const transactionHash = generateTransactionHash(reference, amount.toString(), accountNumber, bankCode);
@@ -874,7 +874,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     // 2. Insert into transfer_queue
     let queuedTransfers: any[] = [];
-    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const defaultProvider = await getActiveProviderName();
     for (const t of transfersToQueue) {
       if (t.amount <= 0) continue;
 
@@ -1324,7 +1324,7 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
       return res.status(400).json({ success: false, error: "Only failed transfers can be retried" });
     }
 
-    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const defaultProvider = await getActiveProviderName();
     
     // Reset status to pending and get the updated transfer
     const updateRes = await query(

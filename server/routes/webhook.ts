@@ -1,6 +1,6 @@
 import express from "express";
-import { query } from "../db";
-import { getProvider } from "../services/providers/factory";
+import { query, pool } from "../db";
+import { getProvider, resolveProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
@@ -601,16 +601,417 @@ const handleMonnifyWebhook = async (event: any) => {
     }
 };
 
+// ---------------------------------------------------------------
+// Flutterwave webhook handling (V3)
+// Docs: https://developer.flutterwave.com/docs/webhooks
+// Events: charge.completed, transfer.completed
+// Security: `verif-hash` header must equal FLW_SECRET_HASH.
+// Credit rule: transaction verification is ALWAYS run against the
+// Flutterwave API before any wallet is credited.
+// ---------------------------------------------------------------
+
+const FLW_TRANSFER_SUCCESS_STATUSES = ["SUCCESSFUL"];
+const FLW_TRANSFER_PENDING_STATUSES = ["NEW", "PENDING", "QUEUED", "ONGOING", "PROCESSING", "CREATED"];
+
+async function verifyFlutterwaveCharge(reference: string): Promise<any | null> {
+    try {
+        const provider = getProvider("flutterwave");
+        const verifyResponse = await provider.verifyPayment(reference);
+        if (verifyResponse?.success && ["successful", "success"].includes(verifyResponse.data?.status)) {
+            return verifyResponse.data;
+        }
+        return null;
+    } catch (error: any) {
+        console.error(`Flutterwave verification failed for ${reference}:`, error.message);
+        return null;
+    }
+}
+
+// Atomically credit a wallet for a wallet_funding transaction (idempotent).
+// Runs transaction + wallet credit + platform fee inside a single DB transaction.
+async function creditWalletFundingTransaction(transaction: any, providerName: string) {
+    const reference = transaction.reference;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Re-check status inside the transaction (double-processing guard)
+        const fresh = await client.query(`SELECT status FROM transactions WHERE id = $1 FOR UPDATE`, [transaction.id]);
+        if (fresh.rows[0]?.status === 'success') {
+            await client.query('COMMIT');
+            return true;
+        }
+
+        // 1. Mark transaction successful
+        await client.query(
+            `UPDATE transactions SET status = 'success', updated_at = NOW() WHERE id = $1`,
+            [transaction.id]
+        );
+
+        // 2. Create settlement if missing
+        const settlementRes = await client.query(`SELECT id, status FROM settlements WHERE transaction_id = $1`, [transaction.id]);
+        if (settlementRes.rows.length === 0) {
+            await client.query(
+                `INSERT INTO settlements (transaction_id, business_id, user_id, amount, status) VALUES ($1, $2, $3, $4, 'settled')`,
+                [transaction.id, transaction.business_id, transaction.user_id, transaction.amount]
+            );
+        } else if (settlementRes.rows[0].status !== 'settled') {
+            await client.query(`UPDATE settlements SET status = 'settled', updated_at = NOW() WHERE id = $1`, [settlementRes.rows[0].id]);
+        }
+
+        // 3. Credit user wallet
+        if (transaction.wallet_id) {
+            await client.query(
+                `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
+                [transaction.amount, transaction.wallet_id]
+            );
+        }
+
+        // 4. Credit platform wallet with the fee (idempotent by reference)
+        const fee = parseFloat(transaction.fee || 0);
+        if (fee > 0) {
+            const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL LIMIT 1`);
+            if (platformWalletRes.rows.length > 0) {
+                const platformWalletId = platformWalletRes.rows[0].id;
+                const platTxCheck = await client.query(
+                    `SELECT id FROM transactions WHERE reference = $1 AND type = 'credit' AND wallet_id = $2`,
+                    [`${reference}-PLATFORM-FEE`, platformWalletId]
+                );
+                if (platTxCheck.rows.length === 0) {
+                    await client.query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [fee, platformWalletId]);
+                    await client.query(
+                        `INSERT INTO transactions 
+                        (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+                        VALUES ($1, 'NGN', 'success', $2, 'credit', 'Fee for Wallet Funding', 'fee', $3, 'credit')`,
+                        [fee, `${reference}-PLATFORM-FEE`, platformWalletId]
+                    );
+                }
+            }
+        }
+
+        await client.query('COMMIT');
+        return true;
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`creditWalletFundingTransaction failed for ${reference}:`, error);
+        return false;
+    } finally {
+        client.release();
+    }
+}
+
+const handleFlutterwaveWebhook = async (event: any) => {
+    const eventType = event?.event;
+    const data = event?.data || {};
+
+    // ---------- Charge (checkout / card / bank transfer / USSD...) ----------
+    if (eventType === 'charge.completed') {
+        const reference = data.tx_ref;
+        const flwRef = data.flw_ref;
+        const isSuccessEvent = data.status === 'successful';
+
+        if (!reference) {
+            console.warn('Flutterwave charge.completed without tx_ref, ignoring');
+            return;
+        }
+
+        // Find local transaction by reference
+        const txnRes = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
+
+        if (txnRes.rows.length > 0) {
+            const transaction = txnRes.rows[0];
+            const businessId = transaction.business_id;
+
+            if (!isSuccessEvent) {
+                // Mark failed without crediting
+                if (transaction.status !== 'failed') {
+                    await query(
+                        `UPDATE transactions SET status = 'failed', gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                        [JSON.stringify(event), transaction.id]
+                    );
+                }
+                return;
+            }
+
+            // SECURITY: run server-to-server transaction verification before crediting
+            const verified = await verifyFlutterwaveCharge(reference);
+            if (!verified) {
+                console.warn(`Flutterwave webhook charge ${reference}: verification failed - wallet NOT credited. Will be re-verified on callback.`);
+                await query(
+                    `UPDATE transactions SET gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                    [JSON.stringify({ ...event, verification: 'pending_webhook_verify_failed' }), transaction.id]
+                );
+                return;
+            }
+
+            // Amount sanity check: verified amount must cover amount + fee
+            const verifiedAmount = parseFloat(verified.amount);
+            const expectedAmount = parseFloat(transaction.amount) + parseFloat(transaction.fee || 0);
+            if (!Number.isNaN(verifiedAmount) && verifiedAmount + 0.01 < expectedAmount) {
+                console.error(`Flutterwave webhook amount mismatch for ${reference}: expected >= ${expectedAmount}, verified ${verifiedAmount}`);
+                return;
+            }
+
+            // Idempotent atomic credit
+            const credited = await creditWalletFundingTransaction(transaction, 'flutterwave');
+            if (credited && transaction.transaction_type === 'wallet_funding') {
+                const newBalanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [transaction.wallet_id]);
+                const newBalance = newBalanceRes.rows.length > 0 ? parseFloat(newBalanceRes.rows[0].balance) : null;
+
+                if (transaction.user_id) {
+                    await createNotification({
+                        businessId: businessId!,
+                        userId: transaction.user_id,
+                        type: "credit",
+                        title: "Wallet Credited",
+                        message: `Your wallet has been credited with ₦${parseFloat(transaction.amount).toLocaleString()}`,
+                        actionUrl: "/wallet",
+                        actionType: "view_wallet",
+                        metadata: { amount: parseFloat(transaction.amount), reference, transactionType: "wallet_funding" },
+                        isActionable: false,
+                        expiresInHours: 24,
+                    }).catch(() => {});
+                }
+
+                const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [transaction.user_id]);
+                if (userRes.rows.length > 0 && newBalance !== null) {
+                    await sendTransactionAlert(
+                        userRes.rows[0].email,
+                        userRes.rows[0].name || 'User',
+                        'credit',
+                        parseFloat(transaction.amount),
+                        transaction.currency || 'NGN',
+                        newBalance,
+                        'success',
+                        reference,
+                        'Wallet Funding via Flutterwave Checkout'
+                    ).catch(() => {});
+                }
+            }
+
+            // Subscription handling (verify first, same rule)
+            if (credited && transaction.transaction_type === 'subscription' && businessId) {
+                const planRes = await query(`SELECT duration FROM pricing_plans WHERE id = $1`, [transaction.plan_id]);
+                const planDuration = planRes.rows.length > 0 ? planRes.rows[0].duration : 'monthly';
+
+                const nextBillingDate = new Date();
+                if (planDuration === 'yearly') {
+                    nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+                } else {
+                    nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+                }
+
+                await query(
+                    `UPDATE businesses 
+                    SET plan_id = $1, 
+                    subscription_status = 'active', 
+                    trial_ends_at = NULL, 
+                    updated_at = CURRENT_TIMESTAMP,
+                    next_billing_date = $3
+                    WHERE id = $2`,
+                    [transaction.plan_id, businessId, nextBillingDate]
+                );
+
+                const subAmount = parseFloat(transaction.amount);
+                await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
+            }
+
+            return;
+        }
+
+        // ---------- Virtual Account funding (no matching local transaction) ----------
+        // Flutterwave static VA payments carry the tx_ref assigned at VA creation
+        // (stored in virtual_accounts.provider_metadata.va_tx_ref).
+        const vaTxRef = data.tx_ref;
+        let wallet: any = null;
+        let vaRecord: any = null;
+
+        // 1. Look up by VA tx_ref in provider metadata (nested data.va_tx_ref or flat va_tx_ref)
+        const vaRowsResult = await query(
+            `SELECT * FROM virtual_accounts 
+             WHERE payment_provider = 'flutterwave' 
+             AND (provider_metadata->'data'->>'va_tx_ref' = $1 
+                  OR provider_metadata->>'va_tx_ref' = $1
+                  OR provider_metadata::text LIKE $2)
+             LIMIT 1`,
+            [vaTxRef, `%"${vaTxRef}"%`]
+        );
+        let vaRows = vaRowsResult.rows;
+        // 2. Fallback: flutterwave VAs store the account number; webhook may include it
+        if (vaRows.length === 0 && (data.account_number || data.virtual_account_number)) {
+            const vaByNumber = await query(
+                `SELECT * FROM virtual_accounts WHERE virtual_account_number = $1 AND payment_provider = 'flutterwave' LIMIT 1`,
+                [data.account_number || data.virtual_account_number]
+            );
+            vaRows = vaByNumber.rows;
+        }
+        // 3. Fallback: customer email -> user wallet
+        if (vaRows.length === 0 && data.customer?.email) {
+            const userRes = await query(`SELECT id FROM users WHERE email = $1 LIMIT 1`, [data.customer.email]);
+            if (userRes.rows.length > 0) {
+                const walletRes = await query(`SELECT * FROM wallets WHERE user_id = $1 LIMIT 1`, [userRes.rows[0].id]);
+                if (walletRes.rows.length > 0) {
+                    wallet = walletRes.rows[0];
+                }
+            }
+        }
+
+        if (!wallet && vaRows.length > 0) {
+            vaRecord = vaRows[0];
+            const walletRes = await query(`SELECT * FROM wallets WHERE id = $1`, [vaRecord.wallet_id]);
+            if (walletRes.rows.length > 0) {
+                wallet = walletRes.rows[0];
+            }
+        }
+
+        if (!wallet || !isSuccessEvent) {
+            console.warn(`Flutterwave VA funding could not be attributed (tx_ref=${vaTxRef}, status=${data.status})`);
+            return;
+        }
+
+        // SECURITY: verify the VA payment via the API before crediting
+        const verified = await verifyFlutterwaveCharge(vaTxRef);
+        if (!verified) {
+            console.warn(`Flutterwave VA funding ${vaTxRef}: verification failed - wallet NOT credited`);
+            return;
+        }
+
+        // Idempotency: use the unique Flutterwave transaction id as reference
+        const creditReference = `FLW-VA-${verified.id || data.id}`;
+        const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [creditReference]);
+        if (txnCheck.rows.length > 0) {
+            console.log(`Flutterwave VA funding ${creditReference} already processed, skipping`);
+            return;
+        }
+
+        const amount = parseFloat(verified.amount || data.amount);
+        if (Number.isNaN(amount) || amount <= 0) {
+            console.error(`Flutterwave VA funding ${vaTxRef}: invalid amount`, verified.amount);
+            return;
+        }
+
+        const fee = await calculateFee(amount, 'funding_account');
+        const creditAmount = Math.max(0, amount - fee);
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            await client.query(
+                `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
+                [creditAmount, wallet.id]
+            );
+            await client.query(
+                `INSERT INTO transactions 
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider, gateway_response)
+                 VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Flutterwave Virtual Account', 'wallet_funding', $5, 'credit', $6, 'flutterwave', $7)`,
+                [wallet.business_id, wallet.user_id, creditAmount, creditReference, wallet.id, fee, JSON.stringify(event)]
+            );
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error(`Flutterwave VA credit failed for ${creditReference}:`, error);
+            return;
+        } finally {
+            client.release();
+        }
+
+        if (fee > 0) {
+            await creditRevenueWallet(fee, 'NGN', creditReference).catch(() => {});
+        }
+
+        // Notify the wallet owner
+        if (wallet.user_id) {
+            await createNotification({
+                businessId: wallet.business_id!,
+                userId: wallet.user_id,
+                type: "credit",
+                title: "Wallet Credited",
+                message: `Your wallet has been credited with ₦${creditAmount.toLocaleString()}`,
+                actionUrl: "/wallet",
+                actionType: "view_wallet",
+                metadata: { amount: creditAmount, reference: creditReference, transactionType: "wallet_funding" },
+                isActionable: false,
+                expiresInHours: 24,
+            }).catch(() => {});
+        }
+
+        const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
+        if (userRes.rows.length > 0) {
+            const balanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [wallet.id]);
+            await sendTransactionAlert(
+                userRes.rows[0].email,
+                userRes.rows[0].name || 'User',
+                'credit',
+                creditAmount,
+                'NGN',
+                parseFloat(balanceRes.rows[0]?.balance || 0),
+                'success',
+                creditReference,
+                'Wallet Funding via Flutterwave Virtual Account'
+            ).catch(() => {});
+        }
+
+        return;
+    }
+
+    // ---------- Transfers (single + bulk items) ----------
+    if (eventType === 'transfer.completed') {
+        const transferData = data;
+        const reference = transferData.reference;
+        const status = (transferData.status || '').toUpperCase();
+
+        if (!reference) {
+            console.warn('Flutterwave transfer.completed without reference, ignoring');
+            return;
+        }
+
+        const transferRes = await query(`SELECT * FROM transfer_queue WHERE reference = $1`, [reference]);
+
+        if (transferRes.rows.length === 0) {
+            console.warn(`Flutterwave transfer.completed for unknown reference ${reference}`);
+            return;
+        }
+
+        const transfer = transferRes.rows[0];
+        let newStatus: 'success' | 'failed' | 'processing' = 'processing';
+        let failureReason: string | null = null;
+
+        if (FLW_TRANSFER_SUCCESS_STATUSES.includes(status)) {
+            newStatus = 'success';
+        } else if (["FAILED", "REVERTED", "CANCELED", "CANCELLED"].includes(status)) {
+            newStatus = 'failed';
+            failureReason = transferData.complete_message || 'Transfer failed at Flutterwave';
+        }
+
+        await query(
+            `UPDATE transfer_queue 
+             SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP, meta_data = $3, provider_metadata = $4
+             WHERE id = $5`,
+            [newStatus, failureReason, JSON.stringify(event), JSON.stringify(transferData), transfer.id]
+        );
+    }
+};
+
 // Webhook Endpoint
 router.post("/", async (req, res) => {
     try {
         const squadSignature = req.headers['x-squad-signature'] as string;
         const monnifySignature = req.headers['monnify-signature'] as string;
+        const flutterwaveSignature = (req.headers['verif-hash'] || req.headers['x-fw-signature']) as string;
         
         let providerName = 'squad';
         let isValid = false;
         
-        if (squadSignature) {
+        if (flutterwaveSignature) {
+            // Flutterwave: `verif-hash` header must match FLW_SECRET_HASH exactly
+            providerName = 'flutterwave';
+            const flwProvider = getProvider('flutterwave');
+            isValid = flwProvider.verifyWebhook(req.body, flutterwaveSignature);
+            if (!isValid) {
+                console.error("Invalid Flutterwave webhook signature - rejecting");
+                return res.status(401).send('Invalid signature');
+            }
+        } else if (squadSignature) {
             const squadProvider = getProvider('squad');
             isValid = squadProvider.verifyWebhook(req.body, squadSignature);
             if (!isValid) {
@@ -629,7 +1030,7 @@ router.post("/", async (req, res) => {
         console.log(`${providerName} Webhook Received:`, JSON.stringify(event, null, 2));
 
         // Save to DB
-        const eventType = providerName === 'squad' ? event.Event : event.eventType;
+        const eventType = providerName === 'squad' ? event.Event : (providerName === 'flutterwave' ? event.event : event.eventType);
         await query(
             `INSERT INTO squad_webhooks (event_type, payload, provider) VALUES ($1, $2, $3)`,
             [eventType, event, providerName]
@@ -639,6 +1040,8 @@ router.post("/", async (req, res) => {
             await handleSquadWebhook(event);
         } else if (providerName === 'monnify') {
             await handleMonnifyWebhook(event);
+        } else if (providerName === 'flutterwave') {
+            await handleFlutterwaveWebhook(event);
         }
 
         res.sendStatus(200);

@@ -230,6 +230,81 @@ export async function query(text: string, params?: unknown[]) {
   throw lastError;
 }
 
+// Canonical list of every table initializeDatabase() must create. Used by
+// verifySchema() after init so a partially-created schema is reported at
+// boot instead of surfacing later as "relation does not exist" errors.
+const EXPECTED_TABLES = [
+  "activity_logs",
+  "admin_permissions",
+  "admin_role_permissions",
+  "admin_roles",
+  "admin_sessions",
+  "attachments",
+  "audit_logs",
+  "businesses",
+  "call_participants",
+  "calls",
+  "chat_conversations",
+  "chat_messages",
+  "chat_participants",
+  "comments",
+  "epics",
+  "fee_configurations",
+  "ideas",
+  "invitation_tokens",
+  "login_attempts",
+  "meeting_attendees",
+  "meeting_reminders",
+  "meetings",
+  "notifications",
+  "payment_cards",
+  "payroll_adjustments",
+  "platform_admins",
+  "platform_wallet",
+  "pricing_plans",
+  "product_documentation",
+  "product_documentation_jobs",
+  "recordings",
+  "settlements",
+  "squad_webhooks",
+  "system_settings",
+  "task_assignments",
+  "task_statuses",
+  "tasks",
+  "transactions",
+  "transfer_queue",
+  "user_sessions",
+  "users",
+  "virtual_accounts",
+  "wallets",
+];
+
+/**
+ * Best-effort post-init check: compares the tables that actually exist in
+ * the database against EXPECTED_TABLES and logs (compactly) any that are
+ * missing. Never throws - init has already succeeded at this point.
+ */
+export async function verifySchema(): Promise<string[]> {
+  try {
+    const result = await query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    `);
+    const existing = new Set(result.rows.map((row: any) => String(row.table_name)));
+    const missing = EXPECTED_TABLES.filter((table) => !existing.has(table));
+    if (missing.length > 0) {
+      console.warn(`Schema check: ${missing.length} expected table(s) missing: ${missing.join(", ")}`);
+    } else {
+      console.log(`Schema check passed: all ${EXPECTED_TABLES.length} expected tables present`);
+    }
+    return missing;
+  } catch (error: any) {
+    console.warn(`Schema check skipped: ${(error?.message || error).toString().substring(0, 200)}`);
+    return [];
+  }
+}
+
 export async function initializeDatabase() {
   try {
     try {
@@ -1498,9 +1573,14 @@ export async function initializeDatabase() {
 
     await fixExistingUuidIdDefaults();
 
+    // Post-init safety net: confirm every expected table actually exists.
+    // Catches partial schema creation at boot instead of at first request.
+    await verifySchema();
+
     console.log("Database tables initialized successfully");
-  } catch (error) {
-    console.error("Failed to initialize database:", error);
+  } catch (error: any) {
+    // Compact one-liner - a raw error dump here previously spammed logs
+    console.error(`Failed to initialize database [${error?.code || "UNKNOWN"}]: ${error?.message}`);
     throw error;
   }
 }

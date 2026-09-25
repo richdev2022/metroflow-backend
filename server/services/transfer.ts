@@ -981,7 +981,7 @@ export async function createBulkTransfers(businessId: string, transfers: any[]) 
     const walletId = t.source_type === 'wallet' ? t.source_id : null;
 
     // Insert into transfer_queue
-    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const defaultProvider = process.env.DEFAULT_PAYMENT_PROVIDER || 'flutterwave';
     const res = await query(
       `INSERT INTO transfer_queue 
        (business_id, amount, currency, recipient_account, recipient_bank, recipient_name, remark, status, reference, wallet_id, fee, payment_provider)

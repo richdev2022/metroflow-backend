@@ -96,7 +96,7 @@ export const processSubscriptionRenewals = async () => {
             }
 
             const amountInMinor = Math.round(amount * 100);
-            const provider = getProvider(sub.active_payment_provider || 'squad');
+            const provider = getProvider(sub.active_payment_provider || 'flutterwave');
 
             console.log(`Charging business ${sub.business_id} amount ${amountInMinor} via ${sub.active_payment_provider}`);
             const chargeRes = await provider.chargeCard({ 

@@ -92,8 +92,17 @@ async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<vo
 const warnedRooms5min = new Set<string>();
 const warnedRooms1min = new Set<string>();
 
-// Check for expired rooms every 10 seconds and emit countdown warnings
-setInterval(async () => {
+// Room lifecycle checker (countdown warnings + auto-close).
+// Cheap by design:
+//   - 30s cadence is plenty precise for 5-min/1-min warnings
+//   - queries are TIME-BOUNDED: only rooms expiring within the next
+//     6 minutes (or already expired but not yet closed, oldest first)
+//   - LIMIT caps the batch; idle DBs with thousands of stale
+//     'ongoing' rows are no longer fetched every few seconds
+//   - errors are rate-limited to one concise line per 5 minutes
+let lastRoomCheckErrorLogAt = 0;
+
+async function checkExpiredRooms() {
   try {
     const now = new Date();
     const nowMs = now.getTime();
@@ -101,8 +110,14 @@ setInterval(async () => {
     const oneMinMs = 1 * 60 * 1000;
 
     // ----- CALLS -----
+    // Only rooms that expire within the warning window (+ already-expired
+    // ones waiting to be closed). Bounded and ordered oldest-first.
     const upcomingCalls = await query(
-      `SELECT id, ended_at, business_id FROM calls WHERE status = 'ongoing' AND ended_at IS NOT NULL`,
+      `SELECT id, ended_at, business_id FROM calls
+       WHERE status = 'ongoing' AND ended_at IS NOT NULL
+         AND ended_at <= NOW() + INTERVAL '6 minutes'
+       ORDER BY ended_at ASC
+       LIMIT 50`,
     );
 
     for (const call of upcomingCalls.rows) {
@@ -144,7 +159,11 @@ setInterval(async () => {
 
     // ----- MEETINGS -----
     const upcomingMeetings = await query(
-      `SELECT id, end_time, business_id FROM meetings WHERE status = 'ongoing' AND end_time IS NOT NULL`,
+      `SELECT id, end_time, business_id FROM meetings
+       WHERE status = 'ongoing' AND end_time IS NOT NULL
+         AND end_time <= NOW() + INTERVAL '6 minutes'
+       ORDER BY end_time ASC
+       LIMIT 50`,
     );
 
     for (const meeting of upcomingMeetings.rows) {
@@ -187,10 +206,26 @@ setInterval(async () => {
         ioServer.to(`meeting:${meeting.id}`).emit("meeting:countdown-warning", payload);
       }
     }
-  } catch (error) {
-    logger.error("Error checking for expired rooms:", error);
+  } catch (error: any) {
+    // Rate-limit: at most one concise error line per 5 minutes
+    const nowMs = Date.now();
+    if (nowMs - lastRoomCheckErrorLogAt > 5 * 60 * 1000) {
+      lastRoomCheckErrorLogAt = nowMs;
+      const msg = error?.message || String(error);
+      const code = error?.code ? ` [pg ${error.code}]` : "";
+      logger.error(`Room lifecycle check skipped: ${msg}${code}`);
+    }
   }
-}, 10000); // Check every 10 seconds
+}
+
+// Self-scheduling loop: next tick is scheduled only after the current one
+// finishes, so slow passes can never overlap (unlike setInterval).
+const ROOM_CHECK_INTERVAL_MS = 30_000; // 30 seconds
+async function runRoomCheckLoop() {
+  await checkExpiredRooms();
+  setTimeout(runRoomCheckLoop, ROOM_CHECK_INTERVAL_MS);
+}
+runRoomCheckLoop();
 
 export function initSocketServer(server: http.Server): void {
   // Initialize mediasoup first

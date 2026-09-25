@@ -1019,39 +1019,50 @@ router.post("/", async (req, res) => {
         const squadSignature = req.headers['x-squad-signature'] as string;
         const monnifySignature = req.headers['monnify-signature'] as string;
         const flutterwaveSignature = (req.headers['verif-hash'] || req.headers['x-fw-signature']) as string;
-        
-        let providerName = 'squad';
-        let isValid = false;
-        
+
+        let providerName: 'squad' | 'monnify' | 'flutterwave';
+
         if (flutterwaveSignature) {
             // Flutterwave: `verif-hash` header must match FLW_SECRET_HASH exactly
             providerName = 'flutterwave';
             const flwProvider = getProvider('flutterwave');
-            isValid = flwProvider.verifyWebhook(req.body, flutterwaveSignature);
-            if (!isValid) {
+            if (!flwProvider.verifyWebhook(req.body, flutterwaveSignature)) {
                 console.error("Invalid Flutterwave webhook signature - rejecting");
                 return res.status(401).send('Invalid signature');
             }
         } else if (squadSignature) {
+            providerName = 'squad';
             const squadProvider = getProvider('squad');
-            isValid = squadProvider.verifyWebhook(req.body, squadSignature);
-            if (!isValid) {
-                console.error("Invalid Squad Signature");
+            if (!squadProvider.verifyWebhook(req.body, squadSignature)) {
+                // SECURITY: an invalid signature must never be processed.
+                // (Previously this only logged and continued.)
+                console.error("Invalid Squad webhook signature - rejecting");
+                return res.status(401).send('Invalid signature');
             }
         } else if (monnifySignature) {
-            const monnifyProvider = getProvider('monnify');
-            isValid = monnifyProvider.verifyWebhook(req.body, monnifySignature);
             providerName = 'monnify';
-            if (!isValid) {
-                console.error("Invalid Monnify Signature");
+            const monnifyProvider = getProvider('monnify');
+            if (!monnifyProvider.verifyWebhook(req.body, monnifySignature)) {
+                console.error("Invalid Monnify webhook signature - rejecting");
+                return res.status(401).send('Invalid signature');
             }
+        } else {
+            // No provider signature header at all - internet scanner or forged
+            // request. Previously these fell through and were processed as
+            // Squad webhooks with zero validation.
+            console.warn("Webhook rejected: no provider signature header present");
+            return res.status(401).send('Missing signature');
         }
         
         const event = req.body;
-        console.log(`${providerName} Webhook Received:`, JSON.stringify(event, null, 2));
 
         // Save to DB
         const eventType = providerName === 'squad' ? event.Event : (providerName === 'flutterwave' ? event.event : event.eventType);
+
+        // Compact single-line log (full payload is persisted in squad_webhooks)
+        const flwRef = event?.data?.tx_ref || event?.data?.reference;
+        console.log(`${providerName} webhook: ${eventType || 'unknown'} | ref: ${flwRef || 'n/a'} | status: ${event?.data?.status || 'n/a'}`);
+
         await query(
             `INSERT INTO squad_webhooks (event_type, payload, provider) VALUES ($1, $2, $3)`,
             [eventType, event, providerName]

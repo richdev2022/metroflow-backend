@@ -570,7 +570,7 @@ router.post("/cards/initiate", authenticateToken, async (req, res) => {
         const businessRes = await query('SELECT plan_id, active_payment_provider FROM businesses WHERE id = $1', [businessId]);
         const planId = businessRes.rows[0]?.plan_id;
         const requestedProvider = typeof req.body.provider === 'string' ? req.body.provider : undefined;
-        const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0]?.active_payment_provider || 'squad';
+        const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0]?.active_payment_provider || 'flutterwave';
         const provider = getProvider(providerName);
 
         // Initiate a small charge (e.g., 100 NGN) to tokenize
@@ -769,7 +769,7 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, error: "Business not found" });
     }
     const requestedProvider = typeof req.body.provider === 'string' ? req.body.provider : undefined;
-    const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0].active_payment_provider || 'squad';
+    const providerName = requestedProvider || process.env.DEFAULT_PAYMENT_PROVIDER || businessRes.rows[0].active_payment_provider || 'flutterwave';
     const provider = getProvider(providerName);
 
     // Verify plan exists
@@ -903,7 +903,7 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
        return res.json({ success: true, message: "Payment already verified" });
     }
 
-    const providerName = transaction.payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'squad';
+    const providerName = transaction.payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'flutterwave';
     const provider = getProvider(providerName);
 
     // Verify with the provider that initiated the transaction
@@ -1203,7 +1203,7 @@ router.post("/cancel", authenticateToken, async (req, res) => {
         // Cancel recurring with the provider attached to this subscription.
         if (business.card_token) {
             try {
-                const provider = getProvider(business.active_payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'squad');
+                const provider = getProvider(business.active_payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'flutterwave');
                 await provider.cancelRecurring(business.card_token);
             } catch (err) {
                 console.warn("Provider cancel recurring warning:", err);

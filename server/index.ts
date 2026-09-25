@@ -79,7 +79,7 @@ import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
@@ -638,6 +638,7 @@ export async function createServer() {
   mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), addCallParticipants);
   mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), generateCallInvite);
   // Guest access (public, no auth): guests join via call link + name (+password if set)
+  mainRouter.get("/calls/guest/validate/:code", guestValidateCall);
   mainRouter.post("/calls/guest/:code/join", guestJoinCall);
 
   // Recordings API routes

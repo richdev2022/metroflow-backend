@@ -504,6 +504,89 @@ export const getMeetingByCode: RequestHandler = async (
 /**
  * @swagger
  * /meetings/{id}:
+ *   get:
+ *     summary: Get a meeting by UUID or meeting code
+ *     tags: [Meetings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Meeting found
+ *       404:
+ *         description: Meeting not found
+ */
+export const getMeetingById: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+
+    // Resolve by UUID first, then by meeting code (clients send either)
+    let result = await query(
+      `SELECT id, title, description, start_time as "startTime", end_time as "endTime", 
+              timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+              status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+              max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+              recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+       FROM meetings WHERE id = $1 AND business_id = $2`,
+      [id, businessId],
+    );
+
+    if (result.rows.length === 0) {
+      result = await query(
+        `SELECT id, title, description, start_time as "startTime", end_time as "endTime", 
+                timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+                status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+                max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+                recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+                google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+         FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
+    const meeting = result.rows[0];
+    const attendeeResult = await query(
+      `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1`,
+      [meeting.id],
+    );
+    meeting.attendees = attendeeResult.rows;
+    enrichMeeting(meeting);
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: meeting,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get meeting by id error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to get meeting",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /meetings/{id}:
  *   put:
  *     summary: Update a meeting
  *     tags: [Meetings]

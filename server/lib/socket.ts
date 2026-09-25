@@ -476,6 +476,26 @@ export function initSocketServer(server: http.Server): void {
           isHost: data.isHost,
           isGuest,
         });
+        // camelCase alias for older clients (e.g. Flutter socket_service)
+        socket.to(`room:${resolvedRoomId}`).emit("call:participantJoined", {
+          callId: resolvedRoomId,
+          userId: data.userId,
+          status: "joined",
+        });
+        if (!isCall) {
+          // Meeting rooms joined via call:join - keep meeting:* aliases in sync
+          socket.to(`room:${resolvedRoomId}`).emit("meeting:participant-joined", {
+            meetingId: resolvedRoomId,
+            meetingCode: data.roomId,
+            userId: data.userId,
+            userName: data.userName,
+            isHost: data.isHost,
+          });
+          socket.to(`room:${resolvedRoomId}`).emit("meeting:participantJoined", {
+            meetingId: resolvedRoomId,
+            userId: data.userId,
+          });
+        }
 
         const roomState = roomManager.getRoomState(resolvedRoomId);
         const participantsListPayload = {
@@ -529,6 +549,22 @@ export function initSocketServer(server: http.Server): void {
           userId: data.userId,
           userName: data.userName,
         });
+        // camelCase alias for older clients (e.g. Flutter socket_service)
+        socket.to(`room:${resolvedRoomId}`).emit("call:participantLeft", {
+          callId: resolvedRoomId,
+          userId: data.userId,
+        });
+        if (resolved.type === 'meeting') {
+          socket.to(`room:${resolvedRoomId}`).emit("meeting:participant-left", {
+            meetingId: resolvedRoomId,
+            userId: data.userId,
+            userName: data.userName,
+          });
+          socket.to(`room:${resolvedRoomId}`).emit("meeting:participantLeft", {
+            meetingId: resolvedRoomId,
+            userId: data.userId,
+          });
+        }
       } catch (error) {
         logger.error("Error leaving call:", error);
       }
@@ -566,6 +602,25 @@ export function initSocketServer(server: http.Server): void {
         socket.to(`room:${resolvedRoomId}`).emit("call:participant-media-state", { ...data, roomId: resolvedRoomId });
       } catch (error) {
         logger.error("Error updating media state:", error);
+      }
+    });
+
+    // 5b. Update media state (meeting variant emitted by the web client)
+    socket.on("meeting:participant-media-state", async (data: { roomId: string; userId: string; audioEnabled: boolean; videoEnabled: boolean; screenSharing: boolean }) => {
+      try {
+        const resolved = await resolveRoomId(data.roomId);
+        if (!resolved) return;
+        const resolvedRoomId = resolved.id;
+
+        roomManager.updateMediaState(resolvedRoomId, data.userId, {
+          audioEnabled: data.audioEnabled,
+          videoEnabled: data.videoEnabled,
+          screenSharing: data.screenSharing,
+        });
+
+        socket.to(`room:${resolvedRoomId}`).emit("meeting:participant-media-state", { ...data, roomId: resolvedRoomId });
+      } catch (error) {
+        logger.error("Error updating meeting media state:", error);
       }
     });
 
@@ -809,6 +864,25 @@ export function initSocketServer(server: http.Server): void {
       logger.info(`Socket ${socket.id} joined conversation:${conversationId}`);
     });
 
+    // Typing indicators (web client emits these; rebroadcast to the conversation room)
+    socket.on("chat:typing", (data: { conversationId: string; userId?: string; userName?: string }) => {
+      if (!data?.conversationId) return;
+      socket.to(`conversation:${data.conversationId}`).emit("chat:typing", {
+        conversationId: data.conversationId,
+        userId: data.userId || socket.data.userId,
+        userName: data.userName,
+      });
+    });
+
+    socket.on("chat:stop-typing", (data: { conversationId: string; userId?: string; userName?: string }) => {
+      if (!data?.conversationId) return;
+      socket.to(`conversation:${data.conversationId}`).emit("chat:stop-typing", {
+        conversationId: data.conversationId,
+        userId: data.userId || socket.data.userId,
+        userName: data.userName,
+      });
+    });
+
     // Call events
     socket.on("call:invite", async (data: { callId: string; targetUserId: string; type: string }) => {
       logger.info(`Call invite: ${data.callId} to user ${data.targetUserId}`);
@@ -921,6 +995,15 @@ export function initSocketServer(server: http.Server): void {
           userName,
           isHost,
         });
+        // camelCase alias for older clients (e.g. Flutter socket_service)
+        socket.to(`room:${resolvedMeetingId}`).emit("meeting:participantJoined", {
+          meetingId: resolvedMeetingId,
+          userId,
+        });
+        socket.to(`meeting:${resolvedMeetingId}`).emit("meeting:participantJoined", {
+          meetingId: resolvedMeetingId,
+          userId,
+        });
 
         const roomState = roomManager.getRoomState(resolvedMeetingId);
         const participantsListPayload = {
@@ -985,6 +1068,15 @@ export function initSocketServer(server: http.Server): void {
           meetingId: resolvedMeetingId,
           userId,
           userName,
+        });
+        // camelCase alias for older clients (e.g. Flutter socket_service)
+        socket.to(`room:${resolvedMeetingId}`).emit("meeting:participantLeft", {
+          meetingId: resolvedMeetingId,
+          userId,
+        });
+        socket.to(`meeting:${resolvedMeetingId}`).emit("meeting:participantLeft", {
+          meetingId: resolvedMeetingId,
+          userId,
         });
         socket.leave(`room:${resolvedMeetingId}`);
         socket.leave(`meeting:${resolvedMeetingId}`);

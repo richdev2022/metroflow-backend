@@ -467,6 +467,78 @@ export const getCallByCode: RequestHandler = async (
 /**
  * @swagger
  * /calls/{id}:
+ *   get:
+ *     summary: Get a call by UUID or call code
+ *     tags: [Calls]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Call found
+ *       404:
+ *         description: Call not found
+ */
+export const getCallById: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+
+    const baseSelect = `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+              ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM calls`;
+
+    // Resolve by UUID first, then by call code (clients send either)
+    let result = await query(`${baseSelect} WHERE id = $1 AND business_id = $2`, [id, businessId]);
+    if (result.rows.length === 0) {
+      result = await query(`${baseSelect} WHERE call_code = $1 AND business_id = $2`, [id, businessId]);
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
+
+    const call = result.rows[0];
+    const participantsResult = await query(
+      `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
+       FROM call_participants WHERE call_id = $1`,
+      [call.id],
+    );
+    call.participants = participantsResult.rows;
+    enrichCall(call);
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: call,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get call by id error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to get call",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /calls/{id}:
  *   put:
  *     summary: Update a call
  *     description: Updates a call status or settings.
@@ -842,7 +914,14 @@ export const joinCall: RequestHandler = async (
 
     const io = getSocketServer();
     if (io) {
+      // Emit both spellings: camelCase (Flutter) and hyphenated (web)
       io.to(`call:${actualId}`).emit("call:participantJoined", {
+        callId: actualId,
+        userId,
+        status: effectiveStatus,
+      });
+      io.to(`call:${actualId}`).emit("call:participant-joined", {
+        roomId: actualId,
         callId: actualId,
         userId,
         status: effectiveStatus,
@@ -958,7 +1037,13 @@ export const leaveCall: RequestHandler = async (
 
     const io = getSocketServer();
     if (io) {
+      // Emit both spellings: camelCase (Flutter) and hyphenated (web)
       io.to(`call:${actualId}`).emit("call:participantLeft", {
+        callId: actualId,
+        userId,
+      });
+      io.to(`call:${actualId}`).emit("call:participant-left", {
+        roomId: actualId,
         callId: actualId,
         userId,
       });

@@ -66,8 +66,11 @@ export const pool = new Pool({
 });
 
 // Add error handler to prevent server crash on idle client errors
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
+pool.on('error', (err: any) => {
+  // Compact one-liner: dumping the raw pg error object here previously
+  // produced 20+ lines of garbage per error (severity/code/schema/table/
+  // constraint/file/line/routine) and blew PM2 logs up to hundreds of MB.
+  console.error(`Idle PG client error [${err?.code || 'UNKNOWN'}]: ${err?.message}`);
   // Don't exit process, just log. The pool will discard the client.
 });
 
@@ -215,7 +218,12 @@ export async function query(text: string, params?: unknown[]) {
         continue;
       }
       
-      console.error("Database error:", error);
+      // Compact one-liner (code + message + query snippet) instead of the
+      // raw pg error object dump - keeps logs parseable and small.
+      const errCode = (error as any)?.code || 'UNKNOWN';
+      const errMsg = (error as any)?.message || String(error);
+      const querySnippet = String(text).trim().replace(/\s+/g, ' ').substring(0, 120);
+      console.error(`Database error [${errCode}]: ${errMsg} | query: ${querySnippet}`);
       throw error;
     }
   }

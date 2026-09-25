@@ -23,13 +23,23 @@ Flutterwave is now a first-class payment provider alongside Squad and Monnify. I
 ## 2. Environment Variables
 
 ```env
-FLW_SECRET_KEY=FLWSECK-xxxxxxxxxxxxxxxxxxxx     # Your secret key (test keys start with FLWSECK-TEST-)
-FLW_PUBLIC_KEY=FLWPUBK_TEST-xxxxxxxxxxxxxxxxx   # Public key (optional server-side)
-FLW_SECRET_HASH=your-webhook-secret-hash        # MUST match the webhook secret hash in the Flutterwave dashboard
+FLW_SECRET_KEY=FLWSECK-xxxxxxxxxxxxxxxxxxxx     # REQUIRED - Bearer token for ALL server-side V3 API calls
+FLW_PUBLIC_KEY=FLWPUBK_TEST-xxxxxxxxxxxxxxxxx   # REQUIRED for client-side inline checkout (v3.js / mobile SDKs)
+FLW_SECRET_HASH=your-webhook-secret-hash        # REQUIRED for webhooks - MUST match the dashboard webhook secret hash
+# FLW_ENCRYPTION_KEY=xxxxxxxxxxxxxxxxxxxxxxxx    # OPTIONAL - only for Direct Charge endpoints (3DES); not used today
 FLW_BASE_URL=https://api.flutterwave.com        # Optional override (test & live share this base URL)
 ```
 
-> **Note:** Flutterwave uses the same API base URL for test and live modes — the mode is determined by the secret key. No environment switch is needed.
+| Variable | Used by | Where |
+|----------|---------|-------|
+| `FLW_SECRET_KEY` | Server → Flutterwave REST API | All `/v3/*` calls (checkout, verify, transfers, VAs, balances) |
+| `FLW_PUBLIC_KEY` | **Client** (web / mobile) | Inline checkout `FlutterwaveCheckout({ public_key })` and mobile SDKs. Served to clients via **public** `GET /api/providers/checkout-config` and included in `GET /api/providers/list` `configStatus` |
+| `FLW_SECRET_HASH` | Webhook validation | `verif-hash` header compare (constant-time), 401 on mismatch |
+| `FLW_ENCRYPTION_KEY` | Direct charges only | 3DES payload encryption — not needed for hosted checkout, transfers, VAs or verification |
+
+> **Note:** Flutterwave uses the same API base URL for test and live modes — the mode is determined by the key prefix (test keys contain `FLWSECK_TEST` / `FLWPUBK_TEST`). No environment switch is needed.
+>
+> **Startup diagnostics:** the server logs a warning at boot if any of `FLW_SECRET_KEY`, `FLW_PUBLIC_KEY` or `FLW_SECRET_HASH` is missing, and `GET /api/providers/list` reports `publicKeyConfigured` / `webhookSecretConfigured` per provider.
 
 ### Webhook configuration (Flutterwave dashboard)
 

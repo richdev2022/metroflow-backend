@@ -958,7 +958,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
     if (eventType === 'transfer.completed') {
         const transferData = data;
         const reference = transferData.reference;
-        const status = (transferData.status || '').toUpperCase();
+        const payloadStatus = (transferData.status || '').toUpperCase();
 
         if (!reference) {
             console.warn('Flutterwave transfer.completed without reference, ignoring');
@@ -973,6 +973,27 @@ const handleFlutterwaveWebhook = async (event: any) => {
         }
 
         const transfer = transferRes.rows[0];
+
+        // Double confirmation (same principle as wallet funding): re-verify the
+        // transfer via the Flutterwave API before trusting the webhook payload.
+        // Docs best practice: use the API as the source of truth for fulfilment.
+        let status = payloadStatus;
+        try {
+            const provider = getProvider('flutterwave');
+            const verifyResponse = await provider.verifyTransfer(reference, {
+                data: { id: transferData.id },
+            });
+            const verified = verifyResponse?.data || verifyResponse;
+            if (verified?.status) {
+                status = String(verified.status).toUpperCase();
+                console.log(`Flutterwave transfer ${reference} verified via API: ${status}`);
+            }
+        } catch (verifyError: any) {
+            // Verification call failed - fall back to the (hash-validated) payload
+            console.warn(`Flutterwave transfer re-verification failed for ${reference}, using payload status:`,
+                verifyError?.message || verifyError);
+        }
+
         let newStatus: 'success' | 'failed' | 'processing' = 'processing';
         let failureReason: string | null = null;
 

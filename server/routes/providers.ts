@@ -80,4 +80,48 @@ router.get("/list", async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /providers/checkout-config:
+ *   get:
+ *     summary: Get client-side checkout configuration for the active provider
+ *     description: >
+ *       Public endpoint. Returns the client-side configuration the web/mobile
+ *       apps need to launch checkout with the active provider. For Flutterwave
+ *       this includes the PUBLIC key (used by inline checkout v3.js and the
+ *       mobile SDKs). Secret keys are never returned.
+ *     tags: [Providers]
+ *     responses:
+ *       200:
+ *         description: Checkout config for the active provider
+ */
+router.get("/checkout-config", async (req, res) => {
+  try {
+    const activeProvider = await getActiveProviderName();
+
+    if (activeProvider === "flutterwave") {
+      const { getFlutterwavePublicKey } = await import("../services/providers/flutterwave");
+      const publicKey = getFlutterwavePublicKey();
+      if (!publicKey) {
+        return res.status(503).json({
+          success: false,
+          error: "Flutterwave is active but FLW_PUBLIC_KEY is not configured on the server",
+        });
+      }
+      return res.json({
+        success: true,
+        data: { provider: "flutterwave", publicKey },
+      });
+    }
+
+    // Squad/Monnify use server-side hosted checkout only - no client key needed
+    return res.json({
+      success: true,
+      data: { provider: activeProvider, publicKey: null },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 export default router;

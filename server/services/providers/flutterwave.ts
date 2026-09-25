@@ -30,11 +30,28 @@ import { BANK_LIST, Bank } from "../../utils/bank-codes";
  */
 
 const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
+// Public key: NOT used for server-to-server REST calls (secret key is the
+// Bearer token). It is required CLIENT-SIDE for Inline checkout (v3.js
+// `FlutterwaveCheckout`) and the mobile SDKs. Served to clients via the
+// public GET /providers/checkout-config endpoint.
+const FLW_PUBLIC_KEY = process.env.FLW_PUBLIC_KEY;
+// Secret hash: set the SAME value in the Flutterwave dashboard webhook
+// settings. Flutterwave sends it back in the `verif-hash` header; requests
+// without a matching value are discarded (see verifyWebhook).
 const FLW_SECRET_HASH = process.env.FLW_SECRET_HASH;
+// Encryption key: only needed for Direct Charge endpoints (3DES payload
+// encryption) which this integration does not use today.
+const FLW_ENCRYPTION_KEY = process.env.FLW_ENCRYPTION_KEY;
 const FLW_BASE_URL = process.env.FLW_BASE_URL || "https://api.flutterwave.com";
 
 if (!FLW_SECRET_KEY) {
   console.warn("FLW_SECRET_KEY is not set. Flutterwave services will fail.");
+}
+if (!FLW_PUBLIC_KEY) {
+  console.warn("FLW_PUBLIC_KEY is not set. Client-side inline checkout (web/mobile) will not work for Flutterwave.");
+}
+if (!FLW_SECRET_HASH) {
+  console.warn("FLW_SECRET_HASH is not set. Flutterwave webhooks will be rejected - set it in .env AND in the Flutterwave dashboard webhook settings.");
 }
 
 const flwClient = axios.create({
@@ -543,4 +560,16 @@ export const flutterwaveProvider: Provider = {
 
 export function isFlutterwaveConfigured(): boolean {
   return Boolean(FLW_SECRET_KEY);
+}
+
+/**
+ * Public key for client-side checkout SDKs (web inline checkout / mobile).
+ * Public by design - safe to expose through public endpoints.
+ */
+export function getFlutterwavePublicKey(): string | null {
+  return FLW_PUBLIC_KEY || null;
+}
+
+export function isFlutterwaveWebhookConfigured(): boolean {
+  return Boolean(FLW_SECRET_HASH);
 }

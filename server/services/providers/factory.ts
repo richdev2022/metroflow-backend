@@ -71,7 +71,7 @@ export function getAvailableProviders(): string[] {
   return Object.keys(providers);
 }
 
-export function getProviderConfigStatus(): Record<string, { configured: boolean; requiredEnv: string[] }> {
+export function getProviderConfigStatus(): Record<string, any> {
   return {
     squad: {
       configured: Boolean(process.env.SQUAD_SECRET_KEY),
@@ -87,7 +87,15 @@ export function getProviderConfigStatus(): Record<string, { configured: boolean;
     },
     flutterwave: {
       configured: Boolean(process.env.FLW_SECRET_KEY),
-      requiredEnv: ["FLW_SECRET_KEY", "FLW_SECRET_HASH"],
+      // Public key powers CLIENT-SIDE inline checkout (v3.js / mobile SDKs).
+      // Public by design - safe to expose to clients.
+      publicKeyConfigured: Boolean(process.env.FLW_PUBLIC_KEY),
+      publicKey: process.env.FLW_PUBLIC_KEY || null,
+      // Webhook secret hash must ALSO be set in the Flutterwave dashboard
+      // (webhook settings) - otherwise all webhooks are rejected with 401.
+      webhookSecretConfigured: Boolean(process.env.FLW_SECRET_HASH),
+      requiredEnv: ["FLW_SECRET_KEY", "FLW_PUBLIC_KEY", "FLW_SECRET_HASH"],
+      optionalEnv: ["FLW_ENCRYPTION_KEY (direct charges only)", "FLW_BASE_URL"],
     },
   };
 }

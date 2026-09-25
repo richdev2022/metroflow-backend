@@ -3,9 +3,20 @@ import http from "http";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { getRedisClient } from "./cache";
 import logger from "./logger";
-import { initMediasoup, getRouter, getOrCreateRoom } from "./mediasoup";
+import {
+  initMediasoup,
+  getOrCreateRoomAsync,
+  getRoom,
+  createWebRtcTransportForRoom,
+  associateTransport,
+  getRoomProducers,
+  closePeer,
+  maybeCloseRoom,
+  ProducerAppData,
+} from "./mediasoup";
 import { query } from "../db";
 import { roomManager } from "./roomManager";
+import { verifyToken } from "../services/auth";
 import crypto from "crypto";
 
 let io: Server | null = null;
@@ -202,8 +213,60 @@ export function initSocketServer(server: http.Server): void {
     logger.info("Socket.io Redis adapter initialized");
   }
 
+  // Optional socket authentication: if the client provides a Bearer session
+  // token in handshake.auth.token we resolve it to userId/businessId.
+  // Unauthenticated (guest) sockets are still allowed to connect.
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake?.auth?.token;
+      if (token) {
+        const session = await verifyToken(token);
+        if (session) {
+          socket.data.userId = session.userId;
+          socket.data.businessId = session.businessId;
+          socket.data.authenticated = true;
+        } else {
+          logger.warn("Socket presented an invalid/expired token - continuing as guest");
+        }
+      }
+    } catch (err) {
+      logger.error("Socket auth middleware error:", err);
+    }
+    next();
+  });
+
+  // In-memory waiting-room queues: roomId -> Map<participantId, entry>
+  const waitingRooms = new Map<
+    string,
+    Map<string, { participantId: string; socketId: string; userName: string; isGuest: boolean; since: number }>
+  >();
+
+  const getWaitingQueue = (roomId: string) => {
+    let q = waitingRooms.get(roomId);
+    if (!q) {
+      q = new Map();
+      waitingRooms.set(roomId, q);
+    }
+    return q;
+  };
+
+  const queueToArray = (roomId: string) =>
+    Array.from(getWaitingQueue(roomId).values()).map((e) => ({
+      participantId: e.participantId,
+      userName: e.userName,
+      isGuest: e.isGuest,
+      since: e.since,
+    }));
+
   io.on("connection", (socket) => {
-    logger.info(`Socket connected: ${socket.id}`);
+    logger.info(`Socket connected: ${socket.id}${socket.data.authenticated ? ` (user ${socket.data.userId})` : " (guest)"}`);
+
+    // 0. Waiting-room state kept per socket
+    socket.data.waitingRoom = false;
+
+    // 0a. Optional authentication middleware support: clients may pass
+    // { auth: { token } } in io() options. Guests connect without tokens.
+    // (The handshake auth was already read in io.use() below; nothing to do here.)
 
     // 1. Verify invitation token
     socket.on("invitation:verify", async (data: { token: string; roomId: string }, callback) => {
@@ -237,8 +300,8 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    // 2. Join call
-    socket.on("call:join", async (data: { roomId: string; userId: string; userName: string; isHost: boolean; audioEnabled: boolean; videoEnabled: boolean }, callback?: (response: any) => void) => {
+    // 2. Join call (works for both calls and meetings; guests use guest-* ids)
+    socket.on("call:join", async (data: { roomId: string; userId: string; userName: string; isHost: boolean; audioEnabled: boolean; videoEnabled: boolean; isGuest?: boolean }, callback?: (response: any) => void) => {
       try {
         const resolved = await resolveRoomId(data.roomId);
         if (!resolved) {
@@ -282,6 +345,8 @@ export function initSocketServer(server: http.Server): void {
           }
         }
 
+        const isGuest = !!data.isGuest || String(data.userId || "").startsWith("guest-");
+
         roomManager.addParticipant(resolvedRoomId, {
           id: data.userId,
           name: data.userName,
@@ -289,6 +354,7 @@ export function initSocketServer(server: http.Server): void {
           audioEnabled: data.audioEnabled,
           videoEnabled: data.videoEnabled,
           screenSharing: false,
+          isGuest,
         }, endsAt, maxMeetingDuration);
 
         const participantCount = roomManager.getParticipants(resolvedRoomId).length;
@@ -321,6 +387,7 @@ export function initSocketServer(server: http.Server): void {
           userId: data.userId,
           userName: data.userName,
           isHost: data.isHost,
+          isGuest,
         });
 
         const roomState = roomManager.getRoomState(resolvedRoomId);
@@ -432,8 +499,182 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
+    // 6b. Room password verification (waiting-room / join gate)
+    socket.on("room:verifyPassword", async (
+      data: { roomId: string; password: string },
+      callback?: (response: any) => void,
+    ) => {
+      try {
+        const resolved = await resolveRoomId(data.roomId);
+        if (!resolved) {
+          if (callback) callback({ success: false, error: "Room not found" });
+          return;
+        }
+        const resolvedRoomId = resolved.id;
+        const table = resolved.type === "call" ? "calls" : "meetings";
+        const result = await query(
+          `SELECT password FROM ${table} WHERE id = $1`,
+          [resolvedRoomId],
+        );
+        const stored = result.rows[0]?.password;
+
+        if (!stored) {
+          if (callback) callback({ success: true, passwordRequired: false });
+          return;
+        }
+        if (stored === data.password) {
+          if (callback) callback({ success: true, passwordRequired: true, roomId: resolvedRoomId });
+        } else {
+          if (callback) callback({ success: false, error: "Incorrect password" });
+        }
+      } catch (error) {
+        logger.error("Error verifying room password:", error);
+        if (callback) callback({ success: false, error: "Server error" });
+      }
+    });
+
+    // 6c. Waiting-room flow: guests/participants request to join
+    socket.on("waiting-room:request", async (
+      data: { roomId: string; userId?: string; userName?: string; meetingId?: string; isGuest?: boolean },
+      callback?: (response: any) => void,
+    ) => {
+      try {
+        const resolved = await resolveRoomId(data.roomId || data.meetingId || "");
+        if (!resolved) {
+          if (callback) callback({ success: false, error: "Room not found" });
+          return;
+        }
+        const resolvedRoomId = resolved.id;
+        const participantId = data.userId || `guest-${socket.id.slice(0, 8)}`;
+        const userName = data.userName || "Guest";
+
+        const queue = getWaitingQueue(resolvedRoomId);
+        queue.set(participantId, {
+          participantId,
+          socketId: socket.id,
+          userName,
+          isGuest: !!data.isGuest || participantId.startsWith("guest-"),
+          since: Date.now(),
+        });
+        socket.data.waitingRoom = true;
+        socket.data.waitingRoomId = resolvedRoomId;
+
+        const entry = {
+          roomId: resolvedRoomId,
+          participantId,
+          userName,
+          isGuest: queue.get(participantId)!.isGuest,
+        };
+
+        // Notify everyone already in the room (hosts & participants)
+        io.to(`room:${resolvedRoomId}`).emit("waiting-room:pending", entry);
+        io.to(`meeting:${resolvedRoomId}`).emit("waiting-room:pending", entry);
+        if (callback) callback({ success: true, ...entry });
+        logger.info(`Waiting-room request: ${userName} (${participantId}) -> room ${resolvedRoomId}`);
+      } catch (error) {
+        logger.error("Error handling waiting-room request:", error);
+        if (callback) callback({ success: false, error: "Server error" });
+      }
+    });
+
+    socket.on("waiting-room:get-queue", async (data: { roomId: string; meetingId?: string }, callback?: (response: any) => void) => {
+      try {
+        const resolved = await resolveRoomId(data.roomId || data.meetingId || "");
+        if (!resolved) {
+          if (callback) callback({ queue: [] });
+          return;
+        }
+        if (callback) callback({ roomId: resolved.id, queue: queueToArray(resolved.id) });
+      } catch (error) {
+        logger.error("Error getting waiting-room queue:", error);
+        if (callback) callback({ queue: [] });
+      }
+    });
+
+    socket.on("waiting-room:admit", async (data: { roomId?: string; meetingId?: string; participantId: string }) => {
+      try {
+        const roomIdInput = data.roomId || data.meetingId || "";
+        const resolved = await resolveRoomId(roomIdInput);
+        if (!resolved) return;
+        const resolvedRoomId = resolved.id;
+        const queue = getWaitingQueue(resolvedRoomId);
+        const entry = queue.get(data.participantId);
+        if (!entry) return;
+        queue.delete(data.participantId);
+
+        io.to(entry.socketId).emit("waiting-room:admitted", {
+          roomId: resolvedRoomId,
+          meetingId: resolvedRoomId,
+          participantId: entry.participantId,
+          userName: entry.userName,
+        });
+        io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
+          roomId: resolvedRoomId,
+          queue: queueToArray(resolvedRoomId),
+        });
+        logger.info(`Waiting-room admit: ${entry.userName} -> room ${resolvedRoomId}`);
+      } catch (error) {
+        logger.error("Error admitting participant:", error);
+      }
+    });
+
+    socket.on("waiting-room:deny", async (data: { roomId?: string; meetingId?: string; participantId: string }) => {
+      try {
+        const roomIdInput = data.roomId || data.meetingId || "";
+        const resolved = await resolveRoomId(roomIdInput);
+        if (!resolved) return;
+        const resolvedRoomId = resolved.id;
+        const queue = getWaitingQueue(resolvedRoomId);
+        const entry = queue.get(data.participantId);
+        if (!entry) return;
+        queue.delete(data.participantId);
+
+        io.to(entry.socketId).emit("waiting-room:denied", {
+          roomId: resolvedRoomId,
+          meetingId: resolvedRoomId,
+          participantId: entry.participantId,
+        });
+        io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
+          roomId: resolvedRoomId,
+          queue: queueToArray(resolvedRoomId),
+        });
+      } catch (error) {
+        logger.error("Error denying participant:", error);
+      }
+    });
+
+    socket.on("waiting-room:admit-all", async (data: { roomId?: string; meetingId?: string }) => {
+      try {
+        const roomIdInput = data.roomId || data.meetingId || "";
+        const resolved = await resolveRoomId(roomIdInput);
+        if (!resolved) return;
+        const resolvedRoomId = resolved.id;
+        const queue = getWaitingQueue(resolvedRoomId);
+        for (const entry of queue.values()) {
+          io.to(entry.socketId).emit("waiting-room:admitted", {
+            roomId: resolvedRoomId,
+            meetingId: resolvedRoomId,
+            participantId: entry.participantId,
+            userName: entry.userName,
+          });
+        }
+        queue.clear();
+        io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
+          roomId: resolvedRoomId,
+          queue: [],
+        });
+      } catch (error) {
+        logger.error("Error admitting all participants:", error);
+      }
+    });
+
     // User presence
     socket.on("user-online", async (userId: string, businessId: string) => {
+      // Prefer the server-verified identity from handshake auth when present
+      if (socket.data.authenticated) {
+        userId = socket.data.userId;
+        businessId = socket.data.businessId;
+      }
       socket.data.userId = userId;
       socket.data.businessId = businessId;
 
@@ -682,12 +923,23 @@ export function initSocketServer(server: http.Server): void {
     });
 
     // Mediasoup / WebRTC signaling
-    socket.on("mediasoup:getRouterRtpCapabilities", async (callback) => {
-      const router = getRouter();
-      if (router) {
+    socket.on("mediasoup:getRouterRtpCapabilities", async ({ roomId }: { roomId?: string }, callback) => {
+      try {
+        let router;
+        if (roomId) {
+          const resolved = await resolveRoomId(roomId);
+          const resolvedRoomId = resolved ? resolved.id : roomId;
+          const room = await getOrCreateRoomAsync(resolvedRoomId);
+          router = room.router;
+        }
+        if (!router) {
+          callback({ error: "Router not initialized" });
+          return;
+        }
         callback({ rtpCapabilities: router.rtpCapabilities });
-      } else {
-        callback({ error: "Router not initialized" });
+      } catch (error) {
+        logger.error("Error getting router rtp capabilities:", error);
+        callback({ error: String(error) });
       }
     });
 
@@ -695,17 +947,15 @@ export function initSocketServer(server: http.Server): void {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getOrCreateRoom(resolvedRoomId);
-        const router = room.router;
+        const { transport } = await createWebRtcTransportForRoom(resolvedRoomId);
+        associateTransport(resolvedRoomId, transport.id, socket.id);
 
-        const transport = await router.createWebRtcTransport({
-          listenIps: [{ ip: "0.0.0.0", announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || "127.0.0.1" }],
-          enableUdp: true,
-          enableTcp: true,
-          preferUdp: true,
+        transport.on("dtlsstatechange", (state) => {
+          if (state === "closed" || state === "failed") {
+            logger.warn(`Transport ${transport.id} DTLS ${state}, cleaning up`);
+            transport.close();
+          }
         });
-
-        room.transports.set(transport.id, transport);
 
         callback({
           id: transport.id,
@@ -724,8 +974,8 @@ export function initSocketServer(server: http.Server): void {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getOrCreateRoom(resolvedRoomId);
-        const transport = room.transports.get(transportId);
+        const room = getRoom(resolvedRoomId);
+        const transport = room?.transports.get(transportId);
         if (!transport) throw new Error("Transport not found");
         await transport.connect({ dtlsParameters });
         callback();
@@ -735,27 +985,112 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    socket.on("mediasoup:produce", async ({ transportId, kind, rtpParameters, roomId }, callback) => {
+    socket.on("mediasoup:produce", async (
+      {
+        transportId,
+        kind,
+        rtpParameters,
+        roomId,
+        appData,
+        userId,
+        userName,
+      }: {
+        transportId: string;
+        kind: "audio" | "video" | string;
+        rtpParameters: any;
+        roomId: string;
+        appData?: ProducerAppData;
+        userId?: string;
+        userName?: string;
+      },
+      callback,
+    ) => {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getOrCreateRoom(resolvedRoomId);
-        const transport = room.transports.get(transportId);
+        const room = getRoom(resolvedRoomId);
+        const transport = room?.transports.get(transportId);
         if (!transport) throw new Error("Transport not found");
 
-        const producer = await transport.produce({ kind, rtpParameters });
-        room.producers.set(producer.id, producer);
+        const effectiveUserId = userId || socket.data.userId || `guest-${socket.id.slice(0, 8)}`;
+        const effectiveUserName = userName || socket.data.userName || "Guest";
+
+        const producer = await transport.produce({
+          kind: kind as "audio" | "video",
+          rtpParameters,
+          appData: {
+            socketId: socket.id,
+            userId: effectiveUserId,
+            userName: effectiveUserName,
+            ...(appData || {}),
+          },
+        });
+        room!.producers.set(producer.id, producer);
 
         producer.on("transportclose", () => {
-          room.producers.delete(producer.id);
+          room!.producers.delete(producer.id);
+          maybeCloseRoom(resolvedRoomId);
+        });
+        producer.on("score", () => {
+          /* could forward scores for quality UI later */
         });
 
-        socket.to(`room:${resolvedRoomId}`).emit("mediasoup:newProducer", { producerId: producer.id, kind, roomId: resolvedRoomId });
+        const newProducerPayload = {
+          producerId: producer.id,
+          kind,
+          roomId: resolvedRoomId,
+          peerId: effectiveUserId,
+          peerName: effectiveUserName,
+          appData: producer.appData,
+        };
+        // Notify everyone except the producer's own socket
+        socket.to(`room:${resolvedRoomId}`).emit("mediasoup:newProducer", newProducerPayload);
 
-        callback({ id: producer.id, roomId: resolvedRoomId });
+        callback({ id: producer.id, roomId: resolvedRoomId, appData: producer.appData });
       } catch (error) {
         logger.error("Error producing:", error);
         callback({ error: String(error) });
+      }
+    });
+
+    // CRITICAL: existing producers discovery for late joiners.
+    // Without this, participants who join after others can never see/hear them.
+    socket.on("mediasoup:getProducers", async ({ roomId }: { roomId: string }, callback) => {
+      try {
+        const resolved = await resolveRoomId(roomId);
+        const resolvedRoomId = resolved ? resolved.id : roomId;
+        const producers = getRoomProducers(resolvedRoomId, socket.id);
+        callback({ producers });
+      } catch (error) {
+        logger.error("Error getting room producers:", error);
+        callback({ error: String(error) });
+      }
+    });
+
+    // Close a producer explicitly (e.g. screen-share stopped, track ended)
+    socket.on("mediasoup:closeProducer", async ({ roomId, producerId }: { roomId: string; producerId: string }, callback) => {
+      try {
+        const resolved = await resolveRoomId(roomId);
+        const resolvedRoomId = resolved ? resolved.id : roomId;
+        const room = getRoom(resolvedRoomId);
+        const producer = room?.producers.get(producerId);
+        if (producer && (producer.appData as ProducerAppData)?.socketId === socket.id) {
+          producer.close(); // fires transportclose? no - fires 'producerclose'; clean map explicitly
+          room!.producers.delete(producerId);
+          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:producerClosed", {
+            producerId,
+            roomId: resolvedRoomId,
+            peerId: (producer.appData as ProducerAppData)?.userId,
+            appData: producer.appData,
+          });
+          maybeCloseRoom(resolvedRoomId);
+          if (callback) callback({ success: true });
+        } else if (callback) {
+          callback({ success: false, error: "Producer not found or not owned by you" });
+        }
+      } catch (error) {
+        logger.error("Error closing producer:", error);
+        if (callback) callback({ success: false, error: String(error) });
       }
     });
 
@@ -763,20 +1098,34 @@ export function initSocketServer(server: http.Server): void {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getOrCreateRoom(resolvedRoomId);
-        const router = room.router;
-        const transport = room.transports.get(transportId);
-        if (!transport) throw new Error("Transport not found");
+        const room = getRoom(resolvedRoomId);
+        const router = room?.router;
+        const transport = room?.transports.get(transportId);
+        if (!router || !transport) throw new Error("Transport not found");
 
         if (!router.canConsume({ producerId, rtpCapabilities })) {
           throw new Error("Cannot consume");
         }
 
-        const consumer = await transport.consume({ producerId, rtpCapabilities });
-        room.consumers.set(consumer.id, consumer);
+        const consumer = await transport.consume({
+          producerId,
+          rtpCapabilities,
+          paused: true, // client resumes after attaching the track (recommended flow)
+        });
+        room!.consumers.set(consumer.id, consumer);
 
         consumer.on("transportclose", () => {
-          room.consumers.delete(consumer.id);
+          room!.consumers.delete(consumer.id);
+          maybeCloseRoom(resolvedRoomId);
+        });
+        consumer.on("producerclose", () => {
+          room!.consumers.delete(consumer.id);
+          socket.emit("mediasoup:producerClosed", {
+            producerId,
+            consumerId: consumer.id,
+            roomId: resolvedRoomId,
+          });
+          maybeCloseRoom(resolvedRoomId);
         });
 
         callback({
@@ -785,6 +1134,7 @@ export function initSocketServer(server: http.Server): void {
           kind: consumer.kind,
           roomId: resolvedRoomId,
           rtpParameters: consumer.rtpParameters,
+          appData: consumer.appData,
         });
       } catch (error) {
         logger.error("Error consuming:", error);
@@ -796,14 +1146,46 @@ export function initSocketServer(server: http.Server): void {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getOrCreateRoom(resolvedRoomId);
-        const consumer = room.consumers.get(consumerId);
+        const room = getRoom(resolvedRoomId);
+        const consumer = room?.consumers.get(consumerId);
         if (!consumer) throw new Error("Consumer not found");
         await consumer.resume();
-        callback();
+        if (callback) callback();
       } catch (error) {
         logger.error("Error resuming consumer:", error);
-        callback({ error: String(error) });
+        if (callback) callback({ error: String(error) });
+      }
+    });
+
+    socket.on("mediasoup:pauseProducer", async ({ roomId, producerId }: { roomId: string; producerId: string }, callback) => {
+      try {
+        const resolved = await resolveRoomId(roomId);
+        const resolvedRoomId = resolved ? resolved.id : roomId;
+        const room = getRoom(resolvedRoomId);
+        const producer = room?.producers.get(producerId);
+        if (producer && (producer.appData as ProducerAppData)?.socketId === socket.id) {
+          await producer.pause();
+          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:producerPaused", { producerId, roomId: resolvedRoomId });
+          if (callback) callback({ success: true });
+        } else if (callback) callback({ success: false, error: "Producer not found" });
+      } catch (error) {
+        if (callback) callback({ error: String(error) });
+      }
+    });
+
+    socket.on("mediasoup:resumeProducer", async ({ roomId, producerId }: { roomId: string; producerId: string }, callback) => {
+      try {
+        const resolved = await resolveRoomId(roomId);
+        const resolvedRoomId = resolved ? resolved.id : roomId;
+        const room = getRoom(resolvedRoomId);
+        const producer = room?.producers.get(producerId);
+        if (producer && (producer.appData as ProducerAppData)?.socketId === socket.id) {
+          await producer.resume();
+          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:producerResumed", { producerId, roomId: resolvedRoomId });
+          if (callback) callback({ success: true });
+        } else if (callback) callback({ success: false, error: "Producer not found" });
+      } catch (error) {
+        if (callback) callback({ error: String(error) });
       }
     });
 
@@ -906,7 +1288,37 @@ export function initSocketServer(server: http.Server): void {
 
     // Disconnect
     socket.on("disconnect", async () => {
-      const { userId, businessId } = socket.data;
+      const { userId, businessId, waitingRoom: wasWaiting, waitingRoomId } = socket.data;
+
+      // Remove from waiting-room queue if applicable
+      if (wasWaiting && waitingRoomId) {
+        const queue = waitingRooms.get(waitingRoomId);
+        if (queue) {
+          for (const [pid, entry] of queue.entries()) {
+            if (entry.socketId === socket.id) {
+              queue.delete(pid);
+              io.to(`room:${waitingRoomId}`).emit("waiting-room:queue", {
+                roomId: waitingRoomId,
+                queue: queueToArray(waitingRoomId),
+              });
+              break;
+            }
+          }
+        }
+      }
+
+      // Close all mediasoup transports/producers owned by this socket and
+      // notify rooms so peers can drop the corresponding consumers/streams.
+      try {
+        const { affectedRooms } = closePeer(socket.id);
+        for (const roomId of affectedRooms) {
+          socket.to(`room:${roomId}`).emit("mediasoup:peerLeft", { roomId, socketId: socket.id });
+          maybeCloseRoom(roomId);
+        }
+      } catch (err) {
+        logger.error("Error cleaning up mediasoup peer on disconnect:", err);
+      }
+
       if (userId && businessId) {
         if (isRedisReady()) {
           await redisClient.del(`online:${businessId}:${userId}`);

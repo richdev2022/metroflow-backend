@@ -1437,7 +1437,8 @@ async function generateInviteLink(
   const encodedUserName = encodeURIComponent(participantName);
   const waitingRoomParam = (!isHost && waitingRoomEnabled) ? 'true' : 'false';
 
-  return `https://myapp.com/call?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}`;
+  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || 'http://localhost:8080';
+  return `${baseUrl}/calls?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}&autoJoin=1`;
 }
 
 // Generate invite link endpoint

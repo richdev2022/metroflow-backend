@@ -143,19 +143,35 @@ export async function createServer() {
   initRedis();
   logger.info("✅ Redis initialization attempted");
 
-  // Initialize database
+  // Initialize database with retries. initializeDatabase() is fully
+  // idempotent (CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so
+  // re-running it after a transient failure (cold-start, quota blip,
+  // connection reset) is safe and completes the previously-partial schema.
+  // Serverless keeps a single attempt: function timeouts are short.
+  const isServerlessEnv = Boolean(process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT);
+  const DB_INIT_MAX_ATTEMPTS = isServerlessEnv ? 1 : 5;
+  const DB_INIT_RETRY_DELAY_MS = 5_000;
   let isDbReady = false;
   let dbInitError: any = null;
 
-  const dbInitPromise = initializeDatabase()
-    .then(() => {
-      logger.info("✅ Database initialized successfully");
-      isDbReady = true;
-    })
-    .catch((error) => {
-      logger.error("❌ Failed to initialize database:", error);
-      dbInitError = error;
-    });
+  const dbInitPromise = (async () => {
+    for (let attempt = 1; attempt <= DB_INIT_MAX_ATTEMPTS; attempt++) {
+      try {
+        await initializeDatabase();
+        logger.info("✅ Database initialized successfully");
+        isDbReady = true;
+        return;
+      } catch (error: any) {
+        dbInitError = error;
+        if (attempt < DB_INIT_MAX_ATTEMPTS) {
+          const delay = DB_INIT_RETRY_DELAY_MS * attempt;
+          logger.error(`Database init attempt ${attempt}/${DB_INIT_MAX_ATTEMPTS} failed [${error?.code || "UNKNOWN"}]: ${error?.message}. Retrying in ${delay / 1000}s...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+    logger.error(`❌ Database initialization failed after ${DB_INIT_MAX_ATTEMPTS} attempt(s): ${dbInitError?.message || dbInitError}`);
+  })();
 
   // In serverless environments, we must wait for the database to initialize
   // because background tasks may be frozen immediately after the response is sent.
@@ -232,19 +248,6 @@ export async function createServer() {
   // bounded batch, self-scheduling loop, exponential backoff on DB errors).
   if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
     startTransferMonitor();
-  }
-
-  // Security configuration diagnostics (once at boot, mirrors the Flutterwave
-  // key warnings). These secrets silently fall back to public defaults when
-  // unset, which is only acceptable for local development.
-  if (!process.env.CRON_SECRET) {
-    console.warn("CRON_SECRET is not set - cron endpoints fall back to a public default (set it before going live).");
-  }
-  if (!process.env.JOBS_SECRET) {
-    console.warn("JOBS_SECRET is not set - /internal/jobs endpoints accept unauthenticated calls (set it before going live).");
-  }
-  if (!process.env.TRANSACTION_HASH_SECRET) {
-    console.warn("TRANSACTION_HASH_SECRET is not set - transaction hashes are signed with a public default (set it before going live).");
   }
 
   // Serverless fallback: in serverless environments there is no persistent

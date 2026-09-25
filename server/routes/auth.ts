@@ -24,6 +24,8 @@ import {
   recordFailedLogin,
   recordSuccessfulLogin,
 } from "../services/login-security";
+import { verifyGoogleIdToken } from "../services/googleAuth";
+import { AuthenticatedRequest } from "../middleware/auth";
 
 export const registerBusiness: RequestHandler = async (req, res) => {
 /**
@@ -900,7 +902,7 @@ export const login: RequestHandler = async (req, res) => {
     }
 
     const result = await query(
-      `SELECT id, business_id as "businessId", password_hash, email_verified, otp_code, otp_expires_at
+      `SELECT id, business_id as "businessId", password_hash, email_verified, otp_code, otp_expires_at, auth_provider, google_id
        FROM users
        WHERE email = $1`,
       [input.email],
@@ -919,6 +921,16 @@ export const login: RequestHandler = async (req, res) => {
 
     const user = result.rows[0];
     console.log("User found, email_verified:", user.email_verified);
+
+    // Google SSO account that has not created a password yet
+    if (!user.password_hash) {
+      return res.status(400).json({
+        success: false,
+        code: "GOOGLE_ACCOUNT_NO_PASSWORD",
+        message:
+          "This account is signed up with Google. Please continue with Google Sign-In, or create a password from Settings after signing in with Google.",
+      });
+    }
 
     const passwordValid = await verifyPassword(input.password, user.password_hash);
     if (!passwordValid) {
@@ -979,5 +991,441 @@ export const login: RequestHandler = async (req, res) => {
       message: "Failed to login",
     };
     res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /auth/google:
+ *   post:
+ *     summary: Sign up or log in with Google (ID token from Google Identity Services)
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - credential
+ *             properties:
+ *               credential:
+ *                 type: string
+ *                 description: Google ID token
+ *               businessName:
+ *                 type: string
+ *                 description: Optional business name for new sign-ups
+ *               businessIndustry:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Google authentication successful
+ */
+export const googleAuth: RequestHandler = async (req, res) => {
+  try {
+    const { credential, businessName, businessIndustry } = req.body || {};
+
+    if (!credential) {
+      return res.status(400).json({
+        success: false,
+        message: "Google credential is required",
+      });
+    }
+
+    const googleUser = await verifyGoogleIdToken(credential);
+    if (!googleUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid or expired Google credential",
+      });
+    }
+
+    if (!googleUser.emailVerified) {
+      return res.status(400).json({
+        success: false,
+        message: "Your Google account email is not verified",
+      });
+    }
+
+    // 1) Existing user linked by google_id
+    const byGoogleId = await query(
+      `SELECT id, business_id as "businessId", email, name, avatar_url as "avatarUrl",
+              auth_provider as "authProvider", password_hash as "passwordHash", email_verified
+       FROM users WHERE google_id = $1 LIMIT 1`,
+      [googleUser.googleId],
+    );
+
+    let user = byGoogleId.rows[0] || null;
+
+    // 2) Existing user with same email (link Google account)
+    if (!user) {
+      const byEmail = await query(
+        `SELECT id, business_id as "businessId", email, name, avatar_url as "avatarUrl",
+                auth_provider as "authProvider", password_hash as "passwordHash", email_verified
+         FROM users WHERE email = $1 LIMIT 1`,
+        [googleUser.email],
+      );
+
+      if (byEmail.rows.length > 0) {
+        user = byEmail.rows[0];
+        // Link google identity to the existing account and trust Google-verified email
+        await query(
+          `UPDATE users
+           SET google_id = $1,
+               auth_provider = CASE WHEN auth_provider = 'google' THEN auth_provider ELSE auth_provider || '+google' END,
+               email_verified = TRUE,
+               avatar_url = COALESCE(avatar_url, $2),
+               verified_at = COALESCE(verified_at, NOW()),
+               otp_code = NULL,
+               otp_expires_at = NULL,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [googleUser.googleId, googleUser.picture || null, user.id],
+        );
+      }
+    }
+
+    let isNewUser = false;
+
+    // 3) Brand-new user: create business + admin user (Google-verified email, no password)
+    if (!user) {
+      isNewUser = true;
+      const derivedBusinessName =
+        (businessName && String(businessName).trim()) ||
+        `${googleUser.name.split(" ")[0]}'s Workspace`;
+
+      const existingBusiness = await query(
+        "SELECT id FROM businesses WHERE email = $1",
+        [googleUser.email],
+      );
+      if (existingBusiness.rows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "A business with this email already exists. Please sign in instead.",
+        });
+      }
+
+      // Get default free/trial plan (same logic as email registration)
+      const planResult = await query("SELECT * FROM pricing_plans WHERE price = 0 LIMIT 1");
+      let planId = null;
+      let trialEndsAt = null;
+      const trialDaysDefault =
+        planResult.rows.length > 0 &&
+        planResult.rows[0].trial_days &&
+        planResult.rows[0].trial_days > 0
+          ? planResult.rows[0].trial_days
+          : 7;
+      const trialDate = new Date();
+      trialDate.setDate(trialDate.getDate() + trialDaysDefault);
+      trialEndsAt = trialDate;
+      if (planResult.rows.length > 0) planId = planResult.rows[0].id;
+
+      const businessId = generateBusinessId(derivedBusinessName);
+      const businessResult = await query(
+        `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, name, email`,
+        [
+          businessId,
+          derivedBusinessName,
+          googleUser.email,
+          businessIndustry || null,
+          planId,
+          trialEndsAt,
+        ],
+      );
+      const business = businessResult.rows[0];
+
+      const userResult = await query(
+        `INSERT INTO users
+          (business_id, email, name, role, email_verified, verified_at, google_id, auth_provider, avatar_url)
+         VALUES ($1, $2, $3, 'admin', TRUE, CURRENT_TIMESTAMP, $4, 'google', $5)
+         RETURNING id, email, name, role`,
+        [business.id, googleUser.email, googleUser.name, googleUser.googleId, googleUser.picture || null],
+      );
+      const newUser = userResult.rows[0];
+
+      await query(`UPDATE businesses SET owner_id = $1 WHERE id = $2`, [
+        newUser.id,
+        business.id,
+      ]);
+
+      // Seed default task statuses (parity with email registration)
+      const defaultStatuses = [
+        { name: "pending", color: "#6b7280", is_default: true, sort_order: 0 },
+        { name: "in_progress", color: "#3b82f6", is_default: true, sort_order: 1 },
+        { name: "completed", color: "#10b981", is_default: true, sort_order: 2 },
+      ];
+      for (const status of defaultStatuses) {
+        await query(
+          `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [business.id, status.name, status.color, status.is_default, status.sort_order],
+        );
+      }
+
+      await logActivity({
+        businessId: business.id,
+        userId: newUser.id,
+        action: "register",
+        actionType: "business",
+        description: `Business registered via Google SSO: ${business.name}`,
+        metadata: {
+          businessName: business.name,
+          authProvider: "google",
+        },
+      });
+
+      const token = await generateToken(newUser.id, business.id);
+
+      return res.json({
+        success: true,
+        token,
+        userId: newUser.id,
+        businessId: business.id,
+        isNewUser,
+        requiresPasswordSetup: true,
+        message: "Google sign-up successful",
+        user: {
+          id: newUser.id,
+          name: newUser.name,
+          email: newUser.email,
+          avatarUrl: googleUser.picture || null,
+          authProvider: "google",
+          hasPassword: false,
+        },
+        business: {
+          id: business.id,
+          name: business.name,
+          email: business.email,
+        },
+      });
+    }
+
+    // 4) Existing user login
+    if (user.email === null || user.email === undefined) {
+      return res.status(400).json({ success: false, message: "Account error" });
+    }
+
+    await recordSuccessfulLogin(user.email);
+    await logActivity({
+      businessId: user.businessId,
+      userId: user.id,
+      action: "login",
+      actionType: "authentication",
+      description: "User logged in with Google SSO",
+    });
+
+    const token = await generateToken(user.id, user.businessId);
+
+    return res.json({
+      success: true,
+      token,
+      userId: user.id,
+      businessId: user.businessId,
+      isNewUser,
+      requiresPasswordSetup: !user.passwordHash,
+      message: isNewUser ? "Google sign-up successful" : "Google login successful",
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        avatarUrl: user.avatarUrl,
+        authProvider: user.authProvider,
+        hasPassword: !!user.passwordHash,
+      },
+    });
+  } catch (error) {
+    console.error("Google auth error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to authenticate with Google",
+    });
+  }
+};
+
+/**
+ * @swagger
+ * /auth/set-password:
+ *   post:
+ *     summary: Create a password for SSO accounts (allows future email+password login)
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - password
+ *             properties:
+ *               password:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password created
+ */
+export const setPassword: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+
+    const { password } = req.body || {};
+    if (!password || typeof password !== "string" || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters",
+      });
+    }
+
+    const result = await query(
+      `SELECT id, password_hash as "passwordHash", auth_provider as "authProvider" FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const user = result.rows[0];
+    if (user.passwordHash) {
+      return res.status(400).json({
+        success: false,
+        code: "PASSWORD_ALREADY_SET",
+        message:
+          "A password already exists for this account. Use change-password instead.",
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+    await query(
+      `UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [passwordHash, userId],
+    );
+
+    await logActivity({
+      businessId: req.user?.businessId,
+      userId,
+      action: "set_password",
+      actionType: "authentication",
+      description: "Password created for SSO account",
+    });
+
+    return res.json({
+      success: true,
+      message:
+        "Password created successfully. You can now sign in with your email and password or with Google.",
+    });
+  } catch (error) {
+    console.error("Set password error:", error);
+    return res.status(500).json({ success: false, message: "Failed to set password" });
+  }
+};
+
+/**
+ * @swagger
+ * /auth/change-password:
+ *   post:
+ *     summary: Change password for accounts that already have one
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ */
+export const changePassword: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+
+    const { currentPassword, newPassword } = req.body || {};
+    if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 8 characters",
+      });
+    }
+
+    const result = await query(
+      `SELECT id, password_hash as "passwordHash" FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const user = result.rows[0];
+    if (!user.passwordHash) {
+      return res.status(400).json({
+        success: false,
+        code: "NO_PASSWORD_SET",
+        message: "This account has no password yet. Use set-password first.",
+      });
+    }
+
+    const valid = await verifyPassword(currentPassword || "", user.passwordHash);
+    if (!valid) {
+      return res.status(400).json({ success: false, message: "Current password is incorrect" });
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    await query(
+      `UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [passwordHash, userId],
+    );
+
+    await logActivity({
+      businessId: req.user?.businessId,
+      userId,
+      action: "change_password",
+      actionType: "authentication",
+      description: "Password changed",
+    });
+
+    return res.json({ success: true, message: "Password updated successfully" });
+  } catch (error) {
+    console.error("Change password error:", error);
+    return res.status(500).json({ success: false, message: "Failed to change password" });
+  }
+};
+
+/**
+ * @swagger
+ * /auth/me:
+ *   get:
+ *     summary: Get the current authenticated user profile
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ */
+export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+
+    const result = await query(
+      `SELECT id, business_id as "businessId", email, name, role,
+              avatar_url as "avatarUrl", auth_provider as "authProvider",
+              (password_hash IS NOT NULL) as "hasPassword",
+              email_verified as "emailVerified", kyc_status as "kycStatus",
+              phone_number as "phoneNumber"
+       FROM users WHERE id = $1`,
+      [userId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error("Get me error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch profile" });
   }
 };

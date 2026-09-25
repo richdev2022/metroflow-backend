@@ -273,6 +273,54 @@ export interface AuthResponse {
   message?: string;
 }
 
+// ---------- Google SSO ----------
+export interface GoogleAuthInput {
+  /** Google ID token issued by Google Identity Services */
+  credential: string;
+  businessName?: string;
+  businessIndustry?: string;
+}
+
+export interface GoogleAuthUser {
+  id: string;
+  name: string;
+  email: string;
+  avatarUrl?: string | null;
+  authProvider: string;
+  hasPassword: boolean;
+}
+
+export interface GoogleAuthResponse extends AuthResponse {
+  isNewUser?: boolean;
+  /** True when the account has no password yet (SSO-only) and should be prompted to create one */
+  requiresPasswordSetup?: boolean;
+  user?: GoogleAuthUser;
+  business?: { id: string; name: string; email: string };
+}
+
+export interface SetPasswordInput {
+  password: string;
+}
+
+export interface ChangePasswordInput {
+  currentPassword: string;
+  newPassword: string;
+}
+
+export interface MeResponse {
+  id: string;
+  businessId: string;
+  email: string;
+  name: string;
+  role: string;
+  avatarUrl?: string | null;
+  authProvider: string;
+  hasPassword: boolean;
+  emailVerified: boolean;
+  kycStatus: string;
+  phoneNumber?: string | null;
+}
+
 // Task Creation with new fields
 export interface CreateTaskInput {
   title: string;

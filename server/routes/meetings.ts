@@ -529,9 +529,15 @@ export const getMeetingById: RequestHandler = async (
     const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
 
+    // Only treat the param as a UUID when it actually looks like one -
+    // otherwise Postgres throws 22P02 (invalid uuid input) and the route
+    // would 500 on non-UUID paths like /meetings/stats.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
     // Resolve by UUID first, then by meeting code (clients send either)
-    let result = await query(
-      `SELECT id, title, description, start_time as "startTime", end_time as "endTime", 
+    let result = UUID_RE.test(id)
+      ? await query(
+      `SELECT id, title, description, start_time as "startTime", end_time as "endTime",
               timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
               status, meeting_code as "meetingCode", is_instant as "isInstant", password,
               max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
@@ -539,7 +545,8 @@ export const getMeetingById: RequestHandler = async (
               google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
        FROM meetings WHERE id = $1 AND business_id = $2`,
       [id, businessId],
-    );
+    )
+      : { rows: [] as any[] };
 
     if (result.rows.length === 0) {
       result = await query(

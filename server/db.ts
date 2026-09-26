@@ -173,6 +173,9 @@ async function ensureBaseSchemaTables() {
       invite_token VARCHAR(255),
       invite_expires_at TIMESTAMP,
       last_login TIMESTAMP,
+      auth_provider VARCHAR(50) DEFAULT 'local',
+      google_id VARCHAR(255),
+      avatar_url TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(business_id, email)
@@ -284,6 +287,33 @@ const EXPECTED_TABLES = [
  * the database against EXPECTED_TABLES and logs (compactly) any that are
  * missing. Never throws - init has already succeeded at this point.
  */
+/**
+ * Critical columns that runtime queries depend on. If any of these are missing
+ * the corresponding endpoints fail with SQL 42703 (errorMissingColumn) - e.g.
+ * login broke in production when auth_provider/google_id were added to code
+ * but never migrated into the existing users table.
+ */
+const EXPECTED_COLUMNS: Record<string, string[]> = {
+  users: [
+    "id",
+    "business_id",
+    "email",
+    "password_hash",
+    "name",
+    "role",
+    "email_verified",
+    "otp_code",
+    "otp_expires_at",
+    "auth_provider",
+    "google_id",
+    "avatar_url",
+    "failed_login_attempts",
+    "locked_until",
+  ],
+  businesses: ["id", "name", "email", "plan_id", "owner_id", "trial_ends_at"],
+  login_attempts: ["id", "email", "success"],
+};
+
 export async function verifySchema(): Promise<string[]> {
   try {
     const result = await query(`
@@ -298,6 +328,46 @@ export async function verifySchema(): Promise<string[]> {
     } else {
       console.log(`Schema check passed: all ${EXPECTED_TABLES.length} expected tables present`);
     }
+
+    // Verify critical columns on existing tables (self-heal when possible)
+    if (missing.length === 0) {
+      try {
+        const colResult = await query(`
+          SELECT table_name, column_name
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+        `);
+        const present = new Set(colResult.rows.map((r: any) => `${r.table_name}.${r.column_name}`));
+        const missingColumns: string[] = [];
+        for (const [table, columns] of Object.entries(EXPECTED_COLUMNS)) {
+          if (!existing.has(table)) continue;
+          for (const column of columns) {
+            if (!present.has(`${table}.${column}`)) missingColumns.push(`${table}.${column}`);
+          }
+        }
+        if (missingColumns.length > 0) {
+          console.warn(`Schema check: ${missingColumns.length} critical column(s) missing: ${missingColumns.join(", ")}`);
+          // Auto-heal the known-safe additive cases
+          const heal: Record<string, string> = {
+            "users.auth_provider": `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'`,
+            "users.google_id": `ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)`,
+            "users.avatar_url": `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
+          };
+          for (const col of missingColumns) {
+            const ddl = heal[col];
+            if (ddl) {
+              await query(ddl);
+              console.log(`Schema self-heal: added missing column ${col}`);
+            }
+          }
+        } else {
+          console.log("Schema check passed: all critical columns present");
+        }
+      } catch (colError: any) {
+        console.warn(`Column check skipped: ${(colError?.message || colError).toString().substring(0, 150)}`);
+      }
+    }
+
     return missing;
   } catch (error: any) {
     console.warn(`Schema check skipped: ${(error?.message || error).toString().substring(0, 200)}`);
@@ -583,6 +653,9 @@ export async function initializeDatabase() {
         invite_token VARCHAR(255),
         invite_expires_at TIMESTAMP,
         last_login TIMESTAMP,
+        auth_provider VARCHAR(50) DEFAULT 'local',
+        google_id VARCHAR(255),
+        avatar_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(business_id, email)
@@ -903,6 +976,10 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45)`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_user_agent TEXT`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`);
+    // Google SSO columns (required by auth login/register - fixes 42703 errorMissingColumn)
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)`);
     
     // Create audit logs table
     await query(`

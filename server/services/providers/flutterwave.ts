@@ -41,7 +41,8 @@ const FLW_PUBLIC_KEY = process.env.FLW_PUBLIC_KEY;
 const FLW_SECRET_HASH = process.env.FLW_SECRET_HASH;
 // Encryption key: only needed for Direct Charge endpoints (3DES payload
 // encryption) which this integration does not use today.
-const FLW_ENCRYPTION_KEY = process.env.FLW_ENCRYPTION_KEY;
+const FLW_ENCRYPTION_KEY =
+  process.env.FLW_ENCRYPTION_KEY || process.env.FLUTTERWAVE_ENCRYPTION_KEY;
 const FLW_BASE_URL = process.env.FLW_BASE_URL || "https://api.flutterwave.com";
 
 if (!FLW_SECRET_KEY) {

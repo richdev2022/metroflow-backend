@@ -232,6 +232,19 @@ export const registerBusiness: RequestHandler = async (req, res) => {
 
     if (!emailSent) {
       console.error("Failed to send OTP email to", input.adminEmail);
+      // Roll back the partially-created account so the user can retry cleanly.
+      // Previously the business/user rows stayed behind and every retry was
+      // rejected with "A business with this email already exists", permanently
+      // locking the email out of signup.
+      try {
+        await query(`DELETE FROM activity_logs WHERE business_id = $1`, [business.id]);
+        await query(`DELETE FROM audit_logs WHERE business_id = $1`, [business.id]);
+        await query(`DELETE FROM businesses WHERE id = $1`, [business.id]);
+      } catch (cleanupError: any) {
+        console.error(
+          `Registration rollback failed for business ${business.id}: ${cleanupError?.message || cleanupError}`,
+        );
+      }
       return res.status(500).json({
         success: false,
         message: "Failed to send verification email. Please try again.",

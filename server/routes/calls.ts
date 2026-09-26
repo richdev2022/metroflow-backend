@@ -499,8 +499,13 @@ export const getCallById: RequestHandler = async (
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls`;
 
-    // Resolve by UUID first, then by call code (clients send either)
-    let result = await query(`${baseSelect} WHERE id = $1 AND business_id = $2`, [id, businessId]);
+    // Resolve by UUID first, then by call code (clients send either).
+    // Guard the UUID query so non-UUID params (e.g. /calls/stats) fall
+    // through to the code lookup instead of throwing 22P02 -> 500.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let result = UUID_RE.test(id)
+      ? await query(`${baseSelect} WHERE id = $1 AND business_id = $2`, [id, businessId])
+      : { rows: [] as any[] };
     if (result.rows.length === 0) {
       result = await query(`${baseSelect} WHERE call_code = $1 AND business_id = $2`, [id, businessId]);
     }

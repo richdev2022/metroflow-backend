@@ -1,6 +1,7 @@
 import type { CorsOptions } from "cors";
 
 const DEFAULT_ALLOWED_ORIGINS = [
+  "https://metroflow-app.netlify.app",
   "https://metricorex-app.netlify.app",
   "http://localhost:3000",
   "http://localhost:5173",

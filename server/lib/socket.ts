@@ -333,25 +333,38 @@ export function initSocketServer(server: http.Server): void {
       }
     })();
 
-    // Verify a room password without exposing the stored password
+    // Verify a room password without exposing the stored password.
+    // Single handler (previously registered twice with different ack shapes).
+    // Ack includes BOTH `valid` and `success`/`passwordRequired` keys so every
+    // client (web/mobile) can read the shape it expects.
     socket.on("room:verifyPassword", async (data: { roomId: string; password: string; roomType?: "meeting" | "call" | "auto" }, callback) => {
       try {
         if (!data?.roomId) {
-          callback({ valid: false, error: "roomId is required" });
+          callback({ valid: false, success: false, error: "roomId is required" });
           return;
         }
         const resolved = await resolveRoomId(data.roomId);
         if (!resolved) {
-          callback({ valid: false, error: "Room not found" });
+          callback({ valid: false, success: false, error: "Room not found" });
           return;
         }
         const table = resolved.type === "call" ? "calls" : "meetings";
         const result = await query(`SELECT password FROM ${table} WHERE id = $1`, [resolved.id]);
         const stored = result.rows[0]?.password;
-        callback({ valid: !stored || stored === data.password, roomType: resolved.type, roomId: resolved.id });
+
+        if (!stored) {
+          // No password set — always valid
+          callback({ valid: true, success: true, passwordRequired: false, roomType: resolved.type, roomId: resolved.id });
+          return;
+        }
+        if (stored === data.password) {
+          callback({ valid: true, success: true, passwordRequired: true, roomType: resolved.type, roomId: resolved.id });
+        } else {
+          callback({ valid: false, success: false, error: "Incorrect password" });
+        }
       } catch (error) {
         logger.error("Error verifying room password:", error);
-        callback({ valid: false, error: "Server error" });
+        callback({ valid: false, success: false, error: "Server error" });
       }
     });
 
@@ -641,39 +654,7 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    // 6b. Room password verification (waiting-room / join gate)
-    socket.on("room:verifyPassword", async (
-      data: { roomId: string; password: string },
-      callback?: (response: any) => void,
-    ) => {
-      try {
-        const resolved = await resolveRoomId(data.roomId);
-        if (!resolved) {
-          if (callback) callback({ success: false, error: "Room not found" });
-          return;
-        }
-        const resolvedRoomId = resolved.id;
-        const table = resolved.type === "call" ? "calls" : "meetings";
-        const result = await query(
-          `SELECT password FROM ${table} WHERE id = $1`,
-          [resolvedRoomId],
-        );
-        const stored = result.rows[0]?.password;
-
-        if (!stored) {
-          if (callback) callback({ success: true, passwordRequired: false });
-          return;
-        }
-        if (stored === data.password) {
-          if (callback) callback({ success: true, passwordRequired: true, roomId: resolvedRoomId });
-        } else {
-          if (callback) callback({ success: false, error: "Incorrect password" });
-        }
-      } catch (error) {
-        logger.error("Error verifying room password:", error);
-        if (callback) callback({ success: false, error: "Server error" });
-      }
-    });
+    // 6b. (room:verifyPassword moved above — single handler, combined ack shape)
 
     // 6c. Waiting-room flow: guests/participants request to join
     socket.on("waiting-room:request", async (

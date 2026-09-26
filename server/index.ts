@@ -77,7 +77,7 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
@@ -609,6 +609,7 @@ export async function createServer() {
   mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
   mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
   mainRouter.post("/meetings/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), joinMeeting);
+  mainRouter.post("/meetings/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), leaveMeeting);
   mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
   mainRouter.post("/meetings/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingInvite);
   // Public guest access (must be before any conflicting authenticated routes)

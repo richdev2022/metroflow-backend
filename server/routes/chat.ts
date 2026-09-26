@@ -157,7 +157,7 @@ export const getConversationMessages: RequestHandler = async (
   res,
 ) => {
   try {
-    const { conversationId } = req.params;
+    const { conversationId } = req.params as { conversationId: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -392,7 +392,7 @@ export const sendMessage: RequestHandler = async (
   res,
 ) => {
   try {
-    const { conversationId } = req.params;
+    const { conversationId } = req.params as { conversationId: string };
     const { content, attachmentUrl, attachmentType } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -521,7 +521,7 @@ export const markConversationAsRead: RequestHandler = async (
   res,
 ) => {
   try {
-    const { conversationId } = req.params;
+    const { conversationId } = req.params as { conversationId: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 

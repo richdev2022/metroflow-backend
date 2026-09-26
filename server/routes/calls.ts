@@ -489,7 +489,7 @@ export const getCallById: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
 
     const baseSelect = `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
@@ -580,7 +580,7 @@ export const updateCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -744,7 +744,7 @@ export const joinCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const { password } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -969,7 +969,7 @@ export const leaveCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1090,7 +1090,7 @@ export const deleteCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1183,7 +1183,7 @@ export const addCallParticipants: RequestHandler = async (
   res,
 ) => {
   try {
-    const { callId } = req.params;
+    const { callId } = req.params as { callId: string };
     const { participantIds } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;

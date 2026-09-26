@@ -551,7 +551,7 @@ export const bulkCreateTasks: RequestHandler = async (req: AuthenticatedRequest,
 
 export const updateTask: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1124,7 +1124,7 @@ export const deleteTask: RequestHandler = async (req: AuthenticatedRequest, res)
    *         description: Server error
    */
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 

@@ -526,7 +526,7 @@ export const getMeetingById: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
 
     // Resolve by UUID first, then by meeting code (clients send either)
@@ -649,7 +649,7 @@ export const updateMeeting: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -864,7 +864,7 @@ export const deleteMeeting: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -961,7 +961,7 @@ export const addMeetingParticipants: RequestHandler = async (
   res,
 ) => {
   try {
-    const { meetingId } = req.params;
+    const { meetingId } = req.params as { meetingId: string };
     const { participantIds } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -1154,7 +1154,7 @@ export const joinMeeting: RequestHandler = async (
   res,
 ) => {
   try {
-    const { id } = req.params;
+    const { id } = req.params as { id: string };
     const { password } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -1348,6 +1348,122 @@ export const joinMeeting: RequestHandler = async (
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to join meeting",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * Leave a meeting (REST counterpart of POST /calls/:id/leave).
+ * Marks the current user's attendee row as 'left' and broadcasts to the room.
+ * Called by both the web app and the mobile app when leaving the meeting room.
+ */
+export const leaveMeeting: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    let actualId: string | undefined;
+    if (isValidUUID(id)) {
+      const idResult = await query(
+        `SELECT id FROM meetings WHERE id = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (idResult.rows.length > 0) {
+        actualId = idResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
+      const codeResult = await query(
+        `SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+      if (codeResult.rows.length > 0) {
+        actualId = codeResult.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
+      return res.status(404).json({
+        success: false,
+        error: "Meeting not found",
+      });
+    }
+
+    await query(
+      `UPDATE meeting_attendees
+       SET status = 'left', left_at = CURRENT_TIMESTAMP
+       WHERE meeting_id = $1 AND user_id = $2`,
+      [actualId, userId],
+    );
+
+    const meetingResult = await query(
+      `SELECT id, business_id as "businessId", title, description, status, start_time as "startTime",
+              end_time as "endTime", timezone, created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", meeting_code as "meetingCode", password, is_instant as "isInstant",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              screen_sharing_enabled as "screenSharingEnabled", max_participants as "maxParticipants",
+              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+       FROM meetings WHERE id = $1 AND business_id = $2`,
+      [actualId, businessId],
+    );
+    const meeting = meetingResult.rows[0];
+
+    if (meeting) {
+      const attendeesResult = await query(
+        `SELECT id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"
+         FROM meeting_attendees WHERE meeting_id = $1`,
+        [actualId],
+      );
+      meeting.attendees = attendeesResult.rows;
+      enrichMeeting(meeting);
+    }
+
+    const io = getSocketServer();
+    if (io) {
+      // Emit both spellings: camelCase (Flutter) and hyphenated (web)
+      io.to(`meeting:${actualId}`).emit("meeting:participantLeft", {
+        meetingId: actualId,
+        userId,
+      });
+      io.to(`room:${actualId}`).emit("meeting:participantLeft", {
+        meetingId: actualId,
+        userId,
+      });
+      io.to(`meeting:${actualId}`).emit("meeting:participant-left", {
+        meetingId: actualId,
+        roomId: actualId,
+        userId,
+      });
+      io.to(`room:${actualId}`).emit("meeting:participant-left", {
+        meetingId: actualId,
+        roomId: actualId,
+        userId,
+      });
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: meeting,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Leave meeting error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to leave meeting",
     };
     res.status(500).json(response);
   }

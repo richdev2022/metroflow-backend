@@ -476,6 +476,14 @@ router.get("/product-documentation/:id/pdf", authenticateToken, checkSubscriptio
 
 router.post("/internal/jobs/product-docs/process", (async (req: AuthenticatedRequest, res) => {
   try {
+    // Same secret check as the app-level route — this router is mounted at both
+    // "/" and "/product-docs" (and again under "/api"), so without this guard the
+    // /api/internal/jobs/product-docs/process path would be publicly reachable.
+    const secretHeader = req.headers["x-job-secret"];
+    const expected = process.env.JOBS_SECRET;
+    if (expected && secretHeader !== expected) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
     const limit = Number((req.body as any)?.limit) || 3;
     const result = await processPendingProductDocJobs(limit);
     res.json({ success: true, data: result });

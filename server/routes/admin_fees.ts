@@ -115,7 +115,7 @@ router.post("/", authenticateAdmin, requirePermission('manage_finance'), async (
  */
 router.put("/:id", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
     try {
-        const fee = await updateFee(req.params.id, req.body);
+        const fee = await updateFee(String(req.params.id), req.body);
         res.json({ success: true, data: fee });
     } catch (error) {
         res.status(500).json({ success: false, error: "Failed to update fee" });
@@ -142,7 +142,7 @@ router.put("/:id", authenticateAdmin, requirePermission('manage_finance'), async
  */
 router.delete("/:id", authenticateAdmin, requirePermission('manage_finance'), async (req, res) => {
     try {
-        await deleteFee(req.params.id);
+        await deleteFee(String(req.params.id));
         res.json({ success: true, message: "Fee deleted" });
     } catch (error) {
         res.status(500).json({ success: false, error: "Failed to delete fee" });

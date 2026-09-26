@@ -1391,6 +1391,11 @@ export async function initializeDatabase() {
       )
     `);
 
+    // join/leave tracking columns used by POST /meetings/:id/join and /meetings/:id/leave
+    // (pre-existing deployments may be missing them — joinMeeting writes joined_at)
+    await query(`ALTER TABLE meeting_attendees ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP`);
+    await query(`ALTER TABLE meeting_attendees ADD COLUMN IF NOT EXISTS left_at TIMESTAMP`);
+
     await query(`
       CREATE TABLE IF NOT EXISTS meeting_reminders (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

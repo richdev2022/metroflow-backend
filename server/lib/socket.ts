@@ -18,6 +18,7 @@ import { query } from "../db";
 import { roomManager } from "./roomManager";
 import { verifyToken } from "../services/auth";
 import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
+import { isCorsOriginAllowed } from "../cors";
 import crypto from "crypto";
 
 let io: Server | null = null;
@@ -233,8 +234,21 @@ export function initSocketServer(server: http.Server): void {
 
   io = new Server(server, {
     cors: {
-      origin: "*",
+      // Reflect allowed origins instead of "*": browsers REJECT
+      // "Access-Control-Allow-Origin: *" whenever a request is sent with
+      // credentials (withCredentials: true), which produced the Socket.IO
+      // CORS errors in production. Origins are validated with the same
+      // policy as the REST API (server/cors.ts). Native/mobile clients that
+      // send no Origin header are always allowed.
+      origin(requestOrigin, callback) {
+        if (!requestOrigin || isCorsOriginAllowed(requestOrigin)) {
+          callback(null, requestOrigin || true);
+        } else {
+          callback(new Error(`Origin ${requestOrigin} is not allowed by CORS`));
+        }
+      },
       methods: ["GET", "POST"],
+      credentials: true,
     },
   });
 

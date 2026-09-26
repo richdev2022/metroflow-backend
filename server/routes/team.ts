@@ -374,27 +374,34 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
 
     const member = result.rows[0];
 
-    // Send invitation email
-    const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
-    if (!baseUrl) {
-      throw new Error('CLIENT_URL environment variable is not set');
-    }
+    // Resolve the web app base URL for the invite link. Fall back to the
+    // production web app so a missing env var can never fail the invite.
+    const baseUrl =
+      process.env.CLIENT_URL ||
+      process.env.APP_BASE_URL ||
+      process.env.APP_URL ||
+      "https://metricorex.com";
     const inviteLink = `${baseUrl}/accept-invite/${inviteToken}`;
     const emailHtml = generateInviteEmailHtml(input.name, inviteLink);
 
-    const emailSent = await sendEmail(
-      input.email,
-      input.name,
-      "You're Invited to Metricorex",
-      emailHtml,
-    );
-
+    // Email is best-effort: the member record is already created above, so an
+    // SMTP/Brevo outage must NOT fail the invitation. When delivery fails we
+    // return the invite link so the admin can share it manually.
+    let emailSent = false;
+    try {
+      emailSent = await sendEmail(
+        input.email,
+        input.name,
+        "You're Invited to Metricorex",
+        emailHtml,
+      );
+    } catch (emailError) {
+      console.error("Invite email threw an error:", emailError);
+    }
     if (!emailSent) {
-      console.error("Failed to send invite email to", input.email);
-      return res.status(500).json({
-        success: false,
-        error: "User created but failed to send invitation email. Please try again.",
-      });
+      console.error(
+        `Failed to send invite email to ${input.email} - share the link manually: ${inviteLink}`,
+      );
     }
 
     // Log team member invitation activity
@@ -409,14 +416,19 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
         invitedEmail: input.email,
         invitedName: input.name,
         role: input.role,
+        emailSent,
       },
     });
 
-    const response: ApiResponse<TeamMember> = {
+    res.status(201).json({
       success: true,
       data: member,
-    };
-    res.status(201).json(response);
+      emailSent,
+      inviteLink,
+      message: emailSent
+        ? "Invitation sent"
+        : "Member invited, but the invitation email could not be delivered. Share the invite link with them manually.",
+    });
   } catch (error) {
     console.error("Invite team member error:", error);
     const response: ApiResponse<null> = {

@@ -2068,19 +2068,31 @@ protectedRouter.post("/users/invite", requirePermission('manage_admins'), async 
     const loginLink = baseUrl.includes('/login') ? baseUrl : `${baseUrl}/login`;
     const emailHtml = generateAdminInviteEmailHtml(name, email, tempPassword, loginLink);
 
-    const emailSent = await sendEmail(
-      email,
-      name,
-      "Admin Access Invitation",
-      emailHtml
-    );
-
+    // Email is best-effort: the admin record is already created, so an
+    // SMTP/Brevo outage must NOT fail the invitation. The caller can resend
+    // or share the temp password through a secure channel.
+    let emailSent = false;
+    try {
+      emailSent = await sendEmail(
+        email,
+        name,
+        "Admin Access Invitation",
+        emailHtml
+      );
+    } catch (emailError) {
+      console.error("Admin invite email threw an error:", emailError);
+    }
     if (!emailSent) {
-      console.error("Failed to send admin invite email to", email);
-      return res.status(500).json({ success: false, error: "Admin created but failed to send invitation email" });
+      console.error(`Failed to send admin invite email to ${email}`);
     }
 
-    res.json({ success: true });
+    res.json({
+      success: true,
+      emailSent,
+      message: emailSent
+        ? "Admin invited"
+        : "Admin created, but the invitation email could not be delivered. Share the credentials manually or resend later.",
+    });
   } catch (error) {
     console.error("Invite admin error:", error);
     res.status(500).json({ success: false, error: "Failed to invite admin" });

@@ -99,6 +99,35 @@ export async function sendEmail(
       subject,
       error: error instanceof Error ? error.message : String(error),
     });
+
+    // Brevo failed (disabled/invalid key, API outage, etc.) - fall back to
+    // SMTP so critical transactional emails (OTP verification, invites) can
+    // still go out when SMTP credentials are configured.
+    if (process.env.SMTP_HOST && process.env.SMTP_HOST !== "smtp.example.com") {
+      try {
+        const transporter = nodemailer.createTransport({
+          host: process.env.SMTP_HOST,
+          port: parseInt(process.env.SMTP_PORT || "587"),
+          secure: process.env.SMTP_SECURE === "true",
+          auth: {
+            user: process.env.SMTP_USER,
+            pass: process.env.SMTP_PASS,
+          },
+        });
+
+        await transporter.sendMail({
+          from: `"${process.env.SMTP_FROM_NAME || 'MetricFlow'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@metricflow.com'}>`,
+          to: to,
+          subject: subject,
+          html: htmlContent,
+        });
+        console.log("Email sent via SMTP fallback after Brevo failure:", { to, subject });
+        return true;
+      } catch (smtpError) {
+        console.error("SMTP fallback also failed:", smtpError instanceof Error ? smtpError.message : smtpError);
+      }
+    }
+
     return false;
   }
 }

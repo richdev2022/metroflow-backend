@@ -682,7 +682,7 @@ protectedRouter.post("/kyc/business/:id/reject", requirePermission('manage_busin
 });
 
 // Businesses Management
-protectedRouter.get("/pricing", requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.get("/pricing", requirePermission('manage_plans', 'manage_businesses'), async (req, res) => {
     try {
 
         const result = await query(`SELECT * FROM pricing_plans ORDER BY price ASC`);
@@ -731,7 +731,7 @@ protectedRouter.get("/pricing", requirePermission('manage_businesses'), async (r
  *       200:
  *         description: Plan created
  */
-protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_businesses'), async (req, res) => {
     try {
         const { 
             name, price, currency, duration, discount, features, permissions,
@@ -804,7 +804,7 @@ protectedRouter.post("/pricing", requirePermission('manage_businesses'), async (
  *       200:
  *         description: Plan updated
  */
-protectedRouter.put("/pricing/:id", requirePermission('manage_businesses'), async (req, res) => {
+protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_businesses'), async (req, res) => {
     try {
         const { id } = req.params;
         const { 
@@ -997,7 +997,8 @@ protectedRouter.get("/businesses", requirePermission('manage_businesses'), async
         total,
         page: Number(page),
         limit: Number(limit),
-        pages: Math.ceil(total / Number(limit))
+        pages: Math.ceil(total / Number(limit)),
+        totalPages: Math.ceil(total / Number(limit))
       }
     });
   } catch (error) {
@@ -1293,7 +1294,8 @@ protectedRouter.get("/transactions", requirePermission('view_dashboard'), async 
                 total,
                 page,
                 perPage,
-                totalPages: Math.ceil(total / perPage)
+                totalPages: Math.ceil(total / perPage),
+                pages: Math.ceil(total / perPage)
             }
         });
 
@@ -1437,7 +1439,8 @@ protectedRouter.get("/transactions/pending-settlement", requirePermission('view_
                 total,
                 page,
                 limit,
-                totalPages: Math.ceil(total / limit)
+                totalPages: Math.ceil(total / limit),
+                pages: Math.ceil(total / limit)
             }
         });
 
@@ -1693,212 +1696,6 @@ protectedRouter.put("/businesses/:id/status", requirePermission('manage_business
  */
 protectedRouter.get("/features", requirePermission('manage_plans'), async (req, res) => {
   res.json({ success: true, features: AVAILABLE_PERMISSIONS });
-});
-
-// Pricing Plans
-/**
- * @swagger
- * /admin/pricing:
- *   get:
- *     summary: Get all pricing plans
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: List of pricing plans
- */
-protectedRouter.get("/pricing", requirePermission('manage_plans'), async (req, res) => {
-  try {
-    const result = await query(`SELECT * FROM pricing_plans ORDER BY price ASC`);
-    res.json({ success: true, plans: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to fetch pricing plans" });
-  }
-});
-
-/**
- * @swagger
- * /admin/pricing:
- *   post:
- *     summary: Create a pricing plan
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - name
- *               - price
- *             properties:
- *               name:
- *                 type: string
- *               description:
- *                 type: string
- *               price:
- *                 type: number
- *               currency:
- *                 type: string
- *               features:
- *                 type: array
- *                 items:
- *                   type: string
- *               permissions:
- *                 type: array
- *                 items:
- *                   type: string
- *               max_team_members:
- *                 type: integer
- *               trial_days:
- *                 type: integer
- *               duration:
- *                 type: string
- *                 enum: [monthly, yearly]
- *     responses:
- *       200:
- *         description: Plan created
- */
-protectedRouter.post("/pricing", requirePermission('manage_plans'), async (req, res) => {
-  try {
-    const { name, description, price, currency, features, permissions, max_team_members, trial_days, duration } = req.body;
-    await query(
-      `INSERT INTO pricing_plans (name, description, price, currency, features, permissions, max_team_members, trial_days, duration) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)`,
-      [name, description, price, currency || 'USD', toJsonbParam(features), toJsonbParam(permissions), max_team_members || 5, trial_days || 0, duration || 'monthly']
-    );
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to create pricing plan" });
-  }
-});
-
-/**
- * @swagger
- * /admin/pricing/{id}:
- *   put:
- *     summary: Update a pricing plan
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *           format: uuid
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               name:
- *                 type: string
- *               description:
- *                 type: string
- *               price:
- *                 type: number
- *               is_active:
- *                 type: boolean
- *               features:
- *                 type: array
- *                 items:
- *                   type: string
- *               permissions:
- *                 type: array
- *                 items:
- *                   type: string
- *               max_team_members:
- *                 type: integer
- *               trial_days:
- *                 type: integer
- *               duration:
- *                 type: string
- *                 enum: [monthly, yearly]
- *     responses:
- *       200:
- *         description: Plan updated
- *       401:
- *         description: Unauthorized
- *       500:
- *         description: Server error
- */
-protectedRouter.put("/pricing/:id", requirePermission('manage_plans'), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, description, price, is_active, features, permissions, max_team_members, trial_days, duration, discount } = req.body;
-    
-    let queryStr = "UPDATE pricing_plans SET updated_at = CURRENT_TIMESTAMP";
-    const params: any[] = [id];
-    let paramCount = 2;
-
-    if (name !== undefined) {
-      queryStr += `, name = $${paramCount}`;
-      params.push(name);
-      paramCount++;
-    }
-    if (description !== undefined) {
-      queryStr += `, description = $${paramCount}`;
-      params.push(description);
-      paramCount++;
-    }
-    if (price !== undefined) {
-      queryStr += `, price = $${paramCount}`;
-      params.push(price);
-      paramCount++;
-    }
-    if (is_active !== undefined) {
-      queryStr += `, is_active = $${paramCount}`;
-      params.push(is_active);
-      paramCount++;
-    }
-    if (features !== undefined) {
-      queryStr += `, features = $${paramCount}::jsonb`;
-      params.push(toJsonbParam(features));
-      paramCount++;
-    }
-    if (permissions !== undefined) {
-      queryStr += `, permissions = $${paramCount}::jsonb`;
-      params.push(toJsonbParam(permissions));
-      paramCount++;
-    }
-    if (max_team_members !== undefined) {
-      queryStr += `, max_team_members = $${paramCount}`;
-      params.push(max_team_members);
-      paramCount++;
-    }
-    if (trial_days !== undefined) {
-      queryStr += `, trial_days = $${paramCount}`;
-      params.push(trial_days);
-      paramCount++;
-    }
-    if (duration !== undefined) {
-      queryStr += `, duration = $${paramCount}`;
-      params.push(duration);
-      paramCount++;
-    }
-    if (discount !== undefined) {
-      queryStr += `, discount = $${paramCount}`;
-      params.push(discount);
-      paramCount++;
-    }
-
-    queryStr += ` WHERE id = $1 RETURNING *`;
-
-    const result = await query(queryStr, params);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "Plan not found" });
-    }
-
-    res.json({ success: true, plan: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to update pricing plan" });
-  }
 });
 
 // RBAC: Permissions Management
@@ -3090,7 +2887,8 @@ protectedRouter.get("/transfers", requirePermission('view_dashboard'), async (re
                 total,
                 page,
                 limit,
-                totalPages: Math.ceil(total / limit)
+                totalPages: Math.ceil(total / limit),
+                pages: Math.ceil(total / limit)
             }
         });
 

@@ -73,7 +73,7 @@ export const authenticateAdmin = async (
   }
 };
 
-export const requirePermission = (permission: string) => {
+export const requirePermission = (...permissions: string[]) => {
   return (req: AuthenticatedAdminRequest, res: Response, next: NextFunction) => {
     if (!req.admin) {
       return res.status(401).json({ success: false, error: "Unauthorized" });
@@ -83,7 +83,7 @@ export const requirePermission = (permission: string) => {
       return next();
     }
 
-    if (req.admin.permissions?.includes(permission)) {
+    if (permissions.length === 0 || req.admin.permissions?.some((p) => permissions.includes(p))) {
       return next();
     }
 

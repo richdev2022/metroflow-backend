@@ -69,6 +69,73 @@ interface Room {
 
 const rooms = new Map<string, Room>();
 
+/**
+ * Resolve the IP mediasoup should ANNOUNCE to clients in ICE candidates.
+ *
+ * A loopback value (127.0.0.1) makes every announced candidate unreachable
+ * for real browsers — remote participants try to connect to THEIR OWN
+ * localhost, so media never flows (the classic "call connects but nobody
+ * sees/hears anyone / cannot initiate a call" failure).
+ *
+ * Resolution order:
+ *  1. MEDIASOUP_ANNOUNCED_IP / MEDIASOUP_PUBLIC_IP if set to a usable,
+ *     non-loopback address.
+ *  2. Auto-detect: prefer a PUBLIC IPv4 of the host, otherwise the first
+ *     non-internal IPv4 interface (works for single VPS deployments).
+ *  3. Fall back to the first non-internal IPv4; loopback only as the very
+ *     last resort (local development).
+ */
+function isPrivateIPv4(ip: string): boolean {
+  return /^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+}
+
+function detectAnnouncedIp(): string {
+  const explicit = process.env.MEDIASOUP_ANNOUNCED_IP || process.env.MEDIASOUP_PUBLIC_IP || '';
+  const usable = explicit && explicit !== '127.0.0.1' && explicit !== '0.0.0.0' && explicit !== '::1';
+  if (usable) return explicit;
+
+  const interfaces = os.networkInterfaces();
+  let firstPrivate = '';
+  let firstNonInternal = '';
+  let loopback = '127.0.0.1';
+
+  for (const addresses of Object.values(interfaces)) {
+    for (const addr of addresses || []) {
+      if (addr.family !== 'IPv4' || addr.internal) continue;
+      if (!firstNonInternal) firstNonInternal = addr.address;
+      if (isPrivateIPv4(addr.address) && !firstPrivate) firstPrivate = addr.address;
+      if (!isPrivateIPv4(addr.address)) {
+        // Public IPv4 of the host — best candidate for announced IP
+        return addr.address;
+      }
+    }
+  }
+
+  if (firstNonInternal) return firstNonInternal;
+  if (firstPrivate) return firstPrivate;
+  return loopback;
+}
+
+let cachedAnnouncedIp: string | null = null;
+
+function getAnnouncedIp(): string {
+  if (cachedAnnouncedIp) return cachedAnnouncedIp;
+  const resolved = detectAnnouncedIp();
+  const explicit = process.env.MEDIASOUP_ANNOUNCED_IP || process.env.MEDIASOUP_PUBLIC_IP || '';
+  if (resolved === '127.0.0.1') {
+    logger.warn(
+      'Mediasoup announced IP resolved to 127.0.0.1 — remote participants will NOT be able to connect media. ' +
+      'Set MEDIASOUP_ANNOUNCED_IP to this server\'s PUBLIC IP in production!'
+    );
+  } else if (explicit && explicit !== resolved) {
+    logger.warn(
+      `Mediasoup: ignoring unusable MEDIASOUP_ANNOUNCED_IP="${explicit}" (loopback/unroutable) — using "${resolved}" instead.`
+    );
+  }
+  cachedAnnouncedIp = resolved;
+  return resolved;
+}
+
 function getRtcPorts(): { rtcMinPort?: number; rtcMaxPort?: number } {
   return {
     rtcMinPort: process.env.MEDIASOUP_RTC_MIN_PORT
@@ -111,9 +178,7 @@ export async function initMediasoup() {
       logger.info(`Mediasoup worker ${i + 1}/${count} created (pid ${worker.pid})`);
     }
     logger.info(
-      `Mediasoup initialized with ${workers.length} worker(s), announced IP: ${
-        process.env.MEDIASOUP_ANNOUNCED_IP || "127.0.0.1"
-      }`,
+      `Mediasoup initialized with ${workers.length} worker(s), announced IP: ${getAnnouncedIp()}`,
     );
   } catch (error) {
     logger.error("Failed to initialize mediasoup:", error);
@@ -132,7 +197,7 @@ function pickWorker(): mediasoup.types.Worker {
 }
 
 function getListenIps(): mediasoup.types.TransportListenIp[] {
-  const announcedIp = process.env.MEDIASOUP_ANNOUNCED_IP || "127.0.0.1";
+  const announcedIp = getAnnouncedIp();
   return [{ ip: "0.0.0.0", announcedIp }];
 }
 

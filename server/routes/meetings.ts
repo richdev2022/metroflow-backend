@@ -20,8 +20,10 @@ function generateMeetingCode() {
 }
 
 // Helper to build a meeting link (for responses + emails)
+// Production-safe fallback: if CLIENT_URL is unset on the VPS, links used to
+// read http://localhost:8080 and were unreachable for invitees.
 function buildMeetingLink(meetingCode: string): string {
-  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:8080';
+  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || 'https://metricorex.com';
   return `${baseUrl}/meetings/${meetingCode}`;
 }
 
@@ -995,7 +997,7 @@ export const addMeetingParticipants: RequestHandler = async (
 ) => {
   try {
     const { meetingId } = req.params as { meetingId: string };
-    const { participantIds } = req.body;
+    const { participantIds, emails } = req.body as { participantIds?: string[]; emails?: string[] };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1006,11 +1008,13 @@ export const addMeetingParticipants: RequestHandler = async (
       });
     }
 
-    // Validate participantIds is a non-empty array
-    if (!Array.isArray(participantIds) || participantIds.length === 0) {
+    // Validate participantIds is a non-empty array (emails may substitute)
+    const hasParticipantIds = Array.isArray(participantIds) && participantIds.length > 0;
+    const hasEmails = Array.isArray(emails) && emails.length > 0;
+    if (!hasParticipantIds && !hasEmails) {
       return res.status(400).json({
         success: false,
-        error: "participantIds must be a non-empty array",
+        error: "participantIds or emails must be a non-empty array",
       });
     }
 
@@ -1052,20 +1056,22 @@ export const addMeetingParticipants: RequestHandler = async (
     );
     const existingUserIds = new Set(existingAttendeesResult.rows.map((row) => row.user_id));
 
-    // Validate all participantIds belong to the business
-    const uniqueParticipantIds = Array.from(new Set(participantIds));
-    const validUserIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
-    if (validUserIds.size !== uniqueParticipantIds.length) {
-      return res.status(400).json({
-        success: false,
-        error: "All participants must belong to this business",
-      });
+    // Validate all participantIds belong to the business (team-member path only)
+    const uniqueParticipantIds = Array.from(new Set(participantIds || []));
+    if (uniqueParticipantIds.length > 0) {
+      const validUserIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+      if (validUserIds.size !== uniqueParticipantIds.length) {
+        return res.status(400).json({
+          success: false,
+          error: "All participants must belong to this business",
+        });
+      }
     }
 
     // Filter out existing attendees
     const newParticipantIds = uniqueParticipantIds.filter((id) => !existingUserIds.has(id));
 
-    if (newParticipantIds.length === 0) {
+    if (newParticipantIds.length === 0 && !hasEmails) {
       return res.json({
         success: true,
         message: "No new participants added (all were already in the meeting)",
@@ -1075,6 +1081,18 @@ export const addMeetingParticipants: RequestHandler = async (
 
     // Bulk insert new attendees
     const addedAttendees = [];
+    const currentUserResult = await query(
+      `SELECT name FROM users WHERE id = $1`,
+      [userId],
+    );
+    const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
+    const fullMeetingResult = await query(
+      `SELECT password, waiting_room_enabled FROM meetings WHERE id = $1`,
+      [actualMeetingId],
+    );
+    const fullMeeting = fullMeetingResult.rows[0];
+    const meetingLink = buildMeetingLink(meeting.meeting_code || '');
+
     for (const attendeeId of newParticipantIds) {
       const attendeeResult = await query(
         `INSERT INTO meeting_attendees (meeting_id, user_id)
@@ -1084,51 +1102,85 @@ export const addMeetingParticipants: RequestHandler = async (
       );
       addedAttendees.push(attendeeResult.rows[0]);
 
-      // Send in-app notification to the attendee
-      await createNotification({
-        businessId: businessId,
-        userId: attendeeId,
-        type: "meeting",
-        title: "Meeting Invitation",
-        message: `You've been invited to a meeting: ${meeting.title}`,
-        actionUrl: `/meetings/${meeting.meeting_code}`,
-        actionType: "view_meeting",
-        metadata: { meetingId: actualMeetingId },
-        isActionable: false,
-        expiresInHours: 24,
-      });
+      // Side effects are best-effort: failing notification/email must never
+      // turn the request into a 500 (the attendee row is already inserted).
+      try {
+        await createNotification({
+          businessId: businessId,
+          userId: attendeeId,
+          type: "meeting",
+          title: "Meeting Invitation",
+          message: `You've been invited to a meeting: ${meeting.title}`,
+          actionUrl: `/meetings/${meeting.meeting_code}`,
+          actionType: "view_meeting",
+          metadata: { meetingId: actualMeetingId },
+          isActionable: false,
+          expiresInHours: 24,
+        });
+      } catch (notifyError) {
+        console.error(`Add meeting participants: failed to notify ${attendeeId}:`, notifyError);
+      }
 
       // Send email invitation
-      const userResult = await query(
-        `SELECT name, email FROM users WHERE id = $1`,
-        [attendeeId],
-      );
-      const user = userResult.rows[0];
-      if (user?.email) {
-        const currentUserResult = await query(
-          `SELECT name FROM users WHERE id = $1`,
-          [userId],
+      try {
+        const userResult = await query(
+          `SELECT name, email FROM users WHERE id = $1`,
+          [attendeeId],
         );
-        const fullMeetingResult = await query(
-          `SELECT password, waiting_room_enabled FROM meetings WHERE id = $1`,
-          [actualMeetingId],
-        );
-        const fullMeeting = fullMeetingResult.rows[0];
-        const currentUserName = currentUserResult.rows[0]?.name;
-        const meetingLink = buildMeetingLink(meeting.meeting_code || '');
-        const emailHtml = generateMeetingInvitationEmailHtml(
-          user.name || 'User',
-          meeting.title,
-          null,
-          new Date(meeting.start_time),
-          new Date(meeting.end_time),
-          meeting.meeting_code || '',
-          currentUserName || 'Someone',
-          meetingLink,
-          fullMeeting?.password || null,
-          !!fullMeeting?.waiting_room_enabled
-        );
-        await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${meeting.title}`, emailHtml);
+        const user = userResult.rows[0];
+        if (user?.email) {
+          const emailHtml = generateMeetingInvitationEmailHtml(
+            user.name || 'User',
+            meeting.title,
+            null,
+            new Date(meeting.start_time),
+            new Date(meeting.end_time),
+            meeting.meeting_code || '',
+            currentUserName,
+            meetingLink,
+            fullMeeting?.password || null,
+            !!fullMeeting?.waiting_room_enabled
+          );
+          await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${meeting.title}`, emailHtml);
+        }
+      } catch (emailError) {
+        console.error(`Add meeting participants: failed to email invitee ${attendeeId}:`, emailError);
+      }
+    }
+
+    // ===== External email invites (people without accounts) =====
+    // Guests join via the public meeting link (/meetings/:code -> guest join).
+    const invitedViaEmail: string[] = [];
+    if (hasEmails) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const validEmails = [...new Set((emails as string[])
+        .map((e: string) => String(e || '').trim().toLowerCase())
+        .filter((e: string) => emailRegex.test(e)))] as string[];
+
+      for (const email of validEmails) {
+        try {
+          const emailHtml = generateMeetingInvitationEmailHtml(
+            email.split('@')[0],
+            meeting.title,
+            null,
+            new Date(meeting.start_time),
+            new Date(meeting.end_time),
+            meeting.meeting_code || '',
+            currentUserName,
+            meetingLink,
+            fullMeeting?.password || null,
+            !!fullMeeting?.waiting_room_enabled
+          );
+          const sent = await sendEmail(
+            email,
+            email.split('@')[0],
+            `${currentUserName} invited you to a meeting: ${meeting.title}`,
+            emailHtml
+          );
+          if (sent) invitedViaEmail.push(email);
+        } catch (emailError) {
+          console.error(`Add meeting participants: failed to email external invitee ${email}:`, emailError);
+        }
       }
     }
 
@@ -1170,8 +1222,11 @@ export const addMeetingParticipants: RequestHandler = async (
 
     res.json({
       success: true,
-      message: `${newParticipantIds.length} participant(s) added`,
-      data: { added: newParticipantIds },
+      message: [
+        newParticipantIds.length > 0 ? `${newParticipantIds.length} participant(s) added` : null,
+        invitedViaEmail.length > 0 ? `${invitedViaEmail.length} email invite(s) sent` : null,
+      ].filter(Boolean).join(' · ') || 'No new participants added (all were already in the meeting)',
+      data: { added: newParticipantIds, invitedEmails: invitedViaEmail },
     });
   } catch (error) {
     console.error("Add meeting participants error:", error);

@@ -1551,6 +1551,7 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS max_participants INTEGER`);
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS waiting_room_enabled BOOLEAN DEFAULT FALSE`);
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS screen_sharing_enabled BOOLEAN DEFAULT TRUE`);
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS jitsi_room_id VARCHAR(255)`);
     // Make jitsi_room_id nullable (in case it was originally NOT NULL)
     await query(`ALTER TABLE calls ALTER COLUMN jitsi_room_id DROP NOT NULL`);

@@ -553,6 +553,15 @@ export function initSocketServer(server: http.Server): void {
 
         socket.join(`room:${resolvedRoomId}`);
 
+        // Push the current waiting-room queue to joining hosts so a host who
+        // enters after requests were made immediately sees the admit list.
+        if (data.isHost) {
+          const q = waitingRooms.get(resolvedRoomId);
+          if (q && q.size > 0) {
+            socket.emit("waiting-room:queue", { roomId: resolvedRoomId, queue: queueToArray(resolvedRoomId) });
+          }
+        }
+
         // Track the socket against this room and detect same-account
         // multi-device joins (the real echo cause).
         const sameUserCount = trackRoomSocket(resolvedRoomId, socket.id, data.userId, data.userName);
@@ -1114,6 +1123,15 @@ export function initSocketServer(server: http.Server): void {
 
         socket.join(`room:${resolvedMeetingId}`);
         socket.join(`meeting:${resolvedMeetingId}`);
+
+        // Push the current waiting-room queue to joining hosts so a host who
+        // enters after requests were made immediately sees the admit list.
+        if (isHost) {
+          const q = waitingRooms.get(resolvedMeetingId);
+          if (q && q.size > 0) {
+            socket.emit("waiting-room:queue", { roomId: resolvedMeetingId, queue: queueToArray(resolvedMeetingId) });
+          }
+        }
 
         // Track the socket against this room and detect same-account
         // multi-device joins (the real echo cause).

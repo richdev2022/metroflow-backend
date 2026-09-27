@@ -1331,6 +1331,15 @@ export const addCallParticipants: RequestHandler = async (
 
     // Validate all participantIds belong to the business (team-member path only)
     const uniqueParticipantIds = [...new Set(participantIds || [])];
+    // Non-UUID ids (e.g. chat participant row ids) would throw 22P02 inside the
+    // SQL `id IN (...)` below -> 500. Reject them with a clear 400 instead.
+    const invalidParticipantIds = uniqueParticipantIds.filter((pid) => !isValidUUID(pid));
+    if (invalidParticipantIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid call participants: one or more participant ids are not valid user ids",
+      });
+    }
     let validUserIds = new Map<string, CallUserFromDb>();
     if (uniqueParticipantIds.length > 0) {
       validUserIds = await getBusinessUserIdsForCalls(uniqueParticipantIds, businessId);
@@ -1543,6 +1552,10 @@ export const validateCallAccess: RequestHandler = async (
       });
     }
 
+    // `id = $1` with a non-UUID code (e.g. KJOZ5I) made Postgres throw 22P02
+    // ("invalid input syntax for type uuid") -> 500 "Failed to validate call
+    // access". Comparing `id::text = $1` instead accepts both call codes and
+    // UUIDs without any cast error.
     const result = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
               ended_at as "endedAt", call_code as "callCode",
@@ -1551,7 +1564,7 @@ export const validateCallAccess: RequestHandler = async (
               co_host_id as "coHostId", created_by as "createdById", password,
               recording_enabled as "recordingEnabled", is_group_call as "isGroupCall"
        FROM calls
-       WHERE (call_code = $1 OR id = $1) AND business_id = $2`,
+       WHERE (call_code = $1 OR id::text = $1) AND business_id = $2`,
       [code, businessId],
     );
 

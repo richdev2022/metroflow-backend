@@ -236,6 +236,22 @@ export const createMeeting: RequestHandler = async (
       });
     }
 
+    // Validate required fields up-front — a missing title or startTime would
+    // otherwise die in Postgres (NOT NULL violation) or Date parsing
+    // (RangeError) and surface as an unhelpful 500.
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ success: false, error: "Meeting title is required" });
+    }
+    if (!isInstant && !startTime) {
+      return res.status(400).json({ success: false, error: "Meeting start time is required" });
+    }
+    if (startTime && isNaN(new Date(startTime).getTime())) {
+      return res.status(400).json({ success: false, error: "Invalid meeting start time" });
+    }
+    if (!isInstant && endTime && isNaN(new Date(endTime).getTime())) {
+      return res.status(400).json({ success: false, error: "Invalid meeting end time" });
+    }
+
     const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
     const validAttendeeIds = await getBusinessUserIds(uniqueAttendeeIds, businessId);
     if (validAttendeeIds.size !== uniqueAttendeeIds.length) {
@@ -261,10 +277,20 @@ export const createMeeting: RequestHandler = async (
 
     if (isInstant) {
       finalStartTime = now;
-      finalEndTime = null;
+      // meetings.end_time is NOT NULL — instant meetings used to insert NULL and
+      // fail with 23502 ("Failed to create meeting"). Default to one hour (or
+      // the plan limit, whichever is shorter); the room countdown can extend it.
+      const instantDurationMinutes = planMaxMeetingDuration ? Math.min(60, planMaxMeetingDuration) : 60;
+      finalEndTime = new Date(now.getTime() + instantDurationMinutes * 60000);
     } else {
       finalStartTime = new Date(startTime);
-      finalEndTime = new Date(endTime);
+      finalEndTime = endTime ? new Date(endTime) : new Date(finalStartTime.getTime() + 60 * 60000);
+      if (isNaN(finalStartTime.getTime())) {
+        return res.status(400).json({ success: false, error: "Invalid meeting start time" });
+      }
+      if (isNaN(finalEndTime.getTime())) {
+        return res.status(400).json({ success: false, error: "Invalid meeting end time" });
+      }
 
       if (planMaxMeetingDuration) {
         const maxAllowedEnd = new Date(finalStartTime.getTime() + planMaxMeetingDuration * 60000);

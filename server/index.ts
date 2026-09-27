@@ -626,18 +626,18 @@ export async function createServer() {
   mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
 
   // Calls API routes
-  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCalls);
-  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallByCode);
-  mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), validateCallAccess);
+  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);
+  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallByCode);
+  mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), validateCallAccess);
   // Get call by UUID or code (must be registered after the more specific GET routes above)
-  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getCallById);
-  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createCall);
-  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateCall);
-  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), joinCall);
-  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), leaveCall);
-  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), deleteCall);
-  mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), addCallParticipants);
-  mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), generateCallInvite);
+  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallById);
+  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), createCall);
+  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), updateCall);
+  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), joinCall);
+  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), leaveCall);
+  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), deleteCall);
+  mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), addCallParticipants);
+  mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), generateCallInvite);
   // Guest access (public, no auth): guests join via call link + name (+password if set)
   mainRouter.get("/calls/guest/validate/:code", guestValidateCall);
   mainRouter.post("/calls/guest/:code/join", guestJoinCall);

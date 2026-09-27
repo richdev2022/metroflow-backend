@@ -230,7 +230,11 @@ export const checkSubscriptionStatus = async (
   }
 };
 
-export const checkFeaturePermission = (requiredPermission: string) => {
+export const checkFeaturePermission = (requiredPermission: string | string[]) => {
+  // Calls were historically gated with "use_chat"; plans in the wild may list
+  // either id. Accept ANY of the provided permissions so switching call routes
+  // to "use_calls" cannot lock out businesses whose plans only grant "use_chat".
+  const requiredList = Array.isArray(requiredPermission) ? requiredPermission : [requiredPermission];
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
       const businessId = req.user?.businessId;
@@ -256,7 +260,7 @@ export const checkFeaturePermission = (requiredPermission: string) => {
 
       const permissions = normalizePlanPermissions(result.rows[0].permissions, result.rows[0].features);
       
-      if (permissions.has(requiredPermission) || permissions.has("*") || permissions.has("all")) {
+      if (permissions.has("*") || permissions.has("all") || requiredList.some((perm) => permissions.has(perm))) {
         return next();
       }
 

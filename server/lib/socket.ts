@@ -879,14 +879,22 @@ export function initSocketServer(server: http.Server): void {
     });
 
     // Call events
-    socket.on("call:invite", async (data: { callId: string; targetUserId: string; type: string }) => {
+    socket.on("call:invite", async (data: { callId: string; targetUserId: string; type: string; callerName?: string }) => {
       logger.info(`Call invite: ${data.callId} to user ${data.targetUserId}`);
       const resolvedCallId = await resolveCallId(data.callId);
       const finalCallId = resolvedCallId || data.callId;
+      // Resolve the caller's display name so clients (especially mobile) can
+      // render "John is calling" instead of a raw user UUID.
+      let callerName: string | null = null;
+      try {
+        const callerRes = await query(`SELECT name FROM users WHERE id = $1`, [socket.data.userId]);
+        callerName = callerRes.rows[0]?.name || null;
+      } catch { /* best-effort */ }
       socket.to(`user:${data.targetUserId}`).emit("call:incoming", {
         callId: finalCallId,
         callCode: data.callId,
         from: socket.data.userId,
+        callerName: callerName || data.callerName || undefined,
         type: data.type,
       });
     });
@@ -895,22 +903,52 @@ export function initSocketServer(server: http.Server): void {
       logger.info(`Call accepted: ${data.callId}`);
       const resolvedCallId = await resolveCallId(data.callId);
       if (!resolvedCallId) return;
-      socket.to(`call:${resolvedCallId}`).emit("call:accepted", { callId: resolvedCallId });
+      // Notify the room AND the call creator: the creator may still be waiting
+      // in the ringback screen before entering the room, so `user:` is the only
+      // room guaranteed to reach them. `call:` rooms are never joined anywhere.
+      let creatorId: string | null = null;
+      try {
+        const callRes = await query(`SELECT created_by FROM calls WHERE id = $1`, [resolvedCallId]);
+        creatorId = callRes.rows[0]?.created_by || null;
+      } catch { /* best-effort */ }
+      io.to(`room:${resolvedCallId}`).emit("call:accepted", { callId: resolvedCallId, userId: socket.data.userId });
+      if (creatorId && creatorId !== socket.data.userId) {
+        io.to(`user:${creatorId}`).emit("call:accepted", { callId: resolvedCallId, userId: socket.data.userId });
+      }
     });
 
     socket.on("call:reject", async (data: { callId: string }) => {
       logger.info(`Call rejected: ${data.callId}`);
       const resolvedCallId = await resolveCallId(data.callId);
       if (!resolvedCallId) return;
-      socket.to(`call:${resolvedCallId}`).emit("call:rejected", { callId: resolvedCallId });
+      let creatorId: string | null = null;
+      try {
+        const callRes = await query(`SELECT created_by FROM calls WHERE id = $1`, [resolvedCallId]);
+        creatorId = callRes.rows[0]?.created_by || null;
+      } catch { /* best-effort */ }
+      io.to(`room:${resolvedCallId}`).emit("call:rejected", { callId: resolvedCallId, userId: socket.data.userId });
+      if (creatorId && creatorId !== socket.data.userId) {
+        io.to(`user:${creatorId}`).emit("call:rejected", { callId: resolvedCallId, userId: socket.data.userId });
+      }
     });
 
     socket.on("call:end", async (data: { callId: string }) => {
       logger.info(`Call ended: ${data.callId}`);
       const resolvedCallId = await resolveCallId(data.callId);
       if (!resolvedCallId) return;
-      socket.to(`call:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId });
-      socket.leave(`call:${resolvedCallId}`);
+      // Persist the ended state so history lists stop showing the call as ongoing.
+      try {
+        await query(
+          `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 AND status <> 'completed'`,
+          [resolvedCallId]
+        );
+      } catch (error) {
+        logger.error(`Failed to persist call end for ${resolvedCallId}:`, error);
+      }
+      // Broadcast to the LIVE room (`room:{id}`) — `call:{id}` is never joined.
+      io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+      socket.leave(`room:${resolvedCallId}`);
     });
 
     // Meeting events (with roomManager integration and duration support)
@@ -1288,6 +1326,10 @@ export function initSocketServer(server: http.Server): void {
         });
         room!.consumers.set(consumer.id, consumer);
 
+        // Surface the producing peer's identity so clients can label/remove
+        // the matching remote tile (consume response otherwise has no peerId).
+        const producerAppData = (room!.producers.get(producerId)?.appData ?? {}) as ProducerAppData;
+
         consumer.on("transportclose", () => {
           room!.consumers.delete(consumer.id);
           maybeCloseRoom(resolvedRoomId);
@@ -1307,6 +1349,8 @@ export function initSocketServer(server: http.Server): void {
           producerId: producerId,
           kind: consumer.kind,
           roomId: resolvedRoomId,
+          peerId: producerAppData.userId,
+          peerName: producerAppData.userName,
           rtpParameters: consumer.rtpParameters,
           appData: consumer.appData,
         });

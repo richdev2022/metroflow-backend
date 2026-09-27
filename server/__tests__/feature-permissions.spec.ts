@@ -85,6 +85,7 @@ describe("checkFeaturePermission", () => {
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({
       success: false,
+      code: "PLAN_UPGRADE_REQUIRED",
       error: "Kindly upgrade your plan to enjoy this feature.",
     });
   });

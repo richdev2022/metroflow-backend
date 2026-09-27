@@ -37,9 +37,12 @@ function generateCallCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Helper to build a call link (for responses + emails)
+// Helper to build a call link (for responses + emails).
+// The final fallback is the PRODUCTION web app: if the VPS env is missing
+// CLIENT_URL, every generated invite link used to read http://localhost:8080
+// (unreachable for invitees). A production domain default is far safer.
 function buildCallLink(callCode: string): string {
-  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || 'http://localhost:8080';
+  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || 'https://metricorex.com';
   return `${baseUrl}/calls/${callCode}`;
 }
 
@@ -1267,7 +1270,7 @@ export const addCallParticipants: RequestHandler = async (
 ) => {
   try {
     const { callId } = req.params as { callId: string };
-    const { participantIds } = req.body;
+    const { participantIds, emails } = req.body as { participantIds?: string[]; emails?: string[] };
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1278,11 +1281,13 @@ export const addCallParticipants: RequestHandler = async (
       });
     }
 
-    // Validate participantIds is a non-empty array
-    if (!Array.isArray(participantIds) || participantIds.length === 0) {
+    // Validate participantIds is a non-empty array (emails may substitute)
+    const hasParticipantIds = Array.isArray(participantIds) && participantIds.length > 0;
+    const hasEmails = Array.isArray(emails) && emails.length > 0;
+    if (!hasParticipantIds && !hasEmails) {
       return res.status(400).json({
         success: false,
-        error: "participantIds must be a non-empty array",
+        error: "participantIds or emails must be a non-empty array",
       });
     }
 
@@ -1324,20 +1329,23 @@ export const addCallParticipants: RequestHandler = async (
     );
     const existingUserIds = new Set(existingParticipantsResult.rows.map((row) => row.user_id));
 
-    // Validate all participantIds belong to the business
-    const uniqueParticipantIds = [...new Set(participantIds)];
-    const validUserIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
-    if (validUserIds.size !== uniqueParticipantIds.length) {
-      return res.status(400).json({
-        success: false,
-        error: "All participants must belong to this business",
-      });
+    // Validate all participantIds belong to the business (team-member path only)
+    const uniqueParticipantIds = [...new Set(participantIds || [])];
+    let validUserIds = new Map<string, CallUserFromDb>();
+    if (uniqueParticipantIds.length > 0) {
+      validUserIds = await getBusinessUserIdsForCalls(uniqueParticipantIds, businessId);
+      if (validUserIds.size !== uniqueParticipantIds.length) {
+        return res.status(400).json({
+          success: false,
+          error: "All participants must belong to this business",
+        });
+      }
     }
 
     // Filter out existing participants
     const newParticipantIds = uniqueParticipantIds.filter((id) => !existingUserIds.has(id));
 
-    if (newParticipantIds.length === 0) {
+    if (newParticipantIds.length === 0 && !hasEmails) {
       return res.json({
         success: true,
         message: "No new participants added (all were already in the call)",
@@ -1370,32 +1378,77 @@ export const addCallParticipants: RequestHandler = async (
       );
       addedParticipants.push(participantResult.rows[0]);
 
-      await createNotification({
-        businessId: businessId,
-        userId: pid,
-        type: "call",
-        title: `${currentUserName} added you to a call`,
-        message: `You've been added to a ${callDetails?.type || 'video'} call by ${currentUserName}`,
-        actionUrl: `/calls/${call.call_code}`,
-        actionType: "join_call",
-        metadata: { callId: actualCallId, callCode: call.call_code },
-        isActionable: true,
-        expiresInHours: 1,
-      });
+      // Side effects are best-effort: a failing notification/email must never
+      // turn the request into a 500 (the participant row is already inserted).
+      try {
+        await createNotification({
+          businessId: businessId,
+          userId: pid,
+          type: "call",
+          title: `${currentUserName} added you to a call`,
+          message: `You've been added to a ${callDetails?.type || 'video'} call by ${currentUserName}`,
+          actionUrl: `/calls/${call.call_code}`,
+          actionType: "join_call",
+          metadata: { callId: actualCallId, callCode: call.call_code },
+          isActionable: true,
+          expiresInHours: 1,
+        });
+      } catch (notifyError) {
+        console.error(`Add call participants: failed to notify ${pid}:`, notifyError);
+      }
 
       const user = usersMap.get(pid);
       if (user?.email) {
-        const emailHtml = generateCallInvitationEmailHtml(
-          user.name || 'User',
-          (callDetails?.type || 'video') as 'audio' | 'video',
-          new Date(callDetails?.started_at || new Date()),
-          call.call_code,
-          currentUserName,
-          callLink,
-          callDetails?.password || null,
-          !!callDetails?.waiting_room_enabled
-        );
-        await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
+        try {
+          const emailHtml = generateCallInvitationEmailHtml(
+            user.name || 'User',
+            (callDetails?.type || 'video') as 'audio' | 'video',
+            new Date(callDetails?.started_at || new Date()),
+            call.call_code,
+            currentUserName,
+            callLink,
+            callDetails?.password || null,
+            !!callDetails?.waiting_room_enabled
+          );
+          await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
+        } catch (emailError) {
+          console.error(`Add call participants: failed to email ${user.email}:`, emailError);
+        }
+      }
+    }
+
+    // ===== External email invites (people without accounts) =====
+    // Guests join via the public call link (/calls/:code -> guest join), so an
+    // account is never required. Every side effect below is best-effort.
+    const invitedViaEmail: string[] = [];
+    if (hasEmails) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const validEmails = [...new Set((emails as string[])
+        .map((e: string) => String(e || '').trim().toLowerCase())
+        .filter((e: string) => emailRegex.test(e)))] as string[];
+
+      for (const email of validEmails) {
+        try {
+          const emailHtml = generateCallInvitationEmailHtml(
+            email.split('@')[0],
+            (callDetails?.type || 'video') as 'audio' | 'video',
+            new Date(callDetails?.started_at || new Date()),
+            call.call_code,
+            currentUserName,
+            callLink,
+            callDetails?.password || null,
+            !!callDetails?.waiting_room_enabled
+          );
+          const sent = await sendEmail(
+            email,
+            email.split('@')[0],
+            `📞 ${currentUserName} invited you to a ${callDetails?.type === 'audio' ? 'Audio' : 'Video'} Call`,
+            emailHtml
+          );
+          if (sent) invitedViaEmail.push(email);
+        } catch (emailError) {
+          console.error(`Add call participants: failed to email external invitee ${email}:`, emailError);
+        }
       }
     }
 
@@ -1454,8 +1507,11 @@ export const addCallParticipants: RequestHandler = async (
 
     res.json({
       success: true,
-      message: `${newParticipantIds.length} participant(s) added`,
-      data: { added: newParticipantIds },
+      message: [
+        newParticipantIds.length > 0 ? `${newParticipantIds.length} participant(s) added` : null,
+        invitedViaEmail.length > 0 ? `${invitedViaEmail.length} email invite(s) sent` : null,
+      ].filter(Boolean).join(' · ') || 'No new participants added (all were already in the call)',
+      data: { added: newParticipantIds, invitedEmails: invitedViaEmail },
     });
   } catch (error) {
     console.error("Add call participants error:", error);
@@ -1607,8 +1663,9 @@ async function generateInviteLink(
   const encodedUserName = encodeURIComponent(participantName);
   const waitingRoomParam = (!isHost && waitingRoomEnabled) ? 'true' : 'false';
 
-  // Build the invite URL from the configured client origin so links stay valid
-  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || process.env.CLIENT_APP_URL || 'http://localhost:8080';
+  // Build the invite URL from the configured client origin so links stay valid.
+  // Production-safe fallback (see buildCallLink note above).
+  const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || process.env.CLIENT_APP_URL || 'https://metricorex.com';
   return `${baseUrl}/calls?roomId=${roomId}&token=${token}&userName=${encodedUserName}&isHost=${isHost}&waitingRoom=${waitingRoomParam}&autoJoin=1`;
 }
 

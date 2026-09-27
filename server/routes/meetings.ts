@@ -1586,7 +1586,7 @@ export const validateMeetingAccess: RequestHandler = async (
               co_host_id as "coHostId", created_by as "createdById", password,
               recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled"
        FROM meetings
-       WHERE (meeting_code = $1 OR id = $1) AND business_id = $2`,
+       WHERE (meeting_code = $1 OR id::text = $1) AND business_id = $2`,
       [code, businessId],
     );
 
@@ -1730,7 +1730,7 @@ export const guestValidateMeeting: RequestHandler = async (req, res) => {
               co_host_id as "coHostId", created_by as "createdById", password,
               recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled"
        FROM meetings
-       WHERE meeting_code = $1 OR id = $1`,
+       WHERE meeting_code = $1 OR id::text = $1`,
       [code],
     );
 
@@ -1877,9 +1877,10 @@ export const generateMeetingInvite: RequestHandler = async (
     }
 
     // Resolve meeting (id or code) inside the host's business
+    // `id::text = $1` avoids the 22P02 cast error when roomId is a CODE.
     const meetingRes = await query(
       `SELECT id, meeting_code as "meetingCode", title FROM meetings
-       WHERE (id = $1 OR meeting_code = $1) AND business_id = $2`,
+       WHERE (meeting_code = $1 OR id::text = $1) AND business_id = $2`,
       [roomId, businessId],
     );
     if (meetingRes.rows.length === 0) {

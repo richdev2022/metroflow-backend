@@ -291,6 +291,63 @@ export function initSocketServer(server: http.Server): void {
     Map<string, { participantId: string; socketId: string; userName: string; isGuest: boolean; since: number }>
   >();
 
+  // Same-account multi-device tracking: roomId -> (socketId -> userId).
+  // roomManager dedupes participants by userId, so a second device joining
+  // with the SAME account is invisible there. This map counts real sockets
+  // per room so the server can tell clients "you joined twice -> echo risk".
+  const roomSockets = new Map<string, Map<string, { userId: string; userName: string }>>();
+
+  const trackRoomSocket = (roomId: string, socketId: string, userId: string, userName: string): number => {
+    if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Map());
+    const sockets = roomSockets.get(roomId)!;
+    sockets.set(socketId, { userId, userName });
+    let sameUserCount = 0;
+    for (const entry of sockets.values()) {
+      if (entry.userId === userId) sameUserCount += 1;
+    }
+    return sameUserCount;
+  };
+
+  const untrackRoomSocket = (roomId: string, socketId: string): void => {
+    const sockets = roomSockets.get(roomId);
+    if (!sockets) return;
+    sockets.delete(socketId);
+    if (sockets.size === 0) roomSockets.delete(roomId);
+  };
+
+  const untrackSocketFromAllRooms = (socketId: string): void => {
+    for (const [roomId, sockets] of roomSockets.entries()) {
+      if (sockets.delete(socketId) && sockets.size === 0) {
+        roomSockets.delete(roomId);
+      }
+    }
+  };
+
+  // Emit a multi-device (echo risk) alert when the same account holds 2+
+  // sockets in the room. Sent to the WHOLE room so every device of that
+  // account shows the warning (all of them contribute to the echo loop).
+  const maybeEmitMultiDeviceAlert = (
+    resolvedRoomId: string,
+    userId: string,
+    userName: string,
+    sameUserCount: number,
+    isCall: boolean,
+  ): void => {
+    if (sameUserCount < 2) return;
+    const payload = {
+      roomId: resolvedRoomId,
+      userId,
+      userName,
+      deviceCount: sameUserCount,
+      message: `${userName || 'This account'} joined on ${sameUserCount} devices — echo likely. Leave on all but one device or use headphones.`,
+    };
+    // Same prefix for calls and meetings: the web room listens for `call:multi-device`.
+    io.to(`room:${resolvedRoomId}`).emit("call:multi-device", payload);
+    if (!isCall) {
+      io.to(`room:${resolvedRoomId}`).emit("meeting:multi-device", { ...payload, meetingId: resolvedRoomId });
+    }
+  };
+
   const getWaitingQueue = (roomId: string) => {
     let q = waitingRooms.get(roomId);
     if (!q) {
@@ -496,6 +553,10 @@ export function initSocketServer(server: http.Server): void {
 
         socket.join(`room:${resolvedRoomId}`);
 
+        // Track the socket against this room and detect same-account
+        // multi-device joins (the real echo cause).
+        const sameUserCount = trackRoomSocket(resolvedRoomId, socket.id, data.userId, data.userName);
+
         socket.to(`room:${resolvedRoomId}`).emit("call:participant-joined", {
           roomId: resolvedRoomId,
           userId: data.userId,
@@ -555,6 +616,9 @@ export function initSocketServer(server: http.Server): void {
             maxMeetingDuration,
           });
         }
+
+        // Server-verified echo-risk alert (same account on multiple devices)
+        maybeEmitMultiDeviceAlert(resolvedRoomId, data.userId, data.userName, sameUserCount, isCall);
       } catch (error) {
         logger.error("Error joining call:", error);
         if (callback) callback({ success: false, error: "Failed to join call" });
@@ -569,6 +633,7 @@ export function initSocketServer(server: http.Server): void {
         const resolvedRoomId = resolved.id;
 
         roomManager.removeParticipant(resolvedRoomId, data.userId);
+        untrackRoomSocket(resolvedRoomId, socket.id);
         socket.leave(`room:${resolvedRoomId}`);
 
         socket.to(`room:${resolvedRoomId}`).emit("call:participant-left", {
@@ -903,6 +968,18 @@ export function initSocketServer(server: http.Server): void {
       });
     });
 
+    // Read receipts: the web client emits this when a conversation is opened
+    // (previously a silent no-op). Rebroadcast so OTHER participants clear
+    // their unread badges for this user in real time.
+    socket.on("chat:mark-read", (data: { conversationId: string; userId?: string }) => {
+      if (!data?.conversationId) return;
+      socket.to(`conversation:${data.conversationId}`).emit("chat:conversation-read", {
+        conversationId: data.conversationId,
+        userId: data.userId || socket.data.userId,
+        readAt: new Date().toISOString(),
+      });
+    });
+
     // Call events
     socket.on("call:invite", async (data: { callId: string; targetUserId: string; type: string; callerName?: string }) => {
       logger.info(`Call invite: ${data.callId} to user ${data.targetUserId}`);
@@ -1038,6 +1115,10 @@ export function initSocketServer(server: http.Server): void {
         socket.join(`room:${resolvedMeetingId}`);
         socket.join(`meeting:${resolvedMeetingId}`);
 
+        // Track the socket against this room and detect same-account
+        // multi-device joins (the real echo cause).
+        const sameUserCount = trackRoomSocket(resolvedMeetingId, socket.id, userId, userName);
+
         logger.info(`Socket ${socket.id} joined meeting:${resolvedMeetingId} (input: ${data.meetingId})`);
         socket.to(`room:${resolvedMeetingId}`).emit("meeting:participant-joined", {
           meetingId: resolvedMeetingId,
@@ -1101,6 +1182,9 @@ export function initSocketServer(server: http.Server): void {
             maxMeetingDuration,
           });
         }
+
+        // Server-verified echo-risk alert (same account on multiple devices)
+        maybeEmitMultiDeviceAlert(resolvedMeetingId, userId, userName, sameUserCount, false);
       } catch (error) {
         logger.error("Error joining meeting:", error);
         if (callback) callback({ success: false, error: "Failed to join meeting" });
@@ -1116,6 +1200,7 @@ export function initSocketServer(server: http.Server): void {
         const userName = data.userName || 'User';
 
         roomManager.removeParticipant(resolvedMeetingId, userId);
+        untrackRoomSocket(resolvedMeetingId, socket.id);
 
         socket.to(`room:${resolvedMeetingId}`).emit("meeting:participant-left", {
           meetingId: resolvedMeetingId,
@@ -1549,6 +1634,10 @@ export function initSocketServer(server: http.Server): void {
     // Disconnect
     socket.on("disconnect", async () => {
       const { userId, businessId, waitingRoom: wasWaiting, waitingRoomId } = socket.data;
+
+      // Remove this socket from all room-tracking maps so multi-device
+      // detection stays accurate after refreshes/crashes.
+      untrackSocketFromAllRooms(socket.id);
 
       // Remove from waiting-room queue if applicable
       if (wasWaiting && waitingRoomId) {

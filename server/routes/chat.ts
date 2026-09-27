@@ -478,6 +478,39 @@ export const sendMessage: RequestHandler = async (
     const io = getSocketServer();
     if (io) {
       io.to(`conversation:${conversationId}`).emit("message:created", message);
+
+      // Real-time badge/sound/popup push to every OTHER participant's personal
+      // room (works even when they have not joined the conversation room).
+      try {
+        const convResult = await query(
+          `SELECT name, type FROM chat_conversations WHERE id = $1`,
+          [conversationId],
+        );
+        const conversationName = convResult.rows[0]?.name || null;
+        const conversationType = convResult.rows[0]?.type || "direct";
+        const preview = String(content || "").slice(0, 140);
+        const notificationPayload = {
+          conversationId,
+          messageId: message.id,
+          senderId: userId,
+          senderName: message.senderName || "Someone",
+          conversationName,
+          conversationType,
+          content: preview,
+          attachmentType: attachmentType || null,
+          createdAt: message.createdAt,
+        };
+        for (const row of participantsResult.rows) {
+          const participantId = row.userId;
+          if (!participantId || participantId === userId) continue;
+          io.to(`user:${participantId}`).emit(
+            "chat:new-message-notification",
+            notificationPayload,
+          );
+        }
+      } catch (notifyError) {
+        console.error("Chat notification push error:", notifyError);
+      }
     }
 
     const response: ApiResponse<any> = {

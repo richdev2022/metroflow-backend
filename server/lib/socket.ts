@@ -483,7 +483,7 @@ export function initSocketServer(server: http.Server): void {
 
           if (isCall) {
             await query(
-              `UPDATE calls SET ended_at = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+              `UPDATE calls SET ended_at = $1, duration_started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
               [calculatedEndsAt.toISOString(), resolvedRoomId]
             );
           } else {
@@ -591,6 +591,31 @@ export function initSocketServer(server: http.Server): void {
             meetingId: resolvedRoomId,
             userId: data.userId,
           });
+        }
+
+        // Everyone has left the call -> actually complete it so history shows
+        // the real duration instead of an "ongoing" call until the plan deadline.
+        if (resolved.type === 'call' && roomManager.getParticipants(resolvedRoomId).length === 0) {
+          try {
+            await query(
+              `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'ongoing'`,
+              [resolvedRoomId]
+            );
+            warnedRooms5min.delete(resolvedRoomId);
+            warnedRooms1min.delete(resolvedRoomId);
+            roomManager.setRoomEndsAt(resolvedRoomId, null);
+            const ioServer = getSocketServer();
+            ioServer?.to(`room:${resolvedRoomId}`).emit("call:ended", {
+              callId: resolvedRoomId,
+              reason: 'all_participants_left',
+            });
+            ioServer?.to(`user:${data.userId}`).emit("call:ended", {
+              callId: resolvedRoomId,
+              reason: 'all_participants_left',
+            });
+          } catch (endError) {
+            logger.error("Error completing emptied call:", endError);
+          }
         }
       } catch (error) {
         logger.error("Error leaving call:", error);

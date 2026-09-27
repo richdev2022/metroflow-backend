@@ -393,7 +393,10 @@ router.get("/current", authenticateToken, async (req, res) => {
     const businessResult = await query(`
       SELECT b.id, b.name, b.subscription_status, b.trial_ends_at, b.next_billing_date,
              p.id as plan_id, p.name as plan_name, p.price as plan_price, p.discount as plan_discount,
-             p.max_team_members, p.features
+             p.max_team_members, p.features, p.permissions, p.trial_days, p.duration,
+             p.max_meeting_duration, p.max_participants, p.max_recording_duration, p.max_recording_storage,
+             p.waiting_room_enabled, p.recording_enabled, p.screen_sharing_enabled,
+             p.breakout_rooms_enabled, p.virtual_backgrounds, p.live_captions
       FROM businesses b
       LEFT JOIN pricing_plans p ON b.plan_id = p.id
       WHERE b.id = $1

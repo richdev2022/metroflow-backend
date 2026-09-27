@@ -272,7 +272,26 @@ export const createConversation: RequestHandler = async (
       });
     }
 
-    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
+    // Normalize + validate participant ids BEFORE the ::uuid[] cast — a single
+    // non-UUID value (e.g. an email or a client-generated id) would throw 22P02
+    // and surface as a 500 "Failed to create conversation".
+    let rawParticipantIds: unknown = participantIds;
+    if (rawParticipantIds != null && !Array.isArray(rawParticipantIds)) {
+      rawParticipantIds = [rawParticipantIds];
+    }
+    const providedIds = ((rawParticipantIds as any[]) || [])
+      .filter((pid): pid is string => typeof pid === "string" && pid.trim().length > 0)
+      .map((pid) => pid.trim());
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const invalidIds = providedIds.filter((pid) => !uuidRegex.test(pid));
+    if (invalidIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid chat participants: one or more participant ids are not valid user ids",
+      });
+    }
+
+    const uniqueParticipantIds = [...new Set([userId, ...providedIds])];
     const validParticipantIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
     if (validParticipantIds.size !== uniqueParticipantIds.length) {
       return res.status(400).json({
@@ -282,7 +301,7 @@ export const createConversation: RequestHandler = async (
     }
 
     // For direct messages, check if conversation already exists
-    if (type === "direct" && participantIds && participantIds.length === 1) {
+    if (type === "direct" && providedIds.length === 1) {
       const existingResult = await query(
         `SELECT cc.id FROM chat_conversations cc
          JOIN chat_participants cp1 ON cc.id = cp1.conversation_id

@@ -230,7 +230,33 @@ export const createCall: RequestHandler = async (
       });
     }
 
-    const uniqueParticipantIds = [...new Set([userId, ...(participantIds || [])])];
+    // Normalize participantIds: clients may send a single id, a JSON string,
+    // or ids that are not user UUIDs (e.g. chat participant row ids). Cast the
+    // whole array with ::uuid[] would throw 22P02 and bubble up as a 500
+    // "Failed to create call", so validate explicitly and 400 instead.
+    let rawParticipantIds: unknown = participantIds;
+    if (typeof rawParticipantIds === "string") {
+      try {
+        rawParticipantIds = JSON.parse(rawParticipantIds);
+      } catch {
+        rawParticipantIds = [rawParticipantIds];
+      }
+    }
+    if (rawParticipantIds != null && !Array.isArray(rawParticipantIds)) {
+      rawParticipantIds = [rawParticipantIds];
+    }
+    const providedParticipantIds = ((rawParticipantIds as any[]) || [])
+      .filter((pid): pid is string => typeof pid === "string" && pid.trim().length > 0)
+      .map((pid) => pid.trim());
+    const invalidParticipantIds = providedParticipantIds.filter((pid) => !isValidUUID(pid));
+    if (invalidParticipantIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid call participants: one or more participant ids are not valid user ids",
+      });
+    }
+
+    const uniqueParticipantIds = [...new Set([userId, ...providedParticipantIds])];
     const validParticipantIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
     if (validParticipantIds.size !== uniqueParticipantIds.length) {
       return res.status(400).json({
@@ -308,76 +334,102 @@ export const createCall: RequestHandler = async (
     );
     const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
 
-    // Send in-app notifications and emails to invited participants
-    const invitedParticipantIds = (participantIds || []).filter((pid: string) => pid !== userId);
+    // Send in-app notifications and emails to invited participants.
+    // These are side effects: the call row is already committed, so a failing
+    // notification/email must NEVER turn the request into a 500 (the caller
+    // would believe the call failed while it is actually live). Best-effort.
+    const invitedParticipantIds = (providedParticipantIds).filter((pid: string) => pid !== userId);
     if (invitedParticipantIds.length > 0) {
-      const usersMap = await getBusinessUserIdsForCalls(invitedParticipantIds, businessId);
-      const callLink = buildCallLink(call.callCode);
+      try {
+        const usersMap = await getBusinessUserIdsForCalls(invitedParticipantIds, businessId);
+        const callLink = buildCallLink(call.callCode);
 
-      for (const pid of invitedParticipantIds) {
-        await createNotification({
-          businessId: businessId,
-          userId: pid,
-          type: "call",
-          title: `${currentUserName} is calling`,
-          message: `You have an incoming ${type || 'video'} call from ${currentUserName}`,
-          actionUrl: `/calls/${call.callCode}`,
-          actionType: "join_call",
-          metadata: { callId: call.id, callCode: call.callCode },
-          isActionable: true,
-          expiresInHours: 1,
-        });
+        for (const pid of invitedParticipantIds) {
+          try {
+            await createNotification({
+              businessId: businessId,
+              userId: pid,
+              type: "call",
+              title: `${currentUserName} is calling`,
+              message: `You have an incoming ${type || 'video'} call from ${currentUserName}`,
+              actionUrl: `/calls/${call.callCode}`,
+              actionType: "join_call",
+              metadata: { callId: call.id, callCode: call.callCode },
+              isActionable: true,
+              expiresInHours: 1,
+            });
+          } catch (notifyError) {
+            console.error(`Create call: failed to notify participant ${pid}:`, notifyError);
+          }
 
-        const user = usersMap.get(pid);
-        if (user?.email) {
-          const emailHtml = generateCallInvitationEmailHtml(
-            user.name || 'User',
-            (type || 'video') as 'audio' | 'video',
-            new Date(call.startedAt),
-            call.callCode,
-            currentUserName,
-            callLink,
-            password || null,
-            waitingRoomEnabled || false
-          );
-          await sendEmail(user.email, user.name || 'User', `📞 Incoming ${type === 'audio' ? 'Audio' : 'Video'} Call from ${currentUserName}`, emailHtml);
+          const user = usersMap.get(pid);
+          if (user?.email) {
+            try {
+              const emailHtml = generateCallInvitationEmailHtml(
+                user.name || 'User',
+                (type || 'video') as 'audio' | 'video',
+                new Date(call.startedAt),
+                call.callCode,
+                currentUserName,
+                callLink,
+                password || null,
+                waitingRoomEnabled || false
+              );
+              const emailSent = await sendEmail(user.email, user.name || 'User', `📞 Incoming ${type === 'audio' ? 'Audio' : 'Video'} Call from ${currentUserName}`, emailHtml);
+              if (!emailSent) console.error(`Create call: invite email not sent to ${user.email} - share the call link manually: ${callLink}`);
+            } catch (emailError) {
+              console.error(`Create call: failed to email participant ${pid}:`, emailError);
+            }
+          }
         }
+      } catch (sideEffectError) {
+        console.error("Create call: participant notification stage failed (call still created):", sideEffectError);
       }
     }
 
-    // Log activity
-    await logActivity({
-      businessId,
-      userId,
-      action: "create",
-      actionType: "call",
-      description: `Started a ${call.type} call`,
-      metadata: {
-        type: call.type,
-        callCode: call.callCode,
-        isGroupCall: call.isGroupCall,
-        participantIds: uniqueParticipantIds,
-      },
-    });
-
-    // Emit socket events
-    const io = getSocketServer();
-    if (io) {
-      uniqueParticipantIds.forEach(targetId => {
-        io.to(`user:${targetId}`).emit("call:created", call);
-      });
-      // Send invites to participants
-      participantIds?.forEach((targetId: string) => {
-        io.to(`user:${targetId}`).emit("call:incoming", {
-          callId: call.id,
-          from: userId,
+    // Log activity (best-effort)
+    try {
+      await logActivity({
+        businessId,
+        userId,
+        action: "create",
+        actionType: "call",
+        description: `Started a ${call.type} call`,
+        metadata: {
           type: call.type,
           callCode: call.callCode,
-          callLink: buildCallLink(call.callCode),
-          hasPassword: !!password,
-          waitingRoomEnabled: waitingRoomEnabled || false,
-        });
+          isGroupCall: call.isGroupCall,
+          participantIds: uniqueParticipantIds,
+        },
       });
+    } catch (logError) {
+      console.error("Create call: failed to log activity:", logError);
+    }
+
+    // Emit socket events (best-effort)
+    try {
+      const io = getSocketServer();
+      if (io) {
+        uniqueParticipantIds.forEach(targetId => {
+          io.to(`user:${targetId}`).emit("call:created", call);
+        });
+        // Send invites to participants
+        providedParticipantIds?.forEach((targetId: string) => {
+          io.to(`user:${targetId}`).emit("call:incoming", {
+            callId: call.id,
+            callCode: call.callCode,
+            roomId: call.id,
+            from: userId,
+            callerName: currentUserName,
+            type: call.type,
+            callLink: buildCallLink(call.callCode),
+            hasPassword: !!password,
+            waitingRoomEnabled: waitingRoomEnabled || false,
+          });
+        });
+      }
+    } catch (socketError) {
+      console.error("Create call: socket emission failed (call still created):", socketError);
     }
 
     const response: ApiResponse<any> = {
@@ -645,7 +697,9 @@ export const updateCall: RequestHandler = async (
       updateFields.push(`status = $${paramIndex++}`);
       values.push(status);
       if (status === "ongoing") {
-        updateFields.push(`started_at = CURRENT_TIMESTAMP`);
+        // Only stamp started_at on the FIRST transition to ongoing; re-issuing
+        // status=ongoing (e.g. every participant join) must not rewrite history.
+        updateFields.push(`started_at = COALESCE(started_at, CURRENT_TIMESTAMP)`);
       } else if (["completed", "missed", "cancelled"].includes(status)) {
         updateFields.push(`ended_at = CURRENT_TIMESTAMP`);
       }
@@ -697,7 +751,10 @@ export const updateCall: RequestHandler = async (
 
     const io = getSocketServer();
     if (io) {
-      io.to(`call:${actualId}`).emit("call:updated", call);
+      // NOTE: clients join `room:{id}` (socket.ts call:join/meeting:join), never
+      // `call:{id}` — emitting there is a no-op, so use the live room.
+      io.to(`room:${actualId}`).emit("call:updated", call);
+      io.to(`meeting:${actualId}`).emit("call:updated", call);
     }
 
     const response: ApiResponse<any> = {
@@ -919,13 +976,14 @@ export const joinCall: RequestHandler = async (
 
     const io = getSocketServer();
     if (io) {
-      // Emit both spellings: camelCase (Flutter) and hyphenated (web)
-      io.to(`call:${actualId}`).emit("call:participantJoined", {
+      // Emit both spellings: camelCase (Flutter) and hyphenated (web).
+      // Room name must be `room:{id}` — that is the room sockets actually join.
+      io.to(`room:${actualId}`).emit("call:participantJoined", {
         callId: actualId,
         userId,
         status: effectiveStatus,
       });
-      io.to(`call:${actualId}`).emit("call:participant-joined", {
+      io.to(`room:${actualId}`).emit("call:participant-joined", {
         roomId: actualId,
         callId: actualId,
         userId,
@@ -1030,6 +1088,13 @@ export const leaveCall: RequestHandler = async (
        FROM calls WHERE id = $1 AND business_id = $2`,
       [actualId, businessId],
     );
+    if (callResult.rows.length === 0) {
+      // Call deleted between the participant update and this lookup
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+      });
+    }
     const call = callResult.rows[0];
 
     const participantsResult = await query(
@@ -1042,12 +1107,13 @@ export const leaveCall: RequestHandler = async (
 
     const io = getSocketServer();
     if (io) {
-      // Emit both spellings: camelCase (Flutter) and hyphenated (web)
-      io.to(`call:${actualId}`).emit("call:participantLeft", {
+      // Emit both spellings: camelCase (Flutter) and hyphenated (web).
+      // Room name must be `room:{id}` — that is the room sockets actually join.
+      io.to(`room:${actualId}`).emit("call:participantLeft", {
         callId: actualId,
         userId,
       });
-      io.to(`call:${actualId}`).emit("call:participant-left", {
+      io.to(`room:${actualId}`).emit("call:participant-left", {
         roomId: actualId,
         callId: actualId,
         userId,
@@ -1356,13 +1422,15 @@ export const addCallParticipants: RequestHandler = async (
       updatedCall.participants = participantsResult.rows;
       enrichCall(updatedCall);
       
-      io.to(`call:${actualCallId}`).emit("call:updated", updatedCall);
+      io.to(`room:${actualCallId}`).emit("call:updated", updatedCall);
 
       // Send invites to new participants
       newParticipantIds.forEach(targetId => {
         io.to(`user:${targetId}`).emit("call:incoming", {
           callId: call.id,
+          roomId: call.id,
           from: userId,
+          callerName: currentUserName,
           type: callDetails?.type || 'video',
           callCode: call.call_code,
           callLink: callLink,
@@ -1660,7 +1728,7 @@ export const guestJoinCall: RequestHandler = async (req, res) => {
         guestId: payload.guestId,
         guestName,
         roomId: call.id,
-        socketRoom: `call:${call.id}`,
+        socketRoom: `room:${call.id}`,
         expiresAt: new Date(payload.exp * 1000).toISOString(),
       },
     });
@@ -1686,9 +1754,11 @@ export const guestValidateCall: RequestHandler = async (req, res) => {
     }
 
     // Look up call globally by code (guests are not business-scoped)
+    // NOTE: calls has no screen_sharing_enabled column (that's meetings/pricing_plans)
+    // — selecting it here caused an unconditional 42703 -> 500 on every guest link.
     const callRes = await query(
       `SELECT c.id, c.type, c.status, c.call_code, c.password, c.waiting_room_enabled,
-              c.max_participants, c.recording_enabled, c.screen_sharing_enabled, c.is_group_call,
+              c.max_participants, c.recording_enabled, c.is_group_call,
               u.name AS host_name, c.started_at, c.ended_at
        FROM calls c
        LEFT JOIN users u ON c.host_id = u.id
@@ -1735,7 +1805,7 @@ export const guestValidateCall: RequestHandler = async (req, res) => {
         hostName: call.host_name,
         waitingRoomEnabled: call.waiting_room_enabled,
         recordingEnabled: call.recording_enabled,
-        screenSharingEnabled: call.screen_sharing_enabled,
+        screenSharingEnabled: true,
         isGroupCall: call.is_group_call,
         hasPassword: Boolean(call.password),
         accessState,

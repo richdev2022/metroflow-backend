@@ -2046,7 +2046,9 @@ protectedRouter.post("/users/invite", requirePermission('manage_admins'), async 
 
     // Create temp password
     const tempPassword = Math.random().toString(36).slice(-8);
-    const hashed = hashPassword(tempPassword);
+    // hashPassword is async — the missing `await` previously persisted "{}"
+    // as password_hash, making the generated temp password unusable.
+    const hashed = await hashPassword(tempPassword);
 
     await query(
       `INSERT INTO platform_admins (name, email, password_hash, role_id, status) VALUES ($1, $2, $3, $4, 'pending_invite')`,

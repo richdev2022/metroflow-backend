@@ -1282,6 +1282,13 @@ export const googleAuth: RequestHandler = async (req, res) => {
  *         description: Password created
  */
 export const setPassword: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  // A valid bcrypt hash always starts with $2a$, $2b$ or $2y$. Anything else
+  // in password_hash (e.g. "{}" written by the historic missing-await bug in
+  // accept-invite) is corrupt and MUST be treated as "no password" so the
+  // user can recover via set-password instead of being locked out forever.
+  const isBcryptHash = (hash: unknown): boolean =>
+    typeof hash === "string" && /^\$2[aby]\$/.test(hash);
+
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -1305,7 +1312,7 @@ export const setPassword: RequestHandler = async (req: AuthenticatedRequest, res
     }
 
     const user = result.rows[0];
-    if (user.passwordHash) {
+    if (user.passwordHash && isBcryptHash(user.passwordHash)) {
       return res.status(400).json({
         success: false,
         code: "PASSWORD_ALREADY_SET",
@@ -1372,7 +1379,9 @@ export const changePassword: RequestHandler = async (req: AuthenticatedRequest, 
     }
 
     const user = result.rows[0];
-    if (!user.passwordHash) {
+    // Only trust a real bcrypt hash here. A corrupt hash (e.g. "{}") means
+    // no usable password exists — the user must go through set-password.
+    if (!user.passwordHash || !/^\$2[aby]\$/.test(user.passwordHash)) {
       return res.status(400).json({
         success: false,
         code: "NO_PASSWORD_SET",

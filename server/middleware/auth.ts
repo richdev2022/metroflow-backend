@@ -260,9 +260,10 @@ export const checkFeaturePermission = (requiredPermission: string) => {
         return next();
       }
 
-      return res.status(403).json({ 
-        success: false, 
-        error: "Kindly upgrade your plan to enjoy this feature." 
+      return res.status(403).json({
+        success: false,
+        code: "PLAN_UPGRADE_REQUIRED",
+        error: "Kindly upgrade your plan to enjoy this feature."
       });
 
     } catch (error) {

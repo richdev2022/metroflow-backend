@@ -1553,6 +1553,10 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE`);
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS screen_sharing_enabled BOOLEAN DEFAULT TRUE`);
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS jitsi_room_id VARCHAR(255)`);
+    // Actual moment the duration countdown started (when the 2nd participant joined).
+    // `ended_at` doubles as the plan-deadline while a call is ongoing, so history
+    // duration must be computed against duration_started_at, not started_at.
+    await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS duration_started_at TIMESTAMPTZ`);
     // Make jitsi_room_id nullable (in case it was originally NOT NULL)
     await query(`ALTER TABLE calls ALTER COLUMN jitsi_room_id DROP NOT NULL`);
 

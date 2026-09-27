@@ -132,6 +132,10 @@ export const getCalls: RequestHandler = async (
         c.co_host_id as "coHostId", c.call_code as "callCode", c.is_group_call as "isGroupCall",
         c.waiting_room_enabled as "waitingRoomEnabled", c.recording_enabled as "recordingEnabled",
         c.created_at as "createdAt", c.updated_at as "updatedAt",
+        c.duration_started_at as "durationStartedAt",
+        CASE WHEN c.status IN ('completed','missed','cancelled') AND c.ended_at IS NOT NULL
+          THEN GREATEST(0, EXTRACT(EPOCH FROM (c.ended_at - COALESCE(c.duration_started_at, c.started_at, c.created_at)))::int)
+          ELSE NULL END AS duration,
         json_agg(json_build_object(
           'id', cp.id,
           'userId', cp.user_id,
@@ -548,7 +552,11 @@ export const getCallById: RequestHandler = async (
               ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
               co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
-              created_at as "createdAt", updated_at as "updatedAt"
+              created_at as "createdAt", updated_at as "updatedAt",
+              duration_started_at as "durationStartedAt",
+              CASE WHEN status IN ('completed','missed','cancelled') AND ended_at IS NOT NULL
+                THEN GREATEST(0, EXTRACT(EPOCH FROM (ended_at - COALESCE(duration_started_at, started_at, created_at)))::int)
+                ELSE NULL END AS duration
        FROM calls`;
 
     // Resolve by UUID first, then by call code (clients send either).
@@ -728,7 +736,11 @@ export const updateCall: RequestHandler = async (
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
-                 created_at as "createdAt", updated_at as "updatedAt"`,
+                 created_at as "createdAt", updated_at as "updatedAt",
+                 duration_started_at as "durationStartedAt",
+                 CASE WHEN status IN ('completed','missed','cancelled') AND ended_at IS NOT NULL
+                   THEN GREATEST(0, EXTRACT(EPOCH FROM (ended_at - COALESCE(duration_started_at, started_at, created_at)))::int)
+                   ELSE NULL END AS duration`,
       values,
     );
 

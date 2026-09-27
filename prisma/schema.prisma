@@ -808,6 +808,10 @@ model Call {
   status             String // ongoing, completed, missed, cancelled
   startedAt          DateTime? @map("started_at")
   endedAt            DateTime? @map("ended_at")
+  // Moment the duration countdown actually began (2nd participant joined).
+  // ended_at doubles as the plan deadline while ongoing, so real talk-time
+  // duration must be measured from duration_started_at.
+  durationStartedAt  DateTime? @map("duration_started_at")
   createdById        String    @map("created_by")
   hostId             String    @map("host_id")
   coHostId           String?   @map("co_host_id")

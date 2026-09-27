@@ -515,7 +515,10 @@ export const acceptInvite: RequestHandler = async (req, res) => {
       return res.status(400).json(response);
     }
 
-    const passwordHash = hashPassword(password);
+    // hashPassword is async (bcrypt) — forgetting `await` here previously
+    // stored the stringified Promise ("{}") as the password hash, leaving the
+    // invitee unable to sign in with a password forever.
+    const passwordHash = await hashPassword(password);
 
     // Update user status to active and set password
     const updateResult = await query(

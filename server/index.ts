@@ -89,6 +89,8 @@ import { getRecordings, createRecording, updateRecording, deleteRecording, uploa
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
+import { isGlmConfigured } from "./lib/glm";
+import { getCloudStorage } from "./lib/storage";
 import publicRouter from "./routes/public";
 import supportRouter from "./routes/support";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
@@ -466,6 +468,41 @@ export async function createServer() {
   mainRouter.get("/ping", (_req, res) => {
     const ping = process.env.PING_MESSAGE ?? "ping";
     res.json({ message: ping });
+  });
+
+  // Deployment/ops health probe (public, read-only, no secrets).
+  // deploy.sh uses this to verify a fresh build is actually serving and to
+  // surface which optional integrations (MetricAi, GIFs, storage) are live.
+  mainRouter.get("/health", async (_req, res) => {
+    const started = Date.now();
+    let db: "up" | "down" = "down";
+    try {
+      await query("SELECT 1");
+      db = "up";
+    } catch {
+      db = "down";
+    }
+    const storage = process.env.CLOUDINARY_URL || process.env.CLOUDINARY_CLOUD_NAME
+      ? "cloudinary"
+      : process.env.CLOUDFLARE_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID
+        ? "r2"
+        : getCloudStorage()
+          ? "configured"
+          : "local-disk";
+    res.json({
+      success: true,
+      data: {
+        status: db === "up" ? "ok" : "degraded",
+        db,
+        metricAi: { configured: isGlmConfigured() },
+        gifs: { configured: Boolean(process.env.TENOR_API_KEY) },
+        storage,
+        uptimeSeconds: Math.round(process.uptime()),
+        nodeVersion: process.version,
+        env: process.env.NODE_ENV || "development",
+        checkedInMs: Date.now() - started,
+      },
+    });
   });
 
   // Test route for Sentry verification

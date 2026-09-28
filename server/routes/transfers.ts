@@ -4,7 +4,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, check
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
 import { accountLookup, processAllPending } from "../services/transfer";
-import { getProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
+import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
@@ -440,7 +440,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // Calculate Fee
     const fee = await calculateFee(amount, 'transfer');
     const reference = genRef();
-    const defaultProvider = await getActiveProviderName();
+    const defaultProvider = await getActiveTransferProviderName();
 
     // Generate transaction hash for integrity
     const transactionHash = generateTransactionHash(reference, amount.toString(), accountNumber, bankCode);
@@ -874,7 +874,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     // 2. Insert into transfer_queue
     let queuedTransfers: any[] = [];
-    const defaultProvider = await getActiveProviderName();
+    const defaultProvider = await getActiveTransferProviderName();
     for (const t of transfersToQueue) {
       if (t.amount <= 0) continue;
 
@@ -1324,7 +1324,7 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
       return res.status(400).json({ success: false, error: "Only failed transfers can be retried" });
     }
 
-    const defaultProvider = await getActiveProviderName();
+    const defaultProvider = await getActiveTransferProviderName();
     
     // Reset status to pending and get the updated transfer
     const updateRes = await query(
@@ -1427,9 +1427,12 @@ router.post("/:id/verify", authenticateToken, async (req: AuthenticatedRequest, 
  */
 router.get("/banks", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const provider = getProvider();
+    // Honour the admin-selected provider (global or transfer-specific) so bank
+    // lists always match the provider actually used for payouts/lookups.
+    const transferProvider = await getActiveTransferProviderName();
+    const provider = getProvider(transferProvider);
     const banks = provider.getBanks();
-    res.json({ success: true, data: banks });
+    res.json({ success: true, data: banks, provider: provider.name });
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to fetch banks" });
   }

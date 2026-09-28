@@ -78,7 +78,7 @@ import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia } from "./routes/chat";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
@@ -624,6 +624,8 @@ export async function createServer() {
   mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), sendMessage);
   mainRouter.put("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
   mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
+  // Voice-note / media upload for chat (WhatsApp-style audio messages)
+  mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), uploadChatMedia);
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);

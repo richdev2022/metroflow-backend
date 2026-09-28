@@ -18,10 +18,12 @@ export const InitiateSingleTransferSchema = z.object({
   accountNumber: z.string().min(1, "Account number is required"),
   accountName: z.string().optional(),
   amount: z.union([z.number(), z.string().transform(Number)]).refine((v) => v > 0, "Amount must be positive"),
+  currency: z.string().length(3).regex(/^[A-Z]+$/, "Currency must be a 3-letter code").optional(),
   remark: z.string().optional(),
   otp: z.string().length(6).regex(/^\d+$/).optional(),
   pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
   walletId: z.string().optional(),
+  wallet_id: z.string().optional(),
 });
 
 export const InitiateBulkTransferSchema = z.object({
@@ -29,6 +31,7 @@ export const InitiateBulkTransferSchema = z.object({
   otp: z.string().length(6).regex(/^\d+$/).optional(),
   pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
   sourceWalletId: z.string().optional(),
+  source_wallet_id: z.string().optional(),
   data: z.object({
     items: z.array(
       z.object({
@@ -36,6 +39,7 @@ export const InitiateBulkTransferSchema = z.object({
         bankCode: z.string().min(1, "Bank code is required"),
         accountNumber: z.string().min(1, "Account number is required"),
         accountName: z.string().optional(),
+        currency: z.string().length(3).optional(),
         remark: z.string().optional(),
       })
     ).optional(),

@@ -16,7 +16,7 @@ import {
   getOTPExpiry,
   generateToken,
 } from "../services/auth";
-import { sendEmail, generateBusinessRegistrationEmailHtml } from "../services/email";
+import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, parseDeviceInfo } from "../services/email";
 import { logActivity } from "../services/activity";
 import { generateBusinessId } from "../utils/idGenerator";
 import {
@@ -166,6 +166,17 @@ export const registerBusiness: RequestHandler = async (req, res) => {
     );
 
     const user = userResult.rows[0];
+
+    // Welcome email on account creation (best effort, does not block registration)
+    try {
+      const loginLink = `${process.env.CLIENT_URL || process.env.APP_BASE_URL || 'https://metricorex.com'}/login`;
+      const welcomeEmail = generateAccountCreationEmailHtml(user.name || input.adminName, loginLink);
+      sendEmail(user.email, user.name || input.adminName, 'Welcome to Metricorex - Your account has been created', welcomeEmail).catch((e) =>
+        console.warn('Account creation email failed:', e?.message),
+      );
+    } catch (welcomeErr: any) {
+      console.warn('Failed to send account creation email:', welcomeErr?.message);
+    }
 
     // Update business to set owner_id
     await query(
@@ -949,6 +960,23 @@ export const login: RequestHandler = async (req, res) => {
     if (!passwordValid) {
       console.log("Password verification failed");
       await recordFailedLogin(input.email, ipAddress, userAgent);
+
+      // Always-on failed login attempt notification with device info - best effort
+      try {
+        const deviceInfo = parseDeviceInfo(userAgent);
+        await query(
+          `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
+           VALUES ($1, $2, $3, 'failed', $4, $5, $6)`,
+          [user.email, user.id, user.businessId, ipAddress, String(userAgent || ''), deviceInfo],
+        );
+        const attemptEmail = generateLoginAttemptEmailHtml(user.email, 'failed', deviceInfo, ipAddress);
+        sendEmail(user.email, user.email, 'Failed login attempt on your Metricorex account', attemptEmail).catch((e) =>
+          console.warn('Login attempt email failed:', e?.message),
+        );
+      } catch (logErr: any) {
+        console.warn('Failed to record failed login attempt:', logErr?.message);
+      }
+
       return res.status(400).json({
         success: false,
         message: "Invalid email or password",
@@ -976,6 +1004,22 @@ export const login: RequestHandler = async (req, res) => {
 
     // Record successful login
     await recordSuccessfulLogin(input.email, ipAddress, userAgent);
+
+    // Always-on login attempt notification (success) with device info - best effort
+    try {
+      const deviceInfo = parseDeviceInfo(userAgent);
+      await query(
+        `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
+         VALUES ($1, $2, $3, 'success', $4, $5, $6)`,
+        [user.email, user.id, user.businessId, ipAddress, String(userAgent || ''), deviceInfo],
+      );
+      const attemptEmail = generateLoginAttemptEmailHtml(user.email, 'success', deviceInfo, ipAddress);
+      sendEmail(user.email, user.email, 'New login to your Metricorex account', attemptEmail).catch((e) =>
+        console.warn('Login attempt email failed:', e?.message),
+      );
+    } catch (logErr: any) {
+      console.warn('Failed to record login attempt:', logErr?.message);
+    }
 
     // Log login activity
     await logActivity({
@@ -1158,6 +1202,17 @@ export const googleAuth: RequestHandler = async (req, res) => {
         [business.id, googleUser.email, googleUser.name, googleUser.googleId, googleUser.picture || null],
       );
       const newUser = userResult.rows[0];
+
+      // Welcome email on Google account creation (best effort)
+      try {
+        const loginLink = `${process.env.CLIENT_URL || process.env.APP_BASE_URL || 'https://metricorex.com'}/login`;
+        const welcomeEmail = generateAccountCreationEmailHtml(newUser.name || googleUser.name, loginLink);
+        sendEmail(newUser.email, newUser.name || googleUser.name, 'Welcome to Metricorex - Your account has been created', welcomeEmail).catch((e) =>
+          console.warn('Account creation email failed:', e?.message),
+        );
+      } catch (welcomeErr: any) {
+        console.warn('Failed to send account creation email:', welcomeErr?.message);
+      }
 
       await query(`UPDATE businesses SET owner_id = $1 WHERE id = $2`, [
         newUser.id,
@@ -1449,5 +1504,154 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
   } catch (error) {
     console.error("Get me error:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch profile" });
+  }
+};
+
+// ============================================================================
+// Biometric unlock (server-backed). The mobile/web client stores the
+// biometric_token in secure storage gated by the platform biometric API.
+// Enrollment requires a normal authenticated session; login only requires the
+// biometric token (no password), keeping the flow passwordless-but-safe.
+// ============================================================================
+
+import { createHash, randomBytes } from "crypto";
+
+const hashBiometricToken = (token: string) =>
+  createHash("sha256").update(`${token}${process.env.JWT_SECRET || ""}`).digest("hex");
+
+/**
+ * POST /auth/biometric/enroll (auth required)
+ * Body: { device_id, device_name?, platform? }
+ * Returns the ONE-TIME plaintext biometric_token to store in secure storage.
+ */
+export const biometricEnroll: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const businessId = req.user?.businessId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    const { device_id, device_name, platform } = req.body || {};
+    if (!device_id || typeof device_id !== 'string') {
+      return res.status(400).json({ success: false, message: "device_id is required" });
+    }
+
+    const token = randomBytes(32).toString("hex");
+    const tokenHash = hashBiometricToken(token);
+
+    // Revoke previous credentials for this user+device
+    await query(
+      `UPDATE biometric_credentials SET revoked_at = CURRENT_TIMESTAMP
+       WHERE user_id = $1 AND device_id = $2 AND revoked_at IS NULL`,
+      [userId, device_id],
+    );
+    await query(
+      `INSERT INTO biometric_credentials (user_id, device_id, token_hash, platform, device_name)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, device_id, tokenHash, platform || null, device_name || null],
+    );
+    // businessId intentionally unused here; kept for future policy scoping
+    void businessId;
+
+    res.json({
+      success: true,
+      message: "Biometric unlock enabled for this device",
+      data: { biometric_token: token, device_id },
+    });
+  } catch (error: any) {
+    console.error("Biometric enroll error:", error);
+    res.status(500).json({ success: false, message: error.message || "Failed to enable biometric unlock" });
+  }
+};
+
+/**
+ * POST /auth/biometric/login
+ * Body: { biometric_token, device_id, device_name? }
+ * Returns the same envelope as /auth/login on success.
+ */
+export const biometricLogin: RequestHandler = async (req, res) => {
+  try {
+    const { biometric_token, device_id, device_name } = req.body || {};
+    if (!biometric_token || !device_id) {
+      return res.status(400).json({ success: false, message: "biometric_token and device_id are required" });
+    }
+
+    const tokenHash = hashBiometricToken(String(biometric_token));
+    const credRes = await query(
+      `SELECT bc.id, bc.user_id, u.id AS uid, u.business_id AS "businessId", u.email, u.name,
+              u.email_verified, u.status, u.auth_provider as "authProvider"
+       FROM biometric_credentials bc
+       JOIN users u ON u.id = bc.user_id
+       WHERE bc.token_hash = $1 AND bc.device_id = $2 AND bc.revoked_at IS NULL
+       LIMIT 1`,
+      [tokenHash, String(device_id)],
+    );
+
+    const cred = credRes.rows[0];
+    if (!cred) {
+      return res.status(401).json({ success: false, message: "Biometric unlock is not set up on this device. Please sign in with your password once." });
+    }
+    if (cred.status !== 'active' || !cred.email_verified) {
+      return res.status(403).json({ success: false, message: "Account is not active. Please sign in with your password." });
+    }
+
+    await query(
+      `UPDATE biometric_credentials SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [cred.id],
+    );
+    if (device_name) {
+      await query(`UPDATE biometric_credentials SET device_name = $1 WHERE id = $2`, [String(device_name).slice(0, 255), cred.id]).catch(() => {});
+    }
+
+    // Login attempt notification (success via biometric)
+    try {
+      const deviceInfo = parseDeviceInfo(req.headers['user-agent']);
+      await query(
+        `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
+         VALUES ($1, $2, $3, 'success', $4, $5, $6)`,
+        [cred.email, cred.uid, cred.businessId, req.ip || null, String(req.headers['user-agent'] || ''), { ...deviceInfo, method: 'biometric' }],
+      );
+      const attemptEmail = generateLoginAttemptEmailHtml(cred.email, 'success', deviceInfo, req.ip);
+      sendEmail(cred.email, cred.email, 'New login to your Metricorex account (biometric)', attemptEmail).catch(() => {});
+    } catch { /* best effort */ }
+
+    const token = await generateToken(cred.uid, cred.businessId);
+    res.json({
+      success: true,
+      userId: cred.uid,
+      businessId: cred.businessId,
+      token,
+      message: "Biometric login successful",
+    });
+  } catch (error: any) {
+    console.error("Biometric login error:", error);
+    res.status(500).json({ success: false, message: error.message || "Biometric login failed" });
+  }
+};
+
+/**
+ * DELETE /auth/biometric/enroll (auth required)
+ * Body: { device_id? } - revokes all credentials for the caller (or one device).
+ */
+export const biometricRevoke: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const { device_id } = req.body || {};
+    if (device_id) {
+      await query(
+        `UPDATE biometric_credentials SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND device_id = $2 AND revoked_at IS NULL`,
+        [userId, String(device_id)],
+      );
+    } else {
+      await query(
+        `UPDATE biometric_credentials SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND revoked_at IS NULL`,
+        [userId],
+      );
+    }
+    res.json({ success: true, message: "Biometric unlock disabled" });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message || "Failed to disable biometric unlock" });
   }
 };

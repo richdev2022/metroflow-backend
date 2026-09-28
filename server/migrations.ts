@@ -9,7 +9,42 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureAppTables();
   await ensurePayrollVerificationColumns();
   await ensureSystemSettingsDefaults();
+  await ensureChatAndAiSchema();
   await backfillLedgerHistory();
+}
+
+/**
+ * Chat attachments (WhatsApp-style), call logs in chat and MetricAi history.
+ */
+async function ensureChatAndAiSchema(): Promise<void> {
+  // Rich attachments: original filename + size + explicit message kind
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255)`);
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_size INTEGER`);
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_type VARCHAR(20) DEFAULT 'text'`);
+  await query(`UPDATE chat_messages SET message_type = 'text' WHERE message_type IS NULL`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_created ON chat_messages(conversation_id, created_at DESC)`);
+
+  // Calls created from a chat conversation link back to it so the ended/missed
+  // call appears in that conversation's transcript.
+  await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS conversation_id UUID`);
+
+  // MetricAi (GLM-powered assistant) per-user chat history
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      role VARCHAR(12) NOT NULL,             -- 'user' | 'assistant'
+      content TEXT,                          -- text content (NULL for image-only replies)
+      image_url TEXT,                        -- generated image (assistant)
+      model VARCHAR(64),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_ai_messages_user_created ON ai_messages(user_id, created_at)`);
+
+  // Plan-gated access: admin enables MetricAi per pricing plan
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_enabled BOOLEAN DEFAULT FALSE`);
 }
 
 /**

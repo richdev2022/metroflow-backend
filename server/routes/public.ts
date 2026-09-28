@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { isMaintenanceMode } from "../services/app-config";
+import { postPublicMetricAiAsk } from "./ai";
 
 /**
  * Public (unauthenticated) app configuration endpoint.
@@ -9,6 +10,17 @@ import { isMaintenanceMode } from "../services/app-config";
  */
 const router = express.Router();
 
+/**
+ * @swagger
+ * /public/app-config:
+ *   get:
+ *     summary: Public app configuration (maintenance mode + active announcement)
+ *     tags: [Public]
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: Maintenance flag + latest active announcement
+ */
 router.get("/app-config", async (req, res) => {
   try {
     const maintenance = await isMaintenanceMode();
@@ -45,5 +57,9 @@ router.get("/app-config", async (req, res) => {
     res.json({ success: true, data: { maintenance_mode: false, announcement: null } });
   }
 });
+
+// Public "Ask MetricAi" — help/support chat for ANY visitor (website widget).
+// Sessions + rate limiting are handled inside the handler.
+router.post("/metric-ai/ask", postPublicMetricAiAsk as any);
 
 export default router;

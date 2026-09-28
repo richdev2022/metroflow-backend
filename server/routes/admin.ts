@@ -3,7 +3,10 @@ import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
-import { sendEmail, generateAdminInviteEmailHtml } from "../services/email";
+import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml } from "../services/email";
+import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-config";
+import { sendPushToAll } from "../services/push";
+import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
 import { verifyPayment } from "../services/squad";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 
@@ -3318,6 +3321,428 @@ protectedRouter.post("/transactions/verify", async (req, res) => {
     } catch (error: any) {
         console.error("Admin verify transaction error:", error);
         res.status(500).json({ success: false, error: error.message || "Failed to verify transaction" });
+    }
+});
+
+// ============================================================================
+// Maintenance mode
+// ============================================================================
+
+/**
+ * GET /admin/maintenance-mode
+ * Returns the current maintenance mode flag.
+ */
+protectedRouter.get("/maintenance-mode", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const value = await getSetting("maintenance_mode", "off");
+        res.json({ success: true, data: { maintenance_mode: value === "on" } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to read maintenance mode" });
+    }
+});
+
+/**
+ * PUT /admin/maintenance-mode
+ * Toggle maintenance mode. When toggled ON, every user is emailed (and pushed)
+ * that the app is under maintenance; when toggled OFF, everyone is emailed that
+ * the app is back up.
+ */
+protectedRouter.put("/maintenance-mode", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const enabled = Boolean(req.body?.enabled);
+        const newValue = enabled ? "on" : "off";
+        const current = await getSetting("maintenance_mode", "off");
+        await setSetting("maintenance_mode", newValue, "When 'on', user apps show a maintenance screen");
+
+        if (current !== newValue) {
+            const now = new Date();
+            const usersRes = await query(`SELECT id, business_id, email, name FROM users WHERE email_verified = TRUE AND status = 'active'`);
+
+            // Fire-and-forget fan-out so the admin request returns quickly
+            (async () => {
+                let sent = 0;
+                for (const user of usersRes.rows) {
+                    try {
+                        const personalized = generateMaintenanceModeEmailHtml(user.name || user.email, enabled, now);
+                        await sendEmail(user.email, user.name || user.email,
+                            enabled ? 'Metricorex maintenance in progress' : 'Metricorex is back up',
+                            personalized);
+                        sent++;
+                    } catch { /* keep going */ }
+                }
+                try {
+                    await sendPushToAll({
+                        title: enabled ? 'Scheduled maintenance' : 'We are back up!',
+                        body: enabled
+                            ? 'Metricorex is undergoing maintenance. Some features may be unavailable.'
+                            : 'Maintenance complete - Metricorex is fully back up. Thank you for your patience!',
+                        androidChannelId: 'general',
+                    }, 'maintenance');
+                } catch (pushErr: any) {
+                    console.warn('Maintenance push fan-out failed:', pushErr?.message);
+                }
+                console.log(`[maintenance] mode=${newValue}; emailed ${sent}/${usersRes.rows.length} users`);
+            })();
+        }
+
+        res.json({ success: true, data: { maintenance_mode: enabled } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update maintenance mode" });
+    }
+});
+
+// ============================================================================
+// Announcements
+// ============================================================================
+
+/**
+ * GET /admin/announcements
+ */
+protectedRouter.get("/announcements", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`SELECT * FROM announcements WHERE business_id IS NULL ORDER BY created_at DESC`);
+        res.json({ success: true, data: result.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to fetch announcements" });
+    }
+});
+
+/**
+ * POST /admin/announcements
+ * Create an announcement shown on the user-side sliding ticker.
+ */
+protectedRouter.post("/announcements", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { message, title, is_active } = req.body || {};
+        if (!message || !String(message).trim()) {
+            return res.status(400).json({ success: false, error: "message is required" });
+        }
+        const result = await query(
+            `INSERT INTO announcements (business_id, title, message, is_active, created_by)
+             VALUES (NULL, $1, $2, COALESCE($3, TRUE), $4)
+             RETURNING *`,
+            [title || null, String(message).trim(), is_active !== false, req.admin?.adminId || null],
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to create announcement" });
+    }
+});
+
+/**
+ * PUT /admin/announcements/:id
+ */
+protectedRouter.put("/announcements/:id", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { message, title, is_active } = req.body || {};
+        const result = await query(
+            `UPDATE announcements SET
+                title = COALESCE($1, title),
+                message = COALESCE($2, message),
+                is_active = COALESCE($3, is_active),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4 AND business_id IS NULL
+             RETURNING *`,
+            [title ?? null, message ? String(message).trim() : null, is_active ?? null, req.params.id],
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Announcement not found" });
+        }
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update announcement" });
+    }
+});
+
+/**
+ * DELETE /admin/announcements/:id
+ */
+protectedRouter.delete("/announcements/:id", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`DELETE FROM announcements WHERE id = $1 AND business_id IS NULL RETURNING id`, [req.params.id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Announcement not found" });
+        }
+        res.json({ success: true, message: "Announcement deleted" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete announcement" });
+    }
+});
+
+// ============================================================================
+// Broadcast push / email notifications
+// ============================================================================
+
+/**
+ * POST /admin/broadcast
+ * Send an email and/or push notification to all (verified) users.
+ * Body: { channels: ['email','push'], subject, message }
+ */
+protectedRouter.post("/broadcast", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const channels: string[] = Array.isArray(req.body?.channels) ? req.body.channels : ['email'];
+        const subject = String(req.body?.subject || '').trim() || 'Metricorex announcement';
+        const message = String(req.body?.message || '').trim();
+        if (!message) {
+            return res.status(400).json({ success: false, error: "message is required" });
+        }
+
+        const usersRes = await query(`SELECT id, business_id, email, name FROM users WHERE email_verified = TRUE AND status = 'active'`);
+        const users = usersRes.rows;
+        const wantsEmail = channels.includes('email');
+        const wantsPush = channels.includes('push');
+
+        // Email fan-out (synchronous-ish but awaited in background)
+        let emailsSent = 0;
+        const emailPromise = (async () => {
+            if (!wantsEmail) return 0;
+            for (const user of users) {
+                try {
+                    await sendEmail(user.email, user.name || user.email, subject, generateBroadcastEmailHtml(user.name || user.email, subject, message));
+                    emailsSent++;
+                } catch { /* continue */ }
+            }
+            return emailsSent;
+        })();
+
+        let pushesSent = 0;
+        if (wantsPush) {
+            try {
+                const pushResult = await sendPushToAll({ title: subject, body: message, androidChannelId: 'general' }, 'broadcast');
+                pushesSent = pushResult.sent;
+            } catch (pushErr: any) {
+                console.warn('Broadcast push failed:', pushErr?.message);
+            }
+        }
+
+        await emailPromise;
+
+        res.json({
+            success: true,
+            data: { recipients: users.length, emails_sent: emailsSent, pushes_sent: pushesSent, channels },
+            message: `Broadcast queued to ${users.length} users`,
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to send broadcast" });
+    }
+});
+
+// ============================================================================
+// International transfer fees / markup configuration
+// ============================================================================
+
+/**
+ * GET /admin/intl-transfer-config
+ */
+protectedRouter.get("/intl-transfer-config", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const config = await getIntlTransferConfig();
+        const transferProvider = await getActiveTransferProviderName();
+        res.json({ success: true, data: { ...config, transfer_provider: transferProvider } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load international transfer config" });
+    }
+});
+
+/**
+ * PUT /admin/intl-transfer-config
+ * Body: { markup_percent, fee_percent, fee_flat, transfer_provider? }
+ */
+protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { markup_percent, fee_percent, fee_flat, transfer_provider } = req.body || {};
+        if (markup_percent !== undefined) {
+            const v = Number(markup_percent);
+            if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "markup_percent must be between 0 and 100" });
+            await setSetting("intl_transfer_markup_percent", String(v));
+        }
+        if (fee_percent !== undefined) {
+            const v = Number(fee_percent);
+            if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "fee_percent must be between 0 and 100" });
+            await setSetting("intl_transfer_fee_percent", String(v));
+        }
+        if (fee_flat !== undefined) {
+            const v = Number(fee_flat);
+            if (!Number.isFinite(v) || v < 0) return res.status(400).json({ success: false, error: "fee_flat must be a positive number" });
+            await setSetting("intl_transfer_fee_flat", String(v));
+        }
+        if (transfer_provider !== undefined) {
+            const allowed = ['flutterwave'];
+            if (transfer_provider && !allowed.includes(transfer_provider)) {
+                return res.status(400).json({ success: false, error: `International transfers support only: ${allowed.join(', ')}` });
+            }
+            await setSetting("active_transfer_provider", transfer_provider || '');
+            invalidateActiveProviderCache();
+        }
+        const config = await getIntlTransferConfig();
+        const transferProvider = await getActiveTransferProviderName();
+        res.json({ success: true, data: { ...config, transfer_provider: transferProvider } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update international transfer config" });
+    }
+});
+
+// ============================================================================
+// Virtual account regeneration (business name fix for existing users)
+// ============================================================================
+
+/**
+ * GET /admin/virtual-accounts/personal-name
+ * Lists business wallets whose stored account_name looks like a personal name
+ * (i.e. differs from the business name) - candidates for regeneration.
+ */
+protectedRouter.get("/virtual-accounts/personal-name", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`
+            SELECT w.id AS wallet_id, w.business_id, w.account_name, w.virtual_account_number, w.bank_code, w.payment_provider,
+                   b.name AS business_name
+            FROM wallets w
+            JOIN businesses b ON b.id = w.business_id
+            WHERE w.virtual_account_number IS NOT NULL
+              AND LOWER(w.account_name) IS DISTINCT FROM LOWER(b.name)
+            ORDER BY w.updated_at DESC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to list mismatched virtual accounts" });
+    }
+});
+
+/**
+ * POST /admin/virtual-accounts/:walletId/regenerate
+ * Regenerates a single business virtual account with the business name.
+ */
+protectedRouter.post("/virtual-accounts/:walletId/regenerate", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const walletId = req.params.walletId;
+        const walletRes = await query(
+            `SELECT w.*, b.name AS business_name FROM wallets w JOIN businesses b ON b.id = w.business_id WHERE w.id = $1`,
+            [walletId],
+        );
+        if (walletRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Wallet not found" });
+        }
+        const wallet = walletRes.rows[0];
+        if (!wallet.business_id) {
+            return res.status(400).json({ success: false, error: "Not a business wallet" });
+        }
+
+        const ownerRes = await query(
+            `SELECT id, bvn, nin, phone_number FROM users WHERE business_id = $1 AND role = 'owner' LIMIT 1`,
+            [wallet.business_id],
+        );
+        const owner = ownerRes.rows[0];
+        if (!owner?.bvn) {
+            return res.status(400).json({ success: false, error: "Business owner has no BVN on file" });
+        }
+
+        const { getProvider } = await import("../services/providers/factory");
+        const provider = getProvider(wallet.payment_provider || undefined);
+        const vaResponse = await provider.createBusinessVirtualAccount({
+            bvn: owner.bvn,
+            nin: owner.nin || "12345678901",
+            businessName: wallet.business_name,
+            customerIdentifier: `BIZ-${String(wallet.business_id).substring(0, 8)}`,
+            phoneNumber: owner.phone_number || "08000000000",
+            beneficiaryAccount: wallet.beneficiary_account || "0000000000",
+        } as any);
+
+        let vaNumber: string | null = null;
+        let bankCode = '058';
+        if (provider.name === 'flutterwave') {
+            if (vaResponse?.status === 'success' && vaResponse?.data?.account_number) {
+                vaNumber = String(vaResponse.data.account_number);
+                bankCode = vaResponse.data.bank_code || '058';
+            }
+        } else if (provider.name === 'monnify') {
+            if (vaResponse?.requestSuccessful) {
+                const accounts = vaResponse?.responseBody?.accounts;
+                vaNumber = accounts?.[0]?.accountNumber || null;
+                bankCode = accounts?.[0]?.bankCode || '058';
+            }
+        } else if (provider.name === 'squad') {
+            if (vaResponse?.success && vaResponse?.data) {
+                vaNumber = vaResponse.data.virtual_account_number;
+                bankCode = vaResponse.data.bank_code || '058';
+            }
+        }
+
+        if (!vaNumber) {
+            const errMsg = vaResponse?.responseMessage || vaResponse?.message || "Provider failed to recreate the virtual account";
+            return res.status(400).json({ success: false, error: errMsg });
+        }
+
+        await query(
+            `UPDATE wallets SET virtual_account_number = $1, bank_code = $2, account_name = $3, payment_provider = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5`,
+            [vaNumber, bankCode, wallet.business_name, provider.name, walletId],
+        );
+
+        res.json({
+            success: true,
+            message: "Virtual account regenerated with the business name",
+            data: { wallet_id: walletId, account_number: vaNumber, bank_code: bankCode, account_name: wallet.business_name },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to regenerate virtual account" });
+    }
+});
+
+
+/**
+ * POST /admin/virtual-accounts/clear
+ * Deletes EVERY virtual account created for a customer on a given provider.
+ * Body: { business_id?, wallet_id?, provider } - provider optional (all).
+ * Clears wallet VA fields and deletes the virtual_accounts rows.
+ */
+protectedRouter.post("/virtual-accounts/clear", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { business_id, wallet_id, user_id, provider } = req.body || {};
+        if (!business_id && !wallet_id && !user_id) {
+            return res.status(400).json({ success: false, error: "Provide business_id, wallet_id or user_id" });
+        }
+
+        const params: any[] = [];
+        let walletWhere = 'virtual_account_number IS NOT NULL';
+        if (business_id) { params.push(business_id); walletWhere += ` AND business_id = $${params.length}`; }
+        if (wallet_id) { params.push(wallet_id); walletWhere += ` AND id = $${params.length}`; }
+        if (user_id) {
+            params.push(user_id); const ui = params.length;
+            walletWhere += ` AND (user_id = $${ui} OR business_id IN (SELECT business_id FROM users WHERE id = $${ui}))`;
+        }
+        if (provider) { params.push(provider); walletWhere += ` AND payment_provider = $${params.length}`; }
+
+        const walletsRes = await query(`SELECT id, account_name, virtual_account_number, payment_provider FROM wallets WHERE ${walletWhere}`, params);
+
+        let clearedWallets = 0;
+        for (const w of walletsRes.rows) {
+            await query(
+                `UPDATE wallets SET virtual_account_number = NULL, bank_code = NULL, account_name = NULL,
+                 customer_identifier = NULL, provider_metadata = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                [w.id],
+            );
+            clearedWallets++;
+        }
+
+        // Delete the per-wallet virtual_accounts rows for the same scope
+        const vaParams: any[] = [];
+        let vaWhere = '1=1';
+        if (business_id) { vaParams.push(business_id); vaWhere += ` AND wallet_id IN (SELECT id FROM wallets WHERE business_id = $${vaParams.length})`; }
+        if (wallet_id) { vaParams.push(wallet_id); vaWhere += ` AND wallet_id = $${vaParams.length}`; }
+        if (user_id) {
+            vaParams.push(user_id); const ui = vaParams.length;
+            vaWhere += ` AND wallet_id IN (SELECT id FROM wallets WHERE user_id = $${ui} OR business_id IN (SELECT business_id FROM users WHERE id = $${ui}))`;
+        }
+        if (provider) { vaParams.push(provider); vaWhere += ` AND payment_provider = $${vaParams.length}`; }
+        const vaDel = await query(`DELETE FROM virtual_accounts WHERE ${vaWhere} RETURNING id`);
+
+        res.json({
+            success: true,
+            message: `Cleared ${clearedWallets} wallet virtual account(s) and ${vaDel.rows.length} provider VA record(s)`,
+            data: { cleared_wallets: clearedWallets, deleted_va_records: vaDel.rows.length, wallets: walletsRes.rows.map((w: any) => ({ id: w.id, provider: w.payment_provider })) },
+        });
+    } catch (error: any) {
+        console.error("Admin clear virtual accounts error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to clear virtual accounts" });
     }
 });
 

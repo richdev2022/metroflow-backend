@@ -59,9 +59,13 @@ const router = express.Router();
 router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
+        const userId = req.user!.userId;
         // Modified to include phone_number and exclude created_at
         const result = await query(
-            `SELECT id, name, email, phone_number, industry, logo_url, currency, COALESCE(timezone, 'UTC') as timezone FROM businesses WHERE id = $1`,
+            `SELECT b.id, b.name, b.email, b.phone_number, b.industry, b.logo_url, b.currency,
+                    COALESCE(b.timezone, 'UTC') as timezone,
+                    COALESCE(b.time_format, '24h') as time_format
+             FROM businesses b WHERE b.id = $1`,
             [businessId]
         );
 
@@ -69,7 +73,20 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
             return res.status(404).json({ success: false, error: "Business not found" });
         }
 
-        res.json({ success: true, settings: result.rows[0] });
+        // The caller's own profile + role so the UI can decide whether business
+        // info is editable (owner/admin) or read-only (invited members).
+        const meRes = await query(
+            `SELECT id, name, email, phone_number, avatar_url as "avatarUrl", role, status,
+                    salary_amount as "salaryAmount", salary_currency as "salaryCurrency",
+                    job_title as "jobTitle", department,
+                    bank_code as "bankCode", bank_name as "bankName", account_number as "accountNumber",
+                    account_name as "accountName", verification_status as "verificationStatus",
+                    verified_account_name as "verifiedAccountName"
+             FROM users WHERE id = $1`,
+            [userId]
+        );
+
+        res.json({ success: true, settings: result.rows[0], profile: meRes.rows[0] || null });
     } catch (error) {
         console.error("Get settings error:", error);
         res.status(500).json({ success: false, error: "Failed to fetch settings" });
@@ -107,7 +124,21 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
 router.put("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
-        const { currency, name, industry, logo_url, timezone } = req.body;
+        const userId = req.user!.userId;
+        const { currency, name, industry, logo_url, timezone, time_format } = req.body;
+
+        // BUSINESS-level fields (name, currency, industry, logo, timezone,
+        // time format) can only be changed by owner/admin. Invited members
+        // see them read-only.
+        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+        const role = roleRes.rows[0]?.role;
+        if (!['owner', 'admin'].includes(role)) {
+            return res.status(403).json({
+                success: false,
+                error: "Only business owners and admins can change business settings. You can edit your personal profile below.",
+                code: "BUSINESS_SETTINGS_FORBIDDEN",
+            });
+        }
 
         const updates: string[] = [];
         const values: any[] = [];
@@ -152,6 +183,16 @@ router.put("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
             }
             updates.push(`timezone = $${paramIdx}`);
             values.push(timezone);
+            paramIdx++;
+        }
+
+        if (time_format) {
+            const tf = String(time_format).toLowerCase();
+            if (!['12h', '24h'].includes(tf)) {
+                return res.status(400).json({ success: false, error: "Invalid time format. Use '12h' or '24h'." });
+            }
+            updates.push(`time_format = $${paramIdx}`);
+            values.push(tf);
             paramIdx++;
         }
 
@@ -702,6 +743,126 @@ router.get("/otp-enabled", authenticateToken, checkSubscriptionStatus, async (re
         console.error("Get OTP status error:", error);
         res.status(500).json({ success: false, error: "Failed to get OTP status" });
     }
+});
+
+
+// ============================================================================
+// Personal profile (any role) - profile fields + avatar upload
+// ============================================================================
+
+import multer from "multer";
+import path from "path";
+import crypto from "crypto";
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error("Only PNG, JPG, WEBP or GIF images are allowed"));
+  },
+} as multer.Options);
+
+/**
+ * PUT /settings/profile
+ * Update the CALLER'S OWN profile (any role): name, phone_number.
+ * Business-level info lives in PUT /settings (owner/admin only).
+ */
+router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const { name, phone_number } = req.body || {};
+
+        const updates: string[] = [];
+        const values: any[] = [];
+        let idx = 1;
+        if (name !== undefined) {
+            const trimmed = String(name).trim();
+            if (!trimmed) return res.status(400).json({ success: false, error: "Name cannot be empty" });
+            updates.push(`name = $${idx}`); values.push(trimmed); idx++;
+        }
+        if (phone_number !== undefined) {
+            updates.push(`phone_number = $${idx}`); values.push(String(phone_number).trim() || null); idx++;
+        }
+        if (updates.length === 0) {
+            return res.status(400).json({ success: false, error: "Nothing to update" });
+        }
+
+        const result = await query(
+            `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $${idx}
+             RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role`,
+            [...values, userId]
+        );
+
+        res.json({ success: true, data: result.rows[0], message: "Profile updated" });
+    } catch (error: any) {
+        console.error("Update profile error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to update profile" });
+    }
+});
+
+/**
+ * POST /settings/profile/avatar (multipart field: 'file')
+ * Upload a profile picture (R2 when configured, else local /uploads with an
+ * absolute URL) and attach it to the caller's profile. Rendered in chat
+ * avatars and profile pages; initials are shown when not set.
+ */
+router.post("/profile/avatar", authenticateToken, (req: AuthenticatedRequest, res) => {
+    avatarUpload.single('file')(req as any, res as any, async (err: any) => {
+        if (err) {
+            return res.status(400).json({ success: false, error: err.message || "Upload failed" });
+        }
+        try {
+            const userId = req.user!.userId;
+            const file = (req as any).file as Express.Multer.File | undefined;
+            if (!file) {
+                return res.status(400).json({ success: false, error: "file field is required" });
+            }
+
+            const { r2Storage } = await import("../lib/storage");
+            let avatarUrl = '';
+            if (r2Storage.isAvailable()) {
+                try {
+                    const ext = file.originalname.includes(".")
+                        ? file.originalname.split(".").pop()!.toLowerCase()
+                        : (file.mimetype.includes('png') ? 'png' : 'jpg');
+                    const key = `avatars/${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+                    avatarUrl = await r2Storage.uploadFile(key, file.buffer, file.mimetype);
+                } catch (uploadError) {
+                    console.error("Avatar R2 upload failed, falling back to local:", uploadError);
+                }
+            }
+            if (!avatarUrl) {
+                const fs = await import("fs");
+                const baseDir = process.cwd();
+                const uploadDir = path.join(baseDir, "uploads");
+                if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+                const ext = file.originalname.includes(".")
+                    ? file.originalname.split(".").pop()!.toLowerCase()
+                    : (file.mimetype.includes('png') ? 'png' : 'jpg');
+                const filename = `avatar-${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+                fs.writeFileSync(path.join(uploadDir, filename), file.buffer);
+                avatarUrl = `/uploads/${filename}`;
+                // Absolute URL so mobile + chat render it directly
+                const apiOrigin = process.env.API_PUBLIC_BASE_URL
+                    || process.env.APP_BASE_URL
+                    || 'https://api.metricorex.com';
+                avatarUrl = `${apiOrigin.replace(/\/$/, '')}${avatarUrl}`;
+            }
+
+            const result = await query(
+                `UPDATE users SET avatar_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2
+                 RETURNING id, name, email, avatar_url as "avatarUrl"`,
+                [avatarUrl, userId]
+            );
+
+            res.json({ success: true, data: result.rows[0], message: "Profile picture updated" });
+        } catch (error: any) {
+            console.error("Avatar upload error:", error);
+            res.status(500).json({ success: false, error: error.message || "Failed to upload avatar" });
+        }
+    });
 });
 
 export default router;

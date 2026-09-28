@@ -398,7 +398,8 @@ function logRateLimited(context: string, error: any) {
 }
 
 // Refund a timed-out transfer back to the source wallet
-async function refundTimedOutTransfer(transfer: any) {
+async function refundTimedOutTransfer(rawTransfer: any) {
+  const transfer = normalizeTransferForProcessing(rawTransfer);
   const amount = parseFloat(transfer.amount);
   const fee = parseFloat(transfer.fee || '0');
   const totalRefund = amount + fee;
@@ -550,6 +551,29 @@ export function startTransferMonitor(firstRunDelayMs: number = IDLE_INTERVAL_MS)
   monitorTimer = setTimeout(tick, firstRunDelayMs);
 }
 
+/**
+ * Normalize a transfer_queue row for processing.
+ * For international payouts, `amount`/`currency` are the DESTINATION values
+ * sent to the provider, while `debit_amount`/`debit_currency` are the
+ * source-currency values actually debited from the wallet and recorded in the
+ * platform/revenue ledgers. Returns a shallow copy where `amount`/`currency`
+ * are the DEBIT values and `_providerAmount`/`_providerCurrency` the provider
+ * (destination) values.
+ */
+export function normalizeTransferForProcessing(transfer: any): any {
+  const debitAmount = transfer.debit_amount != null ? parseFloat(transfer.debit_amount) : NaN;
+  if (Number.isFinite(debitAmount) && debitAmount > 0 && debitAmount !== parseFloat(transfer.amount)) {
+    return {
+      ...transfer,
+      _providerAmount: transfer.amount,
+      _providerCurrency: transfer.currency || 'NGN',
+      amount: debitAmount,
+      currency: transfer.debit_currency || transfer.currency || 'NGN',
+    };
+  }
+  return { ...transfer, _providerAmount: transfer.amount, _providerCurrency: transfer.currency || 'NGN' };
+}
+
 export async function processAllPending(businessId: string) {
   // 1. Fetch pending transfers
   const pendingTransfers = await query(
@@ -561,6 +585,8 @@ export async function processAllPending(businessId: string) {
   );
 
   if (pendingTransfers.rows.length === 0) return;
+
+  pendingTransfers.rows = pendingTransfers.rows.map(normalizeTransferForProcessing);
 
   console.log(`Processing ${pendingTransfers.rows.length} pending transfers for business ${businessId}`);
 
@@ -669,7 +695,7 @@ export async function processAllPending(businessId: string) {
       }
 
       // 3. Initiate Transfer
-      const amountMinor = toMinorUnit(transfer.amount);
+      const amountMinor = toMinorUnit((transfer as any)._providerAmount ?? transfer.amount);
       const provider = getProvider(transfer.payment_provider); // Use transfer's provider or default
       
       const payload = {
@@ -679,7 +705,7 @@ export async function processAllPending(businessId: string) {
         accountName: transfer.recipient_name,
         transactionReference: transfer.reference,
         remark: transfer.remark,
-        currencyId: transfer.currency || 'NGN'
+        currencyId: (transfer as any)._providerCurrency ?? transfer.currency ?? 'NGN'
       };
 
       const response = await provider.initiateTransfer(payload);
@@ -1039,7 +1065,7 @@ export async function processTransfer(transferId: string) {
   // Fetch transfer
   const res = await query(`SELECT * FROM transfer_queue WHERE id = $1`, [transferId]);
   if (res.rows.length === 0) throw new Error("Transfer not found");
-  const transfer = res.rows[0];
+  const transfer = normalizeTransferForProcessing(res.rows[0]);
   
   if (transfer.status === 'success') return { message: "Already successful" };
   
@@ -1136,7 +1162,7 @@ export async function processTransfer(transferId: string) {
     }
 
     // 2. Initiate Transfer
-    const amountMinor = toMinorUnit(transfer.amount);
+    const amountMinor = toMinorUnit((transfer as any)._providerAmount ?? transfer.amount);
     const provider = getProvider(transfer.payment_provider);
     
     const payload = {
@@ -1146,7 +1172,7 @@ export async function processTransfer(transferId: string) {
       accountName: transfer.recipient_name,
       transactionReference: transfer.reference,
       remark: transfer.remark,
-      currencyId: transfer.currency || 'NGN'
+      currencyId: (transfer as any)._providerCurrency ?? transfer.currency ?? 'NGN'
     };
 
     const response = await provider.initiateTransfer(payload);

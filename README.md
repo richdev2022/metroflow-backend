@@ -103,6 +103,14 @@ npx tsx scripts/generate-swagger.ts   # regenerate swagger-output.json
 
 ## Deployment (VPS)
 
+One-shot deploy + verification (recommended — pulls, installs, builds, restarts pm2 and verifies the new build is actually serving, including a live MetricAi probe):
+
+```bash
+bash scripts/deploy.sh
+```
+
+Manual equivalent:
+
 ```bash
 git pull && npm install && npm run build
 pm2 restart metroflow

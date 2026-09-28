@@ -61,7 +61,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         const businessId = req.user!.businessId;
         // Modified to include phone_number and exclude created_at
         const result = await query(
-            `SELECT id, name, email, phone_number, industry, logo_url, currency FROM businesses WHERE id = $1`,
+            `SELECT id, name, email, phone_number, industry, logo_url, currency, COALESCE(timezone, 'UTC') as timezone FROM businesses WHERE id = $1`,
             [businessId]
         );
 
@@ -107,7 +107,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
 router.put("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
-        const { currency, name, industry, logo_url } = req.body;
+        const { currency, name, industry, logo_url, timezone } = req.body;
 
         const updates: string[] = [];
         const values: any[] = [];
@@ -137,6 +137,21 @@ router.put("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         if (logo_url) {
             updates.push(`logo_url = $${paramIdx}`);
             values.push(logo_url);
+            paramIdx++;
+        }
+
+        if (timezone) {
+            // Basic IANA timezone shape validation (e.g. Africa/Lagos, UTC)
+            if (!/^[A-Za-z_]+\/[A-Za-z0-9_+\-]+$/.test(timezone) && timezone !== 'UTC') {
+                return res.status(400).json({ success: false, error: "Invalid timezone. Use an IANA timezone name (e.g. Africa/Lagos)." });
+            }
+            try {
+                new Intl.DateTimeFormat('en-US', { timeZone: timezone });
+            } catch (_) {
+                return res.status(400).json({ success: false, error: "Unknown timezone" });
+            }
+            updates.push(`timezone = $${paramIdx}`);
+            values.push(timezone);
             paramIdx++;
         }
 

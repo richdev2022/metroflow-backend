@@ -278,3 +278,57 @@ export const takeNotificationAction: RequestHandler = async (
     res.status(500).json(response);
   }
 };
+
+/**
+ * POST /notifications/register-device
+ * Registers/refreshes an FCM token for the authenticated user so the backend
+ * can deliver push notifications (calls, chats, broadcasts).
+ * Body: { fcm_token, platform: 'android'|'ios'|'web', device_name?, app_version? }
+ */
+export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const businessId = req.user?.businessId;
+    const { fcm_token, platform, device_name, app_version } = req.body || {};
+
+    if (!userId || !fcm_token) {
+      return res.status(400).json({ success: false, error: "fcm_token is required" });
+    }
+
+    await query(
+      `INSERT INTO user_devices (user_id, business_id, fcm_token, platform, device_name, app_version, last_seen_at)
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+       ON CONFLICT (fcm_token) DO UPDATE SET
+         user_id = EXCLUDED.user_id,
+         business_id = EXCLUDED.business_id,
+         platform = EXCLUDED.platform,
+         device_name = EXCLUDED.device_name,
+         app_version = EXCLUDED.app_version,
+         last_seen_at = CURRENT_TIMESTAMP`,
+      [userId, businessId || null, fcm_token, platform || null, device_name || null, app_version || null],
+    );
+
+    res.json({ success: true, message: "Device registered for push notifications" });
+  } catch (error: any) {
+    console.error("Register device error:", error);
+    res.status(500).json({ success: false, error: "Failed to register device" });
+  }
+};
+
+/**
+ * DELETE /notifications/register-device
+ * Removes an FCM token (e.g. on logout).
+ */
+export const unregisterDevice: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { fcm_token } = req.body || {};
+    if (!fcm_token) {
+      return res.status(400).json({ success: false, error: "fcm_token is required" });
+    }
+    await query(`DELETE FROM user_devices WHERE fcm_token = $1 AND user_id = $2`, [fcm_token, req.user?.userId]);
+    res.json({ success: true, message: "Device unregistered" });
+  } catch (error: any) {
+    console.error("Unregister device error:", error);
+    res.status(500).json({ success: false, error: "Failed to unregister device" });
+  }
+};

@@ -130,9 +130,23 @@ export const getConversations: RequestHandler = async (
       [businessId, userId],
     );
 
+    // Derive display helpers: direct chats show the OTHER participant's name
+    // and avatar; group chats show the conversation name.
+    const data = result.rows.map((conv: any) => {
+      const participants = Array.isArray(conv.participants) ? conv.participants : [];
+      const other = participants.find((p: any) => p && p.userId && String(p.userId) !== String(userId));
+      const isGroup = (conv.type || 'direct') !== 'direct' || participants.length > 2;
+      return {
+        ...conv,
+        isGroup,
+        displayName: isGroup ? (conv.name || 'Group chat') : (other?.name || conv.name || 'Direct chat'),
+        displayAvatarUrl: isGroup ? null : (other?.avatarUrl || null),
+      };
+    });
+
     const response: ApiResponse<any[]> = {
       success: true,
-      data: result.rows,
+      data,
     };
     res.json(response);
   } catch (error) {
@@ -728,6 +742,15 @@ export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest,
         } else {
           mediaUrl = `/uploads/${filename}`;
         }
+      }
+
+      // Resolve relative URLs (local /uploads fallback) against the API origin
+      // so BOTH web and mobile can play the audio directly.
+      if (mediaUrl && mediaUrl.startsWith('/')) {
+        const apiOrigin = process.env.API_PUBLIC_BASE_URL
+          || process.env.APP_BASE_URL
+          || 'https://api.metricorex.com';
+        mediaUrl = `${apiOrigin.replace(/\/$/, '')}${mediaUrl}`;
       }
 
       res.json({

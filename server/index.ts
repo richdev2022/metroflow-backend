@@ -31,6 +31,7 @@ import {
   changePassword,
   getMe,
 } from "./routes/auth";
+import { biometricEnroll, biometricLogin, biometricRevoke } from "./routes/auth";
 import {
   getTasks,
   createTask,
@@ -81,8 +82,10 @@ import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByC
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia } from "./routes/chat";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
-import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction } from "./routes/notifications";
+import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { initializeDatabase, query } from "./db";
+import { runPostInitializeMigrations } from "./migrations";
+import publicRouter from "./routes/public";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -158,6 +161,8 @@ export async function createServer() {
     for (let attempt = 1; attempt <= DB_INIT_MAX_ATTEMPTS; attempt++) {
       try {
         await initializeDatabase();
+        // Post-init migrations + one-off ledger backfills (idempotent)
+        await runPostInitializeMigrations();
         logger.info("✅ Database initialized successfully");
         isDbReady = true;
         return;
@@ -491,6 +496,11 @@ export async function createServer() {
   mainRouter.post("/auth/change-password", authenticateToken, changePassword);
   mainRouter.get("/auth/me", authenticateToken, getMe);
 
+  // Biometric unlock endpoints
+  mainRouter.post("/auth/biometric/enroll", authenticateToken, biometricEnroll);
+  mainRouter.post("/auth/biometric/login", biometricLogin);
+  mainRouter.delete("/auth/biometric/enroll", authenticateToken, biometricRevoke);
+
   // Tasks API routes
   mainRouter.get("/board", authenticateToken, checkSubscriptionStatus, getBoard);
   mainRouter.get("/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
@@ -653,11 +663,18 @@ export async function createServer() {
   mainRouter.post("/recordings/:id/upload", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), ...uploadRecording);
   mainRouter.delete("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), deleteRecording);
 
+  // Public app configuration (maintenance mode, announcements) - no auth
+  mainRouter.use("/public", publicRouter);
+
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);
   mainRouter.patch("/notifications/:id/read", authenticateToken, checkSubscriptionStatus, markNotificationAsRead);
   mainRouter.patch("/notifications/read-all", authenticateToken, checkSubscriptionStatus, markAllNotificationsAsRead);
   mainRouter.post("/notifications/:id/action", authenticateToken, checkSubscriptionStatus, takeNotificationAction);
+
+  // Push notification device registration (FCM)
+  mainRouter.post("/notifications/register-device", authenticateToken, registerDevice);
+  mainRouter.delete("/notifications/register-device", authenticateToken, unregisterDevice);
 
   // Mount the main router at both / and /api for backward compatibility
   app.use(dbCheckMiddleware);

@@ -378,6 +378,159 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
 
 /**
  * @swagger
+ * /wallet/history:
+ *   get:
+ *     summary: Paginated wallet transaction history with filters and CSV export
+ *     tags: [Wallet]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: wallet_id
+ *         schema: { type: string }
+ *         description: Filter by specific wallet
+ *       - in: query
+ *         name: direction
+ *         schema: { type: string, enum: [credit, debit] }
+ *       - in: query
+ *         name: type
+ *         schema: { type: string }
+ *         description: Transaction type filter (wallet_funding, transfer, fee, adjustment, platform)
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *         description: Search reference / description / transaction ID
+ *       - in: query
+ *         name: min_amount / max_amount / start_date / end_date
+ *         schema: { type: string }
+ *       - in: query
+ *         name: format
+ *         schema: { type: string, enum: [json, csv] }
+ *     responses:
+ *       200:
+ *         description: Transaction history
+ */
+router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const businessId = req.user!.businessId;
+        const {
+            wallet_id, direction, type, search,
+            min_amount, max_amount, start_date, end_date,
+            page = "1", limit = "20", format = "json",
+        } = req.query as Record<string, string>;
+
+        // Resolve the wallets visible to this user: personal wallet + business wallet (admins/owner)
+        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+        const role = roleRes.rows[0]?.role;
+        const walletParams: any[] = [userId];
+        let walletSql = `SELECT id, currency, balance FROM wallets WHERE user_id = $1`;
+        if (['owner', 'admin'].includes(role) && businessId) {
+            walletSql += ` OR business_id = $2`;
+            walletParams.push(businessId);
+        }
+        const walletsRes = await query(walletSql, walletParams);
+        const walletIds = walletsRes.rows.map((w: any) => w.id);
+        if (walletIds.length === 0) {
+            return res.json({ success: true, data: [], wallets: [], pagination: { total: 0, page: 1, limit: Number(limit), totalPages: 0 } });
+        }
+
+        const params: any[] = [];
+        let sql = `SELECT t.*, w.currency AS wallet_currency, w.balance AS wallet_balance
+                   FROM transactions t
+                   LEFT JOIN wallets w ON w.id = t.wallet_id
+                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))`;
+        params.push(walletIds, businessId);
+        let idx = params.length + 1;
+
+        if (wallet_id && walletIds.includes(wallet_id)) {
+            sql += ` AND t.wallet_id = $${idx}`;
+            params.push(wallet_id);
+            idx++;
+        }
+        if (direction === 'credit' || direction === 'debit') {
+            sql += ` AND t.direction = $${idx}`;
+            params.push(direction);
+            idx++;
+        }
+        if (type) {
+            sql += ` AND t.transaction_type = $${idx}`;
+            params.push(type);
+            idx++;
+        }
+        if (search) {
+            sql += ` AND (t.reference ILIKE $${idx} OR t.description ILIKE $${idx} OR t.id::text ILIKE $${idx})`;
+            params.push(`%${search}%`);
+            idx++;
+        }
+        if (min_amount) {
+            sql += ` AND t.amount >= $${idx}`;
+            params.push(Number(min_amount));
+            idx++;
+        }
+        if (max_amount) {
+            sql += ` AND t.amount <= $${idx}`;
+            params.push(Number(max_amount));
+            idx++;
+        }
+        if (start_date) {
+            sql += ` AND t.created_at >= $${idx}`;
+            params.push(start_date);
+            idx++;
+        }
+        if (end_date) {
+            // inclusive of the whole end day
+            sql += ` AND t.created_at < ($${idx}::timestamp + interval '1 day')`;
+            params.push(end_date);
+            idx++;
+        }
+
+        sql += ` ORDER BY t.created_at DESC`;
+
+        // CSV export (respects the same filters, no pagination)
+        if (format === 'csv') {
+            const csvRes = await query(sql, params);
+            const rows = csvRes.rows;
+            const esc = (v: any) => {
+                const s = v === null || v === undefined ? '' : String(v);
+                return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+            };
+            const header = ['Transaction ID', 'Reference', 'Date', 'Direction', 'Type', 'Amount', 'Currency', 'Status', 'Fee', 'Description'];
+            const lines = [header.join(',')];
+            for (const r of rows) {
+                lines.push([
+                    esc(r.id), esc(r.reference), esc(r.created_at), esc(r.direction), esc(r.transaction_type),
+                    esc(r.amount), esc(r.currency || r.wallet_currency || 'NGN'), esc(r.status), esc(r.fee ?? 0), esc(r.description),
+                ].join(','));
+            }
+            res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="wallet-transactions-${new Date().toISOString().slice(0, 10)}.csv"`);
+            return res.send(lines.join('\n'));
+        }
+
+        const countRes = await query(`SELECT COUNT(*)::int AS total FROM (${sql}) sub`, params);
+        const total = countRes.rows[0]?.total || 0;
+        const pageNum = Math.max(1, parseInt(page) || 1);
+        const lim = Math.min(Math.max(1, parseInt(limit) || 20), 200);
+        sql += ` LIMIT $${idx} OFFSET $${idx + 1}`;
+        params.push(lim, (pageNum - 1) * lim);
+
+        const dataRes = await query(sql, params);
+
+        res.json({
+            success: true,
+            data: dataRes.rows,
+            wallets: walletsRes.rows,
+            pagination: { total, page: pageNum, limit: lim, totalPages: Math.ceil(total / lim) },
+        });
+    } catch (error: any) {
+        console.error("Wallet history error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch wallet history" });
+    }
+});
+
+/**
+ * @swagger
  * /wallet/fund/card:
  *   post:
  *     summary: Initiate wallet funding via Card
@@ -545,7 +698,7 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
-        const { gtb_account_number, business_name } = req.body;
+        const { gtb_account_number } = req.body;
 
         // Verify Permission
         const roleCheck = await query(`SELECT role, bvn, nin, phone_number FROM users WHERE id = $1`, [userId]);
@@ -557,6 +710,14 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
 
         if (!user.bvn) {
             return res.status(400).json({ success: false, error: "Owner must complete KYC (BVN) first" });
+        }
+
+        // Always resolve the authoritative business name from the DB (falls
+        // back to the request body, never to the BVN personal name).
+        const bizRes = await query(`SELECT name FROM businesses WHERE id = $1`, [businessId]);
+        const businessName = (bizRes.rows[0]?.name || req.body.business_name || '').trim();
+        if (!businessName) {
+            return res.status(400).json({ success: false, error: "Business name is required to create a business virtual account" });
         }
 
         // Check if wallet already exists
@@ -583,7 +744,7 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
         const vaData = {
             bvn: user.bvn,
             nin: user.nin || "12345678901", // Monnify requires NIN
-            businessName: business_name,
+            businessName,
             customerIdentifier: `BIZ-${businessId.substring(0, 8)}`,
             phoneNumber: user.phone_number || "08000000000",
             beneficiaryAccount: gtb_account_number || "0000000000" // GTB Account provided by user (Squad only)
@@ -592,18 +753,17 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
         const vaResponse = await provider.createBusinessVirtualAccount(vaData);
 
         let isSuccess = false;
-        let vaNumber = null;
+        let vaNumber: string | null = null;
         let bankCode = '058';
-        let accountName = business_name;
+        // The account display name must always be the BUSINESS name (never the
+        // personal name pulled from the BVN by the provider).
+        let accountName = businessName;
         
         if (provider.name === 'squad') {
             isSuccess = vaResponse.success && vaResponse.data;
             if (isSuccess) {
                 vaNumber = vaResponse.data.virtual_account_number;
                 bankCode = vaResponse.data.bank_code;
-                accountName = vaResponse.data.first_name 
-                    ? `${vaResponse.data.first_name} ${vaResponse.data.last_name}` 
-                    : business_name;
             }
         } else if (provider.name === 'monnify') {
             isSuccess = vaResponse.requestSuccessful;
@@ -612,8 +772,23 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
                 if (accounts && accounts.length > 0) {
                     vaNumber = accounts[0].accountNumber;
                     bankCode = accounts[0].bankCode;
-                    accountName = vaResponse.responseBody.accountName || business_name;
                 }
+            }
+        } else if (provider.name === 'flutterwave') {
+            // Flutterwave envelope: { status: 'success', data: { account_number, bank_name, ... } }
+            isSuccess = vaResponse?.status === 'success' && !!vaResponse?.data?.account_number;
+            if (isSuccess) {
+                vaNumber = String(vaResponse.data.account_number);
+                bankCode = vaResponse.data.bank_code || vaResponse.data.bank_name || '058';
+                if (vaResponse.data.bank_code && /^[A-Z0-9]{3,10}$/i.test(vaResponse.data.bank_code)) {
+                    bankCode = vaResponse.data.bank_code;
+                }
+            }
+        } else {
+            // Generic provider fallback: { success, data: { account_number } }
+            isSuccess = (vaResponse?.success || vaResponse?.status === 'success') && !!vaResponse?.data?.account_number;
+            if (isSuccess) {
+                vaNumber = String(vaResponse.data.account_number);
             }
         }
 
@@ -638,17 +813,109 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
                 ]
             );
             
-            res.json({ success: true, message: "Business Wallet created successfully", data: vaResponse.responseBody || vaResponse.data });
+            res.json({ success: true, message: "Business Wallet created successfully", data: { ...(vaResponse.responseBody || vaResponse.data || {}), account_name: accountName } });
         } else {
             const errorMessage = provider.name === 'squad' 
                 ? vaResponse.message 
-                : vaResponse.responseMessage || "Failed to create Virtual Account";
+                : vaResponse.responseMessage || vaResponse.message || "Failed to create Virtual Account";
             res.status(400).json({ success: false, error: errorMessage });
         }
 
     } catch (error: any) {
         console.error("Create Business Wallet Error:", error);
         res.status(500).json({ success: false, error: error.message || "Failed to create business wallet" });
+    }
+});
+
+/**
+ * Regenerate the business virtual account. For existing users whose VA was
+ * created with their personal (BVN) name, this recreates it so the account
+ * name reflects the business name. Owner-only, best-effort provider call.
+ */
+router.post("/business/regenerate-va", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const businessId = req.user!.businessId;
+
+        const roleCheck = await query(`SELECT role, bvn, nin, phone_number FROM users WHERE id = $1`, [userId]);
+        if (roleCheck.rows[0]?.role !== 'owner') {
+            return res.status(403).json({ success: false, error: "Only business owner can regenerate the business virtual account" });
+        }
+        const user = roleCheck.rows[0];
+        if (!user.bvn) {
+            return res.status(400).json({ success: false, error: "Owner must complete KYC (BVN) first" });
+        }
+
+        const bizRes = await query(`SELECT name FROM businesses WHERE id = $1`, [businessId]);
+        const businessName = (bizRes.rows[0]?.name || '').trim();
+        if (!businessName) {
+            return res.status(400).json({ success: false, error: "Business name not found" });
+        }
+
+        const walletRes = await query(`SELECT * FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
+        if (walletRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "No wallet found for this business" });
+        }
+        const wallet = walletRes.rows[0];
+
+        const provider = getProvider();
+        const vaData = {
+            bvn: user.bvn,
+            nin: user.nin || "12345678901",
+            businessName,
+            customerIdentifier: `BIZ-${businessId.substring(0, 8)}`,
+            phoneNumber: user.phone_number || "08000000000",
+            beneficiaryAccount: wallet.beneficiary_account || "0000000000",
+        };
+
+        const vaResponse = await provider.createBusinessVirtualAccount(vaData);
+
+        let isSuccess = false;
+        let vaNumber: string | null = null;
+        let bankCode = '058';
+
+        if (provider.name === 'squad') {
+            isSuccess = vaResponse.success && vaResponse.data;
+            if (isSuccess) {
+                vaNumber = vaResponse.data.virtual_account_number;
+                bankCode = vaResponse.data.bank_code;
+            }
+        } else if (provider.name === 'monnify') {
+            isSuccess = vaResponse.requestSuccessful;
+            if (isSuccess) {
+                const accounts = vaResponse.responseBody?.accounts;
+                if (accounts && accounts.length > 0) {
+                    vaNumber = accounts[0].accountNumber;
+                    bankCode = accounts[0].bankCode;
+                }
+            }
+        } else if (provider.name === 'flutterwave') {
+            isSuccess = vaResponse?.status === 'success' && !!vaResponse?.data?.account_number;
+            if (isSuccess) {
+                vaNumber = String(vaResponse.data.account_number);
+                if (vaResponse.data.bank_code && /^[A-Z0-9]{3,10}$/i.test(vaResponse.data.bank_code)) {
+                    bankCode = vaResponse.data.bank_code;
+                }
+            }
+        }
+
+        if (isSuccess && vaNumber) {
+            await query(
+                `UPDATE wallets SET virtual_account_number = $1, bank_code = $2, account_name = $3, payment_provider = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5`,
+                [vaNumber, bankCode, businessName, provider.name, wallet.id],
+            );
+            res.json({
+                success: true,
+                message: "Business virtual account regenerated with the business name",
+                data: { account_number: vaNumber, bank_code: bankCode, account_name: businessName, provider: provider.name },
+            });
+        } else {
+            const errorMessage = vaResponse?.responseMessage || vaResponse?.message || "Failed to regenerate virtual account";
+            res.status(400).json({ success: false, error: errorMessage });
+        }
+    } catch (error: any) {
+        console.error("Regenerate Business VA Error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to regenerate business virtual account" });
     }
 });
 
@@ -769,10 +1036,33 @@ router.get("/verify", async (req, res) => {
         
         // 3. Verify with provider (verification MUST succeed before crediting)
         let verifyResponse;
+        let verifyNotFound = false;
         try {
             verifyResponse = await provider.verifyPayment(reference);
         } catch (err: any) {
             console.error(`${provider.name} Verification Failed:`, err);
+            // A cancelled/abandoned checkout has no completed provider transaction.
+            const notFound = /no transaction|not found|could not be found|does not exist/i.test(err?.message || '')
+                || err?.response?.status === 404;
+            if (notFound && transaction.status !== 'success') {
+                // Mark cancelled locally (idempotent) and show a friendly page
+                await query(
+                    `UPDATE transactions SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND status NOT IN ('success','cancelled')`,
+                    [transaction.id],
+                ).catch(() => {});
+                const cancelledTarget = buildClientRedirect('cancelled', false);
+                return res.send(`
+                    <html>
+                        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                            <div style="margin-bottom: 20px; font-size: 48px;">🚫</div>
+                            <h1 style="color: #f59e0b;">Payment Cancelled</h1>
+                            <p>You cancelled the payment before it was completed. No money was deducted from your account.</p>
+                            <p>You can safely start the payment again at any time.</p>
+                            <a href="${cancelledTarget}" style="display: inline-block; padding: 10px 20px; background: #f59e0b; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;">Return to App</a>
+                        </body>
+                    </html>
+                `);
+            }
         }
         
         // 4. Update Status based on provider response

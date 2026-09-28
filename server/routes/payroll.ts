@@ -2,6 +2,7 @@ import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
 import { sendPayrollAdjustmentNotification, sendEmail, generateInviteEmailHtml } from "../services/email";
+import { accountLookup } from "../services/transfer";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -661,6 +662,18 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                 const bankAccountNumber = row.bank_account_number || row.account_number || row.bankAccountNumber || null;
                 const accountName = row.account_name || row.accountName || null;
                 const contractStartDate = row.contract_start_date || row.contractStartDate || null;
+                const department = row.department || null;
+                const jobTitle = row.job_title || row.title || null;
+                const phoneNumber = row.phone_number || row.phone || null;
+                const bankName = row.bank_name || row.bankName || null;
+                const bankCountry = String(row.bank_country || row.bankCountry || (salaryCurrency === 'USD' ? 'US' : 'NG')).toUpperCase().slice(0, 5) || null;
+                const swiftCode = row.swift_code || row.swiftCode || row.swift || null;
+                const routingNumber = row.routing_number || row.routingNumber || row.aba || row.routing || null;
+                const beneficiaryAddress = row.beneficiary_address || row.address || null;
+                const beneficiaryCity = row.beneficiary_city || row.city || null;
+                const beneficiaryCountry = (row.beneficiary_country || row.country || null)
+                    ? String(row.beneficiary_country || row.country).toUpperCase().slice(0, 5)
+                    : null;
 
                 if (!name) throw new Error('Name is required');
                 if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('A valid email is required');
@@ -677,7 +690,8 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                 let emailSent = false;
 
                 if (existing.rows.length > 0) {
-                    // Existing member -> refresh payroll details only
+                    // Existing member -> refresh payroll details only.
+                    // Recipient detail changes reset the verification status.
                     memberId = existing.rows[0].id;
                     status = existing.rows[0].status;
                     await query(
@@ -690,9 +704,27 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                             account_number = COALESCE($6, account_number),
                             account_name = COALESCE($7, account_name),
                             contract_start_date = COALESCE($8, contract_start_date),
+                            department = COALESCE($9, department),
+                            job_title = COALESCE($10, job_title),
+                            phone_number = COALESCE($11, phone_number),
+                            bank_name = COALESCE($12, bank_name),
+                            bank_country = COALESCE($13, bank_country),
+                            swift_code = COALESCE($14, swift_code),
+                            routing_number = COALESCE($15, routing_number),
+                            beneficiary_address = COALESCE($16, beneficiary_address),
+                            beneficiary_city = COALESCE($17, beneficiary_city),
+                            beneficiary_country = COALESCE($18, beneficiary_country),
+                            verification_status = CASE
+                                WHEN ($5 IS NOT NULL AND bank_code IS DISTINCT FROM $5)
+                                  OR ($6 IS NOT NULL AND account_number IS DISTINCT FROM $6)
+                                THEN 'unverified'
+                                ELSE verification_status
+                            END,
                             updated_at = CURRENT_TIMESTAMP
-                         WHERE id = $9`,
-                        [name, role, salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate, memberId]
+                         WHERE id = $19`,
+                        [name, role, salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate,
+                         department, jobTitle, phoneNumber, bankName, bankCountry, swiftCode, routingNumber,
+                         beneficiaryAddress, beneficiaryCity, beneficiaryCountry, memberId]
                     );
                     updated += 1;
                     rowResult.action = 'updated';
@@ -705,8 +737,10 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                     const inserted = await query(
                         `INSERT INTO users
                          (business_id, name, email, role, status, invite_token, invite_expires_at,
-                          salary_amount, salary_currency, bank_code, account_number, account_name, contract_start_date)
-                         VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11, $12)
+                          salary_amount, salary_currency, bank_code, account_number, account_name, contract_start_date,
+                          department, job_title, phone_number, bank_name, bank_country, swift_code, routing_number,
+                          beneficiary_address, beneficiary_city, beneficiary_country, verification_status)
+                         VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, 'unverified')
                          ON CONFLICT (business_id, email) DO UPDATE SET
                            name = EXCLUDED.name,
                            role = EXCLUDED.role,
@@ -715,10 +749,22 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                            bank_code = COALESCE(EXCLUDED.bank_code, users.bank_code),
                            account_number = COALESCE(EXCLUDED.account_number, users.account_number),
                            account_name = COALESCE(EXCLUDED.account_name, users.account_name),
-                           contract_start_date = COALESCE(EXCLUDED.contract_start_date, users.contract_start_date)
+                           contract_start_date = COALESCE(EXCLUDED.contract_start_date, users.contract_start_date),
+                           department = COALESCE(EXCLUDED.department, users.department),
+                           job_title = COALESCE(EXCLUDED.job_title, users.job_title),
+                           phone_number = COALESCE(EXCLUDED.phone_number, users.phone_number),
+                           bank_name = COALESCE(EXCLUDED.bank_name, users.bank_name),
+                           bank_country = COALESCE(EXCLUDED.bank_country, users.bank_country),
+                           swift_code = COALESCE(EXCLUDED.swift_code, users.swift_code),
+                           routing_number = COALESCE(EXCLUDED.routing_number, users.routing_number),
+                           beneficiary_address = COALESCE(EXCLUDED.beneficiary_address, users.beneficiary_address),
+                           beneficiary_city = COALESCE(EXCLUDED.beneficiary_city, users.beneficiary_city),
+                           beneficiary_country = COALESCE(EXCLUDED.beneficiary_country, users.beneficiary_country)
                          RETURNING id, status`,
                         [businessId, name, email, role, inviteToken, inviteExpiresAt,
-                         salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate]
+                         salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate,
+                         department, jobTitle, phoneNumber, bankName, bankCountry, swiftCode, routingNumber,
+                         beneficiaryAddress, beneficiaryCity, beneficiaryCountry]
                     );
                     memberId = inserted.rows[0].id;
                     status = inserted.rows[0].status;
@@ -783,6 +829,210 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
     } catch (error) {
         console.error("Payroll employees import error:", error);
         res.status(500).json({ success: false, error: "Failed to import employees" });
+    }
+});
+
+/**
+ * GET /payroll/employees
+ * Full employee directory with recipient + verification details.
+ * Filters: verification_status (unverified|verified|failed), search, currency,
+ * status, salary has-bank-details filter, pagination.
+ */
+router.get("/employees", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId;
+        const { verification_status, search, currency, status, page = '1', limit = '50' } = req.query as Record<string, string>;
+
+        const params: any[] = [businessId];
+        let sql = `
+            SELECT id, name, email, role, job_title, department, phone_number, status,
+                   salary_amount, salary_currency, bank_code, account_number, account_name,
+                   bank_name, bank_country, swift_code, routing_number,
+                   beneficiary_address, beneficiary_city, beneficiary_country,
+                   verification_status, verified_account_name, verified_at, verification_error,
+                   avatar_url, created_at
+            FROM users
+            WHERE business_id = $1 AND status != 'deleted'
+              AND (salary_amount IS NOT NULL OR bank_code IS NOT NULL OR account_number IS NOT NULL OR role != 'owner')`;
+        let idx = 2;
+
+        if (verification_status && ['unverified', 'verified', 'failed', 'pending'].includes(verification_status)) {
+            sql += ` AND verification_status = $${idx}`;
+            params.push(verification_status);
+            idx++;
+        }
+        if (currency) {
+            sql += ` AND COALESCE(salary_currency, 'NGN') = $${idx}`;
+            params.push(currency.toUpperCase());
+            idx++;
+        }
+        if (status) {
+            sql += ` AND status = $${idx}`;
+            params.push(status);
+            idx++;
+        }
+        if (search) {
+            sql += ` AND (name ILIKE $${idx} OR email ILIKE $${idx} OR account_number ILIKE $${idx})`;
+            params.push(`%${search}%`);
+            idx++;
+        }
+
+        const countRes = await query(`SELECT COUNT(*)::int AS total FROM (${sql}) sub`, params);
+        const total = countRes.rows[0]?.total || 0;
+
+        sql += ` ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`;
+        const lim = Math.min(Math.max(1, parseInt(limit) || 50), 200);
+        params.push(lim, (Math.max(1, parseInt(page) || 1) - 1) * lim);
+
+        const employeesRes = await query(sql, params);
+
+        res.json({
+            success: true,
+            data: employeesRes.rows,
+            pagination: { total, page: parseInt(page) || 1, limit: lim, totalPages: Math.ceil(total / lim) },
+        });
+    } catch (error: any) {
+        console.error("List payroll employees error:", error);
+        res.status(500).json({ success: false, error: "Failed to list employees" });
+    }
+});
+
+/**
+ * POST /payroll/employees/:id/verify
+ * Runs an account-name lookup against the active transfer provider and stores
+ * the verification result on the employee record.
+ */
+router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId;
+        const employeeId = req.params.id;
+
+        const empRes = await query(
+            `SELECT id, name, bank_code, account_number, verification_status FROM users
+             WHERE id = $1 AND business_id = $2`,
+            [employeeId, businessId],
+        );
+        if (empRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Employee not found" });
+        }
+        const employee = empRes.rows[0];
+        if (!employee.bank_code || !employee.account_number) {
+            return res.status(400).json({ success: false, error: "Employee has no bank account details to verify" });
+        }
+
+        try {
+            const lookup = await accountLookup(employee.bank_code, employee.account_number);
+            const accountName =
+                lookup?.data?.account_name ||
+                lookup?.data?.data?.account_name ||
+                lookup?.data?.data?.accountName ||
+                lookup?.data?.accountName ||
+                null;
+            const lookupStatus = lookup?.status || lookup?.data?.status;
+
+            if (lookupStatus === 'success' && accountName) {
+                await query(
+                    `UPDATE users SET verification_status = 'verified', verified_account_name = $1,
+                     verified_at = CURRENT_TIMESTAMP, verification_error = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $2`,
+                    [accountName, employeeId],
+                );
+                return res.json({ success: true, data: { verification_status: 'verified', account_name: accountName } });
+            }
+
+            const errMsg = lookup?.message || lookup?.data?.message || 'Account lookup failed';
+            await query(
+                `UPDATE users SET verification_status = 'failed', verification_error = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [errMsg, employeeId],
+            );
+            return res.status(400).json({ success: false, error: errMsg });
+        } catch (lookupError: any) {
+            const errMsg = lookupError?.message || 'Account lookup failed';
+            await query(
+                `UPDATE users SET verification_status = 'failed', verification_error = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [errMsg, employeeId],
+            ).catch(() => {});
+            return res.status(400).json({ success: false, error: errMsg });
+        }
+    } catch (error: any) {
+        console.error("Verify employee error:", error);
+        res.status(500).json({ success: false, error: "Failed to verify employee" });
+    }
+});
+
+/**
+ * POST /payroll/employees/verify-bulk
+ * Verify all pending/unverified employees at once (or a provided list of ids).
+ * Returns per-employee results.
+ */
+router.post("/employees/verify-bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId;
+        const ids: string[] | undefined = Array.isArray(req.body?.employee_ids) ? req.body.employee_ids : undefined;
+
+        const targets = ids && ids.length > 0
+            ? await query(
+                `SELECT id, name, bank_code, account_number FROM users
+                 WHERE business_id = $1 AND id = ANY($2::uuid[]) AND verification_status != 'verified'
+                   AND bank_code IS NOT NULL AND account_number IS NOT NULL`,
+                [businessId, ids],
+              )
+            : await query(
+                `SELECT id, name, bank_code, account_number FROM users
+                 WHERE business_id = $1 AND verification_status != 'verified'
+                   AND bank_code IS NOT NULL AND account_number IS NOT NULL`,
+                [businessId],
+              );
+
+        const results: Array<Record<string, any>> = [];
+        let verified = 0;
+        let failed = 0;
+
+        for (const emp of targets.rows) {
+            try {
+                const lookup = await accountLookup(emp.bank_code, emp.account_number);
+                const accountName =
+                    lookup?.data?.account_name ||
+                    lookup?.data?.data?.account_name ||
+                    lookup?.data?.accountName ||
+                    null;
+                const lookupStatus = lookup?.status || lookup?.data?.status;
+                if (lookupStatus === 'success' && accountName) {
+                    await query(
+                        `UPDATE users SET verification_status = 'verified', verified_account_name = $1,
+                         verified_at = CURRENT_TIMESTAMP, verification_error = NULL WHERE id = $2`,
+                        [accountName, emp.id],
+                    );
+                    verified++;
+                    results.push({ id: emp.id, name: emp.name, success: true, account_name: accountName });
+                } else {
+                    const errMsg = lookup?.message || lookup?.data?.message || 'Account lookup failed';
+                    await query(
+                        `UPDATE users SET verification_status = 'failed', verification_error = $1 WHERE id = $2`,
+                        [errMsg, emp.id],
+                    );
+                    failed++;
+                    results.push({ id: emp.id, name: emp.name, success: false, error: errMsg });
+                }
+            } catch (err: any) {
+                failed++;
+                const errMsg = err?.message || 'Account lookup failed';
+                await query(
+                    `UPDATE users SET verification_status = 'failed', verification_error = $1 WHERE id = $2`,
+                    [errMsg, emp.id],
+                ).catch(() => {});
+                results.push({ id: emp.id, name: emp.name, success: false, error: errMsg });
+            }
+        }
+
+        res.json({
+            success: true,
+            data: { total: targets.rows.length, verified, failed, results },
+            message: `Verified ${verified} of ${targets.rows.length} employees`,
+        });
+    } catch (error: any) {
+        console.error("Bulk verify employees error:", error);
+        res.status(500).json({ success: false, error: "Failed to run bulk verification" });
     }
 });
 

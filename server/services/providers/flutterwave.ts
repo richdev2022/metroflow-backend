@@ -559,6 +559,38 @@ export const flutterwaveProvider: Provider = {
   },
 };
 
+/**
+ * Live FX rate from Flutterwave (GET /v3/transfers/rates).
+ * Returns the rate for converting `amount` from source to destination currency.
+ */
+export async function getFlutterwaveTransferRate(
+  amount: number | string,
+  sourceCurrency: string,
+  destinationCurrency: string,
+): Promise<{ rate: number; raw: any }> {
+  try {
+    const response = await flwClient.get("/v3/transfers/rates", {
+      params: {
+        amount: roundAmount(typeof amount === "string" ? parseFloat(amount) : amount),
+        source_currency: sourceCurrency,
+        destination_currency: destinationCurrency,
+      },
+    });
+    const body = response.data;
+    const rate = Number(body?.data?.rate);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new Error(body?.message || "Invalid rate response");
+    }
+    return { rate, raw: body?.data };
+  } catch (error: any) {
+    console.error(
+      "Flutterwave Transfer Rate Error:",
+      error.response?.data || error.message
+    );
+    throw new Error(error.response?.data?.message || "Failed to fetch exchange rate");
+  }
+}
+
 export function isFlutterwaveConfigured(): boolean {
   return Boolean(FLW_SECRET_KEY);
 }

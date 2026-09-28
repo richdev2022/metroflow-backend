@@ -16,6 +16,161 @@ export interface EmailPayload {
   };
 }
 
+/** Parse a User-Agent string into human-friendly device information. */
+export function parseDeviceInfo(userAgent?: string | string[]): { device: string; browser: string; os: string } {
+  const ua = Array.isArray(userAgent) ? userAgent.join(' ') : (userAgent || '');
+  if (!ua) return { device: 'Unknown device', browser: 'Unknown browser', os: 'Unknown OS' };
+
+  let browser = 'Unknown browser';
+  if (/edg\//i.test(ua)) browser = 'Microsoft Edge';
+  else if (/opr\/|opera/i.test(ua)) browser = 'Opera';
+  else if (/chrome|crios/i.test(ua)) browser = 'Chrome';
+  else if (/firefox|fxios/i.test(ua)) browser = 'Firefox';
+  else if (/safari/i.test(ua)) browser = 'Safari';
+
+  let os = 'Unknown OS';
+  if (/windows nt/i.test(ua)) os = 'Windows';
+  else if (/android/i.test(ua)) os = 'Android';
+  else if (/iphone|ipad|ipod/i.test(ua)) os = 'iOS';
+  else if (/mac os x|macintosh/i.test(ua)) os = 'macOS';
+  else if (/linux/i.test(ua)) os = 'Linux';
+
+  let device = 'Desktop';
+  if (/mobile|iphone|android.*mobile/i.test(ua)) device = 'Mobile';
+  else if (/ipad|tablet/i.test(ua)) device = 'Tablet';
+
+  return { device, browser, os };
+}
+
+/**
+ * Always-on login attempt notification (success or failure) with device info.
+ */
+export function generateLoginAttemptEmailHtml(
+  name: string,
+  status: 'success' | 'failed',
+  deviceInfo: { device: string; browser: string; os: string },
+  ipAddress?: string,
+  attemptTime?: Date,
+): string {
+  const time = attemptTime || new Date();
+  const isSuccess = status === 'success';
+  const accent = isSuccess ? '#10b981' : '#ef4444';
+  const heading = isSuccess ? 'New login to your account' : 'Failed login attempt on your account';
+  const body = isSuccess
+    ? 'Your account was just accessed successfully. If this was you, no action is needed.'
+    : 'Someone just tried to sign in to your account with an incorrect email or password. If this was you, you can safely ignore this email. If not, we recommend changing your password immediately.';
+
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="border-left: 4px solid ${accent}; padding-left: 16px; margin-bottom: 20px;">
+            <h2 style="color: ${accent}; margin: 0;">${heading}</h2>
+          </div>
+          <p style="color: #333;">Hi ${name},</p>
+          <p style="color: #666; line-height: 1.6;">${body}</p>
+          <div style="background-color: #f8fafc; border-radius: 8px; padding: 16px; margin: 20px 0;">
+            <p style="margin: 0 0 8px 0; color: #1e40af; font-weight: bold;">Login details</p>
+            <table style="width: 100%; color: #374151; font-size: 14px;">
+              <tr><td style="padding: 4px 0; color: #6b7280;">Status</td><td style="padding: 4px 0; text-align: right; font-weight: bold; color: ${accent};">${isSuccess ? 'Successful' : 'Failed'}</td></tr>
+              <tr><td style="padding: 4px 0; color: #6b7280;">Device</td><td style="padding: 4px 0; text-align: right;">${deviceInfo.device}</td></tr>
+              <tr><td style="padding: 4px 0; color: #6b7280;">Browser</td><td style="padding: 4px 0; text-align: right;">${deviceInfo.browser}</td></tr>
+              <tr><td style="padding: 4px 0; color: #6b7280;">Operating system</td><td style="padding: 4px 0; text-align: right;">${deviceInfo.os}</td></tr>
+              <tr><td style="padding: 4px 0; color: #6b7280;">IP address</td><td style="padding: 4px 0; text-align: right;">${ipAddress || 'Unknown'}</td></tr>
+              <tr><td style="padding: 4px 0; color: #6b7280;">Time (UTC)</td><td style="padding: 4px 0; text-align: right;">${time.toISOString().replace('T', ' ').slice(0, 19)}</td></tr>
+            </table>
+          </div>
+          <p style="color: #9ca3af; font-size: 12px; line-height: 1.5;">
+            You are receiving this email because login attempt notifications are enabled for your Metricorex account.
+          </p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
+ * Welcome email sent whenever a new account is created.
+ */
+export function generateAccountCreationEmailHtml(name: string, loginLink: string): string {
+  const logoUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/Assets/logo.png` : 'https://metricorex.com/Assets/logo.png';
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
+          <h2 style="color: #1d4ed8; margin-bottom: 20px; text-align: center;">Your account has been created 🎉</h2>
+          <p style="color: #333;">Hi ${name},</p>
+          <p style="color: #666; line-height: 1.6;">
+            Welcome to Metricorex! Your account has been created successfully. You can now sign in, set up your
+            workspace, and start collaborating with your team.
+          </p>
+          <div style="text-align: center; margin: 24px 0;">
+            <a href="${loginLink}" style="background-color: #2563eb; color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold;">Sign in to Metricorex</a>
+          </div>
+          <div style="background-color: #f0f9ff; padding: 15px; border-left: 4px solid #2563eb; margin: 20px 0;">
+            <p style="margin: 0; color: #1e40af; font-weight: bold;">Getting started:</p>
+            <ul style="margin: 10px 0 0 20px; color: #374151; padding: 0;">
+              <li>Complete your profile and secure your account</li>
+              <li>Invite teammates and create your first project</li>
+              <li>Explore payroll, transfers and meetings</li>
+            </ul>
+          </div>
+          <p style="color: #9ca3af; font-size: 12px;">
+            If you did not expect this email, you can safely ignore it.
+          </p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
+ * Maintenance-mode notification emails (toggle ON) and back-up emails (toggle OFF).
+ */
+export function generateMaintenanceModeEmailHtml(name: string, isDown: boolean, maintenanceTime: Date): string {
+  const time = maintenanceTime || new Date();
+  const heading = isDown ? 'Scheduled maintenance in progress' : 'We are back up!';
+  const body = isDown
+    ? 'Metricorex is undergoing scheduled maintenance to improve performance and reliability. During this time some features may be unavailable. We will notify you as soon as everything is back up.'
+    : 'Great news - the scheduled maintenance is complete and Metricorex is fully back up. Thank you for your patience!';
+  const accent = isDown ? '#f59e0b' : '#10b981';
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="border-left: 4px solid ${accent}; padding-left: 16px; margin-bottom: 20px;">
+            <h2 style="color: ${accent}; margin: 0;">${heading}</h2>
+          </div>
+          <p style="color: #333;">Hi ${name},</p>
+          <p style="color: #666; line-height: 1.6;">${body}</p>
+          <p style="color: #9ca3af; font-size: 12px;">Time (UTC): ${time.toISOString().replace('T', ' ').slice(0, 19)}</p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
+ * Generic broadcast email (admin announcements / notifications).
+ */
+export function generateBroadcastEmailHtml(name: string, subject: string, message: string): string {
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <h2 style="color: #1d4ed8; margin-bottom: 16px;">${subject}</h2>
+          <p style="color: #333;">Hi ${name},</p>
+          <div style="color: #666; line-height: 1.7;">${message.replace(/\n/g, '<br/>')}</div>
+          <p style="color: #9ca3af; font-size: 12px; margin-top: 24px;">This message was sent by the Metricorex team.</p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 export async function sendEmail(
   toOrPayload: string | EmailPayload,
   nameOrSubject?: string,

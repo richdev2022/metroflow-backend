@@ -1,137 +1,121 @@
-# MetricFlow (Fusion Starter)
+# Metricorex — Backend API
 
-A comprehensive web application for tracking Key Performance Indicators (KPIs), managing developer tasks, and monitoring business performance. Built with a modern tech stack featuring React, Node.js, and PostgreSQL.
+The backend powering **Metricorex** (project: Metroflow) — an all-in-one business operations platform that combines team workspace, WhatsApp-style chat, video meetings/calls, project management, and a full fintech suite (wallets, transfers, international payouts, payroll) behind plan-based subscriptions.
 
-## 🚀 Features
+- **Production API**: `https://api.metricorex.com` (Express + Node, PM2 on VPS, port 3000)
+- **Web app**: `metricorex.com` (Netlify) — repo `metroflow-app`
+- **Mobile app**: Flutter (Android/iOS) — repo `metroflow-mobile`
+- **Admin console**: Netlify — repo `metroflow-admin`
+- **Marketing site**: Netlify — repo `metroflow-site`
+- **Swagger docs**: served at `/api-docs` from `server/swagger-output.json` (regenerate with `npx tsx scripts/generate-swagger.ts`)
 
-- **Authentication & Authorization**: Secure login, registration, password recovery, and role-based access control (Admin/Developer).
-- **Business Management**: Multi-tenant support with business-specific data isolation.
-- **Task Management**:
-  - Create and track tasks with targets and accomplished values.
-  - Organize tasks by Sprints and Epics.
-  - Assign tasks to specific developers.
-  - Track status, due dates, and overdue items.
-- **Dashboard**: Visual analytics using Recharts to monitor progress and KPIs.
-- **Activity Logs**: Audit trail of user actions and system events.
-- **Developer Management**: Manage team members, invites, and profiles.
+---
 
-## 🛠️ Tech Stack
+## Platform Overview
 
-### Frontend
+### Team Workspace
+- Multi-tenant businesses with role-based members (owner / admin / manager / member), plan-based feature permissions.
+- Tasks, Kanban board, backlog, epics, sprints, task statuses (custom per business), comments with mentions & reactions, **file attachments on tasks** (images/videos/documents, WhatsApp-style), activity logs, rankings/leaderboards, product documentation generator (OpenAI / Gemini / **free GLM** — switchable via `AI_PROVIDER`).
 
-- **Framework**: [React](https://reactjs.org/) with [Vite](https://vitejs.dev/)
-- **Language**: [TypeScript](https://www.typescriptlang.org/)
-- **Styling**: [Tailwind CSS](https://tailwindcss.com/)
-- **UI Components**: [Radix UI](https://www.radix-ui.com/) (via shadcn/ui patterns)
-- **State Management**: [TanStack Query](https://tanstack.com/query/latest) (React Query)
-- **Forms**: [React Hook Form](https://react-hook-form.com/) with [Zod](https://zod.dev/) validation
-- **Charts**: [Recharts](https://recharts.org/)
+### Chat (WhatsApp-style)
+- Direct & group conversations, display names/avatars, unread badges.
+- **Attachments**: images, videos, documents, GIFs (Tenor), stickers — send, view, play, download on web and mobile (up to 100 MB per file).
+- Voice notes with in-bubble player (seek + speed), emoji/sticker/GIF picker, big-emoji rendering, call-log messages linked to conversations.
 
-### Backend
+### Calls & Meetings (RTC)
+- 1:1 audio/video calls + group calls + meeting rooms with waiting rooms, co-hosts, meeting passwords, join-by-code/link, guest access.
+- Mediasoup SFU on the backend (`server/lib/mediasoup.ts` + Socket.IO signaling in `server/lib/socket.ts`), Redis-backed waiting-room queue with in-memory fallback.
+- Meeting recordings, screen share, in-call chat, call duration limits enforced from the caller's plan.
 
-- **Runtime**: [Node.js](https://nodejs.org/)
-- **Framework**: [Express](https://expressjs.com/)
-- **Database**: [PostgreSQL](https://www.postgresql.org/) (using `pg` driver)
-- **API**: RESTful API architecture
-- **Deployment**: Configured for [Netlify](https://www.netlify.com/) Functions
+### MetricAi (built-in AI assistant, like Meta AI in WhatsApp)
+- Powered by the **free GLM models from Z.ai** — no cost per user, no user-supplied keys.
+  - Chat: `glm-4-flash` (OpenAI-compatible endpoint)
+  - Image generation: `cogview-3-flash`
+- **Plan-gated**: admins toggle `metric_ai_enabled` on a pricing plan; only subscribers of that plan can chat (`GET /ai/status`, enforced by `requireMetricAiAccess`).
+- Knows the whole Metricorex platform + answers general questions, generates images, and detects when a user needs a human (`suggestHumanSupport`).
+- **Human handoff** into the Support desk (see below), on web, mobile and the public website.
+- **Public "Ask MetricAi"**: `POST /api/public/metric-ai/ask` lets any website visitor chat for help/support (session-based, IP rate-limited), with escalation to human support.
 
-## 📋 Prerequisites
+### Customer Support Desk
+- MetricAi handoff or direct requests create **support conversations** with the full chat transcript attached.
+- Guests (website widget) chat via a per-conversation `access_key`; logged-in users via JWT; agents via admin token + `support` permission.
+- **Admin Support dashboard**: inbox with status filters (open / pending / resolved / closed) + search, live chat (polling with `?after=` cursor), assign-to-me, conclude conversation, loud ringtone on new customer messages, in-app notifications (`admin_notifications`), support stats and a MetricAi activity feed.
+- Agents are platform admins whose role carries the `support` permission (super admins always have access). Customers get FCM push + in-app notifications on agent replies.
 
-- [Node.js](https://nodejs.org/) (v18 or higher recommended)
-- [PostgreSQL](https://www.postgresql.org/) database
-- [pnpm](https://pnpm.io/) (recommended package manager)
+### Fintech
+- Multi-currency wallets (NGN/USD), funding via card (Monnify / Squad / Flutterwave providers), virtual accounts (personal & business, business-name VAs, regeneration).
+- Transfers (single/bulk) with admin-toggled payout provider, account lookup, transfer history with filters + CSV export.
+- **International payouts via Flutterwave** with live FX quotes, admin markup % + fee % + flat fee, three-ledger accounting: debit user wallet → credit platform wallet → credit revenue wallet (fees + markup), all recorded idempotently with historical backfill.
+- Payroll: employees (NGN & USD recipients), Excel import, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
+- Transaction OTP/PIN, KYC (BVN/NIN/business docs via Prembly), biometric unlock, login-attempt alert emails.
 
-## ⚙️ Installation
+### Platform Operations (Admin)
+- Role & permission management (roles carry permission slugs; includes `support`), admin management.
+- Payment provider toggles (global + transfer provider), fees & international transfer config, platform/revenue ledgers with movements + reconciliation.
+- Maintenance mode (emails + pushes all users), announcements ticker, broadcast email/push, KYC review, webhook monitoring, subscriptions & pricing plans (incl. per-plan RTC limits and MetricAi toggle).
 
-1. **Clone the repository**
+### Notifications
+- In-app notifications + FCM push (HTTP v1, token registry with auto-pruning).
+- Login-attempt emails with device info, welcome emails, task notifications, support desk notifications.
+- Maintenance/announcement/broadcast pipelines.
 
-   ```bash
-   git clone <repository-url>
-   cd MetricFlow
-   ```
+---
 
-2. **Install dependencies**
-   ```bash
-   pnpm install
-   # or
-   npm install
-   ```
+## Tech Stack
 
-## 🔧 Configuration
+- **Runtime**: Node.js + Express (REST + Socket.IO), Mediasoup SFU
+- **Database**: PostgreSQL (Neon) via `pg`, Prisma schema in `prisma/schema.prisma`, idempotent runtime migrations in `server/migrations.ts`
+- **Storage**: Cloudflare R2 → Cloudinary → local `/uploads` fallback chain (`server/services/media-upload.ts`)
+- **Auth**: JWT (users) + admin token system (platform admins), Google SSO
+- **Email**: Brevo (fallback SMTP), **SMS/WhatsApp**: Kudi / Termii / Meta WhatsApp, **Push**: FCM
+- **AI**: Z.ai GLM (`glm-4-flash` + `cogview-3-flash`), OpenAI, Gemini — `AI_PROVIDER` env toggle for document generation
+- **Payments**: Monnify, Squad, Flutterwave (collections + transfers + FX)
+- **Testing**: Vitest (`npx vitest --run`)
 
-1. **Environment Variables**
-   Create a `.env` file in the root directory based on `.env.example`:
+## Environment
 
-   ```bash
-   cp .env.example .env
-   ```
+Key variables (see `ENVIRONMENT_SETUP.md` for the full list):
 
-2. **Update `.env` values**
-   ```env
-   DATABASE_URL="postgresql://user:password@localhost:5432/your_database"
-   JWT_SECRET="your-secure-jwt-secret"
-   CLIENT_URL="http://localhost:5173" # Update port if different
-   ```
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection (Neon pooler) |
+| `JWT_SECRET` | User JWT signing |
+| `GLM_API_KEY` | **Required for MetricAi + GLM doc generation** (free from Z.ai; aliases `ZAI_API_KEY` / `Z_AI_API_KEY`) |
+| `GLM_CHAT_MODEL` / `GLM_IMAGE_MODEL` / `GLM_API_BASE` | Optional GLM overrides (defaults: `glm-4-flash`, `cogview-3-flash`, `https://api.z.ai/api/paas/v4`) |
+| `AI_PROVIDER` | Document-generation provider: `openai` \| `google` \| `glm` |
+| `TENOR_API_KEY` | Optional — enables the chat GIF picker |
+| `CLOUDINARY_URL` / R2 vars | Upload storage chain |
+| `BREVO_API_KEY` | Transactional email |
+| `FCM_*` | Push notifications |
+| `SUPPORT_ALERT_EMAIL` | Optional email ping on new support requests |
 
-## 🏃‍♂️ Running the Application
-
-### Development
-
-Start the development server (Frontend + Backend in development mode):
-
-```bash
-npm run dev
-```
-
-This will start Vite for the frontend. The backend setup depends on your specific dev environment configuration, but typically Vite proxies API requests or you run the server separately.
-
-### Production Build
-
-Build both client and server:
-
-```bash
-npm run build
-```
-
-To start the production server:
+## Local Development
 
 ```bash
-npm start
+npm install
+npm run build        # tsc build
+npm start            # run from dist
+npx tsx server/index.ts   # dev
+npx vitest --run          # tests
+npx tsc --noEmit          # typecheck
+npx tsx scripts/generate-swagger.ts   # regenerate swagger-output.json
 ```
 
-## 📜 Scripts
+## Deployment (VPS)
 
-- `npm run dev`: Start the development server (Vite).
-- `npm run build`: Build both client and server.
-- `npm run build:client`: Build only the frontend.
-- `npm run build:server`: Build only the backend.
-- `npm run test`: Run tests using Vitest.
-- `npm run typecheck`: Run TypeScript type checking.
-- `npm run format.fix`: Format code using Prettier.
-
-## 📂 Project Structure
-
-```
-MetricFlow/
-├── client/                 # Frontend source code
-│   ├── components/         # Reusable UI components
-│   ├── hooks/              # Custom React hooks
-│   ├── pages/              # Application pages/routes
-│   └── lib/                # Utility functions
-├── server/                 # Backend source code
-│   ├── routes/             # API routes
-│   ├── middleware/         # Express middleware (auth, etc.)
-│   ├── services/           # Business logic services
-│   └── db.ts               # Database connection and schema
-├── shared/                 # Shared types/utils between client and server
-├── netlify/                # Netlify serverless functions configuration
-└── public/                 # Static assets
+```bash
+git pull && npm install && npm run build
+pm2 restart metroflow
 ```
 
-## 🤝 Contributing
+Migrations run automatically on boot (`runPostInitializeMigrations`): support-desk tables, `admin_notifications`, `ai_messages`, chat attachment columns, payroll verification columns, ledger backfill, plan `metric_ai_enabled`, and more — all idempotent.
 
-1. Fork the project
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+## Support Desk Permissions
+
+1. Admin console → Roles → create/edit a role (e.g. "Customer Support") and grant the **Customer Support (`support`)** permission.
+2. Admins → add an admin with that role.
+3. The Support dashboard (`/support`) appears for that admin; super admins always see it.
+
+## API Documentation
+
+Swagger UI: `/api-docs`. The spec covers auth, team, tasks (+attachments), epics, comments, chat (+media/GIFs), calls, meetings, recordings, MetricAi (+public Ask), support desk, wallet, transfers, payroll, KYC, settings, notifications, subscriptions and the admin API.

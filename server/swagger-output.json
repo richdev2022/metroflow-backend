@@ -186,6 +186,79 @@
         }
       }
     },
+    "/api/wallet/history": {
+      "get": {
+        "summary": "Paginated wallet transaction history with filters and CSV export",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "wallet_id",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by specific wallet"
+          },
+          {
+            "in": "query",
+            "name": "direction",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "credit",
+                "debit"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Transaction type filter (wallet_funding, transfer, fee, adjustment, platform)"
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search reference / description / transaction ID"
+          },
+          {
+            "in": "query",
+            "name": "min_amount / max_amount / start_date / end_date",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction history"
+          }
+        }
+      }
+    },
     "/api/wallet/fund/card": {
       "post": {
         "summary": "Initiate wallet funding via Card",
@@ -2135,6 +2208,117 @@
         }
       }
     },
+    "/api/tasks/{id}/attachments": {
+      "post": {
+        "summary": "Upload file attachments to a task (images, videos, documents)",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "binary"
+                    },
+                    "description": "Up to 10 files, 50MB each"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Uploaded attachments"
+          },
+          "400": {
+            "description": "No files provided / task not found"
+          }
+        }
+      },
+      "get": {
+        "summary": "List a task's file attachments",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Attachment list"
+          }
+        }
+      }
+    },
+    "/api/tasks/attachments/{attachmentId}": {
+      "delete": {
+        "summary": "Delete a task attachment (uploader or business admin only)",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attachmentId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Attachment deleted"
+          },
+          "404": {
+            "description": "Attachment not found"
+          }
+        }
+      }
+    },
     "/api/task-statuses": {
       "get": {
         "summary": "Get all task statuses for the current business",
@@ -2314,6 +2498,612 @@
           },
           "500": {
             "description": "Server error"
+          }
+        }
+      }
+    },
+    "/api/support/escalate": {
+      "post": {
+        "summary": "Hand a MetricAi conversation over to human support",
+        "description": "Creates a support conversation from a MetricAi handoff (or a direct support request). The full chat transcript is attached so agents see everything so far. Supports both authenticated users and guests (website widget). Returns an accessKey that guests must keep to read and reply to the conversation.\n",
+        "tags": [
+          "Support"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "email"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "subject": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string",
+                    "description": "Optional final message from the customer"
+                  },
+                  "channel": {
+                    "type": "string",
+                    "enum": [
+                      "metric_ai",
+                      "webapp_widget",
+                      "website_widget",
+                      "mobile"
+                    ]
+                  },
+                  "transcript": {
+                    "type": "array",
+                    "description": "MetricAi messages so far (oldest first)",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string",
+                          "enum": [
+                            "user",
+                            "assistant"
+                          ]
+                        },
+                        "content": {
+                          "type": "string"
+                        },
+                        "createdAt": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Conversation created"
+          }
+        }
+      }
+    },
+    "/api/support/guest/{id}/messages": {
+      "get": {
+        "summary": "Guest reads a support conversation (website widget)",
+        "tags": [
+          "Support"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Only return messages created after this timestamp (polling cursor)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages + conversation status"
+          }
+        }
+      },
+      "post": {
+        "summary": "Guest replies to a support conversation (website widget)",
+        "tags": [
+          "Support"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "body",
+                  "key"
+                ],
+                "properties": {
+                  "body": {
+                    "type": "string"
+                  },
+                  "key": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Message stored"
+          }
+        }
+      }
+    },
+    "/api/support/my/conversations": {
+      "get": {
+        "summary": "Support conversations of the authenticated user",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of the user's support conversations"
+          }
+        }
+      }
+    },
+    "/api/support/my/{id}/messages": {
+      "get": {
+        "summary": "Customer reads messages of their support conversation",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages + status"
+          }
+        }
+      },
+      "post": {
+        "summary": "Customer replies to their support conversation",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "body"
+                ],
+                "properties": {
+                  "body": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Message stored"
+          }
+        }
+      }
+    },
+    "/api/support/my/{id}/close": {
+      "post": {
+        "summary": "Customer concludes their support conversation",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversation closed"
+          }
+        }
+      }
+    },
+    "/api/support/admin/conversations": {
+      "get": {
+        "summary": "Support inbox for agents (filter + search + pagination)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "open",
+                "pending",
+                "resolved",
+                "closed"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 30
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversations with customer info and unread counters"
+          }
+        }
+      }
+    },
+    "/api/support/admin/{id}/messages": {
+      "get": {
+        "summary": "Agent reads a support conversation (supports ?after= polling cursor)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages, status and customer info"
+          }
+        }
+      },
+      "post": {
+        "summary": "Agent replies to a support conversation",
+        "description": "Stores the agent reply, bumps the customer unread counter and sends a best-effort FCM push + in-app notification to registered customers.\n",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "body"
+                ],
+                "properties": {
+                  "body": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reply stored"
+          }
+        }
+      }
+    },
+    "/api/support/admin/{id}/status": {
+      "post": {
+        "summary": "Update a conversation status (assign / resolve / close / reopen)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "open",
+                      "pending",
+                      "resolved",
+                      "closed"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated status"
+          }
+        }
+      }
+    },
+    "/api/support/admin/{id}/assign": {
+      "post": {
+        "summary": "Assign a conversation to an agent (defaults to self)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Assigned"
+          }
+        }
+      }
+    },
+    "/api/support/admin/notifications": {
+      "get": {
+        "summary": "In-app notifications for support agents (new requests, new messages, MetricAi activity)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 30
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Notifications + unreadCount"
+          }
+        }
+      }
+    },
+    "/api/support/admin/notifications/read-all": {
+      "post": {
+        "summary": "Mark all support notifications as read",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All marked read"
+          }
+        }
+      }
+    },
+    "/api/support/admin/stats": {
+      "get": {
+        "summary": "Support desk statistics (inbox counts + MetricAi activity today)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Counters for the dashboard header"
+          }
+        }
+      }
+    },
+    "/api/support/admin/ai-activity": {
+      "get": {
+        "summary": "Recent MetricAi questions across the platform (activity feed)",
+        "tags": [
+          "Support"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent user questions asked to MetricAi"
           }
         }
       }
@@ -3623,6 +4413,20 @@
         }
       }
     },
+    "/api/public/app-config": {
+      "get": {
+        "summary": "Public app configuration (maintenance mode + active announcement)",
+        "tags": [
+          "Public"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Maintenance flag + latest active announcement"
+          }
+        }
+      }
+    },
     "/api/providers/requirements": {
       "get": {
         "summary": "Get requirements for the active/default provider or a specific provider",
@@ -4421,6 +5225,86 @@
         "responses": {
           "200": {
             "description": "Action taken successfully"
+          }
+        }
+      }
+    },
+    "/api/notifications/register-device": {
+      "post": {
+        "summary": "Register/refresh an FCM push token for the authenticated user",
+        "tags": [
+          "Notifications"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "fcm_token"
+                ],
+                "properties": {
+                  "fcm_token": {
+                    "type": "string"
+                  },
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "android",
+                      "ios",
+                      "web"
+                    ]
+                  },
+                  "device_name": {
+                    "type": "string"
+                  },
+                  "app_version": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device registered"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove an FCM push token (e.g. on logout)",
+        "tags": [
+          "Notifications"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "fcm_token": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device unregistered"
           }
         }
       }
@@ -6037,6 +6921,78 @@
         }
       }
     },
+    "/api/chat/gifs": {
+      "get": {
+        "summary": "Search trending Tenor GIFs for the chat GIF picker",
+        "description": "Returns an empty configured=false payload when TENOR_API_KEY is absent so clients hide the GIF tab.",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 16
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "GIF objects or configured=false"
+          }
+        }
+      }
+    },
+    "/api/chat/media": {
+      "post": {
+        "summary": "Upload chat media (images, videos, audio, documents, GIFs)",
+        "description": "Multipart upload used by the WhatsApp-style chat attachments and voice notes. Storage chain: Cloudflare R2 -> Cloudinary -> local /uploads. Returns a URL + metadata to pass to the send-message endpoint as { attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType }.\n",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Up to 100MB"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Uploaded media metadata (url, attachmentType, size...)"
+          }
+        }
+      }
+    },
     "/api/calls": {
       "get": {
         "summary": "Get calls",
@@ -6987,6 +7943,162 @@
         }
       }
     },
+    "/api/ai/status": {
+      "get": {
+        "summary": "MetricAi availability for the caller (plan-gated)",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status object"
+          }
+        }
+      }
+    },
+    "/api/ai/chat": {
+      "post": {
+        "summary": "Chat with MetricAi (free GLM model, plan-gated)",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "message"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "imageUrl": {
+                    "type": "string",
+                    "description": "Optional image the user attached"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Assistant reply (may include a generated image)"
+          },
+          "403": {
+            "description": "MetricAi not enabled on the caller's plan"
+          }
+        }
+      }
+    },
+    "/api/ai/history": {
+      "get": {
+        "summary": "MetricAi conversation history for the caller",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated history (oldest first)"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Clear the caller's MetricAi history",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "History cleared"
+          }
+        }
+      }
+    },
+    "/api/public/metric-ai/ask": {
+      "post": {
+        "summary": "Public \"Ask MetricAi\" endpoint (marketing site / guest widget)",
+        "description": "Lets ANY visitor (no account, no plan) ask MetricAi for help or support from the marketing website or the floating Ask widget. Sessions are kept server-side for 30 minutes; rate limited per IP. When MetricAi cannot help it flags suggestHumanSupport so the widget can collect the visitor's name + email and escalate to the human support desk.\n",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "message"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "description": "Opaque session id from the first response (omit on first message)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Assistant reply (+ suggestHumanSupport / sessionId)"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "503": {
+            "description": "MetricAi not configured on the server"
+          }
+        }
+      }
+    },
     "/api/admin/fees": {
       "get": {
         "summary": "List all fee configurations",
@@ -7519,7 +8631,7 @@
     },
     "/api/admin/pricing": {
       "post": {
-        "summary": "Create a pricing plan",
+        "summary": "Create a new pricing plan",
         "tags": [
           "Admin"
         ],
@@ -7565,21 +8677,6 @@
                     "items": {
                       "type": "string"
                     }
-                  },
-                  "description": {
-                    "type": "string"
-                  },
-                  "permissions": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "max_team_members": {
-                    "type": "integer"
-                  },
-                  "trial_days": {
-                    "type": "integer"
                   }
                 }
               }
@@ -7589,22 +8686,6 @@
         "responses": {
           "200": {
             "description": "Plan created"
-          }
-        }
-      },
-      "get": {
-        "summary": "Get all pricing plans",
-        "tags": [
-          "Admin"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of pricing plans"
           }
         }
       }
@@ -7626,8 +8707,7 @@
             "name": "id",
             "required": true,
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             }
           }
         ],
@@ -7655,28 +8735,6 @@
                   },
                   "is_active": {
                     "type": "boolean"
-                  },
-                  "description": {
-                    "type": "string"
-                  },
-                  "permissions": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "max_team_members": {
-                    "type": "integer"
-                  },
-                  "trial_days": {
-                    "type": "integer"
-                  },
-                  "duration": {
-                    "type": "string",
-                    "enum": [
-                      "monthly",
-                      "yearly"
-                    ]
                   }
                 }
               }
@@ -7686,12 +8744,6 @@
         "responses": {
           "200": {
             "description": "Plan updated"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "500": {
-            "description": "Server error"
           }
         }
       }

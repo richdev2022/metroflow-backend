@@ -438,3 +438,74 @@ export interface InitiateBulkTransferInput {
     }>;
   };
 }
+
+// ---------------------------------------------------------------------------
+// Customer Support desk (MetricAi human handoff) Types
+// ---------------------------------------------------------------------------
+
+export type SupportConversationStatus = "open" | "pending" | "resolved" | "closed";
+export type SupportSenderType = "customer" | "agent" | "system" | "ai";
+export type SupportChannel = "metric_ai" | "webapp_widget" | "website_widget" | "mobile";
+
+export interface SupportMessage {
+  id: string;
+  conversation_id: string;
+  sender_type: SupportSenderType;
+  sender_id?: string | null;
+  sender_name?: string | null;
+  body: string;
+  meta?: Record<string, any> | null;
+  created_at: string;
+}
+
+export interface SupportConversation {
+  id: string;
+  business_id?: string | null;
+  user_id?: string | null;
+  guest_name?: string | null;
+  guest_email?: string | null;
+  channel?: SupportChannel;
+  subject?: string | null;
+  status: SupportConversationStatus;
+  assigned_agent_id?: string | null;
+  assigned_agent_name?: string | null;
+  last_message_at: string;
+  last_message_preview?: string | null;
+  unread_for_agent?: number;
+  unread_for_customer?: number;
+  user_name?: string | null;
+  user_email?: string | null;
+  business_name?: string | null;
+  message_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EscalateSupportInput {
+  name: string;
+  email: string;
+  subject?: string;
+  message?: string;
+  channel?: SupportChannel;
+  transcript?: Array<{ role: "user" | "assistant"; content: string; createdAt?: string }>;
+}
+
+export interface AiActivityRow {
+  id: string;
+  content?: string | null;
+  image_url?: string | null;
+  created_at: string;
+  user_name?: string | null;
+  user_email?: string | null;
+  business_name?: string | null;
+}
+
+export interface AdminNotification {
+  id: string;
+  type: string;
+  title: string;
+  body?: string | null;
+  conversation_id?: string | null;
+  is_read: boolean;
+  created_at: string;
+}

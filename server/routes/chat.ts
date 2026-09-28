@@ -848,6 +848,26 @@ export const markConversationAsRead: RequestHandler = async (
  * Returns an empty configured=false payload when the key is absent so clients
  * can hide the GIF tab and fall back to emoji stickers.
  */
+/**
+ * @swagger
+ * /chat/gifs:
+ *   get:
+ *     summary: Search trending Tenor GIFs for the chat GIF picker
+ *     description: Returns an empty configured=false payload when TENOR_API_KEY is absent so clients hide the GIF tab.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 16 }
+ *     responses:
+ *       200:
+ *         description: GIF objects or configured=false
+ */
 export const searchChatGifs: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const apiKey = process.env.TENOR_API_KEY;
@@ -894,6 +914,34 @@ export const searchChatGifs: RequestHandler = async (req: AuthenticatedRequest, 
  * Storage chain: Cloudflare R2 -> Cloudinary -> local /uploads.
  * Returns a URL + metadata that can be passed to the send-message endpoint as
  * { attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType }.
+ */
+/**
+ * @swagger
+ * /chat/media:
+ *   post:
+ *     summary: Upload chat media (images, videos, audio, documents, GIFs)
+ *     description: >
+ *       Multipart upload used by the WhatsApp-style chat attachments and voice
+ *       notes. Storage chain: Cloudflare R2 -> Cloudinary -> local /uploads.
+ *       Returns a URL + metadata to pass to the send-message endpoint as
+ *       { attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType }.
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *                 description: Up to 100MB
+ *     responses:
+ *       200:
+ *         description: Uploaded media metadata (url, attachmentType, size...)
  */
 export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest, res) => {
   chatMediaMiddleware(req as any, res as any, async (err: any) => {

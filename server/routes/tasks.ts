@@ -1,10 +1,40 @@
 import { RequestHandler } from "express";
+import multer from "multer";
 import { query } from "../db";
 import { CreateTaskInput, BulkTaskInput, Task, ApiResponse, EpicCounts } from "@shared/api";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { logActivity } from "../services/activity";
 import { sendTaskNotification } from "../services/email";
 import { isOverdue } from "../utils/date";
+import { uploadMediaBuffer } from "../services/media-upload";
+
+// ---------------------------------------------------------------------------
+// Task file attachments (same pipeline as chat media: R2 -> Cloudinary -> local)
+// ---------------------------------------------------------------------------
+
+const TASK_ATTACHMENT_MAX_MB = 50;
+const TASK_ATTACHMENT_MAX_FILES = 10;
+
+const taskAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: TASK_ATTACHMENT_MAX_MB * 1024 * 1024,
+    files: TASK_ATTACHMENT_MAX_FILES,
+  },
+});
+
+export const taskAttachmentMiddleware = taskAttachmentUpload.array("files", TASK_ATTACHMENT_MAX_FILES);
+
+const ATTACHMENT_AGG_SELECT = `att.attachments as "attachments"`;
+const ATTACHMENT_AGG_JOIN = `
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(json_agg(json_build_object(
+           'id', a.id, 'fileName', a.file_name, 'fileType', a.file_type,
+           'fileSize', a.file_size, 'fileUrl', a.file_url, 'isImage', a.is_image,
+           'uploadedBy', a.uploaded_by, 'createdAt', a.created_at
+         ) ORDER BY a.created_at ASC), '[]'::json) AS attachments
+         FROM attachments a WHERE a.task_id = t.id
+       ) att ON TRUE`;
 
 export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
@@ -46,11 +76,13 @@ export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) =
         t.start_date as "startDate", t.end_date as "endDate",
         t.due_date as "dueDate", t.status, t.is_overdue as "isOverdue",
         t.created_at as "createdAt", t.updated_at as "updatedAt",
-        array_agg(ta.user_id) FILTER (WHERE ta.user_id IS NOT NULL) as "assignedTo"
+        array_agg(ta.user_id) FILTER (WHERE ta.user_id IS NOT NULL) as "assignedTo",
+        ${ATTACHMENT_AGG_SELECT}
        FROM tasks t
        LEFT JOIN task_assignments ta ON t.id = ta.task_id
+       ${ATTACHMENT_AGG_JOIN}
        WHERE t.business_id = $1
-       GROUP BY t.id
+       GROUP BY t.id, att.attachments
        ORDER BY t.created_at DESC`,
       [businessId]
     );
@@ -186,11 +218,13 @@ export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) =
         t.start_date as "startDate", t.end_date as "endDate",
         t.due_date as "dueDate", t.status, t.is_overdue as "isOverdue",
         t.created_at as "createdAt", t.updated_at as "updatedAt",
-        array_agg(ta.user_id) FILTER (WHERE ta.user_id IS NOT NULL) as "assignedTo"
+        array_agg(ta.user_id) FILTER (WHERE ta.user_id IS NOT NULL) as "assignedTo",
+        ${ATTACHMENT_AGG_SELECT}
        FROM tasks t
        LEFT JOIN task_assignments ta ON t.id = ta.task_id
+       ${ATTACHMENT_AGG_JOIN}
        ${whereClause}
-       GROUP BY t.id
+       GROUP BY t.id, att.attachments
        ORDER BY t.created_at DESC
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
       params,
@@ -1218,5 +1252,213 @@ export const deleteTask: RequestHandler = async (req: AuthenticatedRequest, res)
       error: "Failed to delete task",
     };
     res.status(500).json(response);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Task attachment endpoints (WhatsApp-style uploads for the task feature)
+// ---------------------------------------------------------------------------
+
+/**
+ * @swagger
+ * /tasks/{id}/attachments:
+ *   post:
+ *     summary: Upload file attachments to a task (images, videos, documents)
+ *     tags: [Tasks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               files:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: binary
+ *                 description: Up to 10 files, 50MB each
+ *     responses:
+ *       200:
+ *         description: Uploaded attachments
+ *       400:
+ *         description: No files provided / task not found
+ */
+export const uploadTaskAttachments: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  taskAttachmentMiddleware(req as any, res as any, async (err: any) => {
+    if (err) {
+      const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
+      const tooMany = err?.code === "LIMIT_UNEXPECTED_FILE";
+      return res.status(400).json({
+        success: false,
+        error: isTooLarge
+          ? `Each file must be ${TASK_ATTACHMENT_MAX_MB}MB or smaller`
+          : tooMany
+            ? `You can attach up to ${TASK_ATTACHMENT_MAX_FILES} files at once`
+            : err.message || "File upload error",
+      });
+    }
+    try {
+      const businessId = req.user?.businessId;
+      const userId = req.user?.userId;
+      if (!businessId || !userId) {
+        return res.status(401).json({ success: false, error: "User authentication required" });
+      }
+      const taskId = String(req.params.id || "");
+      const taskCheck = await query(
+        `SELECT id, title FROM tasks WHERE id = $1 AND business_id = $2`,
+        [taskId, businessId],
+      );
+      if (taskCheck.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Task not found" });
+      }
+
+      const files = ((req as any).files || []) as Express.Multer.File[];
+      if (files.length === 0) {
+        return res.status(400).json({ success: false, error: "At least one file is required" });
+      }
+
+      const saved: any[] = [];
+      for (const file of files) {
+        const media = await uploadMediaBuffer({
+          buffer: file.buffer,
+          originalname: file.originalname,
+          mimeType: file.mimetype || "application/octet-stream",
+          folder: "task-attachments",
+          businessId,
+          userId,
+        });
+        const isImage = /^image\//i.test(media.mimeType || file.mimetype || "");
+        const insert = await query(
+          `INSERT INTO attachments (task_id, file_name, file_type, file_size, file_url, is_image, uploaded_by, business_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING id, file_name as "fileName", file_type as "fileType", file_size as "fileSize",
+                     file_url as "fileUrl", is_image as "isImage", uploaded_by as "uploadedBy", created_at as "createdAt"`,
+          [taskId, media.filename, media.mimeType, media.size, media.url, isImage, userId, businessId],
+        );
+        saved.push(insert.rows[0]);
+      }
+
+      await logActivity({
+        businessId,
+        userId,
+        action: "task_attachment_uploaded",
+        actionType: "task",
+        description: `${saved.length} attachment(s) added to "${taskCheck.rows[0].title}"`,
+        taskId,
+      }).catch(() => {});
+
+      const response: ApiResponse<any> = {
+        success: true,
+        data: { attachments: saved },
+      };
+      res.json(response);
+    } catch (error) {
+      console.error("Upload task attachments error:", error);
+      res.status(500).json({ success: false, error: "Failed to upload attachments" });
+    }
+  });
+};
+
+/**
+ * @swagger
+ * /tasks/{id}/attachments:
+ *   get:
+ *     summary: List a task's file attachments
+ *     tags: [Tasks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Attachment list
+ */
+export const getTaskAttachments: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    if (!businessId) {
+      return res.status(401).json({ success: false, error: "User authentication required" });
+    }
+    const taskId = String(req.params.id || "");
+    const result = await query(
+      `SELECT a.id, a.file_name as "fileName", a.file_type as "fileType", a.file_size as "fileSize",
+              a.file_url as "fileUrl", a.is_image as "isImage", a.uploaded_by as "uploadedBy",
+              a.created_at as "createdAt", u.name as "uploadedByName"
+       FROM attachments a
+       LEFT JOIN users u ON u.id = a.uploaded_by
+       JOIN tasks t ON t.id = a.task_id
+       WHERE a.task_id = $1 AND t.business_id = $2
+       ORDER BY a.created_at ASC`,
+      [taskId, businessId],
+    );
+    const response: ApiResponse<any> = {
+      success: true,
+      data: { attachments: result.rows },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get task attachments error:", error);
+    res.status(500).json({ success: false, error: "Failed to load attachments" });
+  }
+};
+
+/**
+ * @swagger
+ * /tasks/attachments/{attachmentId}:
+ *   delete:
+ *     summary: Delete a task attachment (uploader or business admin only)
+ *     tags: [Tasks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: attachmentId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Attachment deleted
+ *       404:
+ *         description: Attachment not found
+ */
+export const deleteTaskAttachment: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(401).json({ success: false, error: "User authentication required" });
+    }
+    const attachmentId = String(req.params.attachmentId || "");
+    const attachment = await query(
+      `SELECT a.id, a.uploaded_by, a.task_id FROM attachments a
+       JOIN tasks t ON t.id = a.task_id
+       WHERE a.id = $1 AND t.business_id = $2`,
+      [attachmentId, businessId],
+    );
+    if (attachment.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Attachment not found" });
+    }
+    const row = attachment.rows[0];
+    // Only the uploader or a business admin may delete an attachment
+    if (row.uploaded_by !== userId && (req.user as any)?.role !== "admin") {
+      return res.status(403).json({ success: false, error: "You can only delete attachments you uploaded" });
+    }
+    await query(`DELETE FROM attachments WHERE id = $1`, [attachmentId]);
+    const response: ApiResponse<null> = { success: true };
+    res.json(response);
+  } catch (error) {
+    console.error("Delete task attachment error:", error);
+    res.status(500).json({ success: false, error: "Failed to delete attachment" });
   }
 };

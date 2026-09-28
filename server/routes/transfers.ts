@@ -5,7 +5,9 @@ import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
 import { accountLookup, processAllPending } from "../services/transfer";
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
+import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet } from "../services/fees";
+import { getIntlTransferConfig } from "../services/app-config";
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
@@ -17,6 +19,86 @@ const router = express.Router();
 
 // Helper to generate reference if util doesn't exist
 const genRef = () => `TRF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+/**
+ * GET /transfers/quote
+ * International payout quote: live Flutterwave rate + admin markup + fees.
+ * Query: amount (destination-currency amount), source_currency (default NGN),
+ *        destination_currency (default USD)
+ * Response: live_rate, marked_up_rate, receiving_amount, fee, total_debit (source currency)
+ */
+router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const amount = Number(req.query.amount);
+    const sourceCurrency = (String(req.query.source_currency || 'NGN')).toUpperCase();
+    const destinationCurrency = (String(req.query.destination_currency || 'USD')).toUpperCase();
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "amount query parameter is required and must be positive" });
+    }
+
+    // Same-currency payout: no FX needed, just fees.
+    if (sourceCurrency === destinationCurrency) {
+      const config = await getIntlTransferConfig();
+      const fee = config.feePercent > 0
+        ? Math.round(amount * (config.feePercent / 100) * 100) / 100
+        : 0 + (config.feeFlat > 0 ? config.feeFlat : 0);
+      return res.json({
+        success: true,
+        data: {
+          source_currency: sourceCurrency,
+          destination_currency: destinationCurrency,
+          amount,
+          live_rate: 1,
+          markup_percent: config.markupPercent,
+          marked_up_rate: 1,
+          receiving_amount: amount,
+          fee,
+          total_debit: Math.round((amount + fee) * 100) / 100,
+          provider: 'internal',
+        },
+      });
+    }
+
+    const providerName = await getActiveTransferProviderName();
+    if (providerName !== 'flutterwave') {
+      return res.status(400).json({ success: false, error: "International payouts are only available via Flutterwave. Ask an admin to toggle the Flutterwave provider." });
+    }
+
+    const { rate } = await getFlutterwaveTransferRate(amount, sourceCurrency, destinationCurrency);
+    const config = await getIntlTransferConfig();
+
+    // Admin markup is added ON TOP of the live rate and shown to the user
+    const markedUpRate = rate * (1 + config.markupPercent / 100);
+    // The recipient receives the amount in destination currency at the marked-up rate
+    // (the user asks to send `amount` in the DESTINATION currency, so the debit
+    // is computed as amount / markedUpRate in source currency).
+    const sourceDebit = amount / markedUpRate;
+    const fee = Math.round(
+      (sourceDebit * (config.feePercent / 100) + config.feeFlat) * 100,
+    ) / 100;
+    const totalDebit = Math.round((sourceDebit + fee) * 100) / 100;
+
+    res.json({
+      success: true,
+      data: {
+        source_currency: sourceCurrency,
+        destination_currency: destinationCurrency,
+        amount,
+        live_rate: rate,
+        markup_percent: config.markupPercent,
+        marked_up_rate: Math.round(markedUpRate * 1000000) / 1000000,
+        receiving_amount: amount,
+        fee,
+        total_debit: totalDebit,
+        provider: 'flutterwave',
+      },
+    });
+  } catch (error: any) {
+    console.error("Transfer quote error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch quote" });
+  }
+});
 
 /**
  * @swagger
@@ -376,9 +458,15 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  */
 router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { bankCode, accountNumber, accountName, amount, remark, otp, pin, wallet_id, walletId: camelWalletId } = req.body;
+    const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
+    const currency = (requestCurrency || 'NGN').toUpperCase();
+    // International payouts: debitAmount/debitCurrency come from the /quote
+    // endpoint (source-currency total the user actually pays).
+    const hasDebit = debitAmount != null && Number(debitAmount) > 0;
+    const dbDebitAmount = hasDebit ? Number(debitAmount) : null;
+    const dbDebitCurrency = hasDebit ? (debitCurrency || 'NGN').toUpperCase() : null;
 
     // Get business settings
     const businessRes = await query(
@@ -437,8 +525,8 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       else return res.status(400).json({ success: false, error: "Wallet ID required" });
     }
 
-    // Calculate Fee
-    const fee = await calculateFee(amount, 'transfer');
+    // Calculate Fee (international payouts use the intl_transfer fee config)
+    const fee = await calculateFee(amount, currency === 'NGN' ? 'transfer' : 'intl_transfer');
     const reference = genRef();
     const defaultProvider = await getActiveTransferProviderName();
 
@@ -448,10 +536,10 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // Queue Transfer
     const insertRes = await query(
       `INSERT INTO transfer_queue 
-      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by)
-      VALUES ($1, $2, $3, $4, $5, $6, 'NGN', $7, 'manual', null, 'pending', $8, $9, $10, $11, $12)
+      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15)
       RETURNING *`,
-      [businessId, reference, accountNumber, bankCode, accountName, amount, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId]
+      [businessId, reference, accountNumber, bankCode, accountName, amount, currency, dbDebitAmount, dbDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId]
     );
 
     // Log audit event
@@ -789,6 +877,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
     }
 
     let transfersToQueue: any[] = [];
+    let unverifiedEmployees: any[] = [];
 
     // 1. Prepare transfers based on type
     if (type === 'Epic') {
@@ -800,22 +889,34 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         ...item,
         sourceType: 'Epic',
         sourceId: null,
-        fee: await calculateFee(item.amount, 'transfer')
+        debitAmount: item.debitAmount || item.debit_amount || null,
+        debitCurrency: item.debitCurrency || item.debit_currency || null,
+        fee: await calculateFee(item.amount, (item.currency || 'NGN').toUpperCase() === 'NGN' ? 'transfer' : 'intl_transfer')
       })));
 
     } else if (type === 'Salary') {
-      // Pay all active employees with salary_amount > 0
+      // Pay all active employees with salary_amount > 0.
+      // Only employees with VERIFIED recipient account details are queued;
+      // unverified ones are returned so the UI can flag them.
       const usersRes = await query(
-        `SELECT id, salary_amount, salary_currency, bank_code, account_number, account_name 
+        `SELECT id, name, salary_amount, salary_currency, bank_code, account_number, account_name,
+                verification_status, verified_account_name, bank_name, bank_country, swift_code, routing_number,
+                beneficiary_address, beneficiary_city, beneficiary_country
          FROM users 
          WHERE business_id = $1 AND status = 'active' AND salary_amount > 0`,
         [businessId]
       );
       
-      const users = usersRes.rows.filter(u => u.bank_code && u.account_number);
+      const users = usersRes.rows.filter((u: any) => u.bank_code && u.account_number);
+      unverifiedEmployees = users.filter((u: any) => u.verification_status !== 'verified').map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        verification_status: u.verification_status || 'unverified',
+      }));
+      const verifiedUsers = users.filter((u: any) => u.verification_status === 'verified');
 
       // Fetch pending adjustments for these users
-      const userIds = users.map(u => u.id);
+      const userIds = verifiedUsers.map((u: any) => u.id);
       let adjustmentsMap = new Map();
       
       if (userIds.length > 0) {
@@ -833,7 +934,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         });
       }
 
-      transfersToQueue = await Promise.all(users.map(async u => {
+      transfersToQueue = await Promise.all(verifiedUsers.map(async (u: any) => {
         let finalAmount = parseFloat(u.salary_amount);
         let remarks = ['Salary Payment'];
         const userAdjustments = adjustmentsMap.get(u.id) || [];
@@ -850,17 +951,18 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           }
         });
 
+        const empCurrency = (u.salary_currency || 'NGN').toUpperCase();
         return {
           amount: finalAmount > 0 ? finalAmount : 0,
-          currency: u.salary_currency,
+          currency: empCurrency,
           bankCode: u.bank_code,
           accountNumber: u.account_number,
-          accountName: u.account_name || 'Employee',
+          accountName: u.verified_account_name || u.account_name || u.name || 'Employee',
           remark: remarks.join('; '),
           sourceType: 'Salary',
           sourceId: u.id,
           adjustments: userAdjustments, // Pass along to mark as processed later
-          fee: await calculateFee(finalAmount > 0 ? finalAmount : 0, 'transfer')
+          fee: await calculateFee(finalAmount > 0 ? finalAmount : 0, empCurrency === 'NGN' ? 'transfer' : 'intl_transfer')
         };
       }));
 
@@ -869,7 +971,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
     }
 
     if (transfersToQueue.length === 0) {
-      return res.json({ success: true, message: "No eligible transfers found to queue", data: { queued: 0, transfers: [] } });
+      return res.json({ success: true, message: "No eligible transfers found to queue", data: { queued: 0, transfers: [], unverified_employees: unverifiedEmployees } });
     }
 
     // 2. Insert into transfer_queue
@@ -880,8 +982,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
       const transferRes = await query(
         `INSERT INTO transfer_queue 
-        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13)
+        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15)
         RETURNING *`,
         [
           businessId,
@@ -891,6 +993,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.accountName,
           t.amount,
           t.currency || 'NGN',
+          t.debitAmount != null && Number(t.debitAmount) > 0 ? Number(t.debitAmount) : null,
+          t.debitCurrency ? String(t.debitCurrency).toUpperCase() : null,
           t.remark,
           t.sourceType,
           t.sourceId,
@@ -989,6 +1093,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         type,
         walletId,
         summary: statusCounts,
+        unverified_employees: unverifiedEmployees,
         totals: {
           amount: totalAmount,
           fee: totalFee,
@@ -1093,7 +1198,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const businessId = req.user?.businessId;
-    const { search, status, startDate, endDate, page = 1, limit = 20 } = req.query;
+    const { search, status, startDate, endDate, walletId, direction, type, minAmount, maxAmount, page = 1, limit = 20, format } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
     // Build query for transfer_queue (existing)
@@ -1147,6 +1252,53 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     let txParams: any[] = [businessId];
     let txParamIdx = 2;
 
+    // Wallet filter: restrict to a specific wallet (credits/debits of that wallet only)
+    if (walletId) {
+      tqQueryText += ` AND wallet_id = $${tqParamIdx}`;
+      tqParams.push(walletId);
+      tqParamIdx++;
+      txQueryText += ` AND wallet_id = $${txParamIdx}`;
+      txParams.push(walletId);
+      txParamIdx++;
+    }
+
+    // Direction filter: 'debit' -> transfer_queue rows (outgoing payouts);
+    // 'credit' -> transaction rows with direction = credit
+    if (direction === 'debit' || direction === 'credit') {
+      if (direction === 'debit') {
+        tqQueryText += ` AND amount > 0`;
+        txQueryText += ` AND direction = 'debit' AND amount > 0`;
+      } else {
+        tqQueryText += ` AND 1 = 0`; // transfer_queue rows are outgoing debits
+        txQueryText += ` AND direction = 'credit'`;
+      }
+    }
+
+    // Transaction type filter (applies to transactions side only)
+    if (type) {
+      txQueryText += ` AND transaction_type = $${txParamIdx}`;
+      txParams.push(type);
+      txParamIdx++;
+    }
+
+    // Amount range filters
+    if (minAmount) {
+      tqQueryText += ` AND amount >= $${tqParamIdx}`;
+      tqParams.push(Number(minAmount));
+      tqParamIdx++;
+      txQueryText += ` AND amount >= $${txParamIdx}`;
+      txParams.push(Number(minAmount));
+      txParamIdx++;
+    }
+    if (maxAmount) {
+      tqQueryText += ` AND amount <= $${tqParamIdx}`;
+      tqParams.push(Number(maxAmount));
+      tqParamIdx++;
+      txQueryText += ` AND amount <= $${txParamIdx}`;
+      txParams.push(Number(maxAmount));
+      txParamIdx++;
+    }
+
     // Apply filters to both queries
     if (search) {
       // Transfer Queue: search by recipient_name, recipient_account, reference
@@ -1194,6 +1346,9 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
       txParamIdx++;
     }
 
+    // Exclude platform/revenue internal rows - users see their own ledger only
+    txQueryText += ` AND transaction_type NOT IN ('platform')`;
+
     // Execute both queries
     const [tqResult, txResult] = await Promise.all([
       query(tqQueryText, tqParams),
@@ -1227,6 +1382,34 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
 
     // Calculate total for pagination
     const total = allItems.length;
+
+    // CSV export (honours every filter above, ignores pagination)
+    if (format === 'csv') {
+      const esc = (v: any) => {
+        const s = v === null || v === undefined ? '' : String(v);
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const header = ['Date', 'Direction', 'Type', 'Reference', 'Recipient', 'Amount', 'Currency', 'Fee', 'Status', 'Description'];
+      const lines = [header.join(',')];
+      for (const item of allItems) {
+        const isTq = item.source === 'transfer_queue';
+        lines.push([
+          esc(item.created_at),
+          esc(isTq ? 'debit' : (item.direction || 'credit')),
+          esc(isTq ? 'transfer' : item.transaction_type),
+          esc(item.reference),
+          esc(isTq ? `${item.recipient_name || ''} ${item.recipient_account || ''}`.trim() : ''),
+          esc(item.amount),
+          esc(item.currency || 'NGN'),
+          esc(item.fee ?? 0),
+          esc(item.status),
+          esc(isTq ? item.remark : item.description),
+        ].join(','));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="transfer-history-${new Date().toISOString().slice(0, 10)}.csv"`);
+      return res.send(lines.join('\n'));
+    }
 
     // Apply pagination manually
     const paginatedItems = allItems.slice(offset, offset + Number(limit));

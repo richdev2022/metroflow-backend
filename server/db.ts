@@ -489,6 +489,9 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS transaction_pin_hash VARCHAR(255)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_enabled BOOLEAN DEFAULT TRUE`);
 
+    // User-configurable display timezone (IANA name) for date/time rendering
+    await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'UTC'`);
+
     // Create transactions table
     await query(`
       CREATE TABLE IF NOT EXISTS transactions (

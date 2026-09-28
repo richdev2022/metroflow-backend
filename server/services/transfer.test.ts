@@ -137,10 +137,10 @@ describe('processAllPending', () => {
         await processAllPending(businessId);
 
         // Verifications via mocked modules
-        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
-        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
-        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
+        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
 
         // verifySingleTransfer should NOT have been called since we determined immediate status = success
         // (mockVerifyTransfer is the provider.verifyTransfer call)
@@ -208,13 +208,13 @@ describe('processAllPending', () => {
         await processAllPending(businessId);
 
         // Verifications: Debit side should have been called
-        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
-        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
 
         // Refund side should reverse everything
-        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN');
-        expect(fees.debitRevenueWallet).toHaveBeenCalledWith(10, 'NGN');
+        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        expect(fees.debitRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
 
         // verifySingleTransfer should NOT have been called since we determined immediate status = failed
         expect(mockVerifyTransfer).not.toHaveBeenCalled();

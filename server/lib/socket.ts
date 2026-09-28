@@ -285,11 +285,112 @@ export function initSocketServer(server: http.Server): void {
     next();
   });
 
-  // In-memory waiting-room queues: roomId -> Map<participantId, entry>
+  // Waiting-room queues: roomId -> Map<participantId, entry>.
+  // BACKED BY REDIS when available so hosts and participants land on the SAME
+  // queue even when Socket.IO spreads connections across PM2 cluster workers
+  // (the Redis adapter broadcasts events cross-worker, but a plain in-memory
+  // Map made the host's admit hit a DIFFERENT worker with an empty queue ->
+  // "approved but participant still stuck in the waiting room").
+  // Falls back to in-memory when Redis is unavailable (single process).
+  type WaitingEntry = {
+    participantId: string;
+    socketId: string;
+    userName: string;
+    isGuest: boolean;
+    since: number;
+  };
   const waitingRooms = new Map<
     string,
-    Map<string, { participantId: string; socketId: string; userName: string; isGuest: boolean; since: number }>
+    Map<string, WaitingEntry>
   >();
+
+  const WAITING_KEY_TTL_SECONDS = 60 * 60; // 1h safety net for abandoned queues
+  const waitingKey = (roomId: string) => `waitingroom:${roomId}`;
+  const admittedKey = (roomId: string) => `waitingroom:admitted:${roomId}`;
+
+  const wrRedisReady = () => isRedisReady();
+
+  async function wrSet(roomId: string, participantId: string, entry: WaitingEntry): Promise<void> {
+    if (wrRedisReady()) {
+      try {
+        await redisClient.hset(waitingKey(roomId), participantId, JSON.stringify(entry));
+        await redisClient.expire(waitingKey(roomId), WAITING_KEY_TTL_SECONDS);
+        return;
+      } catch (err) {
+        logger.error("waiting-room redis hset failed, falling back to memory:", err);
+      }
+    }
+    getWaitingQueue(roomId).set(participantId, entry);
+  }
+
+  async function wrGet(roomId: string, participantId: string): Promise<WaitingEntry | null> {
+    if (wrRedisReady()) {
+      try {
+        const raw = await redisClient.hget(waitingKey(roomId), participantId);
+        return raw ? (JSON.parse(raw) as WaitingEntry) : null;
+      } catch (err) {
+        logger.error("waiting-room redis hget failed, falling back to memory:", err);
+      }
+    }
+    return getWaitingQueue(roomId).get(participantId) || null;
+  }
+
+  async function wrDelete(roomId: string, participantId: string): Promise<void> {
+    if (wrRedisReady()) {
+      try {
+        await redisClient.hdel(waitingKey(roomId), participantId);
+        return;
+      } catch (err) {
+        logger.error("waiting-room redis hdel failed, falling back to memory:", err);
+      }
+    }
+    getWaitingQueue(roomId).delete(participantId);
+  }
+
+  async function wrList(roomId: string): Promise<WaitingEntry[]> {
+    if (wrRedisReady()) {
+      try {
+        const raw = await redisClient.hgetall(waitingKey(roomId));
+        return Object.values(raw)
+          .map((v) => {
+            try { return JSON.parse(v) as WaitingEntry; } catch { return null; }
+          })
+          .filter((e): e is WaitingEntry => !!e)
+          .sort((a, b) => a.since - b.since);
+      } catch (err) {
+        logger.error("waiting-room redis hgetall failed, falling back to memory:", err);
+      }
+    }
+    return Array.from(getWaitingQueue(roomId).values()).sort((a, b) => a.since - b.since);
+  }
+
+  // Mark a participant as admitted (server-side enforcement gate for call:join)
+  async function wrMarkAdmitted(roomId: string, participantId: string): Promise<void> {
+    if (!wrRedisReady()) return;
+    try {
+      await redisClient.sadd(admittedKey(roomId), participantId);
+      await redisClient.expire(admittedKey(roomId), 2 * 60 * 60);
+    } catch (err) {
+      logger.error("waiting-room sadd admitted failed:", err);
+    }
+  }
+
+  async function wrIsAdmitted(roomId: string, participantId: string): Promise<boolean> {
+    if (!wrRedisReady()) return false;
+    try {
+      return (await redisClient.sismember(admittedKey(roomId), participantId)) === 1;
+    } catch (err) {
+      logger.error("waiting-room sismember failed:", err);
+      return false;
+    }
+  }
+
+  async function wrConsumeAdmission(roomId: string, participantId: string): Promise<void> {
+    if (!wrRedisReady()) return;
+    try {
+      await redisClient.srem(admittedKey(roomId), participantId);
+    } catch (_) { /* non-fatal */ }
+  }
 
   // Same-account multi-device tracking: roomId -> (socketId -> userId).
   // roomManager dedupes participants by userId, so a second device joining
@@ -357,13 +458,57 @@ export function initSocketServer(server: http.Server): void {
     return q;
   };
 
-  const queueToArray = (roomId: string) =>
-    Array.from(getWaitingQueue(roomId).values()).map((e) => ({
+  const queueToArray = (entries: WaitingEntry[]) =>
+    entries.map((e) => ({
       participantId: e.participantId,
       userName: e.userName,
       isGuest: e.isGuest,
       since: e.since,
     }));
+
+  // Shared waiting-room request logic used by BOTH the explicit
+  // `waiting-room:request` event and the server-side enforcement inside
+  // call:join/meeting:join. Upserting by participantId means a reconnecting
+  // client simply refreshes its socketId instead of being orphaned.
+  async function enqueueWaitingParticipant(
+    socket: any,
+    resolvedRoomId: string,
+    socketId: string,
+    participantId: string,
+    userName: string,
+    isGuest: boolean,
+  ): Promise<WaitingEntry> {
+    const entry: WaitingEntry = {
+      participantId,
+      socketId,
+      userName: userName || "Guest",
+      isGuest,
+      since: Date.now(),
+    };
+    await wrSet(resolvedRoomId, participantId, entry);
+    socket.data.waitingRoom = true;
+    socket.data.waitingRoomId = resolvedRoomId;
+
+    io.to(`room:${resolvedRoomId}`).emit("waiting-room:pending", {
+      roomId: resolvedRoomId,
+      participantId: entry.participantId,
+      userId: entry.participantId,
+      userName: entry.userName,
+      participantName: entry.userName,
+      isGuest: entry.isGuest,
+    });
+    io.to(`meeting:${resolvedRoomId}`).emit("waiting-room:pending", {
+      roomId: resolvedRoomId,
+      meetingId: resolvedRoomId,
+      participantId: entry.participantId,
+      userId: entry.participantId,
+      userName: entry.userName,
+      participantName: entry.userName,
+      isGuest: entry.isGuest,
+    });
+    logger.info(`Waiting-room request: ${entry.userName} (${entry.participantId}) -> room ${resolvedRoomId}`);
+    return entry;
+  }
 
   io.on("connection", (socket) => {
     logger.info(`Socket connected: ${socket.id}${socket.data.authenticated ? ` (user ${socket.data.userId})` : " (guest)"}`);
@@ -485,10 +630,11 @@ export function initSocketServer(server: http.Server): void {
 
         let endsAt: Date | null = null;
         let maxMeetingDuration: number | null = null;
+        let waitingRoomEnabled = false;
 
         if (isCall) {
           const callResult = await query(
-            `SELECT c.ended_at as "endedAt", pp.max_meeting_duration as "maxMeetingDuration" 
+            `SELECT c.ended_at as "endedAt", c.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
              FROM calls c
              LEFT JOIN businesses b ON c.business_id = b.id
              LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -499,10 +645,11 @@ export function initSocketServer(server: http.Server): void {
             const callRow = callResult.rows[0];
             endsAt = callRow.endedAt ? new Date(callRow.endedAt) : null;
             maxMeetingDuration = callRow.maxMeetingDuration;
+            waitingRoomEnabled = !!callRow.waitingRoomEnabled;
           }
         } else {
           const meetingResult = await query(
-            `SELECT m.end_time as "endedAt", pp.max_meeting_duration as "maxMeetingDuration" 
+            `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
              FROM meetings m
              LEFT JOIN businesses b ON m.business_id = b.id
              LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -513,10 +660,44 @@ export function initSocketServer(server: http.Server): void {
             const meetingRow = meetingResult.rows[0];
             endsAt = meetingRow.endedAt ? new Date(meetingRow.endedAt) : null;
             maxMeetingDuration = meetingRow.maxMeetingDuration;
+            waitingRoomEnabled = !!meetingRow.waitingRoomEnabled;
           }
         }
 
         const isGuest = !!data.isGuest || String(data.userId || "").startsWith("guest-");
+
+        // -----------------------------------------------------------------
+        // Server-side waiting-room enforcement. Only applied when the client
+        // advertises support (waitingRoomSupport: true) so older clients keep
+        // working unchanged. The host always bypasses; an admitted participant
+        // consumes their admission grant and proceeds.
+        // -----------------------------------------------------------------
+        const supportsWaitingRoom = (data as any).waitingRoomSupport === true;
+        if (supportsWaitingRoom && waitingRoomEnabled && !data.isHost) {
+          const isAdmitted = await wrIsAdmitted(resolvedRoomId, data.userId);
+          if (!isAdmitted) {
+            const existing = await wrGet(resolvedRoomId, data.userId);
+            if (!existing) {
+              await enqueueWaitingParticipant(
+                socket,
+                resolvedRoomId,
+                socket.id,
+                data.userId,
+                data.userName,
+                isGuest,
+              );
+            } else {
+              // Reconnect while waiting: refresh the socket binding without
+              // spamming the host with another pending notification.
+              await wrSet(resolvedRoomId, data.userId, { ...existing, socketId: socket.id });
+              socket.data.waitingRoom = true;
+              socket.data.waitingRoomId = resolvedRoomId;
+            }
+            if (callback) callback({ success: true, waitingRoom: true, roomId: resolvedRoomId, participantId: data.userId });
+            return;
+          }
+          await wrConsumeAdmission(resolvedRoomId, data.userId);
+        }
 
         roomManager.addParticipant(resolvedRoomId, {
           id: data.userId,
@@ -556,9 +737,9 @@ export function initSocketServer(server: http.Server): void {
         // Push the current waiting-room queue to joining hosts so a host who
         // enters after requests were made immediately sees the admit list.
         if (data.isHost) {
-          const q = waitingRooms.get(resolvedRoomId);
-          if (q && q.size > 0) {
-            socket.emit("waiting-room:queue", { roomId: resolvedRoomId, queue: queueToArray(resolvedRoomId) });
+          const entries = await wrList(resolvedRoomId);
+          if (entries.length > 0) {
+            socket.emit("waiting-room:queue", { roomId: resolvedRoomId, queue: queueToArray(entries) });
           }
         }
 
@@ -784,29 +965,16 @@ export function initSocketServer(server: http.Server): void {
         const participantId = data.userId || `guest-${socket.id.slice(0, 8)}`;
         const userName = data.userName || "Guest";
 
-        const queue = getWaitingQueue(resolvedRoomId);
-        queue.set(participantId, {
-          participantId,
-          socketId: socket.id,
-          userName,
-          isGuest: !!data.isGuest || participantId.startsWith("guest-"),
-          since: Date.now(),
-        });
-        socket.data.waitingRoom = true;
-        socket.data.waitingRoomId = resolvedRoomId;
-
-        const entry = {
-          roomId: resolvedRoomId,
+        const entry = await enqueueWaitingParticipant(
+          socket,
+          resolvedRoomId,
+          socket.id,
           participantId,
           userName,
-          isGuest: queue.get(participantId)!.isGuest,
-        };
+          !!data.isGuest || participantId.startsWith("guest-"),
+        );
 
-        // Notify everyone already in the room (hosts & participants)
-        io.to(`room:${resolvedRoomId}`).emit("waiting-room:pending", entry);
-        io.to(`meeting:${resolvedRoomId}`).emit("waiting-room:pending", entry);
-        if (callback) callback({ success: true, ...entry });
-        logger.info(`Waiting-room request: ${userName} (${participantId}) -> room ${resolvedRoomId}`);
+        if (callback) callback({ success: true, roomId: resolvedRoomId, participantId: entry.participantId, userName: entry.userName });
       } catch (error) {
         logger.error("Error handling waiting-room request:", error);
         if (callback) callback({ success: false, error: "Server error" });
@@ -820,23 +988,34 @@ export function initSocketServer(server: http.Server): void {
           if (callback) callback({ queue: [] });
           return;
         }
-        if (callback) callback({ roomId: resolved.id, queue: queueToArray(resolved.id) });
+        const entries = await wrList(resolved.id);
+        if (callback) callback({ roomId: resolved.id, queue: queueToArray(entries) });
       } catch (error) {
         logger.error("Error getting waiting-room queue:", error);
         if (callback) callback({ queue: [] });
       }
     });
 
-    socket.on("waiting-room:admit", async (data: { roomId?: string; meetingId?: string; participantId: string }) => {
+    socket.on("waiting-room:admit", async (data: { roomId?: string; meetingId?: string; participantId: string }, callback?: (response: any) => void) => {
       try {
         const roomIdInput = data.roomId || data.meetingId || "";
         const resolved = await resolveRoomId(roomIdInput);
-        if (!resolved) return;
+        if (!resolved) {
+          if (callback) callback({ success: false, error: "Room not found" });
+          return;
+        }
         const resolvedRoomId = resolved.id;
-        const queue = getWaitingQueue(resolvedRoomId);
-        const entry = queue.get(data.participantId);
-        if (!entry) return;
-        queue.delete(data.participantId);
+        const entry = await wrGet(resolvedRoomId, data.participantId);
+        if (!entry) {
+          // Participant may have connected through another worker, retried, or
+          // dropped. Tell the host so their UI can drop the stale entry.
+          if (callback) callback({ success: false, error: "Participant is no longer waiting" });
+          const entries = await wrList(resolvedRoomId);
+          io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", { roomId: resolvedRoomId, queue: queueToArray(entries) });
+          return;
+        }
+        await wrDelete(resolvedRoomId, data.participantId);
+        await wrMarkAdmitted(resolvedRoomId, data.participantId);
 
         io.to(entry.socketId).emit("waiting-room:admitted", {
           roomId: resolvedRoomId,
@@ -844,49 +1023,64 @@ export function initSocketServer(server: http.Server): void {
           participantId: entry.participantId,
           userName: entry.userName,
         });
+        const entries = await wrList(resolvedRoomId);
         io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
           roomId: resolvedRoomId,
-          queue: queueToArray(resolvedRoomId),
+          queue: queueToArray(entries),
         });
+        if (callback) callback({ success: true });
         logger.info(`Waiting-room admit: ${entry.userName} -> room ${resolvedRoomId}`);
       } catch (error) {
         logger.error("Error admitting participant:", error);
+        if (callback) callback({ success: false, error: "Server error" });
       }
     });
 
-    socket.on("waiting-room:deny", async (data: { roomId?: string; meetingId?: string; participantId: string }) => {
+    socket.on("waiting-room:deny", async (data: { roomId?: string; meetingId?: string; participantId: string }, callback?: (response: any) => void) => {
       try {
         const roomIdInput = data.roomId || data.meetingId || "";
         const resolved = await resolveRoomId(roomIdInput);
-        if (!resolved) return;
+        if (!resolved) {
+          if (callback) callback({ success: false, error: "Room not found" });
+          return;
+        }
         const resolvedRoomId = resolved.id;
-        const queue = getWaitingQueue(resolvedRoomId);
-        const entry = queue.get(data.participantId);
-        if (!entry) return;
-        queue.delete(data.participantId);
+        const entry = await wrGet(resolvedRoomId, data.participantId);
+        if (!entry) {
+          if (callback) callback({ success: false, error: "Participant is no longer waiting" });
+          return;
+        }
+        await wrDelete(resolvedRoomId, data.participantId);
 
         io.to(entry.socketId).emit("waiting-room:denied", {
           roomId: resolvedRoomId,
           meetingId: resolvedRoomId,
           participantId: entry.participantId,
         });
+        const entries = await wrList(resolvedRoomId);
         io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
           roomId: resolvedRoomId,
-          queue: queueToArray(resolvedRoomId),
+          queue: queueToArray(entries),
         });
+        if (callback) callback({ success: true });
       } catch (error) {
         logger.error("Error denying participant:", error);
+        if (callback) callback({ success: false, error: "Server error" });
       }
     });
 
-    socket.on("waiting-room:admit-all", async (data: { roomId?: string; meetingId?: string }) => {
+    socket.on("waiting-room:admit-all", async (data: { roomId?: string; meetingId?: string }, callback?: (response: any) => void) => {
       try {
         const roomIdInput = data.roomId || data.meetingId || "";
         const resolved = await resolveRoomId(roomIdInput);
-        if (!resolved) return;
+        if (!resolved) {
+          if (callback) callback({ success: false, error: "Room not found" });
+          return;
+        }
         const resolvedRoomId = resolved.id;
-        const queue = getWaitingQueue(resolvedRoomId);
-        for (const entry of queue.values()) {
+        const entries = await wrList(resolvedRoomId);
+        for (const entry of entries) {
+          await wrMarkAdmitted(resolvedRoomId, entry.participantId);
           io.to(entry.socketId).emit("waiting-room:admitted", {
             roomId: resolvedRoomId,
             meetingId: resolvedRoomId,
@@ -894,13 +1088,17 @@ export function initSocketServer(server: http.Server): void {
             userName: entry.userName,
           });
         }
-        queue.clear();
+        for (const entry of entries) {
+          await wrDelete(resolvedRoomId, entry.participantId);
+        }
         io.to(`room:${resolvedRoomId}`).emit("waiting-room:queue", {
           roomId: resolvedRoomId,
           queue: [],
         });
+        if (callback) callback({ success: true, admitted: entries.length });
       } catch (error) {
         logger.error("Error admitting all participants:", error);
+        if (callback) callback({ success: false, error: "Server error" });
       }
     });
 
@@ -1080,9 +1278,10 @@ export function initSocketServer(server: http.Server): void {
 
         let endsAt: Date | null = null;
         let maxMeetingDuration: number | null = null;
+        let waitingRoomEnabled = false;
 
         const meetingResult = await query(
-          `SELECT m.end_time as "endedAt", pp.max_meeting_duration as "maxMeetingDuration" 
+          `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
            FROM meetings m
            LEFT JOIN businesses b ON m.business_id = b.id
            LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -1094,6 +1293,33 @@ export function initSocketServer(server: http.Server): void {
           const meetingRow = meetingResult.rows[0];
           endsAt = meetingRow.endedAt ? new Date(meetingRow.endedAt) : null;
           maxMeetingDuration = meetingRow.maxMeetingDuration;
+          waitingRoomEnabled = !!meetingRow.waitingRoomEnabled;
+        }
+
+        // Server-side waiting-room enforcement (clients that advertise support)
+        const supportsWaitingRoom = (data as any).waitingRoomSupport === true;
+        if (supportsWaitingRoom && waitingRoomEnabled && !isHost) {
+          const isAdmitted = await wrIsAdmitted(resolvedMeetingId, userId);
+          if (!isAdmitted) {
+            const existing = await wrGet(resolvedMeetingId, userId);
+            if (!existing) {
+              await enqueueWaitingParticipant(
+                socket,
+                resolvedMeetingId,
+                socket.id,
+                userId,
+                userName,
+                String(userId || "").startsWith("guest-"),
+              );
+            } else {
+              await wrSet(resolvedMeetingId, userId, { ...existing, socketId: socket.id });
+              socket.data.waitingRoom = true;
+              socket.data.waitingRoomId = resolvedMeetingId;
+            }
+            if (callback) callback({ success: true, waitingRoom: true, meetingId: resolvedMeetingId, participantId: userId });
+            return;
+          }
+          await wrConsumeAdmission(resolvedMeetingId, userId);
         }
 
         roomManager.addParticipant(resolvedMeetingId, {
@@ -1127,9 +1353,9 @@ export function initSocketServer(server: http.Server): void {
         // Push the current waiting-room queue to joining hosts so a host who
         // enters after requests were made immediately sees the admit list.
         if (isHost) {
-          const q = waitingRooms.get(resolvedMeetingId);
-          if (q && q.size > 0) {
-            socket.emit("waiting-room:queue", { roomId: resolvedMeetingId, queue: queueToArray(resolvedMeetingId) });
+          const entries = await wrList(resolvedMeetingId);
+          if (entries.length > 0) {
+            socket.emit("waiting-room:queue", { roomId: resolvedMeetingId, queue: queueToArray(entries) });
           }
         }
 
@@ -1657,20 +1883,21 @@ export function initSocketServer(server: http.Server): void {
       // detection stays accurate after refreshes/crashes.
       untrackSocketFromAllRooms(socket.id);
 
-      // Remove from waiting-room queue if applicable
+      // Remove from waiting-room queue if applicable (only this socket's own
+      // entry — a reconnecting participant re-registered under a new socket id
+      // and must NOT be dropped when the OLD socket eventually disconnects).
       if (wasWaiting && waitingRoomId) {
-        const queue = waitingRooms.get(waitingRoomId);
-        if (queue) {
-          for (const [pid, entry] of queue.entries()) {
-            if (entry.socketId === socket.id) {
-              queue.delete(pid);
-              io.to(`room:${waitingRoomId}`).emit("waiting-room:queue", {
-                roomId: waitingRoomId,
-                queue: queueToArray(waitingRoomId),
-              });
-              break;
-            }
-          }
+        // The entry is keyed by participantId; find the entry bound to THIS
+        // socket (works for both redis-backed and memory-backed queues).
+        const entries = await wrList(waitingRoomId);
+        const own = entries.find((e) => e.socketId === socket.id);
+        if (own) {
+          await wrDelete(waitingRoomId, own.participantId);
+          const remaining = await wrList(waitingRoomId);
+          io.to(`room:${waitingRoomId}`).emit("waiting-room:queue", {
+            roomId: waitingRoomId,
+            queue: queueToArray(remaining),
+          });
         }
       }
 

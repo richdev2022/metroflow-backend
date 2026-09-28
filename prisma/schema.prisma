@@ -70,6 +70,7 @@ model Business {
   email                     String    @unique
   industry                  String?
   logoUrl                   String?   @map("logo_url")
+  timezone                  String?   @default("UTC")
   ownerId                   String?   @map("owner_id")
   kycStatus                 String    @default("none") @map("kyc_status")
   currency                  String    @default("NGN")

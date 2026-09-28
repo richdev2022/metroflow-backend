@@ -1,7 +1,8 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
-import { sendPayrollAdjustmentNotification } from "../services/email";
+import { sendPayrollAdjustmentNotification, sendEmail, generateInviteEmailHtml } from "../services/email";
+import crypto from "crypto";
 
 const router = express.Router();
 
@@ -615,6 +616,173 @@ router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePe
     } catch (error) {
         console.error("Update payroll config error:", error);
         res.status(500).json({ success: false, error: "Failed to update payroll config" });
+    }
+});
+
+/**
+ * Bulk employee import for payroll (Excel/CSV upload companion).
+ * The client parses the spreadsheet and posts normalized rows; this endpoint
+ * creates invited users (or updates existing ones) with their payroll details
+ * and sends invite emails best-effort.
+ */
+router.post("/employees/import", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId;
+        const userId = req.user?.userId;
+        const rows: any[] = Array.isArray(req.body?.employees) ? req.body.employees : [];
+
+        if (rows.length === 0) {
+            return res.status(400).json({ success: false, error: "employees array is required" });
+        }
+        if (rows.length > 500) {
+            return res.status(400).json({ success: false, error: "A maximum of 500 employees can be imported at once" });
+        }
+
+        const baseUrl =
+            process.env.CLIENT_URL ||
+            process.env.APP_BASE_URL ||
+            process.env.APP_URL ||
+            "https://metricorex.com";
+
+        const results: Array<Record<string, any>> = [];
+        let created = 0;
+        let updated = 0;
+        let failed = 0;
+
+        for (const [index, row] of rows.entries()) {
+            const rowResult: Record<string, any> = { row: index + 1 };
+            try {
+                const name = String(row.name || row.employee_name || '').trim();
+                const email = String(row.email || row.employee_email || '').trim().toLowerCase();
+                const role = String(row.role || row.job_title || 'Employee').trim() || 'Employee';
+                const salary = row.salary !== undefined && row.salary !== '' ? parseFloat(row.salary) : null;
+                const salaryCurrency = String(row.salary_currency || row.currency || 'NGN').trim().toUpperCase() || 'NGN';
+                const bankCode = row.bank_code || row.bankCode || null;
+                const bankAccountNumber = row.bank_account_number || row.account_number || row.bankAccountNumber || null;
+                const accountName = row.account_name || row.accountName || null;
+                const contractStartDate = row.contract_start_date || row.contractStartDate || null;
+
+                if (!name) throw new Error('Name is required');
+                if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('A valid email is required');
+                if (salary !== null && (isNaN(salary) || salary < 0)) throw new Error('Salary must be a positive number');
+
+                const existing = await query(
+                    `SELECT id, status FROM users WHERE business_id = $1 AND email = $2 LIMIT 1`,
+                    [businessId, email]
+                );
+
+                let memberId: string;
+                let status: string;
+                let inviteLink: string | null = null;
+                let emailSent = false;
+
+                if (existing.rows.length > 0) {
+                    // Existing member -> refresh payroll details only
+                    memberId = existing.rows[0].id;
+                    status = existing.rows[0].status;
+                    await query(
+                        `UPDATE users SET
+                            name = COALESCE($1, name),
+                            role = COALESCE($2, role),
+                            salary_amount = COALESCE($3, salary_amount),
+                            salary_currency = COALESCE($4, salary_currency),
+                            bank_code = COALESCE($5, bank_code),
+                            account_number = COALESCE($6, account_number),
+                            account_name = COALESCE($7, account_name),
+                            contract_start_date = COALESCE($8, contract_start_date),
+                            updated_at = CURRENT_TIMESTAMP
+                         WHERE id = $9`,
+                        [name, role, salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate, memberId]
+                    );
+                    updated += 1;
+                    rowResult.action = 'updated';
+                } else {
+                    // New member -> create invited user with a fresh invite token
+                    const inviteToken = crypto.randomBytes(32).toString("hex");
+                    const inviteExpiresAt = new Date();
+                    inviteExpiresAt.setDate(inviteExpiresAt.getDate() + 7);
+
+                    const inserted = await query(
+                        `INSERT INTO users
+                         (business_id, name, email, role, status, invite_token, invite_expires_at,
+                          salary_amount, salary_currency, bank_code, account_number, account_name, contract_start_date)
+                         VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11, $12)
+                         ON CONFLICT (business_id, email) DO UPDATE SET
+                           name = EXCLUDED.name,
+                           role = EXCLUDED.role,
+                           salary_amount = COALESCE(EXCLUDED.salary_amount, users.salary_amount),
+                           salary_currency = COALESCE(EXCLUDED.salary_currency, users.salary_currency),
+                           bank_code = COALESCE(EXCLUDED.bank_code, users.bank_code),
+                           account_number = COALESCE(EXCLUDED.account_number, users.account_number),
+                           account_name = COALESCE(EXCLUDED.account_name, users.account_name),
+                           contract_start_date = COALESCE(EXCLUDED.contract_start_date, users.contract_start_date)
+                         RETURNING id, status`,
+                        [businessId, name, email, role, inviteToken, inviteExpiresAt,
+                         salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate]
+                    );
+                    memberId = inserted.rows[0].id;
+                    status = inserted.rows[0].status;
+                    inviteLink = `${baseUrl}/accept-invite/${inviteToken}`;
+
+                    try {
+                        emailSent = await sendEmail(
+                            email,
+                            name,
+                            "You're Invited to Metricorex",
+                            generateInviteEmailHtml(name, inviteLink),
+                        );
+                    } catch (emailError) {
+                        console.error(`Payroll import invite email threw for ${email}:`, emailError);
+                    }
+                    created += 1;
+                    rowResult.action = 'created';
+                }
+
+                rowResult.success = true;
+                rowResult.id = memberId;
+                rowResult.status = status;
+                rowResult.name = name;
+                rowResult.email = email;
+                rowResult.emailSent = emailSent;
+                if (inviteLink) rowResult.inviteLink = inviteLink;
+            } catch (rowError: any) {
+                failed += 1;
+                rowResult.success = false;
+                rowResult.error = rowError?.message || 'Failed to import row';
+            }
+            results.push(rowResult);
+        }
+
+        try {
+            const { logActivity } = await import("../services/activity");
+            await logActivity({
+                businessId,
+                userId: userId!,
+                action: "import",
+                actionType: "payroll",
+                description: `Imported ${created + updated} payroll employees via Excel (${created} created, ${updated} updated, ${failed} failed)`,
+                metadata: { created, updated, failed },
+            });
+        } catch (logErr) {
+            console.warn("Failed to log payroll import activity:", logErr);
+        }
+
+        res.json({
+            success: failed < rows.length || rows.length > 0,
+            data: {
+                total: rows.length,
+                created,
+                updated,
+                failed,
+                results,
+            },
+            message: failed === rows.length && rows.length > 0
+                ? 'Import failed - no rows could be processed'
+                : `Imported ${created + updated} of ${rows.length} employees`,
+        });
+    } catch (error) {
+        console.error("Payroll employees import error:", error);
+        res.status(500).json({ success: false, error: "Failed to import employees" });
     }
 });
 

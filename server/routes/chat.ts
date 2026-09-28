@@ -3,6 +3,28 @@ import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { getSocketServer } from "../lib/socket";
+import { r2Storage } from "../lib/storage";
+import multer from "multer";
+import path from "path";
+import crypto from "crypto";
+
+// Voice-note / media upload for chat (WhatsApp-style).
+// 25 MB covers several minutes of compressed audio and stays well below
+// typical request-body limits.
+const chatMediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = /mp3|m4a|aac|ogg|opus|wav|webm|mp4/;
+    const okType = allowed.test(path.extname(file.originalname).toLowerCase()) ||
+      /^audio\//.test(file.mimetype) ||
+      file.mimetype === 'video/webm'; // Safari/Chrome MediaRecorder fallback
+    if (okType) return cb(null, true);
+    cb(new Error("Only audio files (mp3, m4a, aac, ogg, opus, wav, webm) are allowed"));
+  },
+} as multer.Options);
+
+export const chatMediaMiddleware = chatMediaUpload.single('file');
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
   if (userIds.length === 0) return new Set<string>();
@@ -636,4 +658,90 @@ export const markConversationAsRead: RequestHandler = async (
     };
     res.status(500).json(response);
   }
+};
+
+/**
+ * Upload chat media (voice notes) - WhatsApp-style audio messages.
+ * Accepts multipart/form-data with a `file` field (audio/webm, mp3, m4a, ...).
+ * Returns a URL that can be passed as attachmentUrl to the send-message endpoint.
+ */
+export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  chatMediaMiddleware(req as any, res as any, async (err: any) => {
+    if (err) {
+      return res.status(400).json({ success: false, error: err.message || "File upload error" });
+    }
+    try {
+      const businessId = req.user?.businessId;
+      const userId = req.user?.userId;
+      if (!businessId || !userId) {
+        return res.status(400).json({ success: false, error: "User authentication required" });
+      }
+
+      const uploadedFile = (req as any).file as Express.Multer.File | undefined;
+      if (!uploadedFile) {
+        return res.status(400).json({ success: false, error: "file field is required" });
+      }
+
+      let mediaUrl = '';
+      if (r2Storage.isAvailable()) {
+        try {
+          const ext = uploadedFile.originalname.includes(".")
+            ? uploadedFile.originalname.split(".").pop()!.toLowerCase()
+            : (uploadedFile.mimetype.includes('webm') ? 'webm' : 'm4a');
+          const key = `chat-media/${businessId}/${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+          mediaUrl = await r2Storage.uploadFile(key, uploadedFile.buffer, uploadedFile.mimetype);
+        } catch (uploadError) {
+          console.error("Chat media R2 upload failed, falling back to local:", uploadError);
+        }
+      }
+
+      if (!mediaUrl) {
+        // Local /uploads fallback (mirrors recordings upload behaviour)
+        const fs = await import("fs");
+        const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
+        const baseDir = isLambda ? "/tmp" : process.cwd();
+        const uploadDir = path.join(baseDir, "uploads");
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        const ext = uploadedFile.originalname.includes(".")
+          ? uploadedFile.originalname.split(".").pop()!.toLowerCase()
+          : (uploadedFile.mimetype.includes('webm') ? 'webm' : 'm4a');
+        const filename = `chat-${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+        fs.writeFileSync(path.join(uploadDir, filename), uploadedFile.buffer);
+
+        if (isLambda) {
+          try {
+            const { getStore } = require("@netlify/blobs");
+            const store = getStore("uploads");
+            await store.set(filename, uploadedFile.buffer.buffer.slice(
+              uploadedFile.buffer.byteOffset,
+              uploadedFile.buffer.byteOffset + uploadedFile.buffer.byteLength,
+            ) as any);
+            mediaUrl = `/uploads/${filename}`;
+          } catch (blobErr) {
+            console.error("Netlify Blobs upload failed for chat media:", blobErr);
+            const mime = uploadedFile.mimetype || "application/octet-stream";
+            mediaUrl = `data:${mime};base64,${uploadedFile.buffer.toString("base64")}`;
+            try { fs.unlinkSync(path.join(uploadDir, filename)); } catch {}
+          }
+        } else {
+          mediaUrl = `/uploads/${filename}`;
+        }
+      }
+
+      res.json({
+        success: true,
+        data: {
+          url: mediaUrl,
+          mimeType: uploadedFile.mimetype,
+          size: uploadedFile.size,
+          attachmentType: 'audio',
+        },
+      });
+    } catch (error) {
+      console.error("Chat media upload error:", error);
+      res.status(500).json({ success: false, error: "Failed to upload media" });
+    }
+  });
 };

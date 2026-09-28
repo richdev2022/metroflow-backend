@@ -499,11 +499,15 @@ protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req,
   try {
     const walletsRes = await query(`SELECT * FROM platform_wallet`);
     let wallets = walletsRes.rows;
+    // Revenue-side ledger rows are the ones written by creditRevenueWallet()
+    // (transaction_type fee/subscription with NO wallet_id - user-side fee
+    // debits carry a wallet_id and must NOT be double-counted here).
     const revenueBalancesRes = await query(`
       SELECT currency, COALESCE(SUM(amount), 0) as balance
       FROM transactions
       WHERE status = 'success'
       AND transaction_type IN ('subscription', 'fee')
+      AND wallet_id IS NULL
       GROUP BY currency
     `);
     const revenueBalanceByCurrency = new Map(
@@ -562,20 +566,35 @@ protectedRouter.get("/wallet/history", requirePermission('view_dashboard'), asyn
 
 protectedRouter.get("/revenue/history", requirePermission('view_dashboard'), async (req, res) => {
   try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const offset = (page - 1) * limit;
+
+    // Revenue-side movements ONLY (wallet_id IS NULL distinguishes the
+    // revenue ledger rows written by creditRevenueWallet from the user-side
+    // fee debit rows that used to be the only visible records).
+    const countRes = await query(
+        `SELECT COUNT(*)::int AS total FROM transactions
+         WHERE status = 'success'
+         AND transaction_type IN ('subscription', 'fee')
+         AND wallet_id IS NULL`
+    );
     const transactions = await query(
         `SELECT * FROM transactions 
          WHERE status = 'success' 
          AND transaction_type IN ('subscription', 'fee') 
-         ORDER BY created_at DESC`
+         AND wallet_id IS NULL
+         ORDER BY created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset]
     );
 
-    // Transform to ensure they look like credits (Revenue)
     const history = transactions.rows.map(txn => ({
         ...txn,
-        type: 'credit' 
+        type: txn.type === 'debit' ? 'debit' : 'credit'
     }));
 
-    res.json({ success: true, transactions: history });
+    res.json({ success: true, transactions: history, pagination: { page, limit, total: countRes.rows[0]?.total || 0 } });
 
   } catch (error) {
     console.error("Get Admin Revenue History Error:", error);
@@ -3087,8 +3106,9 @@ protectedRouter.put("/kyc/business/:id", requirePermission('manage_businesses'),
 // Get payment providers overview (active provider, config status, stats)
 protectedRouter.get("/payment-providers", async (req, res) => {
     try {
-        const { getActiveProviderName, getAvailableProviders, getProviderConfigStatus } = await import("../services/providers/factory");
+        const { getActiveProviderName, getActiveTransferProviderName, getAvailableProviders, getProviderConfigStatus } = await import("../services/providers/factory");
         const activeProvider = await getActiveProviderName();
+        const transferProvider = await getActiveTransferProviderName();
         const configStatus = getProviderConfigStatus();
 
         // Stats per provider: transaction counts + volume + webhook log counts
@@ -3122,7 +3142,7 @@ protectedRouter.get("/payment-providers", async (req, res) => {
             };
         });
 
-        res.json({ success: true, data: { activeProvider, providers } });
+        res.json({ success: true, data: { activeProvider, transferProvider, providers } });
     } catch (error) {
         console.error("Admin get payment providers error:", error);
         res.status(500).json({ success: false, error: "Failed to load payment providers" });
@@ -3167,6 +3187,47 @@ protectedRouter.put("/payment-providers/active", async (req, res) => {
     } catch (error) {
         console.error("Admin set active payment provider error:", error);
         res.status(500).json({ success: false, error: "Failed to set active payment provider" });
+    }
+});
+
+// Toggle the globally active TRANSFER provider (independent of collections)
+protectedRouter.put("/payment-providers/transfer-active", async (req, res) => {
+    try {
+        const { provider } = req.body || {};
+        const { getAvailableProviders, invalidateActiveProviderCache } = await import("../services/providers/factory");
+
+        if (!provider || !getAvailableProviders().includes(provider)) {
+            return res.status(400).json({
+                success: false,
+                error: `Invalid provider. Must be one of: ${getAvailableProviders().join(", ")}`,
+            });
+        }
+
+        await query(
+            `INSERT INTO system_settings (key, value, description)
+             VALUES ('active_transfer_provider', $1, 'Globally active TRANSFER provider (payouts, bank lookups - managed by platform admins)')
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+            [provider]
+        );
+
+        invalidateActiveProviderCache();
+
+        try {
+            const { logAuditEvent } = await import("../services/audit");
+            await logAuditEvent({
+                action: 'transfer_provider_changed',
+                entityType: 'system_settings',
+                entityId: 'active_transfer_provider',
+                newValues: { provider },
+            });
+        } catch (auditErr) {
+            console.warn("Failed to audit log transfer provider change:", auditErr);
+        }
+
+        res.json({ success: true, message: `Active transfer provider set to ${provider}`, data: { provider } });
+    } catch (error) {
+        console.error("Admin set active transfer provider error:", error);
+        res.status(500).json({ success: false, error: "Failed to set active transfer provider" });
     }
 });
 

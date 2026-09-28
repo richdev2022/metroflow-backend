@@ -1,12 +1,15 @@
 import { query } from "../db";
-import { getProvider } from "./providers/factory";
+import { getProvider, resolveProvider } from "./providers/factory";
 import { creditPlatformWallet, debitPlatformWallet, creditRevenueWallet, debitRevenueWallet } from "./fees";
 import { logAuditEvent, generateTransactionHash } from "./audit";
 import { sendTransactionAlert } from "./email";
 
-// Re-export account lookup from provider
+// Re-export account lookup from provider.
+// Uses resolveProvider() so the ADMIN-SELECTED active provider (system_settings)
+// is honoured - previously this used the env default directly, so switching the
+// provider in admin had no effect on account lookups ("lookup failed").
 export async function accountLookup(bankCode: string, accountNumber: string) {
-  const provider = getProvider();
+  const provider = await resolveProvider();
   return provider.accountLookup(bankCode, accountNumber);
 }
 
@@ -584,12 +587,23 @@ export async function processAllPending(businessId: string) {
           // Debit Wallet
           await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [totalDebit, transfer.wallet_id]);
           
-          // Credit Platform Wallet (Amount) - Intermediary Step for Payout
-          await creditPlatformWallet(amount, transfer.currency || 'NGN');
+          // Credit Platform Wallet (Amount) - Intermediary Step for Payout.
+          // Reference passed so the movement is visible in the admin Platform Ledger.
+          await creditPlatformWallet(
+            amount,
+            transfer.currency || 'NGN',
+            transfer.reference,
+            `Platform Wallet Credit for Transfer ${transfer.reference}`,
+          );
 
           // Credit Revenue Wallet (Fee) - Earnings
           if (fee > 0) {
-              await creditRevenueWallet(fee, transfer.currency || 'NGN');
+            await creditRevenueWallet(
+              fee,
+              transfer.currency || 'NGN',
+              transfer.reference,
+              `Transfer fee revenue for ${transfer.reference}`,
+            );
           }
 
           // Record Transaction (Amount) - Idempotent: Check if exists first, UPDATE if so
@@ -738,7 +752,12 @@ export async function processAllPending(businessId: string) {
       // Debit Platform Wallet (Amount only) if initial response was success
       if (isSuccess) {
         const amount = parseFloat(transfer.amount);
-        await debitPlatformWallet(amount, transfer.currency || 'NGN');
+        await debitPlatformWallet(
+          amount,
+          transfer.currency || 'NGN',
+          transfer.reference,
+          `Payout to ${transfer.recipient_name || transfer.recipient_account || 'recipient'} (${transfer.reference})`,
+        );
 
         // Send email notification on success
         if (transfer.wallet_id) {
@@ -793,10 +812,20 @@ export async function processAllPending(businessId: string) {
             [totalRefund, transfer.wallet_id]
           );
           
-          await debitPlatformWallet(amount, transfer.currency || 'NGN');
+          await debitPlatformWallet(
+            amount,
+            transfer.currency || 'NGN',
+            transfer.reference + '-REFUND',
+            `Reversal of platform hold for failed transfer ${transfer.reference}`,
+          );
 
           if (fee > 0) {
-            await debitRevenueWallet(fee, transfer.currency || 'NGN');
+            await debitRevenueWallet(
+              fee,
+              transfer.currency || 'NGN',
+              transfer.reference + '-REFUND',
+              `Reversal of fee revenue for failed transfer ${transfer.reference}`,
+            );
           }
 
           const refundTxnCheck = await query(

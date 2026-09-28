@@ -15,7 +15,7 @@ const DEFAULT_PROVIDER = process.env.DEFAULT_PAYMENT_PROVIDER || "flutterwave";
 
 // Global active provider (managed by admins) is stored in system_settings.
 // Cached in-memory briefly to avoid a DB hit on every payment call.
-let activeProviderCache: { name: string; fetchedAt: number } | null = null;
+let activeProviderCache: { name: string; fetchedAt: number; key: string } | null = null;
 const ACTIVE_PROVIDER_CACHE_TTL_MS = 30_000;
 
 export function getProvider(providerName?: string): Provider {
@@ -43,24 +43,55 @@ export async function resolveProvider(explicitName?: string): Promise<Provider> 
  * falling back to the env default.
  */
 export async function getActiveProviderName(): Promise<string> {
+  return readActiveProviderSetting('active_payment_provider', DEFAULT_PROVIDER);
+}
+
+const TRANSFER_PROVIDER_ENV_KEY = 'DEFAULT_TRANSFER_PROVIDER';
+
+/**
+ * Returns the active TRANSFER provider (admin-managed via
+ * system_settings.active_transfer_provider). Falls back to the global
+ * payment provider, then to DEFAULT_TRANSFER_PROVIDER / DEFAULT_PAYMENT_PROVIDER env.
+ * Admins can toggle transfers independently of collections.
+ */
+export async function getActiveTransferProviderName(): Promise<string> {
+  try {
+    const result = await query(
+      `SELECT value FROM system_settings WHERE key = 'active_transfer_provider' LIMIT 1`
+    );
+    const value = result.rows[0]?.value;
+    if (value && providers[value]) {
+      return value;
+    }
+  } catch (error) {
+    console.warn("[ProviderFactory] Failed to read active_transfer_provider, falling back:", error);
+  }
+  // Fall back to the global payment provider setting
+  const globalActive = await getActiveProviderName();
+  if (globalActive && providers[globalActive]) return globalActive;
+  return process.env[TRANSFER_PROVIDER_ENV_KEY] || DEFAULT_PROVIDER;
+}
+
+async function readActiveProviderSetting(key: string, fallback: string): Promise<string> {
   const now = Date.now();
-  if (activeProviderCache && now - activeProviderCache.fetchedAt < ACTIVE_PROVIDER_CACHE_TTL_MS) {
+  if (activeProviderCache && now - activeProviderCache.fetchedAt < ACTIVE_PROVIDER_CACHE_TTL_MS && activeProviderCache.key === key) {
     return activeProviderCache.name;
   }
   try {
     const result = await query(
-      `SELECT value FROM system_settings WHERE key = 'active_payment_provider' LIMIT 1`
+      `SELECT value FROM system_settings WHERE key = $1 LIMIT 1`,
+      [key]
     );
     const value = result.rows[0]?.value;
     if (value && providers[value]) {
-      activeProviderCache = { name: value, fetchedAt: now };
+      activeProviderCache = { name: value, fetchedAt: now, key };
       return value;
     }
   } catch (error) {
     // Table may not exist yet or DB hiccup - fall back to env default silently
-    console.warn("[ProviderFactory] Failed to read active_payment_provider, using default:", error);
+    console.warn(`[ProviderFactory] Failed to read ${key}, using default:`, error);
   }
-  return DEFAULT_PROVIDER;
+  return fallback;
 }
 
 export function invalidateActiveProviderCache(): void {

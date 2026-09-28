@@ -41,6 +41,9 @@ import {
   deleteTask,
   bulkDeleteTasks,
   getBoard,
+  uploadTaskAttachments,
+  getTaskAttachments,
+  deleteTaskAttachment,
 } from "./routes/tasks";
 import {
   getTeamMembers,
@@ -87,6 +90,7 @@ import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, t
 import { initializeDatabase, query } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import publicRouter from "./routes/public";
+import supportRouter from "./routes/support";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -512,6 +516,11 @@ export async function createServer() {
   mainRouter.delete("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
   mainRouter.delete("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
 
+  // Task file attachments (WhatsApp-style uploads)
+  mainRouter.post("/tasks/:id/attachments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), uploadTaskAttachments);
+  mainRouter.get("/tasks/:id/attachments", authenticateToken, checkSubscriptionStatus, getTaskAttachments);
+  mainRouter.delete("/tasks/attachments/:attachmentId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTaskAttachment);
+
   // Team API routes
   mainRouter.get("/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
   mainRouter.get("/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
@@ -674,6 +683,9 @@ export async function createServer() {
 
   // Public app configuration (maintenance mode, announcements) - no auth
   mainRouter.use("/public", publicRouter);
+
+  // Customer Support desk (MetricAi handoff, guest widget chat, agent inbox)
+  mainRouter.use("/support", supportRouter);
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);

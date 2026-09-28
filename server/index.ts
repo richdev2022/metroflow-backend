@@ -79,7 +79,8 @@ import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs } from "./routes/chat";
+import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
@@ -636,6 +637,14 @@ export async function createServer() {
   mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
   // Voice-note / media upload for chat (WhatsApp-style audio messages)
   mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), uploadChatMedia);
+  // GIF picker (Tenor proxy — key stays server-side)
+  mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), searchChatGifs);
+
+  // MetricAi — GLM-powered in-app assistant (plan-gated)
+  mainRouter.get("/ai/status", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiStatus);
+  mainRouter.post("/ai/chat", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, postAiChat);
+  mainRouter.get("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiHistory);
+  mainRouter.delete("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, deleteAiHistory);
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);

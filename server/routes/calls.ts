@@ -6,6 +6,7 @@ import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
+import { postCallLogMessage } from "./chat";
 import crypto from "crypto";
 
 interface CallUserFromDb {
@@ -226,7 +227,7 @@ export const createCall: RequestHandler = async (
   res,
 ) => {
   try {
-    const { type, participantIds, isGroupCall, password, waitingRoomEnabled, recordingEnabled } = req.body;
+    const { type, participantIds, isGroupCall, password, waitingRoomEnabled, recordingEnabled, conversationId } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -305,15 +306,15 @@ export const createCall: RequestHandler = async (
 
     const result = await query(
       `INSERT INTO calls 
-        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants)
-       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants, conversation_id)
+       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
-                 max_participants as "maxParticipants",
+                 max_participants as "maxParticipants", conversation_id as "conversationId",
                  created_at as "createdAt", updated_at as "updatedAt"`,
-      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null, planMaxParticipants],
+      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null, planMaxParticipants, conversationId || null],
     );
 
     const call = result.rows[0];
@@ -671,25 +672,34 @@ export const updateCall: RequestHandler = async (
       }
     }
 
-    // First get the call's actual id (try UUID first if valid, then code)
+    // First get the call's actual id (try UUID first if valid, then code).
+    // status/conversation_id captured so we can (a) only log a call entry on
+    // the FIRST transition to a final state and (b) mirror the log into the
+    // chat conversation the call was started from.
     let actualId: string | undefined;
+    let previousStatus: string | undefined;
+    let linkedConversationId: string | null | undefined;
     if (isValidUUID(id)) {
       const idResult = await query(
-        `SELECT id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, status, conversation_id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (idResult.rows.length > 0) {
         actualId = idResult.rows[0].id;
+        previousStatus = idResult.rows[0].status;
+        linkedConversationId = idResult.rows[0].conversation_id || null;
       }
     }
 
     if (!actualId) {
       const codeResult = await query(
-        `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, status, conversation_id FROM calls WHERE call_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (codeResult.rows.length > 0) {
         actualId = codeResult.rows[0].id;
+        previousStatus = codeResult.rows[0].status;
+        linkedConversationId = codeResult.rows[0].conversation_id || null;
       }
     }
 
@@ -763,6 +773,28 @@ export const updateCall: RequestHandler = async (
     );
     call.participants = participantsResult.rows;
     enrichCall(call);
+
+    // WhatsApp-style call log in chat: when the call FIRST reaches a final
+    // state, append a call-log message to the linked conversation (or every
+    // direct conversation between the initiator and each participant).
+    const FINAL_CALL_STATUSES = ["completed", "missed", "cancelled"];
+    if (
+      status !== undefined &&
+      FINAL_CALL_STATUSES.includes(status) &&
+      !FINAL_CALL_STATUSES.includes(previousStatus || "")
+    ) {
+      // Fire-and-forget: must never block or fail the API response.
+      postCallLogMessage({
+        businessId,
+        senderId: call.createdById || userId,
+        conversationId: linkedConversationId || undefined,
+        participantIds: participantsResult.rows.map((r: any) => r.userId).filter(Boolean),
+        callType: call.type,
+        status,
+        durationSeconds: call.duration ?? null,
+        callCode: call.callCode,
+      }).catch((e) => console.error("Call-log insert failed:", e));
+    }
 
     const io = getSocketServer();
     if (io) {

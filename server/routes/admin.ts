@@ -833,7 +833,8 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             name, price, discount, features, permissions, is_active,
             maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
-            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
+            metricAiEnabled
         } = req.body;
 
         // Dynamic update
@@ -919,6 +920,11 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
         if (liveCaptions !== undefined) {
             queryStr += `, live_captions = $${paramCount}`;
             params.push(liveCaptions);
+            paramCount++;
+        }
+        if (metricAiEnabled !== undefined) {
+            queryStr += `, metric_ai_enabled = $${paramCount}`;
+            params.push(String(metricAiEnabled === true));
             paramCount++;
         }
 

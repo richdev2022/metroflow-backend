@@ -156,3 +156,170 @@ class R2Storage {
 }
 
 export const r2Storage = new R2Storage();
+
+/**
+ * Cloudinary storage — zero-dependency REST uploader.
+ *
+ * The production environment provides Cloudinary credentials
+ * (CLOUDINARY_URL=cloudinary://<api_key>:<api_secret>@<cloud_name> or the
+ * discrete CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET
+ * vars). Cloudinary is DIFFERENT from Cloudflare R2 — earlier versions of this
+ * code only supported R2, so Cloudinary credentials were silently ignored and
+ * every upload fell back to local disk. This class makes those credentials
+ * actually work.
+ *
+ * Upload signature: sha1(sorted params joined with & + api_secret) — the
+ * documented Cloudinary signing algorithm. Resource type is derived from the
+ * mime type: image -> image upload, video/audio -> video upload, everything
+ * else (pdf, docx, zip, ...) -> raw upload.
+ */
+class CloudinaryStorage {
+  private cloudName = "";
+  private apiKey = "";
+  private apiSecret = "";
+  private ready = false;
+
+  constructor() {
+    const url = process.env.CLOUDINARY_URL;
+    if (url && url.startsWith("cloudinary://")) {
+      try {
+        const parsed = new URL(url);
+        // cloudinary://api_key:api_secret@cloud_name
+        this.apiKey = decodeURIComponent(parsed.username);
+        this.apiSecret = decodeURIComponent(parsed.password);
+        this.cloudName = parsed.hostname;
+      } catch {
+        console.error("Invalid CLOUDINARY_URL format");
+      }
+    }
+    this.cloudName = (process.env.CLOUDINARY_CLOUD_NAME || this.cloudName || "").trim();
+    this.apiKey = (process.env.CLOUDINARY_API_KEY || this.apiKey || "").trim();
+    this.apiSecret = (process.env.CLOUDINARY_API_SECRET || this.apiSecret || "").trim();
+
+    this.ready = !!(this.cloudName && this.apiKey && this.apiSecret);
+
+    if (this.ready) {
+      console.log("✅ Cloudinary storage initialized for cloud:", this.cloudName);
+    } else {
+      console.log("Cloudinary credentials not fully configured (cloudName/apiKey/apiSecret)");
+    }
+  }
+
+  isAvailable(): boolean {
+    return this.ready;
+  }
+
+  private resourceTypeFor(mimeType?: string, filename?: string): "image" | "video" | "raw" {
+    const mt = (mimeType || "").toLowerCase();
+    if (mt.startsWith("image/")) return "image";
+    if (mt.startsWith("video/") || mt.startsWith("audio/")) return "video";
+    // Some clients send generic octet-stream — sniff by extension
+    const ext = (filename || "").split(".").pop()?.toLowerCase() || "";
+    if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "heic", "heif"].includes(ext)) return "image";
+    if (["mp4", "webm", "mov", "avi", "mkv", "mp3", "m4a", "aac", "ogg", "opus", "wav", "m3u8", "3gp", "flac"].includes(ext)) return "video";
+    return "raw";
+  }
+
+  async uploadFile(
+    key: string,
+    body: Buffer | string,
+    contentType?: string,
+  ): Promise<string> {
+    if (!this.ready) {
+      throw new Error("Cloudinary storage is not available");
+    }
+
+    // Key layout: "<folder>/<public_id>.<ext>"
+    const normalizedKey = key.replace(/^\/+/, "");
+    const lastSlash = normalizedKey.lastIndexOf("/");
+    const folder = lastSlash > 0 ? normalizedKey.slice(0, lastSlash) : undefined;
+    const filename = lastSlash >= 0 ? normalizedKey.slice(lastSlash + 1) : normalizedKey;
+    const dotIdx = filename.lastIndexOf(".");
+    const publicId = dotIdx > 0 ? filename.slice(0, dotIdx) : filename;
+    const resourceType = this.resourceTypeFor(contentType, filename);
+
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const params: Record<string, string> = { public_id: publicId, timestamp };
+    if (folder) params.folder = folder;
+
+    // Signature = sha1("k=v&k=v" + api_secret) over alphabetically sorted params
+    const toSign = Object.keys(params)
+      .sort()
+      .map((k) => `${k}=${params[k]}`)
+      .join("&");
+    const signature = require("crypto")
+      .createHash("sha1")
+      .update(`${toSign}${this.apiSecret}`)
+      .digest("hex");
+
+    const form = new FormData();
+    const blob = typeof body === "string"
+      ? new Blob([body], { type: contentType || "text/plain" })
+      : new Blob([new Uint8Array(body)], { type: contentType || "application/octet-stream" });
+    form.append("file", blob, filename);
+    form.append("api_key", this.apiKey);
+    form.append("timestamp", timestamp);
+    form.append("signature", signature);
+    form.append("public_id", publicId);
+    if (folder) form.append("folder", folder);
+
+    const endpoint = `https://api.cloudinary.com/v1_1/${this.cloudName}/${resourceType}/upload`;
+    const response = await fetch(endpoint, { method: "POST", body: form });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => response.statusText);
+      throw new Error(`Cloudinary upload failed (${response.status}): ${errorText}`);
+    }
+
+    const result = (await response.json()) as { secure_url?: string; url?: string };
+    const uploadedUrl = result.secure_url || result.url;
+    if (!uploadedUrl) {
+      throw new Error("Cloudinary upload response missing secure_url");
+    }
+    return uploadedUrl;
+  }
+
+  /**
+   * Delete by public URL: derive resource_type + public_id from the URL.
+   * Best-effort only (callers swallow errors).
+   */
+  async deleteByUrl(url: string): Promise<void> {
+    if (!this.ready) return;
+    try {
+      const match = url.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.[a-zA-Z0-9]+)?$/);
+      if (!match) return;
+      const publicIdWithFolder = match[1];
+      const resourceType = url.includes("/video/upload/") ? "video" : url.includes("/image/upload/") ? "image" : "raw";
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const signature = require("crypto")
+        .createHash("sha1")
+        .update(`public_id=${publicIdWithFolder}&timestamp=${timestamp}${this.apiSecret}`)
+        .digest("hex");
+      await fetch(`https://api.cloudinary.com/v1_1/${this.cloudName}/${resourceType}/destroy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          public_id: publicIdWithFolder,
+          api_key: this.apiKey,
+          timestamp,
+          signature,
+        }),
+      });
+    } catch (error) {
+      console.error("Cloudinary delete failed:", error);
+    }
+  }
+}
+
+export const cloudinaryStorage = new CloudinaryStorage();
+
+/**
+ * Preferred cloud object storage for user uploads.
+ * Order: Cloudflare R2 (if fully configured) -> Cloudinary -> null (caller
+ * falls back to local /uploads disk). Both return directly-usable public URLs.
+ */
+export function getCloudStorage(): { uploadFile(key: string, body: Buffer | string, contentType?: string): Promise<string> } | null {
+  if (r2Storage.isAvailable()) return r2Storage;
+  if (cloudinaryStorage.isAvailable()) return cloudinaryStorage;
+  return null;
+}

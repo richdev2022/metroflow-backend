@@ -3,28 +3,173 @@ import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import { getSocketServer } from "../lib/socket";
-import { r2Storage } from "../lib/storage";
 import multer from "multer";
 import path from "path";
-import crypto from "crypto";
+import {
+  uploadMediaBuffer,
+  detectMediaKind,
+} from "../services/media-upload";
 
-// Voice-note / media upload for chat (WhatsApp-style).
-// 25 MB covers several minutes of compressed audio and stays well below
-// typical request-body limits.
+// Chat media upload (WhatsApp-style): voice notes, images, videos, documents,
+// GIFs and stickers. 100 MB covers multi-minute videos while remaining within
+// typical proxy limits (nginx client_max_body_size should be >= 100m).
+const CHAT_MEDIA_LIMIT_MB = 100;
+const CHAT_MEDIA_MIMES = [
+  /^image\//,
+  /^video\//,
+  /^audio\//,
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/zip",
+  "application/x-zip-compressed",
+  "application/x-7z-compressed",
+  "application/x-rar-compressed",
+  "application/gzip",
+  "application/json",
+  "text/plain",
+  "text/csv",
+  "application/octet-stream", // final fallback for exotic types; extension-checked below
+];
+
 const chatMediaUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: CHAT_MEDIA_LIMIT_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = /mp3|m4a|aac|ogg|opus|wav|webm|mp4/;
-    const okType = allowed.test(path.extname(file.originalname).toLowerCase()) ||
-      /^audio\//.test(file.mimetype) ||
-      file.mimetype === 'video/webm'; // Safari/Chrome MediaRecorder fallback
-    if (okType) return cb(null, true);
-    cb(new Error("Only audio files (mp3, m4a, aac, ogg, opus, wav, webm) are allowed"));
+    const mimeOk = CHAT_MEDIA_MIMES.some((m) =>
+      typeof m === "string" ? file.mimetype === m : m.test(file.mimetype),
+    );
+    const ext = path.extname(file.originalname).toLowerCase().replace(".", "");
+    const allowedExts = /^(jpg|jpeg|png|gif|webp|bmp|svg|avif|heic|heif|mp4|webm|mov|avi|mkv|3gp|m4v|mp3|m4a|aac|ogg|oga|opus|wav|weba|flac|amr|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|csv|tsv|md|json|xml|zip|rar|7z|tar|gz|apk|ics)$/;
+    const extOk = allowedExts.test(ext);
+    if (mimeOk && extOk) return cb(null, true);
+    cb(new Error("Unsupported file type. Allowed: images, videos, audio, PDF, Office documents, text files and archives"));
   },
 } as multer.Options);
 
 export const chatMediaMiddleware = chatMediaUpload.single('file');
+
+const VALID_MESSAGE_TYPES = new Set([
+  "text", "image", "video", "audio", "document", "gif", "sticker", "voice",
+]);
+
+const CALL_LOG_JSON_META = Symbol("callLogJson");
+
+/**
+ * Insert a WhatsApp-style call log entry into a chat conversation.
+ * Used by the calls service when a call ends/misses so the conversation
+ * transcript reflects call history. Never throws.
+ */
+export async function postCallLogMessage(opts: {
+  businessId: string;
+  senderId: string;                     // call initiator
+  conversationId?: string | null;       // explicit conversation (when call was started from chat)
+  participantIds: string[];             // all call participants (incl. initiator)
+  callType: "audio" | "video" | string;
+  status: "completed" | "missed" | "cancelled" | string;
+  durationSeconds?: number | null;
+  callCode?: string | null;
+}): Promise<void> {
+  try {
+    const { businessId, senderId, conversationId, participantIds } = opts;
+    if (!businessId || !senderId) return;
+
+    const initiatorResult = await query(`SELECT name FROM users WHERE id = $1`, [senderId]);
+    const initiatorName = initiatorResult.rows[0]?.name || null;
+
+    const payload = JSON.stringify({
+      callType: opts.callType === "audio" ? "audio" : "video",
+      status: opts.status,
+      durationSeconds: typeof opts.durationSeconds === "number" ? Math.max(0, Math.round(opts.durationSeconds)) : null,
+      initiatorName,
+      callCode: opts.callCode || null,
+    });
+
+    const targetConversations = new Set<string>();
+
+    // Preferred: explicit conversation the call was started from.
+    if (conversationId) {
+      const valid = await ensureConversationParticipant(conversationId, businessId, senderId);
+      if (valid) targetConversations.add(conversationId);
+    }
+
+    // Fallback: every DIRECT conversation the initiator shares with another
+    // participant (covers "call initiated from chat" even when the client did
+    // not pass conversation_id).
+    const otherIds = (participantIds || []).filter(
+      (pid) => pid && pid !== senderId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pid),
+    );
+    for (const otherId of otherIds) {
+      const conv = await query(
+        `SELECT cc.id FROM chat_conversations cc
+         JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
+         JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
+         WHERE cc.business_id = $3 AND cc.type = 'direct'
+         AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
+         LIMIT 1`,
+        [senderId, otherId, businessId],
+      );
+      if (conv.rows[0]?.id) targetConversations.add(conv.rows[0].id);
+    }
+
+    if (targetConversations.size === 0) return;
+
+    for (const convId of targetConversations) {
+      const insert = await query(
+        `INSERT INTO chat_messages
+          (conversation_id, sender_id, content, message_type)
+         VALUES ($1, $2, $3, 'call-log')
+         RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
+                   content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
+                   attachment_name as "attachmentName", attachment_size as "attachmentSize",
+                   message_type as "messageType", created_at as "createdAt"`,
+        [convId, senderId, payload],
+      );
+      const message = { ...insert.rows[0], senderName: initiatorName };
+
+      await query(
+        `UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [convId],
+      );
+      await query(
+        `UPDATE chat_participants SET last_read_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = $1 AND user_id = $2`,
+        [convId, senderId],
+      );
+
+      const participants = await query(
+        `SELECT user_id as "userId" FROM chat_participants WHERE conversation_id = $1`,
+        [convId],
+      );
+
+      const io = getSocketServer();
+      if (io) {
+        io.to(`conversation:${convId}`).emit("message:created", message);
+        for (const row of participants.rows) {
+          if (!row.userId || row.userId === senderId) continue;
+          io.to(`user:${row.userId}`).emit("chat:new-message-notification", {
+            conversationId: convId,
+            messageId: message.id,
+            senderId,
+            senderName: initiatorName || "Someone",
+            conversationName: null,
+            conversationType: "direct",
+            content: "Call log",
+            attachmentType: "call-log",
+            messageType: "call-log",
+            createdAt: message.createdAt,
+          });
+        }
+      }
+    }
+  } catch (error) {
+    console.error("postCallLogMessage error (non-fatal):", error);
+  }
+}
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
   if (userIds.length === 0) return new Set<string>();
@@ -233,6 +378,8 @@ export const getConversationMessages: RequestHandler = async (
       `SELECT 
         cm.id, cm.conversation_id as "conversationId", cm.sender_id as "senderId", 
         cm.content, cm.attachment_url as "attachmentUrl", cm.attachment_type as "attachmentType", 
+        cm.attachment_name as "attachmentName", cm.attachment_size as "attachmentSize",
+        cm.message_type as "messageType",
         cm.created_at as "createdAt",
         u.name as "senderName"
       FROM chat_messages cm
@@ -448,7 +595,7 @@ export const sendMessage: RequestHandler = async (
 ) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const { content, attachmentUrl, attachmentType } = req.body;
+    const { content, attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -467,12 +614,29 @@ export const sendMessage: RequestHandler = async (
       });
     }
 
+    // message_type: clients may send explicit kinds (image/video/document/gif/
+    // sticker/voice); call-log is RESERVED for the internal calls service so a
+    // forged request cannot fabricate fake call history.
+    let resolvedType = "text";
+    if (typeof messageType === "string" && VALID_MESSAGE_TYPES.has(messageType)) {
+      resolvedType = messageType;
+    } else if (typeof attachmentType === "string" && VALID_MESSAGE_TYPES.has(attachmentType)) {
+      resolvedType = attachmentType;
+    } else if (attachmentUrl) {
+      // Derive from mime/ext when the client did not send a type
+      const derived = detectMediaKind(attachmentType, attachmentName || attachmentUrl);
+      resolvedType = derived;
+    }
+
     const result = await query(
       `INSERT INTO chat_messages 
-        (conversation_id, sender_id, content, attachment_url, attachment_type)
-       VALUES ($1, $2, $3, $4, $5)
+        (conversation_id, sender_id, content, attachment_url, attachment_type,
+         attachment_name, attachment_size, message_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id, conversation_id as "conversationId", sender_id as "senderId", 
-                 content, attachment_url as "attachmentUrl", attachment_type as "attachmentType", 
+                 content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
+                 attachment_name as "attachmentName", attachment_size as "attachmentSize",
+                 message_type as "messageType",
                  created_at as "createdAt"`,
       [
         conversationId,
@@ -480,6 +644,11 @@ export const sendMessage: RequestHandler = async (
         content || null,
         attachmentUrl || null,
         attachmentType || null,
+        attachmentName ? String(attachmentName).slice(0, 255) : null,
+        Number.isFinite(Number(attachmentSize)) && Number(attachmentSize) > 0
+          ? Math.round(Number(attachmentSize))
+          : null,
+        resolvedType,
       ],
     );
 
@@ -675,14 +844,68 @@ export const markConversationAsRead: RequestHandler = async (
 };
 
 /**
- * Upload chat media (voice notes) - WhatsApp-style audio messages.
- * Accepts multipart/form-data with a `file` field (audio/webm, mp3, m4a, ...).
- * Returns a URL that can be passed as attachmentUrl to the send-message endpoint.
+ * GIF search via Tenor v2 (server-side key keeps TENOR_API_KEY out of clients).
+ * Returns an empty configured=false payload when the key is absent so clients
+ * can hide the GIF tab and fall back to emoji stickers.
+ */
+export const searchChatGifs: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const apiKey = process.env.TENOR_API_KEY;
+    if (!apiKey) {
+      return res.json({ success: true, data: { configured: false, gifs: [] } });
+    }
+    const search = String(req.query.search || "trending").slice(0, 80) || "trending";
+    const limit = Math.min(24, Math.max(4, parseInt(req.query.limit as string) || 16));
+
+    const isTrending = search.toLowerCase() === "trending";
+    const url = isTrending
+      ? `https://tenor.googleapis.com/v2/featured?key=${encodeURIComponent(apiKey)}&limit=${limit}&media_filter=gif,tinygif&client_key=metricorex_web`
+      : `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(search)}&key=${encodeURIComponent(apiKey)}&limit=${limit}&media_filter=gif,tinygif&client_key=metricorex_web`;
+
+    const tenorRes = await fetch(url);
+    if (!tenorRes.ok) {
+      console.error("Tenor request failed:", tenorRes.status, await tenorRes.text().catch(() => ""));
+      return res.json({ success: true, data: { configured: true, gifs: [] } });
+    }
+    const payload = (await tenorRes.json()) as {
+      results?: Array<{
+        id: string;
+        content_description?: string;
+        media_formats?: Record<string, { url: string; dims?: number[] }>;
+      }>;
+    };
+    const gifs = (payload.results || []).map((r) => ({
+      id: r.id,
+      description: r.content_description || "GIF",
+      url: r.media_formats?.gif?.url || r.media_formats?.tinygif?.url || null,
+      previewUrl: r.media_formats?.tinygif?.url || r.media_formats?.gif?.url || null,
+    })).filter((g) => g.url);
+
+    res.json({ success: true, data: { configured: true, gifs } });
+  } catch (error) {
+    console.error("GIF search error:", error);
+    res.json({ success: true, data: { configured: !!process.env.TENOR_API_KEY, gifs: [] } });
+  }
+};
+
+/**
+ * Upload chat media (WhatsApp-style) — voice notes, images, videos, documents,
+ * GIFs and stickers. Accepts multipart/form-data with a `file` field.
+ * Storage chain: Cloudflare R2 -> Cloudinary -> local /uploads.
+ * Returns a URL + metadata that can be passed to the send-message endpoint as
+ * { attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType }.
  */
 export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest, res) => {
   chatMediaMiddleware(req as any, res as any, async (err: any) => {
     if (err) {
-      return res.status(400).json({ success: false, error: err.message || "File upload error" });
+      // Multer size errors arrive as generic MulterError — surface a friendly message
+      const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
+      return res.status(400).json({
+        success: false,
+        error: isTooLarge
+          ? `File exceeds the ${CHAT_MEDIA_LIMIT_MB} MB upload limit`
+          : err.message || "File upload error",
+      });
     }
     try {
       const businessId = req.user?.businessId;
@@ -696,70 +919,25 @@ export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest,
         return res.status(400).json({ success: false, error: "file field is required" });
       }
 
-      let mediaUrl = '';
-      if (r2Storage.isAvailable()) {
-        try {
-          const ext = uploadedFile.originalname.includes(".")
-            ? uploadedFile.originalname.split(".").pop()!.toLowerCase()
-            : (uploadedFile.mimetype.includes('webm') ? 'webm' : 'm4a');
-          const key = `chat-media/${businessId}/${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
-          mediaUrl = await r2Storage.uploadFile(key, uploadedFile.buffer, uploadedFile.mimetype);
-        } catch (uploadError) {
-          console.error("Chat media R2 upload failed, falling back to local:", uploadError);
-        }
-      }
-
-      if (!mediaUrl) {
-        // Local /uploads fallback (mirrors recordings upload behaviour)
-        const fs = await import("fs");
-        const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
-        const baseDir = isLambda ? "/tmp" : process.cwd();
-        const uploadDir = path.join(baseDir, "uploads");
-        if (!fs.existsSync(uploadDir)) {
-          fs.mkdirSync(uploadDir, { recursive: true });
-        }
-        const ext = uploadedFile.originalname.includes(".")
-          ? uploadedFile.originalname.split(".").pop()!.toLowerCase()
-          : (uploadedFile.mimetype.includes('webm') ? 'webm' : 'm4a');
-        const filename = `chat-${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
-        fs.writeFileSync(path.join(uploadDir, filename), uploadedFile.buffer);
-
-        if (isLambda) {
-          try {
-            const { getStore } = require("@netlify/blobs");
-            const store = getStore("uploads");
-            await store.set(filename, uploadedFile.buffer.buffer.slice(
-              uploadedFile.buffer.byteOffset,
-              uploadedFile.buffer.byteOffset + uploadedFile.buffer.byteLength,
-            ) as any);
-            mediaUrl = `/uploads/${filename}`;
-          } catch (blobErr) {
-            console.error("Netlify Blobs upload failed for chat media:", blobErr);
-            const mime = uploadedFile.mimetype || "application/octet-stream";
-            mediaUrl = `data:${mime};base64,${uploadedFile.buffer.toString("base64")}`;
-            try { fs.unlinkSync(path.join(uploadDir, filename)); } catch {}
-          }
-        } else {
-          mediaUrl = `/uploads/${filename}`;
-        }
-      }
-
-      // Resolve relative URLs (local /uploads fallback) against the API origin
-      // so BOTH web and mobile can play the audio directly.
-      if (mediaUrl && mediaUrl.startsWith('/')) {
-        const apiOrigin = process.env.API_PUBLIC_BASE_URL
-          || process.env.APP_BASE_URL
-          || 'https://api.metricorex.com';
-        mediaUrl = `${apiOrigin.replace(/\/$/, '')}${mediaUrl}`;
-      }
+      const media = await uploadMediaBuffer({
+        buffer: uploadedFile.buffer,
+        originalname: uploadedFile.originalname,
+        mimeType: uploadedFile.mimetype || "application/octet-stream",
+        folder: "chat-media",
+        businessId,
+        userId,
+      });
 
       res.json({
         success: true,
         data: {
-          url: mediaUrl,
-          mimeType: uploadedFile.mimetype,
-          size: uploadedFile.size,
-          attachmentType: 'audio',
+          url: media.url,
+          filename: media.filename,
+          name: media.filename,
+          mimeType: media.mimeType,
+          size: media.size,
+          attachmentType: media.kind,
+          storage: media.storage,
         },
       });
     } catch (error) {

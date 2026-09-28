@@ -572,6 +572,7 @@ export const postPublicMetricAiAsk: RequestHandler = async (req, res) => {
       error: isConfig
         ? "MetricAi is temporarily unavailable. Please try again later."
         : "MetricAi failed to respond. Please try again.",
+      ...(isConfig ? {} : { code: "ai_upstream_error" }),
     });
   }
 };

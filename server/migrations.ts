@@ -10,6 +10,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensurePayrollVerificationColumns();
   await ensureSystemSettingsDefaults();
   await ensureChatAndAiSchema();
+  await ensureSupportSchema();
   await backfillLedgerHistory();
 }
 
@@ -45,6 +46,79 @@ async function ensureChatAndAiSchema(): Promise<void> {
 
   // Plan-gated access: admin enables MetricAi per pricing plan
   await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_enabled BOOLEAN DEFAULT FALSE`);
+}
+
+/**
+ * Customer Support desk: MetricAi -> human handoff conversations, agent chat
+ * and admin in-app notifications (support alerts + MetricAi activity).
+ */
+async function ensureSupportSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS support_conversations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255),
+      user_id UUID,
+      guest_name VARCHAR(255),
+      guest_email VARCHAR(255),
+      channel VARCHAR(30) DEFAULT 'metric_ai',   -- metric_ai | webapp_widget | website_widget | mobile
+      subject VARCHAR(255),
+      status VARCHAR(20) DEFAULT 'open',         -- open | pending | resolved | closed
+      access_key VARCHAR(80),                    -- lets guests (website visitors) poll/reply safely
+      assigned_agent_id UUID,
+      last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_message_preview TEXT,
+      unread_for_agent INTEGER DEFAULT 0,
+      unread_for_customer INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_support_conv_status ON support_conversations(status, last_message_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_support_conv_user ON support_conversations(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_support_conv_agent ON support_conversations(assigned_agent_id)`);
+  await query(`ALTER TABLE support_conversations ADD COLUMN IF NOT EXISTS access_key VARCHAR(80)`);
+  await query(`ALTER TABLE support_conversations ADD COLUMN IF NOT EXISTS assigned_agent_id UUID`);
+  await query(`ALTER TABLE support_conversations ADD COLUMN IF NOT EXISTS unread_for_agent INTEGER DEFAULT 0`);
+  await query(`ALTER TABLE support_conversations ADD COLUMN IF NOT EXISTS unread_for_customer INTEGER DEFAULT 0`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      conversation_id UUID NOT NULL REFERENCES support_conversations(id) ON DELETE CASCADE,
+      sender_type VARCHAR(12) NOT NULL,          -- customer | agent | system | ai
+      sender_id VARCHAR(255),
+      sender_name VARCHAR(255),
+      body TEXT NOT NULL,
+      meta JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_support_msg_conv ON support_messages(conversation_id, created_at)`);
+
+  // In-app notifications for the admin console (support inbox + MetricAi activity)
+  await query(`
+    CREATE TABLE IF NOT EXISTS admin_notifications (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      admin_id UUID,                             -- NULL = visible to every support agent / super admin
+      type VARCHAR(40) NOT NULL,                 -- support_new_conversation | support_new_message | metric_ai_activity
+      title VARCHAR(255) NOT NULL,
+      body TEXT,
+      conversation_id UUID,
+      dedupe_key VARCHAR(120),
+      is_read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_admin_notifications_unread ON admin_notifications(is_read, created_at DESC)`);
+  await query(`ALTER TABLE admin_notifications ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(120)`);
+  await query(`ALTER TABLE admin_notifications ADD COLUMN IF NOT EXISTS conversation_id UUID`);
+
+  // Permission that gates the Support dashboard (assignable to any admin role)
+  await query(`
+    INSERT INTO admin_permissions (slug, name, description)
+    VALUES ('support', 'Customer Support', 'Access the support inbox and chat with customers')
+    ON CONFLICT (slug) DO NOTHING
+  `);
 }
 
 /**

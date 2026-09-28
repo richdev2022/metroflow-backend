@@ -285,6 +285,30 @@ export const takeNotificationAction: RequestHandler = async (
  * can deliver push notifications (calls, chats, broadcasts).
  * Body: { fcm_token, platform: 'android'|'ios'|'web', device_name?, app_version? }
  */
+/**
+ * @swagger
+ * /notifications/register-device:
+ *   post:
+ *     summary: Register/refresh an FCM push token for the authenticated user
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [fcm_token]
+ *             properties:
+ *               fcm_token: { type: string }
+ *               platform: { type: string, enum: [android, ios, web] }
+ *               device_name: { type: string }
+ *               app_version: { type: string }
+ *     responses:
+ *       200:
+ *         description: Device registered
+ */
 export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
@@ -318,6 +342,25 @@ export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, 
 /**
  * DELETE /notifications/register-device
  * Removes an FCM token (e.g. on logout).
+ */
+/**
+ * @swagger
+ * /notifications/register-device:
+ *   delete:
+ *     summary: Remove an FCM push token (e.g. on logout)
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               fcm_token: { type: string }
+ *     responses:
+ *       200:
+ *         description: Device unregistered
  */
 export const unregisterDevice: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {

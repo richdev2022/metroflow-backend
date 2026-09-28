@@ -103,11 +103,15 @@ npx tsx scripts/generate-swagger.ts   # regenerate swagger-output.json
 
 ## Deployment (VPS)
 
-One-shot deploy + verification (recommended — pulls, installs, builds, restarts pm2 and verifies the new build is actually serving, including a live MetricAi probe):
+One-shot deploy + verification (recommended — handles a dirty working tree safely, pulls, installs, builds, restarts pm2 and verifies the new build is actually serving via `/api/health`, including a live MetricAi probe):
 
 ```bash
 bash scripts/deploy.sh
 ```
+
+Notes:
+- Local drift in generated `server/swagger-output.json` is discarded automatically (it is rebuilt during the build); any other uncommitted edits are stashed and can be restored with `git stash pop`.
+- `GET /api/health` (public, no secrets) reports `db`, `metricAi.configured`, `gifs.configured`, `storage`, uptime and node version — useful for ops dashboards and post-deploy checks.
 
 Manual equivalent:
 
@@ -117,6 +121,12 @@ pm2 restart metroflow
 ```
 
 Migrations run automatically on boot (`runPostInitializeMigrations`): support-desk tables, `admin_notifications`, `ai_messages`, chat attachment columns, payroll verification columns, ledger backfill, plan `metric_ai_enabled`, and more — all idempotent.
+
+## Branching
+
+- `main` — production. What the VPS runs (`api.metricorex.com`).
+- `develop` — integration branch. Changes land here first and are verified, then a PR `develop → main` is merged for release.
+- Hotfixes may branch from `main` and be merged back into `develop` to keep them in sync.
 
 ## Support Desk Permissions
 

@@ -2,8 +2,13 @@
  * GLM (Z.ai) client — used by MetricAi and product document generation.
  *
  * Uses the free-tier models so no paid API key is required:
- *   - Chat:  glm-4-flash      (free, fast, multimodal-context text model)
+ *   - Chat:  glm-4.7-flash    (current free flash model on api.z.ai)
  *   - Image: cogview-3-flash  (free text-to-image model)
+ *
+ * IMPORTANT — free model ids age: Z.ai retired glm-4.5-flash on 2026-01-30 and
+ * glm-4-flash before that. glmChat therefore never hard-fails on one id: it
+ * walks a fallback chain of known-free ids, caches the last one that worked
+ * for the process lifetime, and logs an actionable error for auth/quota bugs.
  *
  * The end USER never supplies a key — the platform provides it server-side via
  *   GLM_API_KEY  (or ZAI_API_KEY / Z_AI_API_KEY alias)
@@ -16,8 +21,17 @@
  */
 
 const DEFAULT_API_BASE = "https://api.z.ai/api/paas/v4";
-const DEFAULT_CHAT_MODEL = "glm-4-flash";
+const DEFAULT_CHAT_MODEL = "glm-4.7-flash";
 const DEFAULT_IMAGE_MODEL = "cogview-3-flash";
+
+/**
+ * Known-free chat model ids, newest first. Walked in order whenever the
+ * current model stops working (e.g. upstream retirement).
+ */
+const FALLBACK_CHAT_MODELS = ["glm-4.5-flash", "glm-4-flash"];
+
+/** Chat model id that last answered OK (process lifetime cache). */
+let resolvedChatModel: string | null = null;
 
 export function getGlmApiKey(): string | undefined {
   return (
@@ -37,6 +51,7 @@ export function getGlmApiBase(): string {
 }
 
 export function getGlmChatModel(): string {
+  if (resolvedChatModel) return resolvedChatModel;
   return process.env.GLM_CHAT_MODEL || DEFAULT_CHAT_MODEL;
 }
 
@@ -60,6 +75,14 @@ export interface GlmChatOptions {
 /**
  * Chat completion via the OpenAI-compatible GLM endpoint.
  * Throws with a readable message when the key is missing or the API errors.
+ *
+ * Model resolution order:
+ *   1. explicit `opts.model` (used verbatim, no fallback)
+ *   2. previously-resolved working model (cache)
+ *   3. GLM_CHAT_MODEL env, else the current free default
+ *   4. remaining known-free ids (FALLBACK_CHAT_MODELS) — only when the request
+ *      itself fails with a model-level error (4xx/5xx); auth (401/403) and
+ *      quota (429) failures abort immediately with an actionable message.
  */
 export async function glmChat(opts: GlmChatOptions): Promise<string> {
   const apiKey = getGlmApiKey();
@@ -68,30 +91,75 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
   }
 
   const endpoint = `${getGlmApiBase()}/chat/completions`;
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: opts.model || getGlmChatModel(),
-      messages: opts.messages,
-      temperature: opts.temperature ?? 0.7,
-      max_tokens: opts.maxTokens ?? 2048,
-      stream: false,
-    }),
-  });
+  const candidates = opts.model
+    ? [opts.model]
+    : Array.from(new Set([getGlmChatModel(), ...FALLBACK_CHAT_MODELS]));
 
-  if (!response.ok) {
+  let lastError: Error | null = null;
+
+  for (const model of candidates) {
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: opts.messages,
+          temperature: opts.temperature ?? 0.7,
+          max_tokens: opts.maxTokens ?? 2048,
+          stream: false,
+        }),
+      });
+    } catch (networkError: any) {
+      lastError = new Error(
+        `GLM chat network error (${endpoint}): ${networkError?.message || networkError}`,
+      );
+      console.warn(`[glm] network error on model ${model} — trying next candidate...`);
+      continue;
+    }
+
+    if (response.ok) {
+      if (!opts.model) resolvedChatModel = model;
+      try {
+        const data = (await response.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        return data.choices?.[0]?.message?.content || "";
+      } catch (parseError: any) {
+        throw new Error(
+          `GLM chat returned malformed JSON: ${parseError?.message || parseError}`,
+        );
+      }
+    }
+
     const errorText = await response.text().catch(() => response.statusText);
-    throw new Error(`GLM chat error (${response.status}): ${errorText.slice(0, 500)}`);
+    lastError = new Error(
+      `GLM chat error (${response.status}) [model=${model}] :: ${errorText.slice(0, 300)}`,
+    );
+
+    // Account-level problems — another model id will not help.
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(
+        `${lastError.message} — the GLM key was rejected by ${getGlmApiBase()}. ` +
+          `GLM_API_KEY must match the platform of GLM_API_BASE ` +
+          `(z.ai keys typically start with "sk-"; open.bigmodel.cn keys look like "id.secret" ` +
+          `and need GLM_API_BASE=https://open.bigmodel.cn/api/paas/v4).`,
+      );
+    }
+    if (response.status === 429) {
+      throw new Error(`${lastError.message} — GLM rate limit/quota exhausted, retry later.`);
+    }
+
+    console.warn(
+      `[glm] chat model "${model}" not usable (HTTP ${response.status}) — trying next candidate...`,
+    );
   }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  return data.choices?.[0]?.message?.content || "";
+  throw lastError || new Error("GLM chat failed: no model candidates");
 }
 
 export interface GlmImageResult {

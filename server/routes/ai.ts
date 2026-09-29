@@ -781,13 +781,12 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
     try {
       await query(
         `INSERT INTO admin_notifications (type, title, body, dedupe_key)
-         SELECT 'metric_ai_activity', $2, $3, $4
+         SELECT 'metric_ai_activity'::varchar, $1::varchar, $2::text, $3::varchar
          WHERE NOT EXISTS (
            SELECT 1 FROM admin_notifications
-           WHERE dedupe_key = $4 AND created_at > NOW() - INTERVAL '30 minutes'
+           WHERE dedupe_key = $3::varchar AND created_at > NOW() - INTERVAL '30 minutes'
          )`,
         [
-          null,
           `${(req as any).user?.name || "A user"} is chatting with MetricAi`,
           trimmed.slice(0, 200),
           `metric-ai-${userId}`,

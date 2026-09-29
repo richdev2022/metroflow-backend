@@ -1,7 +1,7 @@
 import express from "express";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
-import { calculateFee, creditRevenueWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
@@ -169,7 +169,7 @@ const handleSquadWebhook = async (event: any) => {
                         );
 
                         const subAmount = parseFloat(transaction.amount);
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'squad');
                     }
                 }
             }
@@ -207,29 +207,22 @@ const handleSquadWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Debit platform wallet for user credit
-              const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL LIMIT 1`);
-              if (platformWalletRes.rows.length > 0) {
-                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [creditAmount, platformWalletRes.rows[0].id]);
-                
-                await query(
-                  `INSERT INTO transactions 
-                   (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                   VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                  [creditAmount, `${reference}-USER`, platformWalletRes.rows[0].id]
-                );
-              }
+              // Platform ledger (double-entry): the customer's gross inflow lands
+              // in the platform pool, the user payout leaves it and the fee moves
+              // to revenue - net platform balance change is zero.
+              await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'squad');
+              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'Platform Wallet Debit for User Funding', 'squad');
 
               // Credit revenue wallet (this will also debit platform wallet for fee)
               if (fee > 0) {
-                await creditRevenueWallet(fee, 'NGN', reference);
+                await creditRevenueWallet(fee, 'NGN', reference, undefined, 'squad');
               }
 
               await query(
                 `INSERT INTO transactions 
                  (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
                  VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, 'squad')`,
-                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee]
+                [wallet.business_id, wallet.user_id, creditAmount, reference, wallet.id, fee]
               );
 
               // Send in-app notification
@@ -330,18 +323,7 @@ const handleMonnifyWebhook = async (event: any) => {
                         
                         if (walletId) {
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
-                            
-                            const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                            if (platformWallet.rows.length > 0) {
-                                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
-                                
-                                await query(
-                                    `INSERT INTO transactions 
-                                    (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                                    [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
-                                );
-                            }
+                            await debitPlatformWallet(amount, 'NGN', `${reference}-PLATFORM`, 'Platform Wallet Debit for User Funding', 'monnify');
                         }
                     }
                     
@@ -369,7 +351,7 @@ const handleMonnifyWebhook = async (event: any) => {
                         );
                         
                         const subAmount = parseFloat(transaction.amount);
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'monnify');
                     }
                 }
             }
@@ -444,29 +426,21 @@ const handleMonnifyWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Debit platform wallet for user credit
-              const platformWalletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-              if (platformWalletRes.rows.length > 0) {
-                await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [creditAmount, platformWalletRes.rows[0].id]);
-                
-                await query(
-                  `INSERT INTO transactions 
-                   (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                   VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
-                  [creditAmount, `${reference}-USER`, platformWalletRes.rows[0].id]
-                );
-              }
+              // Platform ledger (double-entry): gross inflow lands in the pool,
+              // the user payout leaves it, the fee moves to revenue - net zero.
+              await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'monnify');
+              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'Platform Wallet Debit for User Funding', 'monnify');
 
               // Credit revenue wallet (this will also debit platform wallet for fee)
               if (fee > 0) {
-                await creditRevenueWallet(fee, 'NGN', reference);
+                await creditRevenueWallet(fee, 'NGN', reference, undefined, 'monnify');
               }
 
               await query(
                 `INSERT INTO transactions 
                  (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
                  VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Virtual Account', 'wallet_funding', $5, 'credit', $6, $7)`,
-                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, paymentProvider]
+                [wallet.business_id, wallet.user_id, creditAmount, reference, wallet.id, fee, paymentProvider]
               );
 
               // Send in-app notification
@@ -813,7 +787,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 );
 
                 const subAmount = parseFloat(transaction.amount);
-                await creditRevenueWallet(subAmount, transaction.currency || 'NGN');
+                await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'flutterwave');
             }
 
             return;
@@ -915,8 +889,16 @@ const handleFlutterwaveWebhook = async (event: any) => {
             client.release();
         }
 
+        // Platform ledger (double-entry): the customer's gross inflow lands in
+        // the platform pool, the user payout leaves it and the fee moves to
+        // revenue - net platform balance change is zero. Flutterwave fundings
+        // previously wrote NO platform rows at all, which made the admin
+        // Platform Ledger show fee movements only.
+        await creditPlatformWallet(amount, 'NGN', creditReference, 'Customer Wallet Funding Received (Flutterwave Virtual Account)', 'flutterwave').catch(() => {});
+        await debitPlatformWallet(creditAmount, 'NGN', `${creditReference}-USER`, 'Platform Wallet Debit for User Funding', 'flutterwave').catch(() => {});
+
         if (fee > 0) {
-            await creditRevenueWallet(fee, 'NGN', creditReference).catch(() => {});
+            await creditRevenueWallet(fee, 'NGN', creditReference, undefined, 'flutterwave').catch(() => {});
         }
 
         // Notify the wallet owner

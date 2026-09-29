@@ -11,7 +11,45 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureSystemSettingsDefaults();
   await ensureChatAndAiSchema();
   await ensureSupportSchema();
+  await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
+}
+
+/**
+ * Ledger + virtual account repairs:
+ *  1. virtual_accounts.is_active — selected by the admin VA list endpoint but
+ *     never added to pre-existing tables (admin list returned 500).
+ *  2. transactions.payment_provider DEFAULT 'squad' — every platform ledger
+ *     row inserted without an explicit provider silently became 'squad',
+ *     mislabelling Flutterwave/Monnify movements. Drop the default and
+ *     backfill the true provider from the reference prefix.
+ */
+async function ensureLedgerAndVirtualAccountFixes(): Promise<void> {
+  // 1. Admin VA list requires va.is_active
+  await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
+  await query(`UPDATE virtual_accounts SET is_active = TRUE WHERE is_active IS NULL`);
+
+  // 2. No silent provider default: rows without an explicit provider must be
+  //    NULL, never 'squad'.
+  await query(`ALTER TABLE transactions ALTER COLUMN payment_provider DROP DEFAULT`);
+
+  // 3. Backfill the real provider from the reference prefix on rows that were
+  //    mislabelled by the old default (or never tagged).
+  await query(
+    `UPDATE transactions SET payment_provider = 'flutterwave'
+     WHERE reference LIKE 'FLW-%' AND (payment_provider IS NULL OR payment_provider NOT IN ('flutterwave'))`,
+  );
+  await query(
+    `UPDATE transactions SET payment_provider = 'monnify'
+     WHERE (reference LIKE 'MNFY%' OR reference LIKE 'monnify-%')
+       AND (payment_provider IS NULL OR payment_provider NOT IN ('monnify'))`,
+  );
+  await query(
+    `UPDATE transactions SET payment_provider = 'squad'
+     WHERE (reference LIKE 'SB-%' OR reference LIKE 'squad-%' OR reference LIKE 'SQUAD%')
+       AND payment_provider IS NULL`,
+  );
+  console.log("[migrations] ledger + virtual account fixes applied");
 }
 
 /**

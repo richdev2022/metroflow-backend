@@ -93,6 +93,21 @@ export async function deleteFee(id: string) {
     await query(`DELETE FROM fee_configurations WHERE id = $1`, [id]);
 }
 
+/**
+ * Best-effort provider attribution from a payment reference prefix.
+ * Platform mirror rows (which never carry payment_provider explicitly) use
+ * this so the admin ledger shows the gateway that actually processed the
+ * money instead of a stale column default.
+ */
+export function inferProviderFromReference(reference?: string | null): string | null {
+    if (!reference) return null;
+    const ref = String(reference).toUpperCase();
+    if (ref.startsWith('FLW') || ref.includes('FLUTTERWAVE')) return 'flutterwave';
+    if (ref.startsWith('MNFY') || ref.includes('MONNIFY')) return 'monnify';
+    if (ref.startsWith('SB-') || ref.startsWith('SQUAD') || ref.includes('SQUAD')) return 'squad';
+    return null;
+}
+
 async function getOrCreateInternalWallet(currency: string): Promise<string> {
     // Operational/Platform Wallet (intermediary funds) - business_id & user_id NULL
     const walletRes = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL AND currency = $1 LIMIT 1`, [currency]);
@@ -115,10 +130,12 @@ async function recordPlatformTransaction(
     currency: string,
     reference: string | undefined,
     description: string,
+    provider?: string | null,
 ): Promise<void> {
     if (amount === 0) return;
     const direction = amount > 0 ? 'credit' : 'debit';
     const ref = reference || `platform-${direction}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    const resolvedProvider = provider || inferProviderFromReference(ref);
 
     const existing = await query(
         `SELECT id FROM transactions WHERE reference = $1 AND wallet_id = $2 AND transaction_type = 'platform' LIMIT 1`,
@@ -128,9 +145,9 @@ async function recordPlatformTransaction(
 
     await query(
         `INSERT INTO transactions
-         (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-         VALUES ($1, $2, 'success', $3, $4, $5, 'platform', $6, $7)`,
-        [Math.abs(amount), currency, ref, direction, description, walletId, direction]
+         (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider)
+         VALUES ($1, $2, 'success', $3, $4, $5, 'platform', $6, $7, $8)`,
+        [Math.abs(amount), currency, ref, direction, description, walletId, direction, resolvedProvider]
     );
 }
 
@@ -139,6 +156,7 @@ export async function creditPlatformWallet(
     currency: string = 'NGN',
     reference?: string,
     description?: string,
+    provider?: string | null,
 ) {
     // This is the Operational Wallet (Intermediary funds)
     if (amount === 0) return;
@@ -156,6 +174,7 @@ export async function creditPlatformWallet(
         currency,
         reference,
         description || (amount > 0 ? 'Platform Wallet Credit' : 'Platform Wallet Debit'),
+        provider,
     );
 }
 
@@ -164,9 +183,10 @@ export async function debitPlatformWallet(
     currency: string = 'NGN',
     reference?: string,
     description?: string,
+    provider?: string | null,
 ) {
     if (amount <= 0) return;
-    await creditPlatformWallet(-amount, currency, reference, description);
+    await creditPlatformWallet(-amount, currency, reference, description, provider);
 }
 
 export async function creditRevenueWallet(
@@ -174,12 +194,14 @@ export async function creditRevenueWallet(
     currency: string = 'NGN',
     reference?: string,
     description?: string,
+    provider?: string | null,
 ) {
     // This is the Revenue Wallet (platform_wallet table)
     if (amount === 0) return;
 
     const sign = amount >= 0 ? 1 : -1;
     const absAmount = Math.abs(amount);
+    const resolvedProvider = provider || inferProviderFromReference(reference);
 
     // 1. Move the fee in/out of the operational platform wallet - WITH a
     //    ledger row so the Platform Ledger shows the fee movement too.
@@ -194,6 +216,7 @@ export async function creditRevenueWallet(
         currency,
         reference,
         description || (sign > 0 ? 'Platform Wallet Debit for Revenue' : 'Platform Wallet Credit (Revenue Reversal)'),
+        resolvedProvider,
     );
 
     // 2. Mirror the movement into the revenue wallet balance.
@@ -227,9 +250,9 @@ export async function creditRevenueWallet(
     if (existingRevenue.rows.length === 0) {
         await query(
             `INSERT INTO transactions
-             (amount, currency, status, reference, type, description, transaction_type, direction)
-             VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit')`,
-            [absAmount, currency, revenueRef, description || 'Revenue Credit (fee)']
+             (amount, currency, status, reference, type, description, transaction_type, direction, payment_provider)
+             VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5)`,
+            [absAmount, currency, revenueRef, description || 'Revenue Credit (fee)', resolvedProvider]
         );
     }
 }
@@ -239,7 +262,8 @@ export async function debitRevenueWallet(
     currency: string = 'NGN',
     reference?: string,
     description?: string,
+    provider?: string | null,
 ) {
     if (amount <= 0) return;
-    await creditRevenueWallet(-amount, currency, reference, description || 'Revenue Debit (refund/reversal)');
+    await creditRevenueWallet(-amount, currency, reference, description || 'Revenue Debit (refund/reversal)', provider);
 }

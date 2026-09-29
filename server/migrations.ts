@@ -81,6 +81,30 @@ async function ensureChatAndAiSchema(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_ai_messages_user_created ON ai_messages(user_id, created_at)`);
+  // MetricAi generated videos land in the same history stream
+  await query(`ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS video_url TEXT`);
+  await query(`ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS video_cover_url TEXT`);
+
+  // MetricAi text-to-video async jobs (CogVideoX is an upstream async API:
+  // create -> poll minutes later). Jobs persist so a restart never orphans one.
+  await query(`
+    CREATE TABLE IF NOT EXISTS metric_ai_video_jobs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      prompt TEXT NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'processing',  -- processing|success|failed
+      video_url TEXT,
+      cover_url TEXT,
+      model VARCHAR(64),
+      upstream_base TEXT,
+      upstream_job_id TEXT,
+      error TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_video_jobs_user_created ON metric_ai_video_jobs(user_id, created_at)`);
 
   // Plan-gated access: admin enables MetricAi per pricing plan
   await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_enabled BOOLEAN DEFAULT FALSE`);

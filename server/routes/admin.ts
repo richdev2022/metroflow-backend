@@ -7,6 +7,7 @@ import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHt
 import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
+import { invalidatePlanLimitsCache } from "../lib/ai-usage";
 import { verifyPayment } from "../services/squad";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 
@@ -3799,6 +3800,106 @@ protectedRouter.post("/virtual-accounts/clear", requirePermission('manage_financ
     } catch (error: any) {
         console.error("Admin clear virtual accounts error:", error);
         res.status(500).json({ success: false, error: error.message || "Failed to clear virtual accounts" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// MetricAi usage limits — per plan, per feature, daily/monthly (admin-managed)
+// ---------------------------------------------------------------------------
+const AI_LIMIT_FIELDS = [
+    "metric_ai_chat_daily",
+    "metric_ai_chat_monthly",
+    "metric_ai_image_daily",
+    "metric_ai_image_monthly",
+    "metric_ai_video_daily",
+    "metric_ai_video_monthly",
+] as const;
+
+/** Normalize an incoming limit value: positive int, 0, or null (= unlimited). */
+const normalizeAiLimit = (value: unknown): number | null => {
+    if (value === null || value === undefined || value === "" || value === "null") return null;
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return null;
+    return Math.floor(num);
+};
+
+protectedRouter.get("/ai/limits", requirePermission('manage_plans'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(
+            `SELECT id, name, price, currency, duration, is_active,
+                    metric_ai_enabled,
+                    metric_ai_chat_daily, metric_ai_chat_monthly,
+                    metric_ai_image_daily, metric_ai_image_monthly,
+                    metric_ai_video_daily, metric_ai_video_monthly
+             FROM pricing_plans
+             ORDER BY price ASC, created_at ASC`
+        );
+        res.json({ success: true, data: { plans: result.rows } });
+    } catch (error: any) {
+        console.error("Admin list AI limits error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load AI limits" });
+    }
+});
+
+protectedRouter.put("/ai/limits/:planId", requirePermission('manage_plans'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { planId } = req.params;
+        const body = req.body || {};
+
+        const planCheck = await query(`SELECT id, name FROM pricing_plans WHERE id = $1`, [planId]);
+        if (planCheck.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Plan not found" });
+        }
+
+        const values: Record<string, number | null> = {};
+        for (const field of AI_LIMIT_FIELDS) {
+            // Accept camelCase or snake_case keys from the admin UI
+            const camel = field.replace(/_([a-z])/g, (_m, c) => c.toUpperCase());
+            if (body[field] !== undefined || body[camel] !== undefined) {
+                values[field] = normalizeAiLimit(body[field] ?? body[camel]);
+            }
+        }
+
+        const sets: string[] = [];
+        const params: unknown[] = [];
+        let idx = 1;
+        for (const [field, value] of Object.entries(values)) {
+            sets.push(`${field} = $${idx}`);
+            params.push(value);
+            idx += 1;
+        }
+        if (typeof body.metric_ai_enabled === "boolean" || typeof body.metricAiEnabled === "boolean") {
+            sets.push(`metric_ai_enabled = $${idx}`);
+            params.push(Boolean(body.metric_ai_enabled ?? body.metricAiEnabled));
+            idx += 1;
+        }
+        if (sets.length === 0) {
+            return res.status(400).json({ success: false, error: "No limit fields provided" });
+        }
+
+        params.push(planId);
+        await query(
+            `UPDATE pricing_plans SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = $${idx}`,
+            params,
+        );
+        invalidatePlanLimitsCache();
+
+        const updated = await query(
+            `SELECT id, name, metric_ai_enabled,
+                    metric_ai_chat_daily, metric_ai_chat_monthly,
+                    metric_ai_image_daily, metric_ai_image_monthly,
+                    metric_ai_video_daily, metric_ai_video_monthly
+             FROM pricing_plans WHERE id = $1`,
+            [planId],
+        );
+        res.json({
+            success: true,
+            message: `MetricAi limits updated for ${planCheck.rows[0].name}`,
+            data: updated.rows[0],
+        });
+    } catch (error: any) {
+        console.error("Admin update AI limits error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to update AI limits" });
     }
 });
 

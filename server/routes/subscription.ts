@@ -53,9 +53,14 @@ const isPaymentSuccessful = (response: any) => {
         response?.success &&
         (
             data.transaction_status === 'success' ||
+            data.transaction_status === 'successful' ||
             data.paymentStatus === 'PAID' ||
             data.status === 'PAID' ||
-            data.status === 'SUCCESS'
+            data.status === 'SUCCESS' ||
+            data.status === 'success' ||
+            // Flutterwave v3 verify_by_reference returns data.status = "successful"
+            // (lowercase) — valid payments were being marked failed without this.
+            data.status === 'successful'
         )
     );
 };
@@ -1003,8 +1008,20 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
         }
     }
 
-    // Verify with the provider that initiated the transaction
-    const verifyResponse = await provider.verifyPayment(reference);
+    // Verify with the provider that initiated the transaction.
+    // A provider-side failure (network, 5xx, bad key) must NOT mark the local
+    // transaction failed — the customer may have already paid.
+    let verifyResponse: any;
+    try {
+        verifyResponse = await provider.verifyPayment(reference);
+    } catch (verifyErr: any) {
+        console.error("Provider verifyPayment threw:", verifyErr?.message || verifyErr);
+        return res.status(503).json({
+            success: false,
+            error: "Payment verification is temporarily unavailable. Please retry in a moment — do not pay twice.",
+            code: "verification_unavailable",
+        });
+    }
 
     if (isPaymentSuccessful(verifyResponse)) {
         // Extract Card Information

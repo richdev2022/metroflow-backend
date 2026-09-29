@@ -138,10 +138,45 @@ else
 fi
 
 # Route-existence probes (401 = registered + auth-gated)
-for p in "/api/ai/status" "/api/chat/gifs" "/api/support/my/conversations" "/api/tasks/00000000-0000-0000-0000-000000000000/attachments"; do
+for p in "/api/ai/status" "/api/ai/usage" "/api/chat/gifs" "/api/support/my/conversations" "/api/tasks/00000000-0000-0000-0000-000000000000/attachments"; do
   CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "$BASE$p")
   if [ "$CODE" = "404" ]; then fail "$p -> 404 (route missing!)"; STALE=1; else ok "$p -> $CODE (registered)"; fi
 done
+
+# ---------------------------------------------------------------------
+# RTC readiness: announced IP must be PUBLIC and the UDP range reachable
+# (the #1 cause of participants stuck on "Preparing to join").
+# ---------------------------------------------------------------------
+if echo "$HEALTH_JSON" | grep -q '"rtc"'; then
+  RTC_ANNOUNCED="$(echo "$HEALTH_JSON" | grep -o '"announcedIp":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  RTC_PUBLIC="$(echo "$HEALTH_JSON" | grep -o '"announcedIpIsPublic":[a-z]*' | head -1 | cut -d: -f2)"
+  RTC_READY="$(echo "$HEALTH_JSON" | grep -o '"ready":[a-z]*' | head -1 | cut -d: -f2)"
+  if [ "$RTC_READY" = "true" ]; then
+    ok "Mediasoup: workers up, announced IP = ${RTC_ANNOUNCED:-?}"
+  else
+    warn "Mediasoup: workers not ready yet (starts in the background after boot)"
+  fi
+  if [ "$RTC_PUBLIC" != "true" ]; then
+    warn "Mediasoup announced IP is NOT a public address (${RTC_ANNOUNCED:-unknown}) — remote participants WILL be stuck joining."
+    echo "       Fix: set MEDIASOUP_ANNOUNCED_IP=<this server's PUBLIC IP> in the backend .env, then: pm2 restart $APP_NAME --update-env"
+  fi
+fi
+RTC_MIN="$(grep -oE 'MEDIASOUP_RTC_MIN_PORT=[0-9]+' .env 2>/dev/null | cut -d= -f2 || true)"
+RTC_MAX="$(grep -oE 'MEDIASOUP_RTC_MAX_PORT=[0-9]+' .env 2>/dev/null | cut -d= -f2 || true)"
+RTC_MIN="${RTC_MIN:-40000}"; RTC_MAX="${RTC_MAX:-49999}"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ufw status | grep -qE "${RTC_MIN}.*udp|${RTC_MIN}:${RTC_MAX}"; then
+    ok "Firewall: UDP ${RTC_MIN}-${RTC_MAX} already open (mediasoup media ports)"
+  else
+    if ufw allow "${RTC_MIN}:${RTC_MAX}/udp" >/dev/null 2>&1; then
+      ok "Firewall: opened UDP ${RTC_MIN}-${RTC_MAX} for mediasoup media (ufw)"
+    else
+      warn "Could not open UDP ${RTC_MIN}-${RTC_MAX} via ufw — open this range manually or media will not connect."
+    fi
+  fi
+else
+  echo "  • Firewall check: ensure UDP ${RTC_MIN}-${RTC_MAX} is reachable (cloud firewall + ufw) for calls/meetings."
+fi
 
 [ "$STASHED" = "1" ] && warn "remember: your pre-deploy local edits are in 'git stash' (git stash pop / git stash drop)"
 

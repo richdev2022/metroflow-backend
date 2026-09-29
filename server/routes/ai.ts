@@ -1,5 +1,7 @@
 import { RequestHandler } from "express";
 import crypto from "crypto";
+import multer from "multer";
+import { execFile } from "child_process";
 import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
@@ -8,6 +10,7 @@ import {
   glmImageGen,
   glmVideoCreate,
   glmVideoPoll,
+  glmVision,
   isGlmConfigured,
   getGlmChatModel,
   getGlmImageModel,
@@ -15,6 +18,15 @@ import {
   GlmVideoStatus,
 } from "../lib/glm";
 import { uploadMediaBuffer } from "../services/media-upload";
+import {
+  AiFeatureUsage,
+  AiPlanLimits,
+  getAiUsageSnapshot,
+  getPlanAiLimits,
+  assertWithinAiUsage,
+  recordAiUsage,
+  tryConsumeAiUsage,
+} from "../lib/ai-usage";
 
 /**
  * MetricAi — the platform's built-in assistant (like Meta AI in WhatsApp).
@@ -54,6 +66,8 @@ What you know about Metricorex (answer confidently from this when asked):
 - Security: KYC verification (BVN/NIN/business docs), transaction PIN & OTP, biometric unlock, login-attempt alerts by email.
 - Plans & Subscriptions: monthly/annual pricing plans that unlock feature bundles; admins can toggle features like MetricAi per plan.
 - MetricAi (you): available on web and mobile; you answer questions, explain concepts, write and improve text, brainstorm, do quick math, guide users step by step, and generate IMAGES on request. Videos are generated asynchronously (they take a few minutes and arrive in the chat when ready).
+- VISION: you can SEE images the user attaches or pastes — screenshots, photos of documents, receipts, error dialogs, charts, whiteboards, handwriting. Read ALL text in them (OCR), interpret what is shown (including app UI and error messages), and use it to answer. When the user sends a screenshot of a Metricorex screen, use it to diagnose exactly where they are and guide them precisely.
+- VIDEO attachments: a few frames of an attached video may be extracted for you. If the analysis says no frames were available, say you couldn't watch the video and ask the user to describe it or send a screenshot of the key moment.
 - Support: if you cannot solve something, the user can hand the chat to the real human support team right from the conversation.
 
 Rules:
@@ -249,8 +263,175 @@ interface MetricAiRequest extends AuthenticatedRequest {
     userId: string;
     businessId: string;
     planName: string | null;
+    planId: string | null;
+    limits: AiPlanLimits;
   };
 }
+
+/** Uniform 429 body for a reached usage cap. */
+function limitReached(block: { feature: string; period: string; limit: number; used: number; resetsAt: string; friendlyError: string }) {
+  return {
+    status: 429 as const,
+    body: {
+      success: false,
+      error: block.friendlyError,
+      code: "ai_limit_reached",
+      upgradeRequired: true,
+      data: {
+        feature: block.feature,
+        period: block.period,
+        limit: block.limit,
+        used: block.used,
+        resetsAt: block.resetsAt,
+      },
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Attachments: image paste/attach + video attach (vision input)        */
+/* ------------------------------------------------------------------ */
+
+/** Download an attached image (https URL or data: URL) into a Buffer. */
+async function fetchImageBytes(src: string): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  try {
+    if (src.startsWith("data:")) {
+      const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(src);
+      if (!match) return null;
+      const mimeType = match[1] || "image/png";
+      const buffer = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3]), "utf8");
+      return buffer.length > 0 ? { buffer, mimeType } : null;
+    }
+    if (!/^https?:\/\//i.test(src)) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    try {
+      const res = await fetch(src, { signal: ctrl.signal });
+      if (!res.ok) return null;
+      const mimeType = res.headers.get("content-type") || "image/png";
+      if (!/^image\//.test(mimeType)) return null;
+      const arrayBuf = await res.arrayBuffer();
+      if (arrayBuf.byteLength > 15 * 1024 * 1024) return null; // vision safety cap
+      return { buffer: Buffer.from(arrayBuf), mimeType };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e: any) {
+    console.warn("fetchImageBytes failed:", e?.message);
+    return null;
+  }
+}
+
+interface VideoFrame {
+  buffer: Buffer;
+  mimeType: string;
+}
+
+/**
+ * Best-effort frame extraction from an attached video using ffmpeg (if the
+ * host has it). Grabs up to `max` JPEG frames at spread offsets. Returns []
+ * when ffmpeg is unavailable or the video cannot be read — callers degrade
+ * gracefully instead of failing the chat.
+ */
+async function extractVideoFrames(videoUrl: string, max = 2): Promise<VideoFrame[]> {
+  const frames: VideoFrame[] = [];
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile("ffmpeg", ["-version"], { timeout: 5000 }, (err) => (err ? reject(err) : resolve()));
+    });
+  } catch {
+    return []; // ffmpeg not installed on this host
+  }
+  const offsets = [0.5, Math.min(3, 0.5 + max), Math.min(8, 1 + max * 2)];
+  for (const offset of offsets.slice(0, max)) {
+    try {
+      const stdout = await new Promise<Buffer>((resolve, reject) => {
+        execFile(
+          "ffmpeg",
+          [
+            "-hide_banner", "-loglevel", "error",
+            "-ss", String(offset),
+            "-i", videoUrl,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "pipe:1",
+          ],
+          { timeout: 25_000, maxBuffer: 16 * 1024 * 1024 },
+          (err, stdoutBuf, stderr) => {
+            if (err) reject(new Error(String(stderr || err).slice(0, 200)));
+            else resolve(typeof stdoutBuf === "string" ? Buffer.from(stdoutBuf) : Buffer.from(stdoutBuf));
+          },
+        );
+      });
+      if (stdout && stdout.length > 512) {
+        frames.push({ buffer: stdout, mimeType: "image/jpeg" });
+      }
+      if (frames.length >= max) break;
+    } catch {
+      // offset beyond video end etc — try the next offset
+    }
+  }
+  return frames;
+}
+
+/** Multer uploader for MetricAi attachments (image/video/pdf/text, 100 MB). */
+export const aiAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mime = (file.mimetype || "").toLowerCase();
+    const ok =
+      mime.startsWith("image/") ||
+      mime.startsWith("video/") ||
+      mime === "application/pdf" ||
+      mime.startsWith("text/");
+    if (ok) return cb(null, true);
+    cb(new Error("Unsupported attachment type. Images, videos, PDFs and text files are accepted."));
+  },
+}).single("file");
+
+/**
+ * POST /ai/attachments — upload an image/video for MetricAi chat.
+ * Returns a persistent URL that /ai/chat accepts as imageUrl/attachmentUrl.
+ */
+export const postAiAttachment: RequestHandler = async (req: MetricAiRequest, res) => {
+  try {
+    const file = (req as any).file as
+      | { buffer: Buffer; originalname?: string; mimetype?: string; size?: number }
+      | undefined;
+    if (!file || !file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({ success: false, error: "file is required" });
+    }
+    const { userId, businessId } = req.aiAccess!;
+    const mime = file.mimetype || "application/octet-stream";
+    const kind = mime.startsWith("video/") ? "video" : mime.startsWith("image/") ? "image" : "file";
+    const ext = (file.originalname || "").match(/\.[a-z0-9]{1,6}$/i)?.[0] || (mime.startsWith("video/") ? ".mp4" : mime === "image/png" ? ".png" : mime === "image/jpeg" ? ".jpg" : mime === "application/pdf" ? ".pdf" : "");
+    const media = await uploadMediaBuffer({
+      buffer: file.buffer,
+      originalname: `metricai-attach-${Date.now()}${ext}`,
+      mimeType: mime,
+      folder: "metricai",
+      businessId,
+      userId,
+    });
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        url: media.url,
+        filename: file.originalname || null,
+        mimeType: mime,
+        size: file.size || file.buffer.length,
+        attachmentType: kind,
+        storage: media.storage || undefined,
+      },
+    };
+    res.json(response);
+  } catch (error: any) {
+    console.error("MetricAi attachment upload error:", error);
+    res.status(500).json({ success: false, error: "Failed to upload attachment" });
+  }
+};
 
 /**
  * Plan-gate: the caller's business plan must have metric_ai_enabled = TRUE.
@@ -266,7 +447,7 @@ const requireMetricAiAccess: RequestHandler = async (req, res, next) => {
     }
 
     const result = await query(
-      `SELECT p.metric_ai_enabled, p.name as plan_name
+      `SELECT p.metric_ai_enabled, p.name as plan_name, p.id as plan_id
        FROM businesses b
        LEFT JOIN pricing_plans p ON b.plan_id = p.id
        WHERE b.id = $1`,
@@ -291,6 +472,8 @@ const requireMetricAiAccess: RequestHandler = async (req, res, next) => {
       userId,
       businessId,
       planName: result.rows[0].plan_name || null,
+      planId: result.rows[0].plan_id || null,
+      limits: await getPlanAiLimits(result.rows[0].plan_id),
     };
     next();
   } catch (error) {
@@ -311,24 +494,21 @@ const requireMetricAiAccess: RequestHandler = async (req, res, next) => {
  *       200:
  *         description: Status object
  */
-export const getAiStatus: RequestHandler = async (req: AuthenticatedRequest, res) => {
+export const getAiStatus: RequestHandler = async (req: MetricAiRequest, res) => {
   try {
-    const userId = req.user?.userId;
-    const businessId = req.user?.businessId;
-    if (!userId || !businessId) {
+    const aiAccess = req.aiAccess;
+    if (!aiAccess?.userId) {
       return res.status(401).json({ success: false, error: "User authentication required" });
     }
-
-    const result = await query(
-      `SELECT p.metric_ai_enabled, p.name as plan_name
-       FROM businesses b
-       LEFT JOIN pricing_plans p ON b.plan_id = p.id
-       WHERE b.id = $1`,
-      [businessId],
-    );
-    const row = result.rows[0] || {};
-    const enabled = row.metric_ai_enabled === true;
+    const enabled = true; // requireMetricAiAccess already gated the plan
     const serverConfigured = isGlmConfigured();
+
+    let usage: Record<string, AiFeatureUsage> | undefined;
+    try {
+      usage = await getAiUsageSnapshot(aiAccess.userId, aiAccess.limits);
+    } catch (usageError) {
+      console.error("MetricAi usage snapshot failed (non-fatal):", usageError);
+    }
 
     const response: ApiResponse<any> = {
       success: true,
@@ -336,9 +516,11 @@ export const getAiStatus: RequestHandler = async (req: AuthenticatedRequest, res
         enabled,                       // plan includes MetricAi
         serverConfigured,              // GLM key present on the server
         available: enabled && serverConfigured,
-        planName: row.plan_name || null,
+        planName: aiAccess.planName || null,
         chatModel: getGlmChatModel(),
         imageModel: getGlmImageModel(),
+        limits: aiAccess.limits,
+        usage,
         code: enabled ? undefined : "metric_ai_not_enabled",
       },
     };
@@ -346,6 +528,28 @@ export const getAiStatus: RequestHandler = async (req: AuthenticatedRequest, res
   } catch (error) {
     console.error("MetricAi status error:", error);
     res.status(500).json({ success: false, error: "Failed to fetch MetricAi status" });
+  }
+};
+
+/**
+ * GET /ai/usage — per-feature daily/monthly usage vs the caller's plan limits.
+ * Powers the quota chips in the MetricAi header (web + mobile).
+ */
+export const getAiUsage: RequestHandler = async (req: MetricAiRequest, res) => {
+  try {
+    const aiAccess = req.aiAccess;
+    if (!aiAccess?.userId) {
+      return res.status(401).json({ success: false, error: "User authentication required" });
+    }
+    const usage = await getAiUsageSnapshot(aiAccess.userId, aiAccess.limits);
+    const response: ApiResponse<any> = {
+      success: true,
+      data: { usage, limits: aiAccess.limits, planName: aiAccess.planName || null },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("MetricAi usage error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch MetricAi usage" });
   }
 };
 
@@ -378,15 +582,62 @@ export const getAiStatus: RequestHandler = async (req: AuthenticatedRequest, res
  */
 export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
   try {
-    const { message, imageUrl } = req.body || {};
+    const { message, imageUrl, attachmentUrl, attachmentType } = req.body || {};
     const trimmed = typeof message === "string" ? message.trim() : "";
-    if (!trimmed && !imageUrl) {
+    if (!trimmed && !imageUrl && !attachmentUrl) {
       return res.status(400).json({ success: false, error: "message is required" });
     }
 
-    const { userId, businessId } = req.aiAccess!;
+    const { userId, businessId, limits } = req.aiAccess!;
+
+    // ---- Usage limit: every chat message consumes one 'chat' slot --------
+    const chatGate = await tryConsumeAiUsage(userId, businessId, "chat", limits);
+    if (chatGate.ok === false) {
+      const blocked = limitReached(chatGate);
+      return res.status(blocked.status).json(blocked.body);
+    }
+
     const wantsVideo = VIDEO_INTENT_RE.test(trimmed);
     const wantsImage = !wantsVideo && IMAGE_INTENT_RE.test(trimmed);
+
+    // ---- Vision / OCR: understand attached images (and video frames) ------
+    const normalizedType = typeof attachmentType === "string" ? attachmentType.toLowerCase() : "";
+    const attachedImageUrl: string | null =
+      typeof imageUrl === "string" && imageUrl.length > 8 ? imageUrl : null;
+    const attachedVideoUrl: string | null =
+      typeof attachmentUrl === "string" && attachmentUrl.length > 8 && (normalizedType === "video" || /\.(mp4|webm|mov|m4v|avi|mkv|3gp)(\?|$)/i.test(attachmentUrl))
+        ? attachmentUrl
+        : null;
+
+    let visionReport: string | null = null;
+    let attachmentNote: string | null = null;
+    try {
+      if (attachedImageUrl) {
+        const img = await fetchImageBytes(attachedImageUrl);
+        if (img) {
+          visionReport = await glmVision({ buffer: img.buffer, mimeType: img.mimeType, question: trimmed });
+        } else {
+          attachmentNote = "an image that could not be loaded";
+        }
+      } else if (attachedVideoUrl) {
+        const frames = await extractVideoFrames(attachedVideoUrl, 2);
+        if (frames.length > 0) {
+          const reports = await Promise.allSettled(
+            frames.map((f, i) => glmVision({ buffer: f.buffer, mimeType: f.mimeType, question: `${trimmed} (frame ${i + 1} of ${frames.length} from the attached video)` })),
+          );
+          const okReports = reports.filter((r) => r.status === "fulfilled").map((r) => (r as PromiseFulfilledResult<string>).value);
+          if (okReports.length > 0) {
+            visionReport = okReports.join("\n\n--- next frame ---\n\n");
+          }
+        }
+        if (!visionReport) {
+          attachmentNote = "a video whose frames could not be extracted";
+        }
+      }
+    } catch (visionError: any) {
+      console.warn("MetricAi vision analysis failed (continuing text-only):", visionError?.message);
+      attachmentNote = attachedVideoUrl ? "a video" : "an image";
+    }
 
     // Load recent history (last 12 exchanges) for continuity
     const history = await query(
@@ -399,9 +650,15 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
       .filter((r: any) => r.content)
       .map((r: any) => ({ role: r.role === "assistant" ? "assistant" : "user", content: r.content }));
 
-    const userContent = imageUrl
-      ? `${trimmed}${trimmed ? "\n" : ""}[user attached an image: ${imageUrl}]`
-      : trimmed;
+    let userContent = trimmed;
+    if (visionReport) {
+      const label = attachedVideoUrl ? "video" : "image";
+      userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached a ${label}. You can see it through this vision analysis:\n${visionReport}]`;
+    } else if (attachmentNote) {
+      userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached ${attachmentNote}, but it could not be analyzed visually. If the message depends on it, briefly ask them to describe it or send a screenshot.]`;
+    } else if (attachedImageUrl && !attachedVideoUrl) {
+      userContent = `${trimmed}${trimmed ? "\n" : ""}[user attached an image: ${attachedImageUrl}]`;
+    }
 
     const messages: GlmChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
@@ -411,9 +668,9 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
 
     // Store the user's message first (even if generation fails, history is honest)
     await query(
-      `INSERT INTO ai_messages (user_id, business_id, role, content, image_url)
-       VALUES ($1, $2, 'user', $3, $4)`,
-      [userId, businessId, trimmed || null, imageUrl || null],
+      `INSERT INTO ai_messages (user_id, business_id, role, content, image_url, attachment_url, attachment_type)
+       VALUES ($1, $2, 'user', $3, $4, $5, $6)`,
+      [userId, businessId, trimmed || null, attachedImageUrl, attachedVideoUrl, attachedVideoUrl ? "video" : attachedImageUrl ? "image" : null],
     );
 
     let replyText = "";
@@ -424,8 +681,15 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
     if (wantsVideo) {
       // Video generation path — CogVideoX is an upstream ASYNC job: create now,
       // poll in the background, drop the finished video into the chat history.
+      // Usage: checked before the job, recorded only when a job actually starts.
+      const videoGate = await assertWithinAiUsage(userId, "video", limits);
+      if (videoGate.ok === false) {
+        const blocked = limitReached(videoGate);
+        return res.status(blocked.status).json(blocked.body);
+      }
       try {
         const job = await glmVideoCreate(trimmed);
+        await recordAiUsage(userId, businessId, "video");
         const jobRow = await query(
           `INSERT INTO metric_ai_video_jobs (user_id, business_id, prompt, status, model, upstream_base, upstream_job_id)
            VALUES ($1, $2, $3, 'processing', $4, $5, $6) RETURNING id`,
@@ -464,7 +728,13 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
         });
       }
     } else if (wantsImage) {
-      // Image generation path — the reply accompanies the generated artwork
+      // Image generation path — the reply accompanies the generated artwork.
+      // Usage: checked before generating, recorded only on success.
+      const imageGate = await assertWithinAiUsage(userId, "image", limits);
+      if (imageGate.ok === false) {
+        const blocked = limitReached(imageGate);
+        return res.status(blocked.status).json(blocked.body);
+      }
       try {
         const image = await glmImageGen(trimmed, async (buffer, mimeType, originalname) => {
           const media = await uploadMediaBuffer({
@@ -477,6 +747,7 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
           });
           return media.url;
         });
+        await recordAiUsage(userId, businessId, "image");
         generatedImageUrl = image.url;
         modelUsed = image.model;
         replyText = await glmChat({
@@ -510,13 +781,12 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
     try {
       await query(
         `INSERT INTO admin_notifications (type, title, body, dedupe_key)
-         SELECT 'metric_ai_activity', $2, $3, $4
+         SELECT 'metric_ai_activity'::varchar, $1::varchar, $2::text, $3::varchar
          WHERE NOT EXISTS (
            SELECT 1 FROM admin_notifications
-           WHERE dedupe_key = $4 AND created_at > NOW() - INTERVAL '30 minutes'
+           WHERE dedupe_key = $3::varchar AND created_at > NOW() - INTERVAL '30 minutes'
          )`,
         [
-          null,
           `${(req as any).user?.name || "A user"} is chatting with MetricAi`,
           trimmed.slice(0, 200),
           `metric-ai-${userId}`,
@@ -539,6 +809,8 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
         id: assistantInsert.rows[0].id,
         reply: replyText,
         imageUrl: generatedImageUrl,
+        attachmentUrl: attachedVideoUrl || attachedImageUrl || undefined,
+        attachmentType: attachedVideoUrl ? "video" : attachedImageUrl ? "image" : undefined,
         videoJob: videoJobId ? { id: videoJobId, status: "processing" } : undefined,
         model: modelUsed,
         suggestHumanSupport: handoff.suggestHumanSupport,
@@ -589,7 +861,8 @@ export const getAiHistory: RequestHandler = async (req: MetricAiRequest, res) =>
       [userId],
     );
     const result = await query(
-      `SELECT id, role, content, image_url as "imageUrl", video_url as "videoUrl", video_cover_url as "videoCoverUrl", model, created_at as "createdAt"
+      `SELECT id, role, content, image_url as "imageUrl", video_url as "videoUrl", video_cover_url as "videoCoverUrl",
+              attachment_url as "attachmentUrl", attachment_type as "attachmentType", model, created_at as "createdAt"
        FROM ai_messages WHERE user_id = $1
        ORDER BY created_at ASC LIMIT $2 OFFSET $3`,
       [userId, limit, offset],

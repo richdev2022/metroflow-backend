@@ -573,29 +573,41 @@ protectedRouter.get("/revenue/history", requirePermission('view_dashboard'), asy
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
     const offset = (page - 1) * limit;
 
-    // Revenue-side movements ONLY (wallet_id IS NULL distinguishes the
-    // revenue ledger rows written by creditRevenueWallet from the user-side
-    // fee debit rows that used to be the only visible records).
+    // Revenue-side movements ONLY. Two row generations exist in the ledger:
+    //  - current: transaction_type IN ('fee','subscription') written by
+    //    creditRevenueWallet() with wallet_id NULL, and
+    //  - legacy: transaction_type = 'revenue' rows attached to the platform
+    //    wallet by the pre-refactor writer (reference *-REVENUE).
+    // Excluding the legacy generation is why this endpoint returned an empty
+    // list on production databases that predate the current writer.
+    const where = `status = 'success'
+         AND (
+           (transaction_type IN ('subscription', 'fee') AND wallet_id IS NULL)
+           OR transaction_type = 'revenue'
+         )`;
     const countRes = await query(
-        `SELECT COUNT(*)::int AS total FROM transactions
-         WHERE status = 'success'
-         AND transaction_type IN ('subscription', 'fee')
-         AND wallet_id IS NULL`
+        `SELECT COUNT(*)::int AS total FROM transactions WHERE ${where}`
     );
     const transactions = await query(
-        `SELECT * FROM transactions 
-         WHERE status = 'success' 
-         AND transaction_type IN ('subscription', 'fee') 
-         AND wallet_id IS NULL
+        `SELECT * FROM transactions
+         WHERE ${where}
          ORDER BY created_at DESC
          LIMIT $1 OFFSET $2`,
         [limit, offset]
     );
 
-    const history = transactions.rows.map(txn => ({
-        ...txn,
-        type: txn.type === 'debit' ? 'debit' : 'credit'
-    }));
+    const history = transactions.rows.map(txn => {
+        const isLegacyRevenue = txn.transaction_type === 'revenue';
+        return {
+            ...txn,
+            // Legacy rows are platform-wallet mirrors of a fee inflow: show
+            // them as credits (revenue direction) with a clean description.
+            type: isLegacyRevenue ? 'credit' : (txn.type === 'debit' ? 'debit' : 'credit'),
+            description: isLegacyRevenue && /debit for revenue/i.test(txn.description || '')
+                ? 'Revenue Credit (fee)'
+                : txn.description,
+        };
+    });
 
     res.json({ success: true, transactions: history, pagination: { page, limit, total: countRes.rows[0]?.total || 0 } });
 
@@ -3696,55 +3708,93 @@ protectedRouter.post("/virtual-accounts/:walletId/regenerate", requirePermission
 
 /**
  * POST /admin/virtual-accounts/clear
- * Deletes EVERY virtual account created for a customer on a given provider.
- * Body: { business_id?, wallet_id?, provider } - provider optional (all).
+ * Deletes virtual accounts, optionally scoped:
+ *   { provider }                                  -> EVERY VA on that provider
+ *   { all: true }                                 -> EVERY VA on every provider
+ *   { business_id | wallet_id | user_id, provider? } -> one customer's VAs
  * Clears wallet VA fields and deletes the virtual_accounts rows.
  */
 protectedRouter.post("/virtual-accounts/clear", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
-        const { business_id, wallet_id, user_id, provider } = req.body || {};
-        if (!business_id && !wallet_id && !user_id) {
-            return res.status(400).json({ success: false, error: "Provide business_id, wallet_id or user_id" });
+        const { business_id, wallet_id, user_id, provider, all } = req.body || {};
+        if (!business_id && !wallet_id && !user_id && !provider && !all) {
+            return res.status(400).json({ success: false, error: "Provide provider, business_id, wallet_id, user_id, or all=true" });
         }
 
-        const params: any[] = [];
-        let walletWhere = 'virtual_account_number IS NOT NULL';
-        if (business_id) { params.push(business_id); walletWhere += ` AND business_id = $${params.length}`; }
-        if (wallet_id) { params.push(wallet_id); walletWhere += ` AND id = $${params.length}`; }
-        if (user_id) {
-            params.push(user_id); const ui = params.length;
-            walletWhere += ` AND (user_id = $${ui} OR business_id IN (SELECT business_id FROM users WHERE id = $${ui}))`;
-        }
-        if (provider) { params.push(provider); walletWhere += ` AND payment_provider = $${params.length}`; }
-
-        const walletsRes = await query(`SELECT id, account_name, virtual_account_number, payment_provider FROM wallets WHERE ${walletWhere}`, params);
-
-        let clearedWallets = 0;
-        for (const w of walletsRes.rows) {
-            await query(
-                `UPDATE wallets SET virtual_account_number = NULL, bank_code = NULL, account_name = NULL,
-                 customer_identifier = NULL, provider_metadata = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-                [w.id],
-            );
-            clearedWallets++;
-        }
-
-        // Delete the per-wallet virtual_accounts rows for the same scope
         const vaParams: any[] = [];
         let vaWhere = '1=1';
-        if (business_id) { vaParams.push(business_id); vaWhere += ` AND wallet_id IN (SELECT id FROM wallets WHERE business_id = $${vaParams.length})`; }
-        if (wallet_id) { vaParams.push(wallet_id); vaWhere += ` AND wallet_id = $${vaParams.length}`; }
+        if (provider) { vaParams.push(provider); vaWhere += ` AND va.payment_provider = $${vaParams.length}`; }
+        if (wallet_id) { vaParams.push(wallet_id); vaWhere += ` AND va.wallet_id = $${vaParams.length}`; }
+        if (business_id) { vaParams.push(business_id); vaWhere += ` AND va.wallet_id IN (SELECT id FROM wallets WHERE business_id = $${vaParams.length})`; }
         if (user_id) {
             vaParams.push(user_id); const ui = vaParams.length;
-            vaWhere += ` AND wallet_id IN (SELECT id FROM wallets WHERE user_id = $${ui} OR business_id IN (SELECT business_id FROM users WHERE id = $${ui}))`;
+            vaWhere += ` AND va.wallet_id IN (SELECT id FROM wallets WHERE user_id = $${ui} OR business_id IN (SELECT business_id FROM users WHERE id = $${ui}))`;
         }
-        if (provider) { vaParams.push(provider); vaWhere += ` AND payment_provider = $${vaParams.length}`; }
-        const vaDel = await query(`DELETE FROM virtual_accounts WHERE ${vaWhere} RETURNING id`);
+
+        // Wallets whose provider-side VA records will be removed
+        const walletsRes = await query(
+            `SELECT DISTINCT w.id, w.payment_provider
+             FROM virtual_accounts va JOIN wallets w ON va.wallet_id = w.id
+             WHERE ${vaWhere}`,
+            vaParams,
+        );
+
+        // Delete the per-wallet virtual_accounts rows for the same scope
+        const vaDel = await query(`DELETE FROM virtual_accounts va WHERE ${vaWhere} RETURNING va.id, va.payment_provider`, vaParams);
+
+        // Clear the legacy single-VA mirror fields on the wallets themselves
+        // (pre virtual_accounts-table deployments stored the VA on the wallet).
+        const walletParams: any[] = [];
+        let walletWhere = 'virtual_account_number IS NOT NULL';
+        if (provider) { walletParams.push(provider); walletWhere += ` AND payment_provider = $${walletParams.length}`; }
+        if (wallet_id) { walletParams.push(wallet_id); walletWhere += ` AND id = $${walletParams.length}`; }
+        if (business_id) { walletParams.push(business_id); walletWhere += ` AND business_id = $${walletParams.length}`; }
+        if (user_id) {
+            walletParams.push(user_id); const wi = walletParams.length;
+            walletWhere += ` AND (user_id = $${wi} OR business_id IN (SELECT business_id FROM users WHERE id = $${wi}))`;
+        }
+        const walletClear = await query(
+            `UPDATE wallets SET virtual_account_number = NULL, bank_code = NULL, account_name = NULL,
+             customer_identifier = NULL, provider_metadata = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE ${walletWhere} RETURNING id`,
+            walletParams,
+        );
+
+        // Deactivate the provider on affected wallets so a fresh VA can be issued
+        for (const w of walletsRes.rows) {
+            await query(
+                `UPDATE wallets SET provider_metadata = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1 AND virtual_account_number IS NOT NULL`,
+                [w.id],
+            ).catch(() => {});
+        }
+
+        try {
+            const { logAuditEvent } = await import("../services/audit");
+            await logAuditEvent({
+                action: 'virtual_accounts_cleared',
+                entityType: 'virtual_accounts',
+                entityId: provider || 'all',
+                newValues: {
+                    provider: provider || null,
+                    deleted_va_records: vaDel.rows.length,
+                    wallets_affected: walletsRes.rows.length,
+                    legacy_wallet_fields_cleared: walletClear.rows.length,
+                },
+            });
+        } catch (auditErr) {
+            console.warn("Failed to audit log virtual account clear:", auditErr);
+        }
 
         res.json({
             success: true,
-            message: `Cleared ${clearedWallets} wallet virtual account(s) and ${vaDel.rows.length} provider VA record(s)`,
-            data: { cleared_wallets: clearedWallets, deleted_va_records: vaDel.rows.length, wallets: walletsRes.rows.map((w: any) => ({ id: w.id, provider: w.payment_provider })) },
+            message: `Deleted ${vaDel.rows.length} virtual account record(s) across ${walletsRes.rows.length} wallet(s)${provider ? ` on ${provider}` : ''}`,
+            data: {
+                deleted_va_records: vaDel.rows.length,
+                wallets_affected: walletsRes.rows.length,
+                legacy_wallet_fields_cleared: walletClear.rows.length,
+                providers: [...new Set(vaDel.rows.map((r: any) => r.payment_provider))],
+            },
         });
     } catch (error: any) {
         console.error("Admin clear virtual accounts error:", error);

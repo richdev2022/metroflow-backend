@@ -857,6 +857,7 @@ export async function initializeDatabase() {
         account_name VARCHAR(255),
         customer_identifier VARCHAR(255),
         beneficiary_account VARCHAR(20),
+        is_active BOOLEAN DEFAULT TRUE,
         provider_metadata JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -880,7 +881,17 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)`);
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS customer_identifier VARCHAR(255)`);
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS beneficiary_account VARCHAR(20)`);
+    await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
     await query(`ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS provider_metadata JSONB`);
+
+    // No silent provider default: ledger rows must carry their true provider
+    // (flutterwave/monnify/squad) or NULL — 'squad' by default mislabels
+    // Flutterwave movements on the admin ledger.
+    try {
+        await query(`ALTER TABLE transactions ALTER COLUMN payment_provider DROP DEFAULT`);
+    } catch (error) {
+        console.warn("Could not drop payment_provider default (may already be dropped):", error);
+    }
 
     await fixUuidIdDefaults([
       'transactions',

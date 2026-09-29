@@ -90,6 +90,7 @@ import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, t
 import { initializeDatabase, query } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
+import { isTenorConfigured } from "./lib/config-flags";
 import { getCloudStorage } from "./lib/storage";
 import publicRouter from "./routes/public";
 import supportRouter from "./routes/support";
@@ -495,7 +496,7 @@ export async function createServer() {
         status: db === "up" ? "ok" : "degraded",
         db,
         metricAi: { configured: isGlmConfigured() },
-        gifs: { configured: Boolean(process.env.TENOR_API_KEY) },
+        gifs: { configured: isTenorConfigured() },
         storage,
         uptimeSeconds: Math.round(process.uptime()),
         nodeVersion: process.version,

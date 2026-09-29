@@ -9,6 +9,7 @@ import {
   uploadMediaBuffer,
   detectMediaKind,
 } from "../services/media-upload";
+import { getTenorApiKey } from "../lib/config-flags";
 
 // Chat media upload (WhatsApp-style): voice notes, images, videos, documents,
 // GIFs and stickers. 100 MB covers multi-minute videos while remaining within
@@ -870,7 +871,9 @@ export const markConversationAsRead: RequestHandler = async (
  */
 export const searchChatGifs: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
-    const apiKey = process.env.TENOR_API_KEY;
+    // Placeholder values ("PASTE_TENOR_KEY_HERE") count as not configured so
+    // clients hide the GIF tab instead of showing an empty broken picker.
+    const apiKey = getTenorApiKey();
     if (!apiKey) {
       return res.json({ success: true, data: { configured: false, gifs: [] } });
     }
@@ -904,7 +907,7 @@ export const searchChatGifs: RequestHandler = async (req: AuthenticatedRequest, 
     res.json({ success: true, data: { configured: true, gifs } });
   } catch (error) {
     console.error("GIF search error:", error);
-    res.json({ success: true, data: { configured: !!process.env.TENOR_API_KEY, gifs: [] } });
+    res.json({ success: true, data: { configured: !!getTenorApiKey(), gifs: [] } });
   }
 };
 

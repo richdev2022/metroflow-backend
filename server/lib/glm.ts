@@ -131,6 +131,11 @@ export interface GlmChatOptions {
   maxTokens?: number;
   /** Explicit override (defaults to GLM_CHAT_MODEL / glm-4.7-flash) */
   model?: string;
+  /**
+   * Enable the model's hidden reasoning pass. Default OFF — it multiplies
+   * latency (6-16s vs 1-2.4s measured) which feels broken for chat replies.
+   */
+  enableThinking?: boolean;
 }
 
 /**
@@ -139,6 +144,35 @@ export interface GlmChatOptions {
  */
 function isQuotaExhausted429(bodyText: string): boolean {
   return /\b1113\b|insufficient|balance|quota|arrears|recharge|余额|充值/i.test(bodyText || "");
+}
+
+/**
+ * Latency: glm-4.5/4.7-flash run a hidden REASONING pass by default (measured
+ * live: 6-16s with thinking vs 1-2.4s disabled for the same answer). MetricAi
+ * replies are short — thinking is disabled unless a caller opts in.
+ */
+const GLM_THINKING_OFF = { type: "disabled" as const };
+
+/**
+ * Overload memory: models that recently returned a transient-overload 429 are
+ * tried last (not skipped) so fresh processes don't pay the 429 round-trip on
+ * every cold start while the overloaded model recovers.
+ */
+const OVERLOAD_BACKOFF_MS = 3 * 60 * 1000;
+const recentOverloads = new Map<string, number>();
+
+function markOverloaded(model: string) {
+  recentOverloads.set(model, Date.now());
+}
+
+function isRecentlyOverloaded(model: string): boolean {
+  const at = recentOverloads.get(model);
+  if (!at) return false;
+  if (Date.now() - at > OVERLOAD_BACKOFF_MS) {
+    recentOverloads.delete(model);
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -167,6 +201,14 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
     ? [opts.model]
     : Array.from(new Set([getGlmChatModel(), ...FALLBACK_CHAT_MODELS]));
 
+  // Recently-overloaded models go last so cold starts try a healthy model first.
+  const orderedModels = opts.model
+    ? models
+    : [
+        ...models.filter((m) => !isRecentlyOverloaded(m)),
+        ...models.filter((m) => isRecentlyOverloaded(m)),
+      ];
+
   const bases = getGlmApiBases();
   let lastError: Error | null = null;
   let sawAuthRejection = false;
@@ -174,13 +216,12 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
   for (const base of bases) {
     let baseRejected = false;
 
-    for (const model of models) {
+    for (const model of orderedModels) {
       if (baseRejected) break; // auth is key-level: no model id will fix it
 
       const endpoint = `${base}/chat/completions`;
-      let response: Response;
-      try {
-        response = await fetch(endpoint, {
+      const postChat = (includeThinking: boolean) =>
+        fetch(endpoint, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -192,8 +233,19 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
             temperature: opts.temperature ?? 0.7,
             max_tokens: opts.maxTokens ?? 2048,
             stream: false,
+            ...(includeThinking ? { thinking: opts.enableThinking ? { type: "enabled" } : GLM_THINKING_OFF } : {}),
           }),
         });
+
+      let response: Response;
+      try {
+        response = await postChat(true);
+        // Very old/strict endpoints may reject the thinking field outright —
+        // retry that candidate once without it before moving on.
+        if (response.status === 400 && /thinking/i.test(await response.clone().text().catch(() => ""))) {
+          console.warn(`[glm] endpoint rejected thinking param — retrying ${model} without it...`);
+          response = await postChat(false);
+        }
       } catch (networkError: any) {
         lastError = new Error(
           `GLM chat network error (${endpoint}): ${networkError?.message || networkError}`,
@@ -237,6 +289,7 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
         }
         // 1305 / "overloaded" / transient traffic limits — the next free model
         // usually answers immediately (verified live on production keys).
+        markOverloaded(model);
         console.warn(`[glm] chat model "${model}" overloaded on ${base} — trying next candidate...`);
         continue;
       }

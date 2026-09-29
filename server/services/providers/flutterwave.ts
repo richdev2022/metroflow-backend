@@ -283,7 +283,7 @@ export const flutterwaveProvider: Provider = {
    */
   async initiateTransfer(data: SingleTransferRequest) {
     try {
-      const payload = {
+      const payload: Record<string, unknown> = {
         account_bank: data.bankCode,
         account_number: data.accountNumber,
         amount: roundAmount(toMajorUnit(data.amount)),
@@ -293,6 +293,33 @@ export const flutterwaveProvider: Provider = {
         beneficiary_name: data.accountName,
         debit_currency: data.currencyId || "NGN",
       };
+
+      // International rails (USD/GBP/EUR etc.): Flutterwave requires the
+      // beneficiary's address block and (per corridor) bank name / SWIFT /
+      // routing number. Send whatever we collected — domestic NGN payouts
+      // simply omit them.
+      if (data.beneficiaryAddress) payload.beneficiary_address = data.beneficiaryAddress;
+      if (data.beneficiaryCity) payload.beneficiary_city = data.beneficiaryCity;
+      if (data.beneficiaryState) payload.beneficiary_state = data.beneficiaryState;
+      if (data.beneficiaryPostalCode) payload.beneficiary_postal_code = data.beneficiaryPostalCode;
+      if (data.beneficiaryCountry) payload.beneficiary_country = data.beneficiaryCountry.toUpperCase();
+      if (data.bankName) payload.bank_name = data.bankName;
+      if (data.swiftCode) payload.swift_code = data.swiftCode.toUpperCase();
+      if (data.routingNumber) payload.routing_number = data.routingNumber;
+
+      // Sender block (compliance): required for international transfers.
+      const isIntl = (data.currencyId || "NGN") !== "NGN" || !!data.beneficiaryCountry;
+      if (isIntl) {
+        payload.sender = {
+          name: data.senderName || data.accountName || "Metroflow business",
+          ...(data.senderEmail ? { email: data.senderEmail } : {}),
+          ...(data.senderPhone ? { phone_number: data.senderPhone } : {}),
+          ...(data.senderAddress ? { address: data.senderAddress } : {}),
+          ...(data.senderCountry || data.beneficiaryCountry
+            ? { country: (data.senderCountry || data.beneficiaryCountry).toUpperCase() }
+            : {}),
+        };
+      }
 
       const response = await flwClient.post("/v3/transfers", payload);
       return response.data;

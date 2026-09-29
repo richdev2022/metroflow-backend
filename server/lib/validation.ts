@@ -24,6 +24,17 @@ export const InitiateSingleTransferSchema = z.object({
   pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
   walletId: z.string().optional(),
   wallet_id: z.string().optional(),
+  // ---- International payout beneficiary details (Flutterwave rails) ----
+  // Required for corridors like USD ACH/SWIFT: street address, city, postal
+  // code and ISO-2 country; state/SWIFT/routing depend on the destination.
+  recipientAddress: z.string().max(200).optional(),
+  recipientCity: z.string().max(100).optional(),
+  recipientState: z.string().max(100).optional(),
+  recipientPostalCode: z.string().max(20).optional(),
+  recipientCountry: z.string().length(2).regex(/^[A-Za-z]{2}$/, "Country must be an ISO-2 code").optional(),
+  bankName: z.string().max(150).optional(),
+  swiftCode: z.string().max(20).optional(),
+  routingNumber: z.string().max(20).optional(),
 });
 
 export const InitiateBulkTransferSchema = z.object({

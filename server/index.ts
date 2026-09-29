@@ -83,7 +83,7 @@ import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs } from "./routes/chat";
-import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, requireMetricAiAccess } from "./routes/ai";
+import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
@@ -91,6 +91,7 @@ import { initializeDatabase, query } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
 import { isTenorConfigured } from "./lib/config-flags";
+import { getMediasoupDiagnostics } from "./lib/mediasoup";
 import { getCloudStorage } from "./lib/storage";
 import publicRouter from "./routes/public";
 import supportRouter from "./routes/support";
@@ -497,6 +498,8 @@ export async function createServer() {
         db,
         metricAi: { configured: isGlmConfigured() },
         gifs: { configured: isTenorConfigured() },
+        rtc: getMediasoupDiagnostics(),
+        redis: { configured: !!process.env.REDIS_URL && !process.env.DISABLE_REDIS },
         storage,
         uptimeSeconds: Math.round(process.uptime()),
         nodeVersion: process.version,
@@ -693,6 +696,21 @@ export async function createServer() {
   mainRouter.get("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiHistory);
   mainRouter.delete("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, deleteAiHistory);
   mainRouter.get("/ai/video/:jobId", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiVideoJob);
+  mainRouter.get("/ai/usage", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiUsage);
+  mainRouter.post("/ai/attachments", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, (req, res, next) => {
+    aiAttachmentUpload(req, res, (err: any) => {
+      if (err) {
+        const isLimit = err?.code === "LIMIT_FILE_SIZE";
+        return res.status(isLimit ? 413 : 400).json({
+          success: false,
+          error: isLimit
+            ? "Attachment exceeds the 100 MB upload limit."
+            : err?.message || "Attachment upload failed.",
+        });
+      }
+      next();
+    });
+  }, postAiAttachment);
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);

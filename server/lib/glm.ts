@@ -133,9 +133,15 @@ export function getGlmVideoModel(): string {
   return process.env.GLM_VIDEO_MODEL || "cogvideox-3";
 }
 
+/** A message part: plain text or an image (data URL / https URL). */
+export type GlmChatPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface GlmChatMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  /** Multimodal messages use the OpenAI-compatible parts array (vision). */
+  content: string | GlmChatPart[];
 }
 
 export interface GlmChatOptions {
@@ -328,6 +334,238 @@ export interface GlmImageResult {
   /** Persistent URL (uploaded through our storage chain) */
   url: string;
   model: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* VISION / OCR — "look at an image and reason about it"               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Vision candidates, best-first. All are OpenAI-compatible chat/completions:
+ *   1. glm-4.5v (Zhipu) — excellent OCR, but needs account credit; a 429
+ *      balance error skips it in ~100ms so trying it first is cheap when the
+ *      account HAS credit, and harmless when it does not.
+ *   2. OpenAI gpt-4o-mini — used when OPENAI_API_KEY is configured on the VPS.
+ *   3. Pollinations "openai" — FREE, keyless, always available (verified live).
+ * The chain means MetricAi image understanding NEVER hard-fails.
+ */
+const VISION_GLM_MODEL = process.env.GLM_VISION_MODEL || "glm-4.5v";
+
+/** When glm-4.5v answers 429/1113 (no credit) the account cannot run ANY vision
+ *  request — remember for 3 min so attached-image chats skip the two ~1-2s
+ *  round-trips and go straight to the working providers. */
+let visionGlmBlockedUntil = 0;
+
+function isOpenAiConfigured(): boolean {
+  const key = (process.env.OPENAI_API_KEY || "").trim();
+  return key.length > 30 && !isPlaceholderValue(key);
+}
+
+async function postJson(url: string, body: unknown, headers: Record<string, string> = {}, timeoutMs = 45_000): Promise<{ ok: boolean; status: number; text: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const payload = typeof body === "string" ? body : JSON.stringify(body);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: payload,
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractChatContent(text: string): string {
+  try {
+    const data = JSON.parse(text);
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      return content.map((p: any) => (typeof p === "string" ? p : p?.text || "")).join("").trim();
+    }
+    if (data?.error) throw new Error(data.error?.message || JSON.stringify(data.error).slice(0, 200));
+    throw new Error("no content in response");
+  } catch (e: any) {
+    throw new Error(`vision parse failed: ${String(e?.message || e).slice(0, 160)}`);
+  }
+}
+
+export interface GlmVisionInput {
+  buffer: Buffer;
+  mimeType: string;
+  /** Optional secondary question focused on the user's actual message. */
+  question?: string;
+}
+
+const OCR_PROMPT =
+  "You are the vision system of MetricAi, an assistant inside the Metricorex business platform. " +
+  "Analyze this image exhaustively for the assistant that will answer the user.\n" +
+  "1. If the image contains text, transcribe ALL of it verbatim (OCR), preserving layout that matters.\n" +
+  "2. Describe the key visual elements (people, UI screens, charts, documents, error messages, handwriting...).\n" +
+  "3. Note anything directly relevant to the user's accompanying message.\n" +
+  "Be factual and complete — the assistant can only see what you report.";
+
+/**
+ * Understand an image (OCR + scene understanding) and return a textual report
+ * for the chat model. Walks glm-4.5v -> OpenAI -> Pollinations -> OCR.space.
+ * Throws only when EVERY provider fails.
+ */
+export async function glmVision(input: GlmVisionInput): Promise<string> {
+  const { buffer, mimeType } = input;
+  const safeMime = /^image\//.test(mimeType) ? mimeType : "image/png";
+  const b64 = buffer.toString("base64");
+  const dataUrl = `data:${safeMime};base64,${b64}`;
+  const userQuestion = (input.question || "").slice(0, 2000);
+  const prompt = userQuestion ? `${OCR_PROMPT}\n\nUSER'S MESSAGE: "${userQuestion}"` : OCR_PROMPT;
+  const contentParts = [
+    { type: "image_url", image_url: { url: dataUrl } },
+    { type: "text", text: prompt },
+  ];
+  const errors: string[] = [];
+
+  // 1) GLM glm-4.5v on the key's platform (cheap skip when balance is empty)
+  if (isGlmConfigured() && Date.now() >= visionGlmBlockedUntil) {
+    for (const base of getGlmApiBases()) {
+      try {
+        const r = await postJson(`${base}/chat/completions`, {
+          model: VISION_GLM_MODEL,
+          messages: [{ role: "user", content: contentParts }],
+          max_tokens: 1400,
+          stream: false,
+        }, { Authorization: `Bearer ${getGlmApiKey()}` }, 40_000);
+        if (r.ok) {
+          const report = extractChatContent(r.text);
+          if (!isBlindVisionReply(report)) return report;
+          errors.push(`glm(${base}): model replied without seeing the image`);
+          continue;
+        }
+        errors.push(`glm(${base}) HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+        if (r.status === 401 || r.status === 403) break; // key-level: skip other base
+        if (r.status === 429 && isQuotaExhausted429(r.text)) {
+          visionGlmBlockedUntil = Date.now() + 3 * 60_000;
+          break; // balance-level: no vision on this key at all right now
+        }
+      } catch (e: any) {
+        errors.push(`glm(${base}): ${String(e?.message || e).slice(0, 120)}`);
+      }
+    }
+  } else if (isGlmConfigured()) {
+    errors.push(`glm: skipped (no credit, retry after ${new Date(visionGlmBlockedUntil).toISOString().slice(11, 19)})`);
+  }
+
+  // 2) OpenAI (VPS may have OPENAI_API_KEY configured)
+  if (isOpenAiConfigured()) {
+    try {
+      const r = await postJson("https://api.openai.com/v1/chat/completions", {
+        model: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
+        messages: [{ role: "user", content: contentParts }],
+        max_tokens: 1400,
+      }, { Authorization: `Bearer ${(process.env.OPENAI_API_KEY || "").trim()}` }, 40_000);
+      if (r.ok) {
+        const report = extractChatContent(r.text);
+        if (!isBlindVisionReply(report)) return report;
+        errors.push("openai: model replied without seeing the image");
+      } else {
+        errors.push(`openai HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+      }
+    } catch (e: any) {
+      errors.push(`openai: ${String(e?.message || e).slice(0, 120)}`);
+    }
+  }
+
+  // 3) Pollinations (free, keyless). NOTE: the free tier has become
+  // text-only at times — replies that say "I can't see the image" are
+  // rejected below so a text model never pretends to have seen a photo.
+  try {
+    const r = await postJson("https://text.pollinations.ai/openai", {
+      model: "openai",
+      messages: [{ role: "user", content: contentParts }],
+      referrer: "metricorex",
+    }, { Referer: "https://metricorex.com" }, 60_000);
+    if (r.ok) {
+      const report = extractChatContent(r.text);
+      if (!isBlindVisionReply(report)) return report;
+      errors.push("pollinations: text-only reply (no image support on free tier)");
+    } else {
+      errors.push(`pollinations HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+    }
+  } catch (e: any) {
+    errors.push(`pollinations: ${String(e?.message || e).slice(0, 120)}`);
+  }
+
+  // 4) OCR.space free tier — text-only OCR, but genuinely reads the image
+  // (live-verified: 328ms, correct transcription). Beats failing outright.
+  try {
+    const ocrText = await ocrSpaceExtract(b64);
+    if (ocrText) {
+      return (
+        `[OCR text extracted from the image]:\n${ocrText}\n\n` +
+        "(Note: only the TEXT could be extracted — the image's colors/layout were not analyzed. Do not claim to see visual details beyond this text.)"
+      );
+    }
+    errors.push("ocr.space: no text found");
+  } catch (e: any) {
+    errors.push(`ocr.space: ${String(e?.message || e).slice(0, 120)}`);
+  }
+
+  throw new Error(`All vision providers failed: ${errors.join(" | ").slice(0, 500)}`);
+}
+
+/** Detect a text-only model pretending the image was attached but unseen.
+ *  Live-observed blind phrasings (Pollinations rotates models daily, so cast a
+ *  wide net — a text model will ALWAYS signal it cannot see the image):
+ *    "I can't see any image", "I'm unable to view the image",
+ *    "I don't have an image to analyze", "please upload the image",
+ *    "the image appears to be blank", ...
+ *  IMPORTANT: models often emit CURLY apostrophes (can’t) — normalize first or
+ *  every can’t/don’t pattern silently misses (this exact bug shipped once).
+ *  The length guard keeps a genuine long analysis (>=800 chars) that merely
+ *  quotes such a phrase (e.g. transcribing an error dialog) from being rejected. */
+function isBlindVisionReply(report: string): boolean {
+  if (!report) return true;
+  const text = report
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"');
+  const blind = new RegExp([
+    "can('|no)?t (see|view|access|analy[sz]e|process|open|read|receive|detect)",
+    "unable to (see|view|access|analy[sz]e|process|open|read|receive|detect)",
+    "not able to (see|view|access|analy[sz]e|process|open|read)",
+    "(don'?t|do not|didn'?t|did not|doesn'?t|does not) (see|have|view|find|detect|get|notice|observe)",
+    "no image (was |is |to )?(attached|provided|visible|found|uploaded|analy[sz]e|load)",
+    "(don'?t|do not) have (an|any|the) image",
+    "(need|requires?) (the |an |a )?(image|photo|picture) (itself|first|again|to)",
+    "(please )?(re-?)?upload (the|an|your) (image|photo|picture|file)",
+    "image (is |seems? |appears? to be )?(missing|empty|blank|not visible|not loading|failed to load|did(n't)? load|unavailable|corrupt)",
+    "having trouble (seeing|viewing|accessing|processing|reading)",
+    "there (is|seems?) no (image|picture|photo|attachment)",
+    "i (do|did) n[o']t (receive|get|see) (any|the|your) (image|photo|picture|attachment)",
+    "(paste|type|provide|describe) the (text|image|content) (or |for me|instead|directly)",
+    "could you (please )?(paste|describe|share|send)",
+  ].join("|"), "i");
+  return blind.test(text) && report.length < 800;
+}
+
+/** OCR.space free-tier text extraction (env OCRSPACE_API_KEY or the shared free key). */
+async function ocrSpaceExtract(b64: string): Promise<string | null> {
+  const key = (process.env.OCRSPACE_API_KEY || "helloworld").trim();
+  const body = new URLSearchParams({
+    base64Image: `data:image/png;base64,${b64}`,
+    OCREngine: "2",
+    scale: "true",
+  });
+  const r = await postJson("https://api.ocr.space/parse/image", body.toString(), {
+    apikey: key,
+    "Content-Type": "application/x-www-form-urlencoded",
+  }, 30_000);
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+  const data = JSON.parse(r.text);
+  if (data?.IsErroredOnProcessing) throw new Error(String(data?.ErrorMessage || "ocr failed").slice(0, 120));
+  const text = (data?.ParsedResults || []).map((p: any) => p?.ParsedText || "").join("\n").trim();
+  return text.length > 0 ? text.slice(0, 4000) : null;
 }
 
 /** Fetch image bytes from a URL with a timeout. */

@@ -87,7 +87,7 @@ import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, 
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
-import { initializeDatabase, query } from "./db";
+import { initializeDatabase, query, resolvedDatabaseName } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
 import { isTenorConfigured } from "./lib/config-flags";
@@ -185,6 +185,13 @@ export async function createServer() {
       }
     }
     logger.error(`❌ Database initialization failed after ${DB_INIT_MAX_ATTEMPTS} attempt(s): ${dbInitError?.message || dbInitError}`);
+    if (dbInitError?.code === "3D000") {
+      logger.error(`   → PostgreSQL rejected the database name "${resolvedDatabaseName || "?"}".`);
+      logger.error("     Almost always a typo in the DATABASE_URL line of .env (e.g. a stray '>' from a manual edit).");
+      logger.error("     Check it with:  grep -n '^DATABASE_URL' .env");
+      logger.error("     The name between the last '/' and '?' must EXACTLY match the database created at your provider (Neon console → project → Dashboard → database name).");
+      logger.error("     After fixing:   pm2 restart metroflow --update-env");
+    }
   })();
 
   // In serverless environments, we must wait for the database to initialize

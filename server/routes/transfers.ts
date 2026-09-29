@@ -458,12 +458,21 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  */
 router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId } = req.body;
+    const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId, recipientAddress, recipientCity, recipientState, recipientPostalCode, recipientCountry, bankName, swiftCode, routingNumber } = req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
     const currency = (requestCurrency || 'NGN').toUpperCase();
     // International payouts: debitAmount/debitCurrency come from the /quote
-    // endpoint (source-currency total the user actually pays).
+    // endpoint (source-currency total the user actually pays). Flutterwave's
+    // international rails require the beneficiary's full address details.
+    const isIntl = currency !== 'NGN';
+    if (isIntl && (!recipientAddress || !recipientCity || !recipientPostalCode || !recipientCountry)) {
+      return res.status(400).json({
+        success: false,
+        error: "International payouts require the recipient's street address, city, postal code and country",
+        code: "BENEFICIARY_ADDRESS_REQUIRED",
+      });
+    }
     const hasDebit = debitAmount != null && Number(debitAmount) > 0;
     const dbDebitAmount = hasDebit ? Number(debitAmount) : null;
     const dbDebitCurrency = hasDebit ? (debitCurrency || 'NGN').toUpperCase() : null;
@@ -536,10 +545,12 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // Queue Transfer
     const insertRes = await query(
       `INSERT INTO transfer_queue 
-      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15)
+      (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by,
+       recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
       RETURNING *`,
-      [businessId, reference, accountNumber, bankCode, accountName, amount, currency, dbDebitAmount, dbDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId]
+      [businessId, reference, accountNumber, bankCode, accountName, amount, currency, dbDebitAmount, dbDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
+       recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, (recipientCountry || '').toUpperCase() || null, bankName || null, swiftCode || null, routingNumber || null]
     );
 
     // Log audit event

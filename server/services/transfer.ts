@@ -1,10 +1,51 @@
 import { query } from "../db";
 import { getProvider, resolveProvider } from "./providers/factory";
+import type { SingleTransferRequest } from "./providers";
 import { creditPlatformWallet, debitPlatformWallet, creditRevenueWallet, debitRevenueWallet } from "./fees";
 import { logAuditEvent, generateTransactionHash } from "./audit";
 import { sendTransactionAlert } from "./email";
 
 // Re-export account lookup from provider.
+
+/**
+ * Map a transfer_queue row onto the provider TransferRequest.
+ * Includes the international beneficiary address block (required by
+ * Flutterwave's USD/GBP/EUR rails) and the sender (paying business)
+ * compliance data fetched from the businesses table for intl payouts.
+ */
+async function buildTransferProviderPayload(transfer: any): Promise<SingleTransferRequest> {
+  const payload: SingleTransferRequest = {
+    bankCode: transfer.recipient_bank,
+    accountNumber: transfer.recipient_account,
+    amount: toMinorUnit((transfer as any)._providerAmount ?? transfer.amount),
+    accountName: transfer.recipient_name,
+    transactionReference: transfer.reference,
+    remark: transfer.remark,
+    currencyId: (transfer as any)._providerCurrency ?? transfer.currency ?? 'NGN',
+    beneficiaryAddress: transfer.recipient_address || undefined,
+    beneficiaryCity: transfer.recipient_city || undefined,
+    beneficiaryState: transfer.recipient_state || undefined,
+    beneficiaryPostalCode: transfer.recipient_postal_code || undefined,
+    beneficiaryCountry: transfer.recipient_country || undefined,
+    bankName: transfer.recipient_bank_name || undefined,
+    swiftCode: transfer.recipient_swift_code || undefined,
+    routingNumber: transfer.recipient_routing_number || undefined,
+  };
+
+  const isIntl = payload.currencyId !== 'NGN' || !!payload.beneficiaryCountry;
+  if (isIntl && transfer.business_id) {
+    try {
+      const bRes = await query(`SELECT name, email FROM businesses WHERE id = $1`, [transfer.business_id]);
+      payload.senderName = bRes.rows[0]?.name || payload.accountName;
+      payload.senderEmail = bRes.rows[0]?.email || undefined;
+      payload.senderAddress = payload.beneficiaryAddress;
+      payload.senderCountry = payload.beneficiaryCountry;
+    } catch (e) {
+      console.warn('[transfer] could not load sender details for intl payout:', e);
+    }
+  }
+  return payload;
+}
 // Uses resolveProvider() so the ADMIN-SELECTED active provider (system_settings)
 // is honoured - previously this used the env default directly, so switching the
 // provider in admin had no effect on account lookups ("lookup failed").
@@ -695,18 +736,9 @@ export async function processAllPending(businessId: string) {
       }
 
       // 3. Initiate Transfer
-      const amountMinor = toMinorUnit((transfer as any)._providerAmount ?? transfer.amount);
       const provider = getProvider(transfer.payment_provider); // Use transfer's provider or default
-      
-      const payload = {
-        bankCode: transfer.recipient_bank,
-        accountNumber: transfer.recipient_account,
-        amount: amountMinor,
-        accountName: transfer.recipient_name,
-        transactionReference: transfer.reference,
-        remark: transfer.remark,
-        currencyId: (transfer as any)._providerCurrency ?? transfer.currency ?? 'NGN'
-      };
+
+      const payload = await buildTransferProviderPayload(transfer);
 
       const response = await provider.initiateTransfer(payload);
 
@@ -1162,18 +1194,9 @@ export async function processTransfer(transferId: string) {
     }
 
     // 2. Initiate Transfer
-    const amountMinor = toMinorUnit((transfer as any)._providerAmount ?? transfer.amount);
     const provider = getProvider(transfer.payment_provider);
-    
-    const payload = {
-      bankCode: transfer.recipient_bank,
-      accountNumber: transfer.recipient_account,
-      amount: amountMinor,
-      accountName: transfer.recipient_name,
-      transactionReference: transfer.reference,
-      remark: transfer.remark,
-      currencyId: (transfer as any)._providerCurrency ?? transfer.currency ?? 'NGN'
-    };
+
+    const payload = await buildTransferProviderPayload(transfer);
 
     const response = await provider.initiateTransfer(payload);
 

@@ -25,7 +25,11 @@ const taskAttachmentUpload = multer({
 
 export const taskAttachmentMiddleware = taskAttachmentUpload.array("files", TASK_ATTACHMENT_MAX_FILES);
 
-const ATTACHMENT_AGG_SELECT = `att.attachments as "attachments"`;
+// NOTE: json_agg() yields `json`, which has NO equality operator — a
+// `GROUP BY att.attachments` on plain json fails with "could not identify an
+// equality operator for type json" (broke /board and /tasks everywhere).
+// Casting to jsonb (equality-capable) fixes grouping; wire format unchanged.
+const ATTACHMENT_AGG_SELECT = `att.attachments::jsonb as "attachments"`;
 const ATTACHMENT_AGG_JOIN = `
        LEFT JOIN LATERAL (
          SELECT COALESCE(json_agg(json_build_object(
@@ -82,7 +86,7 @@ export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) =
        LEFT JOIN task_assignments ta ON t.id = ta.task_id
        ${ATTACHMENT_AGG_JOIN}
        WHERE t.business_id = $1
-       GROUP BY t.id, att.attachments
+       GROUP BY t.id, att.attachments::jsonb
        ORDER BY t.created_at DESC`,
       [businessId]
     );
@@ -105,6 +109,7 @@ export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) =
     };
     res.json(response);
   } catch (error) {
+    console.error("getBoard error:", error);
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to get board",
@@ -224,7 +229,7 @@ export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) =
        LEFT JOIN task_assignments ta ON t.id = ta.task_id
        ${ATTACHMENT_AGG_JOIN}
        ${whereClause}
-       GROUP BY t.id, att.attachments
+       GROUP BY t.id, att.attachments::jsonb
        ORDER BY t.created_at DESC
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
       params,
@@ -256,6 +261,7 @@ export const getTasks: RequestHandler = async (req: AuthenticatedRequest, res) =
     };
     res.json(response);
   } catch (error) {
+    console.error("getTasks error:", error);
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to fetch tasks",

@@ -46,6 +46,24 @@ export interface TransferRequest {
   transactionReference: string;
   remark: string;
   currencyId?: string;
+  // ---- International payout beneficiary details (Flutterwave) ----
+  // Flutterwave's USD/GBP/EUR rails reject transfers without the
+  // beneficiary's full address; see providers/flutterwave.ts mapping.
+  beneficiaryAddress?: string;
+  beneficiaryCity?: string;
+  beneficiaryState?: string;
+  beneficiaryPostalCode?: string;
+  /** ISO 3166-1 alpha-2, e.g. "US" */
+  beneficiaryCountry?: string;
+  bankName?: string;
+  swiftCode?: string;
+  routingNumber?: string;
+  // Sender (the paying business) — compliance data for intl transfers
+  senderName?: string;
+  senderEmail?: string;
+  senderPhone?: string;
+  senderAddress?: string;
+  senderCountry?: string;
 }
 
 export interface SenderInfo {

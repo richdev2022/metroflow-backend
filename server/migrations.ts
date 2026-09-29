@@ -46,6 +46,32 @@ async function ensureChatAndAiSchema(): Promise<void> {
 
   // Plan-gated access: admin enables MetricAi per pricing plan
   await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_enabled BOOLEAN DEFAULT FALSE`);
+  // MetricAi ships with every plan: it runs on a free GLM tier and is a core
+  // product surface (site widget, webapp, unauthenticated pages). The gate
+  // stays in the schema so paid-only AI features can be toggled later.
+  await query(`UPDATE pricing_plans SET metric_ai_enabled = TRUE WHERE metric_ai_enabled IS DISTINCT FROM TRUE`);
+
+  // task_statuses UNIQUE(business_id, name) is required by the board's
+  // `INSERT ... ON CONFLICT (business_id, name)` — but tables created before
+  // that constraint was added to the CREATE never gained it (CREATE TABLE IF
+  // NOT EXISTS is a no-op on existing tables). Force it via a unique index.
+  await query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS task_statuses_business_name_uq ON task_statuses (business_id, name)`,
+  );
+
+  // International payout beneficiary details (Flutterwave beneficiary_* params
+  // are mandatory on USD/GBP/EUR rails: address, city, postal code, country).
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_address TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_city TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_state TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_postal_code TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_country VARCHAR(2)`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_bank_name TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_swift_code TEXT`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_routing_number TEXT`);
+  // Ledger backfill reads transfer_queue.description (see backfillLedgerHistory)
+  // but the column was never part of the CREATE — boot-time backfill errored.
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS description TEXT`);
 }
 
 /**

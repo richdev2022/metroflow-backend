@@ -34,13 +34,34 @@ const FALLBACK_CHAT_MODELS = ["glm-4.5-flash", "glm-4-flash"];
 let resolvedChatModel: string | null = null;
 
 export function getGlmApiKey(): string | undefined {
-  return (
+  const raw =
     process.env.GLM_API_KEY ||
     process.env.ZAI_API_KEY ||
     process.env.Z_AI_API_KEY ||
-    undefined
-  );
+    "";
+  const key = raw.trim();
+  // Treat obvious placeholder/invalid values as "not configured" so callers get
+  // the clean 503 ai_not_configured path instead of a guaranteed upstream 401.
+  if (!key) return undefined;
+  if (
+    key.toUpperCase().startsWith("PASTE_") ||
+    /^(your[_-]?key|placeholder|changeme|xxx+|undefined|null|test)$/i.test(key) ||
+    key.length < 20
+  ) {
+    if (!placeholderWarned) {
+      placeholderWarned = true;
+      console.error(
+        "[glm] GLM_API_KEY looks like a placeholder (or is too short). " +
+          "MetricAi is serving 503 ai_not_configured. Get a free key at https://z.ai " +
+          ".env: GLM_API_KEY=sk-...   then: pm2 restart metroflow --update-env",
+      );
+    }
+    return undefined;
+  }
+  return key;
 }
+
+let placeholderWarned = false;
 
 export function isGlmConfigured(): boolean {
   return !!getGlmApiKey();

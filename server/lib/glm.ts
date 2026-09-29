@@ -133,9 +133,15 @@ export function getGlmVideoModel(): string {
   return process.env.GLM_VIDEO_MODEL || "cogvideox-3";
 }
 
+/** A message part: plain text or an image (data URL / https URL). */
+export type GlmChatPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface GlmChatMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  /** Multimodal messages use the OpenAI-compatible parts array (vision). */
+  content: string | GlmChatPart[];
 }
 
 export interface GlmChatOptions {
@@ -328,6 +334,141 @@ export interface GlmImageResult {
   /** Persistent URL (uploaded through our storage chain) */
   url: string;
   model: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* VISION / OCR — "look at an image and reason about it"               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Vision candidates, best-first. All are OpenAI-compatible chat/completions:
+ *   1. glm-4.5v (Zhipu) — excellent OCR, but needs account credit; a 429
+ *      balance error skips it in ~100ms so trying it first is cheap when the
+ *      account HAS credit, and harmless when it does not.
+ *   2. OpenAI gpt-4o-mini — used when OPENAI_API_KEY is configured on the VPS.
+ *   3. Pollinations "openai" — FREE, keyless, always available (verified live).
+ * The chain means MetricAi image understanding NEVER hard-fails.
+ */
+const VISION_GLM_MODEL = process.env.GLM_VISION_MODEL || "glm-4.5v";
+
+function isOpenAiConfigured(): boolean {
+  const key = (process.env.OPENAI_API_KEY || "").trim();
+  return key.length > 30 && !isPlaceholderValue(key);
+}
+
+async function postJson(url: string, body: unknown, headers: Record<string, string> = {}, timeoutMs = 45_000): Promise<{ ok: boolean; status: number; text: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractChatContent(text: string): string {
+  try {
+    const data = JSON.parse(text);
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      return content.map((p: any) => (typeof p === "string" ? p : p?.text || "")).join("").trim();
+    }
+    if (data?.error) throw new Error(data.error?.message || JSON.stringify(data.error).slice(0, 200));
+    throw new Error("no content in response");
+  } catch (e: any) {
+    throw new Error(`vision parse failed: ${String(e?.message || e).slice(0, 160)}`);
+  }
+}
+
+export interface GlmVisionInput {
+  buffer: Buffer;
+  mimeType: string;
+  /** Optional secondary question focused on the user's actual message. */
+  question?: string;
+}
+
+const OCR_PROMPT =
+  "You are the vision system of MetricAi, an assistant inside the Metricorex business platform. " +
+  "Analyze this image exhaustively for the assistant that will answer the user.\n" +
+  "1. If the image contains text, transcribe ALL of it verbatim (OCR), preserving layout that matters.\n" +
+  "2. Describe the key visual elements (people, UI screens, charts, documents, error messages, handwriting...).\n" +
+  "3. Note anything directly relevant to the user's accompanying message.\n" +
+  "Be factual and complete — the assistant can only see what you report.";
+
+/**
+ * Understand an image (OCR + scene understanding) and return a textual report
+ * for the chat model. Walks glm-4.5v -> OpenAI -> Pollinations. Throws only
+ * when EVERY provider fails.
+ */
+export async function glmVision(input: GlmVisionInput): Promise<string> {
+  const { buffer, mimeType } = input;
+  const safeMime = /^image\//.test(mimeType) ? mimeType : "image/png";
+  const b64 = buffer.toString("base64");
+  const dataUrl = `data:${safeMime};base64,${b64}`;
+  const userQuestion = (input.question || "").slice(0, 2000);
+  const prompt = userQuestion ? `${OCR_PROMPT}\n\nUSER'S MESSAGE: "${userQuestion}"` : OCR_PROMPT;
+  const contentParts = [
+    { type: "image_url", image_url: { url: dataUrl } },
+    { type: "text", text: prompt },
+  ];
+  const errors: string[] = [];
+
+  // 1) GLM glm-4.5v on the key's platform (cheap skip when balance is empty)
+  if (isGlmConfigured()) {
+    for (const base of getGlmApiBases()) {
+      try {
+        const r = await postJson(`${base}/chat/completions`, {
+          model: VISION_GLM_MODEL,
+          messages: [{ role: "user", content: contentParts }],
+          max_tokens: 1400,
+          stream: false,
+        }, { Authorization: `Bearer ${getGlmApiKey()}` }, 40_000);
+        if (r.ok) return extractChatContent(r.text);
+        errors.push(`glm(${base}) HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+        if (r.status === 401 || r.status === 403) break; // key-level: skip other base
+      } catch (e: any) {
+        errors.push(`glm(${base}): ${String(e?.message || e).slice(0, 120)}`);
+      }
+    }
+  }
+
+  // 2) OpenAI (VPS may have OPENAI_API_KEY configured)
+  if (isOpenAiConfigured()) {
+    try {
+      const r = await postJson("https://api.openai.com/v1/chat/completions", {
+        model: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
+        messages: [{ role: "user", content: contentParts }],
+        max_tokens: 1400,
+      }, { Authorization: `Bearer ${(process.env.OPENAI_API_KEY || "").trim()}` }, 40_000);
+      if (r.ok) return extractChatContent(r.text);
+      errors.push(`openai HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+    } catch (e: any) {
+      errors.push(`openai: ${String(e?.message || e).slice(0, 120)}`);
+    }
+  }
+
+  // 3) Pollinations (free, keyless — verified live 2026-09)
+  try {
+    const r = await postJson("https://text.pollinations.ai/openai", {
+      model: "openai",
+      messages: [{ role: "user", content: contentParts }],
+      referrer: "metricorex",
+    }, { Referer: "https://metricorex.com" }, 60_000);
+    if (r.ok) return extractChatContent(r.text);
+    errors.push(`pollinations HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+  } catch (e: any) {
+    errors.push(`pollinations: ${String(e?.message || e).slice(0, 120)}`);
+  }
+
+  throw new Error(`All vision providers failed: ${errors.join(" | ").slice(0, 500)}`);
 }
 
 /** Fetch image bytes from a URL with a timeout. */

@@ -351,6 +351,11 @@ export interface GlmImageResult {
  */
 const VISION_GLM_MODEL = process.env.GLM_VISION_MODEL || "glm-4.5v";
 
+/** When glm-4.5v answers 429/1113 (no credit) the account cannot run ANY vision
+ *  request — remember for 3 min so attached-image chats skip the two ~1-2s
+ *  round-trips and go straight to the working providers. */
+let visionGlmBlockedUntil = 0;
+
 function isOpenAiConfigured(): boolean {
   const key = (process.env.OPENAI_API_KEY || "").trim();
   return key.length > 30 && !isPlaceholderValue(key);
@@ -423,7 +428,7 @@ export async function glmVision(input: GlmVisionInput): Promise<string> {
   const errors: string[] = [];
 
   // 1) GLM glm-4.5v on the key's platform (cheap skip when balance is empty)
-  if (isGlmConfigured()) {
+  if (isGlmConfigured() && Date.now() >= visionGlmBlockedUntil) {
     for (const base of getGlmApiBases()) {
       try {
         const r = await postJson(`${base}/chat/completions`, {
@@ -440,10 +445,16 @@ export async function glmVision(input: GlmVisionInput): Promise<string> {
         }
         errors.push(`glm(${base}) HTTP ${r.status}: ${r.text.slice(0, 120)}`);
         if (r.status === 401 || r.status === 403) break; // key-level: skip other base
+        if (r.status === 429 && isQuotaExhausted429(r.text)) {
+          visionGlmBlockedUntil = Date.now() + 3 * 60_000;
+          break; // balance-level: no vision on this key at all right now
+        }
       } catch (e: any) {
         errors.push(`glm(${base}): ${String(e?.message || e).slice(0, 120)}`);
       }
     }
+  } else if (isGlmConfigured()) {
+    errors.push(`glm: skipped (no credit, retry after ${new Date(visionGlmBlockedUntil).toISOString().slice(11, 19)})`);
   }
 
   // 2) OpenAI (VPS may have OPENAI_API_KEY configured)
@@ -504,11 +515,38 @@ export async function glmVision(input: GlmVisionInput): Promise<string> {
   throw new Error(`All vision providers failed: ${errors.join(" | ").slice(0, 500)}`);
 }
 
-/** Detect a text-only model pretending the image was attached but unseen. */
+/** Detect a text-only model pretending the image was attached but unseen.
+ *  Live-observed blind phrasings (Pollinations rotates models daily, so cast a
+ *  wide net — a text model will ALWAYS signal it cannot see the image):
+ *    "I can't see any image", "I'm unable to view the image",
+ *    "I don't have an image to analyze", "please upload the image",
+ *    "the image appears to be blank", ...
+ *  IMPORTANT: models often emit CURLY apostrophes (can’t) — normalize first or
+ *  every can’t/don’t pattern silently misses (this exact bug shipped once).
+ *  The length guard keeps a genuine long analysis (>=800 chars) that merely
+ *  quotes such a phrase (e.g. transcribing an error dialog) from being rejected. */
 function isBlindVisionReply(report: string): boolean {
   if (!report) return true;
-  const blind = /can('|no)?t (see|view|access)|unable to (see|view|access)|cannot (see|view|access)|don.t see any|no image (was )?(attached|provided|visible)|not able to (see|view)/i;
-  return blind.test(report) && report.length < 600;
+  const text = report
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"');
+  const blind = new RegExp([
+    "can('|no)?t (see|view|access|analy[sz]e|process|open|read|receive|detect)",
+    "unable to (see|view|access|analy[sz]e|process|open|read|receive|detect)",
+    "not able to (see|view|access|analy[sz]e|process|open|read)",
+    "(don'?t|do not|didn'?t|did not|doesn'?t|does not) (see|have|view|find|detect|get|notice|observe)",
+    "no image (was |is |to )?(attached|provided|visible|found|uploaded|analy[sz]e|load)",
+    "(don'?t|do not) have (an|any|the) image",
+    "(need|requires?) (the |an |a )?(image|photo|picture) (itself|first|again|to)",
+    "(please )?(re-?)?upload (the|an|your) (image|photo|picture|file)",
+    "image (is |seems? |appears? to be )?(missing|empty|blank|not visible|not loading|failed to load|did(n't)? load|unavailable|corrupt)",
+    "having trouble (seeing|viewing|accessing|processing|reading)",
+    "there (is|seems?) no (image|picture|photo|attachment)",
+    "i (do|did) n[o']t (receive|get|see) (any|the|your) (image|photo|picture|attachment)",
+    "(paste|type|provide|describe) the (text|image|content) (or |for me|instead|directly)",
+    "could you (please )?(paste|describe|share|send)",
+  ].join("|"), "i");
+  return blind.test(text) && report.length < 800;
 }
 
 /** OCR.space free-tier text extraction (env OCRSPACE_API_KEY or the shared free key). */

@@ -32,6 +32,36 @@ warn() { printf "  \033[1;33m⚠ %s\033[0m\n" "$*"; }
 fail() { printf "  \033[0;31m✖ %s\033[0m\n" "$*"; }
 
 step "1/5  Preparing working tree + pulling latest code"
+
+# ---------------------------------------------------------------------
+# 0. Preflight: validate DATABASE_URL BEFORE touching anything.
+#    A single stray character in the database name (e.g. a '>' from a
+#    manual .env edit) crashes the new process after restart with
+#    pg 3D000 — aborting here keeps the OLD process serving (no outage).
+# ---------------------------------------------------------------------
+if [ -f .env ]; then
+  DB_URL="$(grep -E '^[A-Za-z_]*DATABASE_URL=' .env | head -1 | cut -d= -f2- | tr -d '\"'"'"'')"
+  if [ -z "$DB_URL" ]; then
+    fail "DATABASE_URL is missing/empty in .env — the new process would crash on boot."
+    echo "       Add: DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require"
+    exit 1
+  fi
+  DB_NAME="$(printf '%s' "$DB_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*/([^?#]*).*$#\1#')"
+  if [ -z "$DB_NAME" ]; then
+    fail "DATABASE_URL has no database name (expected .../dbname?sslmode=require). Fix .env, then re-run."
+    exit 1
+  fi
+  if printf '%s' "$DB_NAME" | grep -qE '[^A-Za-z0-9_$.~-]'; then
+    fail "DATABASE_URL database name \"$DB_NAME\" contains invalid characters — pm2 restart would crash-loop the API."
+    echo "       Fix the DATABASE_URL line in .env (the name between the last '/' and '?'),"
+    echo "       it must EXACTLY match the database name at your provider, then re-run deploy.sh."
+    exit 1
+  fi
+  ok "DATABASE_URL targets database \"$DB_NAME\""
+else
+  warn "no .env file found in $(pwd) — the backend may boot without configuration"
+fi
+
 OLD_REV="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 # 1a. discard drift in generated files (rebuilt by npm run build)

@@ -5,6 +5,7 @@ import { getRedisClient } from "./cache";
 import logger from "./logger";
 import {
   initMediasoup,
+  isMediasoupReady,
   getOrCreateRoomAsync,
   getRoom,
   createWebRtcTransportForRoom,
@@ -229,8 +230,13 @@ async function runRoomCheckLoop() {
 runRoomCheckLoop();
 
 export function initSocketServer(server: http.Server): void {
-  // Initialize mediasoup first
-  initMediasoup().catch(err => logger.error("Mediasoup init failed:", err));
+  // Initialize mediasoup with one automatic retry — a failed worker spawn must
+  // not permanently kill the media plane for the process lifetime.
+  initMediasoup().catch(async (err) => {
+    logger.error("Mediasoup init failed (retrying once in 5s):", err);
+    await new Promise((r) => setTimeout(r, 5000));
+    initMediasoup().catch((retryErr) => logger.error("Mediasoup init retry failed:", retryErr));
+  });
 
   io = new Server(server, {
     cors: {
@@ -1491,6 +1497,12 @@ export function initSocketServer(server: http.Server): void {
     // Mediasoup / WebRTC signaling
     socket.on("mediasoup:getRouterRtpCapabilities", async ({ roomId }: { roomId?: string }, callback) => {
       try {
+        if (!isMediasoupReady()) {
+          // Workers are still booting — tell the client to retry shortly
+          // instead of stranding it on the join screen.
+          callback({ error: "Media service is starting, please retry", retryable: true });
+          return;
+        }
         let router;
         if (roomId) {
           const resolved = await resolveRoomId(roomId);
@@ -1499,7 +1511,7 @@ export function initSocketServer(server: http.Server): void {
           router = room.router;
         }
         if (!router) {
-          callback({ error: "Router not initialized" });
+          callback({ error: "Router not initialized", retryable: true });
           return;
         }
         callback({ rtpCapabilities: router.rtpCapabilities });

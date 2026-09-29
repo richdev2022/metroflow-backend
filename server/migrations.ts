@@ -10,6 +10,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensurePayrollVerificationColumns();
   await ensureSystemSettingsDefaults();
   await ensureChatAndAiSchema();
+  await ensureAiLimitsSchema();
   await ensureSupportSchema();
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
@@ -134,6 +135,52 @@ async function ensureChatAndAiSchema(): Promise<void> {
   // Ledger backfill reads transfer_queue.description (see backfillLedgerHistory)
   // but the column was never part of the CREATE — boot-time backfill errored.
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS description TEXT`);
+}
+
+/**
+ * MetricAi per-plan usage limits (admin-configurable) + per-user counters +
+ * user attachment columns (pasted/attached images & videos in MetricAi chat).
+ */
+async function ensureAiLimitsSchema(): Promise<void> {
+  // Six limit columns on pricing_plans (NULL = unlimited). Admin edits them via
+  // /admin/ai/limits; each plan row carries its own values.
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_chat_daily INTEGER`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_chat_monthly INTEGER`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_image_daily INTEGER`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_image_monthly INTEGER`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_video_daily INTEGER`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS metric_ai_video_monthly INTEGER`);
+
+  // Sensible starter limits for every plan that has none yet (protects the free
+  // GLM quota from runaway usage; admins tune per plan afterwards).
+  await query(`UPDATE pricing_plans SET metric_ai_chat_daily = 200 WHERE metric_ai_chat_daily IS NULL`);
+  await query(`UPDATE pricing_plans SET metric_ai_chat_monthly = 3000 WHERE metric_ai_chat_monthly IS NULL`);
+  await query(`UPDATE pricing_plans SET metric_ai_image_daily = 15 WHERE metric_ai_image_daily IS NULL`);
+  await query(`UPDATE pricing_plans SET metric_ai_image_monthly = 150 WHERE metric_ai_image_monthly IS NULL`);
+  await query(`UPDATE pricing_plans SET metric_ai_video_daily = 5 WHERE metric_ai_video_daily IS NULL`);
+  await query(`UPDATE pricing_plans SET metric_ai_video_monthly = 30 WHERE metric_ai_video_monthly IS NULL`);
+
+  // Per-user per-feature daily counters (monthly usage = SUM over the month).
+  await query(`
+    CREATE TABLE IF NOT EXISTS metric_ai_usage (
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      feature VARCHAR(10) NOT NULL,          -- chat | image | video
+      day DATE NOT NULL,                     -- UTC day bucket
+      month CHAR(7) NOT NULL,                -- UTC month bucket (YYYY-MM)
+      count INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, feature, day)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_metric_ai_usage_month ON metric_ai_usage(user_id, feature, month)`);
+
+  // MetricAi chat: user attachments (image paste / attach, video attach).
+  // image_url stays reserved for GENERATED images (assistant messages).
+  await query(`ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
+  await query(`ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS attachment_type VARCHAR(20)`);
+
+  console.log("[migrations] MetricAi limits + attachments schema applied");
 }
 
 /**

@@ -125,7 +125,14 @@ async function lookupPublicIpFromMetadata(): Promise<string | null> {
 
 function detectAnnouncedIp(): string {
   const explicit = process.env.MEDIASOUP_ANNOUNCED_IP || process.env.MEDIASOUP_PUBLIC_IP || '';
-  const usable = explicit && explicit !== '127.0.0.1' && explicit !== '0.0.0.0' && explicit !== '::1';
+  // MEDIASOUP_ALLOW_LOOPBACK=true is for local development / same-machine
+  // browser tests only — a loopback announced IP can never serve remote peers.
+  const loopbackAllowed = process.env.MEDIASOUP_ALLOW_LOOPBACK === 'true';
+  const usable =
+    explicit &&
+    explicit !== '0.0.0.0' &&
+    explicit !== '::1' &&
+    (explicit !== '127.0.0.1' || loopbackAllowed);
   if (usable) return explicit;
 
   const interfaces = os.networkInterfaces();

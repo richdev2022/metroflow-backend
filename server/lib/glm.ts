@@ -360,10 +360,11 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
+    const payload = typeof body === "string" ? body : JSON.stringify(body);
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify(body),
+      body: payload,
       signal: ctrl.signal,
     });
     const text = await res.text();
@@ -405,8 +406,8 @@ const OCR_PROMPT =
 
 /**
  * Understand an image (OCR + scene understanding) and return a textual report
- * for the chat model. Walks glm-4.5v -> OpenAI -> Pollinations. Throws only
- * when EVERY provider fails.
+ * for the chat model. Walks glm-4.5v -> OpenAI -> Pollinations -> OCR.space.
+ * Throws only when EVERY provider fails.
  */
 export async function glmVision(input: GlmVisionInput): Promise<string> {
   const { buffer, mimeType } = input;
@@ -431,7 +432,12 @@ export async function glmVision(input: GlmVisionInput): Promise<string> {
           max_tokens: 1400,
           stream: false,
         }, { Authorization: `Bearer ${getGlmApiKey()}` }, 40_000);
-        if (r.ok) return extractChatContent(r.text);
+        if (r.ok) {
+          const report = extractChatContent(r.text);
+          if (!isBlindVisionReply(report)) return report;
+          errors.push(`glm(${base}): model replied without seeing the image`);
+          continue;
+        }
         errors.push(`glm(${base}) HTTP ${r.status}: ${r.text.slice(0, 120)}`);
         if (r.status === 401 || r.status === 403) break; // key-level: skip other base
       } catch (e: any) {
@@ -448,27 +454,80 @@ export async function glmVision(input: GlmVisionInput): Promise<string> {
         messages: [{ role: "user", content: contentParts }],
         max_tokens: 1400,
       }, { Authorization: `Bearer ${(process.env.OPENAI_API_KEY || "").trim()}` }, 40_000);
-      if (r.ok) return extractChatContent(r.text);
-      errors.push(`openai HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+      if (r.ok) {
+        const report = extractChatContent(r.text);
+        if (!isBlindVisionReply(report)) return report;
+        errors.push("openai: model replied without seeing the image");
+      } else {
+        errors.push(`openai HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+      }
     } catch (e: any) {
       errors.push(`openai: ${String(e?.message || e).slice(0, 120)}`);
     }
   }
 
-  // 3) Pollinations (free, keyless — verified live 2026-09)
+  // 3) Pollinations (free, keyless). NOTE: the free tier has become
+  // text-only at times — replies that say "I can't see the image" are
+  // rejected below so a text model never pretends to have seen a photo.
   try {
     const r = await postJson("https://text.pollinations.ai/openai", {
       model: "openai",
       messages: [{ role: "user", content: contentParts }],
       referrer: "metricorex",
     }, { Referer: "https://metricorex.com" }, 60_000);
-    if (r.ok) return extractChatContent(r.text);
-    errors.push(`pollinations HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+    if (r.ok) {
+      const report = extractChatContent(r.text);
+      if (!isBlindVisionReply(report)) return report;
+      errors.push("pollinations: text-only reply (no image support on free tier)");
+    } else {
+      errors.push(`pollinations HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+    }
   } catch (e: any) {
     errors.push(`pollinations: ${String(e?.message || e).slice(0, 120)}`);
   }
 
+  // 4) OCR.space free tier — text-only OCR, but genuinely reads the image
+  // (live-verified: 328ms, correct transcription). Beats failing outright.
+  try {
+    const ocrText = await ocrSpaceExtract(b64);
+    if (ocrText) {
+      return (
+        `[OCR text extracted from the image]:\n${ocrText}\n\n` +
+        "(Note: only the TEXT could be extracted — the image's colors/layout were not analyzed. Do not claim to see visual details beyond this text.)"
+      );
+    }
+    errors.push("ocr.space: no text found");
+  } catch (e: any) {
+    errors.push(`ocr.space: ${String(e?.message || e).slice(0, 120)}`);
+  }
+
   throw new Error(`All vision providers failed: ${errors.join(" | ").slice(0, 500)}`);
+}
+
+/** Detect a text-only model pretending the image was attached but unseen. */
+function isBlindVisionReply(report: string): boolean {
+  if (!report) return true;
+  const blind = /can('|no)?t (see|view|access)|unable to (see|view|access)|cannot (see|view|access)|don.t see any|no image (was )?(attached|provided|visible)|not able to (see|view)/i;
+  return blind.test(report) && report.length < 600;
+}
+
+/** OCR.space free-tier text extraction (env OCRSPACE_API_KEY or the shared free key). */
+async function ocrSpaceExtract(b64: string): Promise<string | null> {
+  const key = (process.env.OCRSPACE_API_KEY || "helloworld").trim();
+  const body = new URLSearchParams({
+    base64Image: `data:image/png;base64,${b64}`,
+    OCREngine: "2",
+    scale: "true",
+  });
+  const r = await postJson("https://api.ocr.space/parse/image", body.toString(), {
+    apikey: key,
+    "Content-Type": "application/x-www-form-urlencoded",
+  }, 30_000);
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.text.slice(0, 120)}`);
+  const data = JSON.parse(r.text);
+  if (data?.IsErroredOnProcessing) throw new Error(String(data?.ErrorMessage || "ocr failed").slice(0, 120));
+  const text = (data?.ParsedResults || []).map((p: any) => p?.ParsedText || "").join("\n").trim();
+  return text.length > 0 ? text.slice(0, 4000) : null;
 }
 
 /** Fetch image bytes from a URL with a timeout. */

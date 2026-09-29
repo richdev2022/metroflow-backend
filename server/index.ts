@@ -83,7 +83,7 @@ import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs } from "./routes/chat";
-import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, requireMetricAiAccess } from "./routes/ai";
+import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
@@ -692,6 +692,7 @@ export async function createServer() {
   mainRouter.post("/ai/chat", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, postAiChat);
   mainRouter.get("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiHistory);
   mainRouter.delete("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, deleteAiHistory);
+  mainRouter.get("/ai/video/:jobId", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiVideoJob);
 
   // Calls API routes
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);

@@ -23,14 +23,84 @@ const parseBooleanEnv = (name: string, fallback = false) => {
 };
 
 const databaseUrl = process.env.DATABASE_URL;
+
+// ---------------------------------------------------------------------------
+// DATABASE_URL guard: a single stray character in the database name (e.g. a
+// ">" left over from a manual .env edit) hard-crashes the whole backend with
+// pg 3D000 "database ... does not exist" and takes the API + Swagger down.
+// Detect that class of typo at boot, auto-repair what is safely repairable
+// (trailing junk like whitespace/quotes/redirect characters) and ALWAYS show
+// the exact database name in the startup log so a bad value is visible in
+// `pm2 logs` within seconds instead of after an outage.
+// ---------------------------------------------------------------------------
+const DB_NAME_ILLEGAL_RE = /[^A-Za-z0-9_$\-]/;
+const DB_NAME_STRIP_RE = /[^A-Za-z0-9_$\-]/g;
+
+const safeUriDecode = (value: string) => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+/** Split a postgres:// URL the same way pg-connection-string does and return the raw db name. */
+const extractDbName = (raw: string): string => {
+  const schemeIdx = raw.indexOf("://");
+  const afterScheme = schemeIdx >= 0 ? raw.slice(schemeIdx + 3) : raw;
+  const queryIdx = afterScheme.indexOf("?");
+  const authorityAndPath = queryIdx >= 0 ? afterScheme.slice(0, queryIdx) : afterScheme;
+  const hashIdx = authorityAndPath.indexOf("#");
+  const noHash = hashIdx >= 0 ? authorityAndPath.slice(0, hashIdx) : authorityAndPath;
+  const slashIdx = noHash.indexOf("/");
+  return slashIdx >= 0 ? safeUriDecode(noHash.slice(slashIdx + 1)) : "";
+};
+
+const resolveDatabaseUrl = (raw?: string): string | undefined => {
+  if (!raw) return raw;
+
+  const rawDbName = extractDbName(raw);
+  if (!rawDbName) return raw;
+
+  if (!DB_NAME_ILLEGAL_RE.test(rawDbName)) return raw;
+
+  const fixedDbName = rawDbName.replace(DB_NAME_STRIP_RE, "");
+  console.warn("⚠️  DATABASE_URL database name contains invalid characters — likely a manual .env edit typo.");
+  console.warn(`    raw database name:   ${JSON.stringify(rawDbName)}`);
+  console.warn(
+    fixedDbName
+      ? `    auto-corrected to:   ${JSON.stringify(fixedDbName)}`
+      : "    auto-correction produced an EMPTY name — connection will fail until .env is fixed.",
+  );
+  console.warn("    Fix the DATABASE_URL line in .env permanently, then: pm2 restart metroflow --update-env");
+  if (!fixedDbName) return raw;
+
+  // Rebuild the URL with the sanitized db name (keeps credentials, host, query intact).
+  const schemeIdx = raw.indexOf("://");
+  const scheme = raw.slice(0, schemeIdx + 3);
+  let rest = raw.slice(schemeIdx + 3);
+  const queryIdx = rest.indexOf("?");
+  const query = queryIdx >= 0 ? rest.slice(queryIdx) : "";
+  if (queryIdx >= 0) rest = rest.slice(0, queryIdx);
+  const hashIdx = rest.indexOf("#");
+  if (hashIdx >= 0) rest = rest.slice(0, hashIdx);
+  const slashIdx = rest.indexOf("/");
+  const authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+  return `${scheme}${authority}/${encodeURIComponent(fixedDbName)}${query}`;
+};
+
+const resolvedDatabaseUrl = resolveDatabaseUrl(databaseUrl);
+const resolvedDatabaseName = resolvedDatabaseUrl ? extractDbName(resolvedDatabaseUrl) : "";
+export { resolvedDatabaseName };
+
 const isServerless = Boolean(process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT);
 const databaseHost = (() => {
-  if (!databaseUrl) {
+  if (!resolvedDatabaseUrl) {
     return "";
   }
 
   try {
-    return new URL(databaseUrl).hostname;
+    return new URL(resolvedDatabaseUrl).hostname;
   } catch {
     return "";
   }
@@ -46,6 +116,7 @@ const channelBindingRequired = databaseUrl?.includes("channel_binding=require");
 
 console.log("DB Pool config", {
   host: databaseHost || "not configured",
+  database: resolvedDatabaseName || "not configured",
   ssl: shouldUseSsl,
   channelBinding: channelBindingRequired,
   poolMax: parseIntegerEnv("PGPOOL_MAX", defaultPoolMax),
@@ -53,8 +124,12 @@ console.log("DB Pool config", {
   idleTimeoutMs: parseIntegerEnv("PG_IDLE_TIMEOUT_MS", defaultIdleTimeout),
 });
 
+if (!databaseUrl) {
+  console.error("❌ DATABASE_URL is not set — add it to .env (postgresql://user:password@host/dbname?sslmode=require)");
+}
+
 export const pool = new Pool({
-  connectionString: databaseUrl,
+  connectionString: resolvedDatabaseUrl,
   ssl: shouldUseSsl ? { rejectUnauthorized: false } : false,
   connectionTimeoutMillis: parseIntegerEnv("PG_CONNECTION_TIMEOUT_MS", defaultConnectionTimeout),
   idleTimeoutMillis: parseIntegerEnv("PG_IDLE_TIMEOUT_MS", defaultIdleTimeout),

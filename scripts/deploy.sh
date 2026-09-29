@@ -110,8 +110,8 @@ if [ -n "$HEALTH_JSON" ]; then
   echo "$HEALTH_JSON" | grep -q '"metricAi":{"configured":true' \
     && ok "MetricAi: GLM key configured — AI replies live" \
     || warn "MetricAi: GLM_API_KEY missing -> /api/public/metric-ai/ask will 503."
-  echo "       Get a free key at https://z.ai, add GLM_API_KEY to the backend .env,"
-  echo "       then: pm2 restart $APP_NAME --update-env"
+  echo "       Free key: https://z.ai (starts with sk-) or https://open.bigmodel.cn (looks like id.secret)."
+  echo "       Both formats are auto-detected — add GLM_API_KEY to the backend .env, then: pm2 restart $APP_NAME --update-env"
   echo "$HEALTH_JSON" | grep -q '"gifs":{"configured":true' \
     && ok "GIF picker: TENOR_API_KEY configured" \
     || warn "GIF picker: TENOR_API_KEY not set (chat GIF tab stays hidden — optional)"

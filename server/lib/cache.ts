@@ -6,6 +6,18 @@ let redisClient: Redis | null = null;
 const isRedisDisabled = (): boolean =>
   ["true", "1", "yes"].includes((process.env.DISABLE_REDIS || "").toLowerCase());
 
+/**
+ * REDIS_URL must be a real connection endpoint:
+ *   redis://[:password@]host:port   |   rediss://...   (TLS)
+ * Upstash-style REST setups use REDIS_REST_URL + REDIS_REST_TOKEN instead and
+ * are not supported by the ioredis client used here.
+ * A bare token (e.g. "lc1_..." from a provider dashboard) has no host — the
+ * client would crash-loop. We refuse it with an actionable message and run
+ * without Redis (everything falls back: DB counters, in-memory rate limits,
+ * socket.io without the redis adapter).
+ */
+const isValidRedisUrl = (url: string): boolean => /^rediss?:\/\//i.test(url);
+
 const getRedisRetryLimit = (): number => {
   const retries = Number(process.env.REDIS_MAX_RETRIES ?? 1);
   return Number.isFinite(retries) && retries >= 0 ? retries : 1;
@@ -22,8 +34,20 @@ export function createRedisClient(context: string): Redis | null {
     return null;
   }
 
-  if (!process.env.REDIS_URL) {
+  const rawUrl = (process.env.REDIS_URL || "").trim();
+  if (!rawUrl) {
     logger.warn(`${context}: REDIS_URL not set, Redis features disabled`);
+    return null;
+  }
+
+  if (!isValidRedisUrl(rawUrl)) {
+    logger.error(
+      `${context}: REDIS_URL is not a redis:// or rediss:// connection URL — Redis disabled, running on fallbacks. ` +
+        `Got: "${rawUrl.slice(0, 12)}…". A bare API token (like "lc1_…") is not a Redis endpoint: ` +
+        `copy the connection string from your Redis provider (e.g. redis://default:PASSWORD@host:6379, ` +
+        `or for Upstash use REDIS_URL=rediss://default:PASSWORD@host:6379). ` +
+        `Everything works without Redis — you just lose cross-instance caching.`,
+    );
     return null;
   }
 

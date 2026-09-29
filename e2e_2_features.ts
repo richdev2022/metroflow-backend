@@ -19,10 +19,10 @@ async function main() {
   const partToken = creds.partToken;
   const hostId = creds.hostUser.id || creds.hostUser.userId;
 
-  // ---- Meeting create (scheduled now) ----
+  // ---- Meeting create (instant) ----
   const mk = await fetch(`${BASE}/meetings`, {
     method: "POST", headers: H(hostToken),
-    body: JSON.stringify({ title: "E2E Signal Test", scheduledAt: new Date().toISOString() }),
+    body: JSON.stringify({ title: "E2E Signal Test", isInstant: true, startTime: new Date().toISOString() }),
   });
   const mkBody = await mk.json();
   const meeting = mkBody.data || mkBody;
@@ -32,10 +32,14 @@ async function main() {
   creds.meeting = meeting;
   fs.writeFileSync("/home/z/my-project/scripts/e2e-creds.json", JSON.stringify(creds, null, 2));
 
-  // ---- Participant validates meeting (join gate) ----
-  const val = await fetch(`${BASE}/meetings/${meetingCode}/validate`.replace("//", "/"), { headers: H(partToken) });
+  // ---- Participant validates meeting (join gate; webapp calls GET /meetings/validate/:code) ----
+  const val = await fetch(`${BASE}/meetings/validate/${meetingCode}`, { headers: H(partToken) });
   const valBody = await val.json().catch(() => ({}));
-  assert("participant validate meeting", val.status === 200 || val.status === 404, `HTTP ${val.status} ${JSON.stringify(valBody).slice(0, 120)}`);
+  // The backend returns the entity FLAT (no nested .meeting) — this is the shape
+  // JoinMeeting.tsx expects (commit 0aecf4d). Assert flat id presence.
+  const flat = (valBody.data || valBody);
+  assert("participant validate meeting (flat shape)", val.status === 200 && !!flat.id && flat.accessState !== undefined,
+    `HTTP ${val.status} keys=${Object.keys(flat).slice(0, 8).join(",")} accessState=${flat.accessState}`);
 
   // ---- AI chat (plain text) ----
   const t0 = Date.now();

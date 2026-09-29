@@ -41,13 +41,22 @@ export const BIGMODEL_API_BASE = "https://open.bigmodel.cn/api/paas/v4";
 
 const DEFAULT_API_BASE = ZAI_API_BASE;
 const DEFAULT_CHAT_MODEL = "glm-4.7-flash";
-const DEFAULT_IMAGE_MODEL = "cogview-3-flash";
+const DEFAULT_IMAGE_MODEL = "cogview-4-250304";
 
 /**
  * Known-free chat model ids, newest first. Walked in order whenever the
  * current model stops working (retired id, transient overload, ...).
  */
 const FALLBACK_CHAT_MODELS = ["glm-4.5-flash", "glm-4-flash"];
+
+/**
+ * Image model candidates, newest first. Live-verified 2026-09: cogview-3-flash
+ * (the old free default) is RETIRED on both z.ai and open.bigmodel.cn (code
+ * 1211); cogview-4-250304 exists but needs account credit. When every GLM
+ * candidate fails, glmImageGen falls back to the keyless free Pollinations
+ * endpoint so MetricAi image generation never hard-breaks again.
+ */
+const IMAGE_MODEL_CANDIDATES = ["cogview-4-250304", "cogview-3-flash"];
 
 /** Chat model id that last answered OK (process lifetime cache). */
 let resolvedChatModel: string | null = null;
@@ -118,6 +127,10 @@ export function getGlmChatModel(): string {
 
 export function getGlmImageModel(): string {
   return process.env.GLM_IMAGE_MODEL || DEFAULT_IMAGE_MODEL;
+}
+
+export function getGlmVideoModel(): string {
+  return process.env.GLM_VIDEO_MODEL || "cogvideox-3";
 }
 
 export interface GlmChatMessage {
@@ -317,74 +330,272 @@ export interface GlmImageResult {
   model: string;
 }
 
+/** Fetch image bytes from a URL with a timeout. */
+async function downloadImage(url: string, timeoutMs = 120000): Promise<{ buffer: Buffer; mimeType: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`download failed (${res.status})`);
+    return {
+      buffer: Buffer.from(await res.arrayBuffer()),
+      mimeType: res.headers.get("content-type") || "image/png",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
- * Text-to-image via the free CogView model. The API returns either a
- * short-lived hosted URL or base64 — we always download/decode and re-upload
- * through our own storage chain so the link we hand to clients never expires.
- * Walks the same platform endpoints as glmChat (key-format detection).
+ * Keyless FREE image fallback (Pollinations — donations-funded, no account,
+ * no key). Guarantees MetricAi can always produce an image even when every
+ * GLM cogview candidate is retired or the GLM account has no credit.
+ */
+async function pollinationsImageGen(
+  prompt: string,
+  upload: (buffer: Buffer, mimeType: string, originalname: string) => Promise<string>,
+): Promise<GlmImageResult> {
+  const seed = Math.floor(Math.random() * 1_000_000);
+  const endpoint =
+    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.slice(0, 900))}` +
+    `?width=1024&height=1024&nologo=true&seed=${seed}`;
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const { buffer, mimeType } = await downloadImage(endpoint, 120000);
+      if (buffer.length < 1024) throw new Error("suspiciously small response");
+      const ext = mimeType.includes("jpeg") ? "jpg" : mimeType.includes("webp") ? "webp" : "png";
+      const url = await upload(buffer, mimeType, `metricai-${Date.now()}.${ext}`);
+      return { url, model: "pollinations-free" };
+    } catch (e: any) {
+      lastError = new Error(`Pollinations attempt ${attempt} failed: ${e?.message || e}`);
+      console.warn(`[glm] ${lastError.message}`);
+    }
+  }
+  throw lastError || new Error("Pollinations image generation failed");
+}
+
+let imageCreditWarned = false;
+
+/**
+ * Text-to-image with a resilient chain:
+ *   1. GLM cogview candidates (env GLM_IMAGE_MODEL -> cogview-4-250304 ->
+ *      cogview-3-flash) across every platform endpoint (key-format aware).
+ *      Retired ids (1211/404) and credit-less accounts (1113/429) fall through.
+ *   2. Keyless free Pollinations fallback — always available, zero config.
+ * The API returns either a short-lived hosted URL or base64 — we always
+ * download/decode and re-upload through our own storage chain so the link we
+ * hand to clients never expires.
  */
 export async function glmImageGen(
   prompt: string,
   upload: (buffer: Buffer, mimeType: string, originalname: string) => Promise<string>,
 ): Promise<GlmImageResult> {
+  const models = Array.from(
+    new Set([getGlmImageModel(), ...IMAGE_MODEL_CANDIDATES]),
+  );
   const apiKey = getGlmApiKey();
-  if (!apiKey) {
-    throw new Error("GLM_API_KEY is not configured on the server");
+  let lastError: Error | null = null;
+
+  if (apiKey) {
+    for (const base of getGlmApiBases()) {
+      let baseRejected = false;
+
+      for (const model of models) {
+        if (baseRejected) break;
+        const endpoint = `${base}/images/generations`;
+        let response: Response;
+        try {
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({ model, prompt, n: 1, size: "1024x1024" }),
+          });
+        } catch (networkError: any) {
+          lastError = new Error(
+            `GLM image network error (${endpoint}): ${networkError?.message || networkError}`,
+          );
+          console.warn(`[glm] image network error on ${base} — trying next candidate...`);
+          continue;
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => response.statusText);
+          lastError = new Error(`GLM image error (${response.status}): ${errorText.slice(0, 500)}`);
+          if (response.status === 401 || response.status === 403) {
+            baseRejected = true; // key-level: try the other platform endpoint
+            continue;
+          }
+          if (/1211|not exist|Unknown Model|1113|Insufficient balance|余额|充值|insufficient/i.test(errorText)) {
+            // retired id or no credit — the fallback chain handles both
+            if (!imageCreditWarned && /1113|Insufficient balance|余额|充值|insufficient/i.test(errorText)) {
+              imageCreditWarned = true;
+              console.warn(
+                "[glm] GLM image models need account credit (cogview-4-250304). " +
+                  "Using the free keyless fallback until the GLM account is topped up.",
+              );
+            }
+            console.warn(`[glm] image model "${model}" unavailable on ${base} — trying next candidate...`);
+            continue;
+          }
+          throw lastError;
+        }
+
+        try {
+          const data = (await response.json()) as {
+            data?: Array<{ url?: string; b64_json?: string }>;
+          };
+          const item = data.data?.[0];
+          if (!item) {
+            lastError = new Error("GLM image response contained no image");
+            continue;
+          }
+          let buffer: Buffer;
+          let mimeType = "image/png";
+          if (item.b64_json) {
+            buffer = Buffer.from(item.b64_json, "base64");
+          } else if (item.url) {
+            const dl = await downloadImage(item.url);
+            buffer = dl.buffer;
+            mimeType = dl.mimeType;
+          } else {
+            lastError = new Error("GLM image response contained neither url nor b64_json");
+            continue;
+          }
+          const url = await upload(buffer, mimeType, `metricai-${Date.now()}.png`);
+          return { url, model };
+        } catch (e: any) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+          console.warn(`[glm] image candidate "${model}" on ${base} failed: ${lastError.message}`);
+        }
+      }
+    }
   }
 
-  const model = getGlmImageModel();
+  // Every GLM candidate failed (or no key) — the free keyless fallback.
+  console.warn("[glm] all GLM image candidates failed — falling back to free Pollinations endpoint");
+  try {
+    return await pollinationsImageGen(prompt, upload);
+  } catch (pollError) {
+    console.error("[glm] Pollinations fallback also failed:", pollError);
+    throw (
+      lastError ||
+      (pollError instanceof Error ? pollError : new Error("image generation failed"))
+    );
+  }
+}
+
+export interface GlmVideoJob {
+  /** Upstream async job id (bigmodel/z.ai style) */
+  jobId: string;
+  /** Platform base the job was created on (polling must hit the same base) */
+  base: string;
+  model: string;
+  status: string;
+}
+
+export interface GlmVideoStatus {
+  status: "processing" | "success" | "failed";
+  videoUrl?: string;
+  coverUrl?: string;
+  raw?: string;
+}
+
+function videoError(code: string, message: string): Error {
+  const err = new Error(message) as Error & { code: string };
+  err.code = code;
+  return err;
+}
+
+/**
+ * Create an async text-to-video job (CogVideoX). PAID on GLM: if the account
+ * has no credit the upstream answers 1113 — surfaced as a coded error so
+ * callers can show an actionable message instead of a generic failure.
+ */
+export async function glmVideoCreate(prompt: string): Promise<GlmVideoJob> {
+  const apiKey = getGlmApiKey();
+  if (!apiKey) throw videoError("video_not_configured", "GLM_API_KEY is not configured on the server");
+
+  const model = getGlmVideoModel();
   let lastError: Error | null = null;
 
   for (const base of getGlmApiBases()) {
-    const endpoint = `${base}/images/generations`;
     let response: Response;
     try {
-      response = await fetch(endpoint, {
+      response = await fetch(`${base}/videos/generations`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({ model, prompt, n: 1, size: "1024x1024" }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, prompt: prompt.slice(0, 2000), quality: "quality", fps: 30 }),
       });
     } catch (networkError: any) {
-      lastError = new Error(
-        `GLM image network error (${endpoint}): ${networkError?.message || networkError}`,
-      );
-      console.warn(`[glm] image network error on ${base} — trying next endpoint...`);
+      lastError = networkError instanceof Error ? networkError : new Error(String(networkError));
       continue;
     }
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      lastError = new Error(`GLM image error (${response.status}): ${errorText.slice(0, 500)}`);
-      // Auth is key-level: the other platform endpoint may accept this key.
-      if (response.status === 401 || response.status === 403) continue;
-      throw lastError;
+    if (response.ok) {
+      const data = (await response.json().catch(() => ({}))) as {
+        id?: string; task_status?: string;
+      };
+      if (data.id) {
+        return { jobId: data.id, base, model, status: data.task_status || "PROCESSING" };
+      }
+      lastError = new Error("GLM video response contained no job id");
+      continue;
     }
 
-    const data = (await response.json()) as {
-      data?: Array<{ url?: string; b64_json?: string }>;
-    };
-    const item = data.data?.[0];
-    if (!item) throw new Error("GLM image response contained no image");
-
-    let buffer: Buffer;
-    let mimeType = "image/png";
-    if (item.b64_json) {
-      buffer = Buffer.from(item.b64_json, "base64");
-    } else if (item.url) {
-      const imgRes = await fetch(item.url);
-      if (!imgRes.ok) throw new Error(`Failed to download generated image (${imgRes.status})`);
-      mimeType = imgRes.headers.get("content-type") || "image/png";
-      buffer = Buffer.from(await imgRes.arrayBuffer());
-    } else {
-      throw new Error("GLM image response contained neither url nor b64_json");
+    const errorText = await response.text().catch(() => response.statusText);
+    if (/1113|Insufficient balance|余额|充值|no resource package|insufficient/i.test(errorText)) {
+      throw videoError(
+        "video_requires_credit",
+        "Video generation runs on the paid CogVideoX model and the GLM account " +
+          "currently has no credit/resource pack. Top up at " +
+          (base.includes("bigmodel") ? "https://open.bigmodel.cn" : "https://z.ai") +
+          " (image generation stays free — it uses a keyless fallback).",
+      );
     }
-
-    const url = await upload(buffer, mimeType, `metricai-${Date.now()}.png`);
-    return { url, model };
+    if (response.status === 401 || response.status === 403) continue; // try other platform
+    if (/1211|not exist|Unknown Model/i.test(errorText)) {
+      lastError = videoError("video_model_unavailable", `Video model "${model}" is not available on ${base}.`);
+      continue;
+    }
+    lastError = new Error(`GLM video error (${response.status}): ${errorText.slice(0, 300)}`);
   }
 
-  throw lastError || new Error("GLM image generation failed: no endpoints available");
+  throw (
+    lastError ||
+    videoError("video_unavailable", "Video generation is unavailable right now.")
+  );
+}
+
+/**
+ * Poll an async video job. Must be polled on the SAME base that created it.
+ * Returns normalized status; the video URL is present only on success.
+ */
+export async function glmVideoPoll(jobId: string, base: string): Promise<GlmVideoStatus> {
+  const apiKey = getGlmApiKey();
+  if (!apiKey) throw videoError("video_not_configured", "GLM_API_KEY is not configured on the server");
+
+  const res = await fetch(`${base}/videos/generations/${encodeURIComponent(jobId)}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => res.statusText);
+    throw new Error(`GLM video poll error (${res.status}): ${errorText.slice(0, 300)}`);
+  }
+  const data = (await res.json().catch(() => ({}))) as {
+    task_status?: string;
+    video_result?: Array<{ url?: string; cover_image_url?: string }>;
+  };
+  const rawStatus = (data.task_status || "PROCESSING").toUpperCase();
+  if (rawStatus === "SUCCESS") {
+    const item = data.video_result?.[0];
+    if (!item?.url) return { status: "failed", raw: "success without video_result" };
+    return { status: "success", videoUrl: item.url, coverUrl: item.cover_image_url };
+  }
+  if (rawStatus === "FAIL") return { status: "failed", raw: "upstream reported FAIL" };
+  return { status: "processing", raw: rawStatus };
 }

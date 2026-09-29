@@ -8056,6 +8056,39 @@
         }
       }
     },
+    "/api/ai/video/{jobId}": {
+      "get": {
+        "summary": "Poll a MetricAi video generation job",
+        "description": "Clients poll while status is \"processing\"; the finished video (uploaded to our own storage so the URL never expires) appears in MetricAi history as well.",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status (processing|success|failed)"
+          },
+          "404": {
+            "description": "Job not found for this user"
+          }
+        }
+      }
+    },
     "/api/public/metric-ai/ask": {
       "post": {
         "summary": "Public \"Ask MetricAi\" endpoint (marketing site / guest widget)",

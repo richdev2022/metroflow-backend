@@ -334,7 +334,7 @@ export const verifyOTP: RequestHandler = async (req, res) => {
     }
 
     const result = await query(
-      `SELECT id, business_id as "businessId", otp_code, otp_expires_at 
+      `SELECT id, business_id as "businessId", otp_code, otp_expires_at, name, email 
        FROM users 
        WHERE email = $1`,
       [input.email],
@@ -413,6 +413,8 @@ export const verifyOTP: RequestHandler = async (req, res) => {
       userId: user.id,
       businessId: user.businessId,
       token,
+      name: user.name || "",
+      email: user.email || "",
       message: "Email verified successfully",
     };
 
@@ -926,7 +928,7 @@ export const login: RequestHandler = async (req, res) => {
     }
 
     const result = await query(
-      `SELECT id, business_id as "businessId", password_hash, email_verified, otp_code, otp_expires_at, auth_provider, google_id
+      `SELECT id, business_id as "businessId", password_hash, email_verified, otp_code, otp_expires_at, auth_provider, google_id, name, email
        FROM users
        WHERE email = $1`,
       [input.email],
@@ -1032,11 +1034,15 @@ export const login: RequestHandler = async (req, res) => {
 
     const token = await generateToken(user.id, user.businessId);
 
+    // Name/email ride along so every client (web + mobile) can greet the user
+    // by NAME after email/password login — not by their email address.
     const response: AuthResponse = {
       success: true,
       userId: user.id,
       businessId: user.businessId,
       token,
+      name: user.name || "",
+      email: user.email || "",
       message: "Login successful",
     };
 

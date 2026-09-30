@@ -83,12 +83,14 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs } from "./routes/chat";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant } from "./routes/chat";
+import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
+import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
 import { initializeDatabase, query, resolvedDatabaseName } from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
@@ -705,6 +707,8 @@ export async function createServer() {
   mainRouter.get("/meetings/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingTranscript);
   mainRouter.get("/meetings/:id/notes", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingNotes);
   mainRouter.post("/meetings/:id/notes/generate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingNotesEndpoint);
+  // Post-meeting report (attendees, AI notes, transcript, recordings)
+  mainRouter.get("/meetings/:id/report", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingReport);
   // Public guest access (must be before any conflicting authenticated routes)
   mainRouter.get("/meetings/guest/validate/:code", guestValidateMeeting);
   // Guest join (public, no auth): guests join via meeting link + name (+password if set)
@@ -721,6 +725,21 @@ export async function createServer() {
   mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), uploadChatMedia);
   // GIF picker (Tenor proxy — key stays server-side)
   mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), searchChatGifs);
+
+  // Chat message edit / delete (WhatsApp-style)
+  mainRouter.patch("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), editMessage);
+  mainRouter.delete("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), deleteMessage);
+
+  // Chat participants: roster / leave / roles / remove (WhatsApp-style)
+  mainRouter.get("/chat/conversations/:conversationId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getParticipants);
+  mainRouter.post("/chat/conversations/:conversationId/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), leaveConversation);
+  mainRouter.patch("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateParticipantRole);
+  mainRouter.delete("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), removeParticipant);
+
+  // Contact blocking (direct chats; enforced in sendMessage/createConversation)
+  mainRouter.get("/users/blocked", authenticateToken, checkSubscriptionStatus, listBlocked);
+  mainRouter.post("/users/:userId/block", authenticateToken, checkSubscriptionStatus, blockUser);
+  mainRouter.delete("/users/:userId/block", authenticateToken, checkSubscriptionStatus, unblockUser);
 
   // MetricAi — GLM-powered in-app assistant (plan-gated)
   mainRouter.get("/ai/status", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiStatus);
@@ -748,8 +767,13 @@ export async function createServer() {
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);
   mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallByCode);
   mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), validateCallAccess);
+  // Rich call detail (GET /calls/:id returns a superset of the legacy payload:
+  // legacy top-level call fields + { call, participants, hasTranscript,
+  // transcriptsCount, recording, conversationId }). Transcript endpoint kept
+  // separate so /calls/:id keeps matching codes and UUIDs alike.
+  mainRouter.get("/calls/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallTranscript);
   // Get call by UUID or code (must be registered after the more specific GET routes above)
-  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallById);
+  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallDetail);
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), joinCall);
@@ -785,6 +809,11 @@ export async function createServer() {
   // Push notification device registration (FCM)
   mainRouter.post("/notifications/register-device", authenticateToken, registerDevice);
   mainRouter.delete("/notifications/register-device", authenticateToken, unregisterDevice);
+
+  // Web Push (VAPID) — browser push subscriptions
+  mainRouter.get("/push/vapid-public-key", getVapidPublicKeyEndpoint);
+  mainRouter.post("/push/subscribe", authenticateToken, subscribePush);
+  mainRouter.post("/push/unsubscribe", authenticateToken, unsubscribePush);
 
   // Mount the main router at both / and /api for backward compatibility
   app.use(dbCheckMiddleware);

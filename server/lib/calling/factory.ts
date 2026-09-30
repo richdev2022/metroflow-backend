@@ -1,7 +1,7 @@
 import { getSetting, setSetting } from "../../services/app-config";
 import { query } from "../../db";
 import { mediasoupProvider } from "./mediasoup";
-import { livekitProvider, isLiveKitConfigured } from "./livekit";
+import { livekitProvider, isLiveKitConfigured, isLiveKitReachable } from "./livekit";
 import type {
   CallingCredentials,
   CallingJoinContext,
@@ -119,7 +119,9 @@ export async function getProvidersStatus(): Promise<{
 /**
  * Build the `calling` credentials block for a join response.
  * Returns undefined for MediaSoup (legacy clients just signal over Socket.IO),
- * and degrades LiveKit→MediaSoup when LiveKit is not configured.
+ * and degrades LiveKit→MediaSoup when LiveKit is not configured OR the LiveKit
+ * server is unreachable (e.g. SFU container down behind a 502 proxy) so a
+ * misconfigured/offline SFU can never strand callers with unusable tokens.
  */
 export async function buildCallingCredentials(
   provider: CallingProvider,
@@ -129,10 +131,17 @@ export async function buildCallingCredentials(
   let fallback = false;
   let fallbackReason: string | undefined;
 
-  if (effective.name === "livekit" && !isLiveKitConfigured()) {
-    fallback = true;
-    fallbackReason = "LiveKit is not configured on this deployment; using MediaSoup";
-    effective = mediasoupProvider;
+  if (effective.name === "livekit") {
+    if (!isLiveKitConfigured()) {
+      fallback = true;
+      fallbackReason = "LiveKit is not configured on this deployment; using MediaSoup";
+      effective = mediasoupProvider;
+    } else if (!(await isLiveKitReachable())) {
+      // Probe result is cached (30s healthy / 10s down) — cheap on joins.
+      fallback = true;
+      fallbackReason = "LiveKit server is unreachable; using MediaSoup";
+      effective = mediasoupProvider;
+    }
   }
 
   try {

@@ -42,6 +42,9 @@ export const mediasoupProvider: CallingProvider = {
     }
   },
 
+  // NOTE: no startRecording/stopRecording — MediaSoup rooms have no server
+  // recorder; routes treat the missing methods as "client-side recording".
+
   diagnostics() {
     return mediasoup.getMediasoupDiagnostics();
   },

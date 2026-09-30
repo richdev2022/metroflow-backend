@@ -270,6 +270,10 @@ export interface AuthResponse {
   businessId?: string;
   token?: string;
   requiresOtp?: boolean;
+  /** Authenticated user's display name — clients greet the user by NAME,
+   *  regardless of whether they logged in with password, OTP or Google. */
+  name?: string;
+  email?: string;
   message?: string;
 }
 

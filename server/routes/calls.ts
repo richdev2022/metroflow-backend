@@ -1203,6 +1203,7 @@ export const leaveCall: RequestHandler = async (
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
               ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
               co_host_id as "coHostId", call_code as "callCode", is_group_call as "isGroupCall",
+              conversation_id as "conversationId", duration_started_at as "durationStartedAt",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
        FROM calls WHERE id = $1 AND business_id = $2`,
@@ -1238,6 +1239,94 @@ export const leaveCall: RequestHandler = async (
         callId: actualId,
         userId,
       });
+    }
+
+    // ===== Finalize the call + WhatsApp-style chat call-log (PERMANENT FIX) =====
+    // Mobile and web both end calls via POST /calls/:id/leave. The old flow
+    // only wrote a call-log row on the REST updateCall path (host-only), so
+    // chats never received call logs. Now:
+    //   - 1:1 calls finalize as soon as either side leaves
+    //   - group calls finalize when the last 'joined' participant leaves
+    //   - duration/status/transcript flags ride on the log like updateCall
+    const FINAL_CALL_STATUSES = ["completed", "missed", "cancelled"];
+    if (!FINAL_CALL_STATUSES.includes(call.status)) {
+      const othersJoined = participantsResult.rows.some(
+        (r: any) => r.userId && r.userId !== userId && r.status === "joined",
+      );
+      const hadConnected =
+        !!call.durationStartedAt || !!call.startedAt || call.status === "ongoing";
+      const shouldFinalize = call.isGroupCall ? !othersJoined : true;
+
+      if (shouldFinalize) {
+        const finalStatus = hadConnected
+          ? "completed"
+          : call.createdById === userId
+            ? "cancelled"
+            : "missed";
+
+        const finalizeResult = await query(
+          `UPDATE calls
+           SET status = $1, ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2 AND status NOT IN ('completed','missed','cancelled')
+           RETURNING GREATEST(0, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(duration_started_at, started_at, created_at)))::int) AS duration`,
+          [finalStatus, actualId],
+        );
+
+        if (finalizeResult.rows.length > 0) {
+          const durationSeconds = finalizeResult.rows[0]?.duration ?? null;
+          call.status = finalStatus;
+          call.endedAt = new Date().toISOString();
+
+          // WhatsApp-style chat call-log — same helper the REST updateCall uses.
+          postCallLogMessage(
+            {
+              businessId,
+              senderId: call.createdById || userId,
+              conversationId: call.conversationId || undefined,
+              participantIds: participantsResult.rows
+                .map((r: any) => r.userId)
+                .filter(Boolean),
+              callType: call.type,
+              status: finalStatus,
+              durationSeconds,
+              callCode: call.callCode,
+              callId: call.id,
+              endedAt: call.endedAt,
+            },
+            getSocketServer(),
+          ).catch((e) => console.error("Call-log insert failed:", e));
+
+          // Missed/cancelled: notify the other side (in-app + push).
+          if (finalStatus === "missed" || finalStatus === "cancelled") {
+            const calleeIds = participantsResult.rows
+              .map((r: any) => r.userId)
+              .filter((pid: any) => pid && pid !== (call.createdById || userId));
+            const callerName = await resolveUserName(call.createdById || userId);
+            pushMissedCall(calleeIds, {
+              callId: call.id,
+              callerName,
+              callerId: call.createdById || userId,
+              callCode: call.callCode,
+              status: finalStatus,
+            });
+          }
+
+          // Tell the remaining peer(s) the call ended so their UI closes and
+          // they also run their leave path (idempotent — call is already final).
+          if (io) {
+            io.to(`room:${actualId}`).emit("call:ended", {
+              roomId: actualId,
+              callId: actualId,
+              callCode: call.callCode,
+              reason: finalStatus,
+            });
+            io.to(`room:${actualId}`).emit("call:participantLeft", {
+              callId: actualId,
+              userId,
+            });
+          }
+        }
+      }
     }
 
     const response: ApiResponse<any> = {

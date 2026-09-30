@@ -16,6 +16,7 @@ This guide will help you set up all required environment variables for MetricFlo
 6. [Caching & Background Jobs](#caching--background-jobs)
 7. [Error Monitoring](#error-monitoring)
 8. [File Storage](#file-storage)
+9. [Web Push (VAPID)](#9-web-push-vapid--optional-auto-generated)
 
 ---
 
@@ -156,6 +157,33 @@ CLOUDFLARE_R2_PUBLIC_URL=
   3. Account ID is found in the Cloudflare dashboard URL (after `dash.cloudflare.com/`).
   4. Go to R2 > Manage R2 API Tokens to create an Access Key and Secret Key.
   5. (Optional) Set up a Custom Domain for your bucket to use as `CLOUDFLARE_R2_PUBLIC_URL`.
+
+---
+
+## 9. Web Push (VAPID) — optional, auto-generated
+```env
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT="mailto:support@metricorex.com"
+```
+- **Purpose**: browser push notifications (incoming-call rings, missed-call
+  notices) via the Web Push protocol. Mobile keeps using FCM
+  (`FIREBASE_SERVICE_ACCOUNT_JSON` / `FCM_SERVER_KEY`).
+- **How to get**:
+  - **Nothing to do (default)**: if both keys are missing at boot, the backend
+    generates a key pair with `webpush.generateVAPIDKeys()`, persists it to the
+    `system_settings` table (`vapid_public_key` / `vapid_private_key`) and
+    prints a banner with both keys — copy them into `.env` (and your secret
+    manager) so they are STABLE across deployments and database resets.
+    Changing the public key silently invalidates every existing browser
+    subscription.
+  - **Manual**: generate a pair once with
+    `node -e "console.log(require('web-push').generateVAPIDKeys())"` and paste
+    the values here.
+- **VAPID_SUBJECT** (optional): a `mailto:` or `https:` contact URL sent with
+  every push; defaults to `mailto:support@metricorex.com`.
+- Related endpoints: `POST /push/subscribe`, `POST /push/unsubscribe`,
+  `GET /push/vapid-public-key`.
 
 ---
 

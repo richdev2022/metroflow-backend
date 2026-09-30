@@ -3253,6 +3253,67 @@ protectedRouter.put("/payment-providers/transfer-active", async (req, res) => {
     }
 });
 
+// ---------------------------------------------------------------------
+// Calling / meeting provider (LiveKit vs MediaSoup) — platform setting.
+// The backend is the source of truth: clients ask the API which media
+// infrastructure a room uses; they never decide it themselves.
+// ---------------------------------------------------------------------
+protectedRouter.get("/calling/providers", async (req, res) => {
+    try {
+        const { getProvidersStatus } = await import("../lib/calling/factory");
+        const status = await getProvidersStatus();
+        res.json({ success: true, data: status });
+    } catch (error) {
+        console.error("Admin get calling providers error:", error);
+        res.status(500).json({ success: false, error: "Failed to load calling providers" });
+    }
+});
+
+// Health/status alias per API spec (same payload as GET /calling/providers).
+protectedRouter.get("/calling/providers/status", async (req, res) => {
+    try {
+        const { getProvidersStatus } = await import("../lib/calling/factory");
+        const status = await getProvidersStatus();
+        res.json({ success: true, data: status });
+    } catch (error) {
+        console.error("Admin calling providers status error:", error);
+        res.status(500).json({ success: false, error: "Failed to load calling provider status" });
+    }
+});
+
+protectedRouter.put("/calling/provider", async (req, res) => {
+    try {
+        const { provider } = req.body || {};
+        const { setActiveProviderName, listProviderNames, isProviderName } = await import("../lib/calling/factory");
+
+        if (!isProviderName(provider)) {
+            return res.status(400).json({
+                success: false,
+                error: `Invalid provider. Must be one of: ${listProviderNames().join(", ")}`,
+            });
+        }
+
+        await setActiveProviderName(provider);
+
+        try {
+            const { logAuditEvent } = await import("../services/audit");
+            await logAuditEvent({
+                action: 'calling_provider_changed',
+                entityType: 'system_settings',
+                entityId: 'calling_provider',
+                newValues: { provider },
+            });
+        } catch (auditErr) {
+            console.warn("Failed to audit log calling provider change:", auditErr);
+        }
+
+        res.json({ success: true, message: `Active calling provider set to ${provider}`, data: { provider } });
+    } catch (error) {
+        console.error("Admin set active calling provider error:", error);
+        res.status(500).json({ success: false, error: "Failed to set active calling provider" });
+    }
+});
+
 // List all virtual accounts (per provider) with wallet ownership context
 protectedRouter.get("/virtual-accounts", async (req, res) => {
     try {

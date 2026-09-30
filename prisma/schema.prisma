@@ -711,6 +711,7 @@ model Meeting {
   recordingEnabled     Boolean  @default(false) @map("recording_enabled")
   screenSharingEnabled Boolean  @default(true) @map("screen_sharing_enabled")
   googleEventId        String?  @map("google_event_id")
+  provider             String?  @map("provider")
   createdAt            DateTime @default(now()) @map("created_at")
   updatedAt            DateTime @default(now()) @map("updated_at")
 
@@ -803,6 +804,7 @@ model ChatMessage {
 
 // Calls
 model Call {
+
   id                 String    @id @default(uuid())
   businessId         String    @map("business_id")
   type               String // audio or video
@@ -822,6 +824,7 @@ model Call {
   waitingRoomEnabled Boolean   @default(false) @map("waiting_room_enabled")
   recordingEnabled   Boolean   @default(false) @map("recording_enabled")
   maxParticipants    Int?      @map("max_participants")
+  provider           String?   @map("provider")
   createdAt          DateTime  @default(now()) @map("created_at")
   updatedAt          DateTime  @default(now()) @map("updated_at")
 
@@ -910,4 +913,34 @@ model InvitationToken {
 
   @@index([roomId])
   @@map("invitation_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider calling: transcripts + AI meeting notes (provider-agnostic)
+// ---------------------------------------------------------------------------
+model MeetingTranscript {
+  id          String   @id @default(uuid())
+  meetingId   String   @map("meeting_id")
+  speakerId   String?  @map("speaker_id")
+  speakerName String?  @map("speaker_name")
+  text        String
+  language    String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([meetingId, createdAt])
+  @@map("meeting_transcripts")
+}
+
+model MeetingNotes {
+  id                  String   @id @default(uuid())
+  meetingId           String   @unique @map("meeting_id")
+  summary             String?
+  keyPoints           Json?    @map("key_points")
+  decisions           Json?
+  actionItems         Json?    @map("action_items")
+  importantTimestamps Json?    @map("important_timestamps")
+  model               String?
+  generatedAt         DateTime @default(now()) @map("generated_at")
+
+  @@map("meeting_notes")
 }

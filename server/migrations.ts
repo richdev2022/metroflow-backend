@@ -14,6 +14,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureSupportSchema();
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
+  await ensureCallingSchema();
 }
 
 /**
@@ -518,4 +519,56 @@ async function backfillLedgerHistory(): Promise<void> {
   } catch (err: any) {
     console.error(`[migrations] ledger backfill failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
   }
+}
+
+/**
+ * Calling provider architecture (LiveKit + MediaSoup):
+ *  1. `provider` column on calls/meetings — the media provider a room was
+ *     created with (a session never migrates providers mid-flight).
+ *  2. `meeting_transcripts` — persisted caption segments (provider-agnostic;
+ *     the backend relays captions over Socket.IO no matter which provider
+ *     carries the audio).
+ *  3. `meeting_notes` — AI summary / key points / decisions / action items.
+ * Everything idempotent, safe on every boot.
+ */
+async function ensureCallingSchema(): Promise<void> {
+  await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS provider VARCHAR(20)`);
+  await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS provider VARCHAR(20)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meeting_transcripts (
+      id UUID PRIMARY KEY,
+      meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+      speaker_id VARCHAR(200),
+      speaker_name VARCHAR(120),
+      text TEXT NOT NULL,
+      language VARCHAR(20),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_meeting_transcripts_meeting ON meeting_transcripts(meeting_id, created_at)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meeting_notes (
+      id UUID PRIMARY KEY,
+      meeting_id UUID NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE,
+      summary TEXT,
+      key_points JSONB DEFAULT '[]'::jsonb,
+      decisions JSONB DEFAULT '[]'::jsonb,
+      action_items JSONB DEFAULT '[]'::jsonb,
+      important_timestamps JSONB DEFAULT '[]'::jsonb,
+      model VARCHAR(100),
+      generated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Default for the admin-selected calling provider (LiveKit is the default;
+  // the factory also falls back to it when the setting is absent).
+  await query(`
+    INSERT INTO system_settings (key, value, description)
+    VALUES ('calling_provider', 'livekit', 'Globally active calling provider for calls & meetings (managed by platform admins)')
+    ON CONFLICT (key) DO NOTHING
+  `);
+
+  console.log("igrations] calling provider schema applied");
 }

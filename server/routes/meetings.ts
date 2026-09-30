@@ -7,6 +7,13 @@ import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { createNotification } from "../services/notifications";
 import { sendEmail, generateMeetingInvitationEmailHtml } from "../services/email";
+import {
+  buildCallingCredentials,
+  computeRemainingSeconds,
+  getActiveProviderName,
+  resolveProviderForRoom,
+} from "../lib/calling/factory";
+import { generateMeetingNotes, hasSummarizableTranscript } from "../lib/meeting-notes";
 
 // Helper to check if string is valid UUID v4
 function isValidUUID(str: string): boolean {
@@ -273,6 +280,10 @@ export const createMeeting: RequestHandler = async (
     const planMaxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
     const planMaxParticipants = planResult.rows[0]?.planMaxParticipants || null;
 
+    // Calling provider resolved once at creation (see calls.ts — the room stays
+    // on this provider for its whole lifetime even if the admin switches later).
+    const callingProvider = await getActiveProviderName();
+
     const now = new Date();
     let finalStartTime: Date;
     let finalEndTime: Date | null;
@@ -323,14 +334,14 @@ export const createMeeting: RequestHandler = async (
     const result = await query(
       `INSERT INTO meetings 
         (business_id, title, description, start_time, end_time, timezone, created_by, host_id, meeting_code, 
-         is_instant, password, max_participants, waiting_room_enabled, recording_enabled, screen_sharing_enabled)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         is_instant, password, max_participants, waiting_room_enabled, recording_enabled, screen_sharing_enabled, provider)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
                  timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
                  status, meeting_code as "meetingCode", is_instant as "isInstant", password,
                  max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
                  recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
-                 google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"`,
+                 google_event_id as "googleEventId", provider, created_at as "createdAt", updated_at as "updatedAt"`,
       [
         businessId,
         title,
@@ -347,6 +358,7 @@ export const createMeeting: RequestHandler = async (
         waitingRoomEnabled || false,
         recordingEnabled || false,
         screenSharingEnabled !== undefined ? screenSharingEnabled : true,
+        callingProvider,
       ],
     );
 
@@ -1391,7 +1403,7 @@ export const joinMeeting: RequestHandler = async (
               co_host_id as "coHostId", meeting_code as "meetingCode", password, is_instant as "isInstant",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               screen_sharing_enabled as "screenSharingEnabled", max_participants as "maxParticipants",
-              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+              google_event_id as "googleEventId", provider, created_at as "createdAt", updated_at as "updatedAt"
        FROM meetings WHERE id = $1 AND business_id = $2`,
       [actualId, businessId],
     );
@@ -1425,6 +1437,25 @@ export const joinMeeting: RequestHandler = async (
     meeting.earlyJoin = earlyJoin;
     meeting.inWaitingRoom = useWaitingRoom;
     meeting.isHost = joiningAsHost;
+
+    // Provider-specific media credentials for the joining participant
+    // (LiveKit JWT minted server-side; mediasoup requires none).
+    try {
+      const userRes = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const provider = await resolveProviderForRoom("meeting", actualId, (meeting as any).provider || null);
+      meeting.calling = await buildCallingCredentials(provider, {
+        roomType: "meeting",
+        roomId: actualId,
+        title: meeting.title || "",
+        identity: userId,
+        displayName: userRes.rows[0]?.name || "User",
+        isHost: joiningAsHost,
+        remainingSeconds: computeRemainingSeconds(meeting.endTime),
+        maxParticipants: meeting.maxParticipants || null,
+      });
+    } catch (err) {
+      console.error("Failed to build meeting calling credentials:", err);
+    }
 
     const response: ApiResponse<any> = {
       success: true,
@@ -1984,6 +2015,24 @@ export const guestJoinMeeting: RequestHandler = async (req, res) => {
       ttlMinutes: 6 * 60,
     });
 
+    // Provider-specific media credentials for the guest (never host grants).
+    let calling: unknown;
+    try {
+      const provider = await resolveProviderForRoom("meeting", meeting.id, (meeting as any).provider || null);
+      calling = await buildCallingCredentials(provider, {
+        roomType: "meeting",
+        roomId: meeting.id,
+        title: meeting.title || "",
+        identity: payload.guestId,
+        displayName: guestName,
+        isHost: false,
+        remainingSeconds: computeRemainingSeconds(meeting.end_time),
+        maxParticipants: meeting.max_participants || null,
+      });
+    } catch (err) {
+      console.error("Failed to build guest meeting calling credentials:", err);
+    }
+
     res.json({
       success: true,
       data: {
@@ -2006,10 +2055,145 @@ export const guestJoinMeeting: RequestHandler = async (req, res) => {
         roomId: meeting.id,
         socketRoom: `meeting:${meeting.id}`,
         expiresAt: new Date(payload.exp * 1000).toISOString(),
+        calling,
       },
     });
   } catch (error) {
     console.error("Guest join meeting error:", error);
     res.status(500).json({ success: false, error: "Failed to join meeting as guest" });
+  }
+};
+
+/**
+ * GET /meetings/:id/transcript
+ * Provider-agnostic meeting transcript (built from caption segments that the
+ * backend relays + persists regardless of whether the media provider is
+ * LiveKit or MediaSoup). Access: host, co-host or attendees of the meeting.
+ */
+export const getMeetingTranscript: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    let actualId: string | undefined;
+    if (isValidUUID(id)) {
+      const r = await query(`SELECT id FROM meetings WHERE id = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      const r = await query(`SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      return res.status(404).json({ success: false, error: "Meeting not found" });
+    }
+
+    const transcript = await query(
+      `SELECT t.id, t.speaker_id as "speakerId", t.speaker_name as "speakerName", t.text,
+              t.language, t.created_at as "createdAt"
+       FROM meeting_transcripts t
+       WHERE t.meeting_id = $1
+       ORDER BY t.created_at ASC
+       LIMIT 2000`,
+      [actualId],
+    );
+
+    res.json({ success: true, data: { meetingId: actualId, segments: transcript.rows } });
+  } catch (error) {
+    console.error("Get meeting transcript error:", error);
+    res.status(500).json({ success: false, error: "Failed to load transcript" });
+  }
+};
+
+/**
+ * GET /meetings/:id/notes — AI meeting notes (summary, key points, decisions,
+ * action items). Returns notes: null when not generated yet.
+ */
+export const getMeetingNotes: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    if (!businessId || !req.user?.userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    let actualId: string | undefined;
+    if (isValidUUID(id)) {
+      const r = await query(`SELECT id FROM meetings WHERE id = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      const r = await query(`SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      return res.status(404).json({ success: false, error: "Meeting not found" });
+    }
+
+    const notes = await query(
+      `SELECT meeting_id as "meetingId", summary, key_points as "keyPoints", decisions,
+              action_items as "actionItems", important_timestamps as "importantTimestamps",
+              model, generated_at as "generatedAt"
+       FROM meeting_notes WHERE meeting_id = $1`,
+      [actualId],
+    );
+
+    res.json({ success: true, data: { meetingId: actualId, notes: notes.rows[0] || null } });
+  } catch (error) {
+    console.error("Get meeting notes error:", error);
+    res.status(500).json({ success: false, error: "Failed to load meeting notes" });
+  }
+};
+
+/**
+ * POST /meetings/:id/notes/generate — (re)generate AI notes from the stored
+ * transcript on demand (also runs automatically when a meeting ends).
+ */
+export const generateMeetingNotesEndpoint: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    if (!businessId || !req.user?.userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    let actualId: string | undefined;
+    if (isValidUUID(id)) {
+      const r = await query(`SELECT id FROM meetings WHERE id = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      const r = await query(`SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2`, [id, businessId]);
+      actualId = r.rows[0]?.id;
+    }
+    if (!actualId) {
+      return res.status(404).json({ success: false, error: "Meeting not found" });
+    }
+
+    if (!(await hasSummarizableTranscript(actualId))) {
+      return res.status(409).json({
+        success: false,
+        error: "Not enough transcript content yet. Captions recorded during the meeting are required.",
+        errorCode: "no_transcript",
+      });
+    }
+
+    const notes = await generateMeetingNotes(actualId);
+    if (!notes) {
+      return res.status(503).json({
+        success: false,
+        error: "AI notes are unavailable right now (AI provider not configured or output invalid).",
+        errorCode: "ai_unavailable",
+      });
+    }
+
+    res.json({ success: true, data: { meetingId: actualId, notes } });
+  } catch (error) {
+    console.error("Generate meeting notes error:", error);
+    res.status(500).json({ success: false, error: "Failed to generate meeting notes" });
   }
 };

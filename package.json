@@ -36,6 +36,7 @@
     "express": "^5.1.0",
     "form-data": "^4.0.6",
     "ioredis": "^5.11.1",
+    "livekit-server-sdk": "^2.19.1",
     "mediasoup": "^3.14.19",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
@@ -70,5 +71,17 @@
     "vite": "^7.1.2",
     "vitest": "^3.2.4"
   },
-  "packageManager": "pnpm@10.14.0+sha512.ad27a79641b49c3e481a16a805baa71817a04bbe06a38d17e60e2eaee83f6a146c6a688125f5792e48dd5ba30e7da52a5cda4c3992b9ccf333f9ce223af84748"
+  "packageManager": "pnpm@10.14.0+sha512.ad27a79641b49c3e481a16a805baa71817a04bbe06a38d17e60e2eaee83f6a146c6a688125f5792e48dd5ba30e7da52a5cda4c3992b9ccf333f9ce223af84748",
+  "allowScripts": {
+    "@google/genai@1.52.0": true,
+    "@prisma/client@5.19.0": true,
+    "@prisma/engines@5.19.0": true,
+    "@scarf/scarf@1.4.0": true,
+    "bcrypt@6.0.0": true,
+    "esbuild@0.28.2": true,
+    "mediasoup@3.27.1": true,
+    "msgpackr-extract@3.0.4": true,
+    "prisma@5.19.0": true,
+    "protobufjs@7.6.6": true
+  }
 }

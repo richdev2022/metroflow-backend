@@ -21,6 +21,13 @@ import { verifyToken } from "../services/auth";
 import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
 import { isCorsOriginAllowed } from "../cors";
 import crypto from "crypto";
+import {
+  buildCallingCredentials,
+  computeRemainingSeconds,
+  resolveProviderForRoom,
+  type CallingCredentials,
+} from "./calling/factory";
+import { generateMeetingNotesIfEligible } from "./meeting-notes";
 
 let io: Server | null = null;
 
@@ -60,16 +67,13 @@ async function resolveRoomId(inputId: string): Promise<{ id: string; type: 'call
 // Function to end call/meeting automatically
 async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<void> {
   try {
+    let storedProvider: string | null = null;
     if (roomType === 'call') {
-      await query(
-        `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP WHERE id = $1`,
-        [roomId]
-      );
+      const r = await query(`UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING provider`, [roomId]);
+      storedProvider = r.rows[0]?.provider || null;
     } else {
-      await query(
-        `UPDATE meetings SET status = 'completed', end_time = CURRENT_TIMESTAMP WHERE id = $1`,
-        [roomId]
-      );
+      const r = await query(`UPDATE meetings SET status = 'completed', end_time = CURRENT_TIMESTAMP WHERE id = $1 RETURNING provider`, [roomId]);
+      storedProvider = r.rows[0]?.provider || null;
     }
 
     const ioServer = getSocketServer();
@@ -80,6 +84,23 @@ async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<vo
         ioServer.to(`room:${roomId}`).emit("meeting:ended", { meetingId: roomId, reason: 'duration_limit' });
         ioServer.to(`meeting:${roomId}`).emit("meeting:ended", { meetingId: roomId, reason: 'duration_limit' });
       }
+    }
+
+    // Tear down the media session at the provider so nobody stays connected
+    // after the backend-enforced deadline (a malicious client cannot extend
+    // the meeting by keeping its socket/media connection alive).
+    try {
+      const provider = await resolveProviderForRoom(roomType, roomId, storedProvider);
+      await provider.endSession(roomId);
+    } catch (err) {
+      logger.warn(`Provider endSession failed for ${roomType}:${roomId}:`, err);
+    }
+
+    // Finalize meeting notes/transcript (meetings only, best effort).
+    if (roomType === 'meeting') {
+      generateMeetingNotesIfEligible(roomId).catch((err) =>
+        logger.warn("Meeting notes generation failed:", err),
+      );
     }
 
     const participants = roomManager.getParticipants(roomId);
@@ -637,10 +658,12 @@ export function initSocketServer(server: http.Server): void {
         let endsAt: Date | null = null;
         let maxMeetingDuration: number | null = null;
         let waitingRoomEnabled = false;
+        let roomProvider: string | null = null;
+        let roomMaxParticipants: number | null = null;
 
         if (isCall) {
           const callResult = await query(
-            `SELECT c.ended_at as "endedAt", c.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
+            `SELECT c.ended_at as "endedAt", c.waiting_room_enabled as "waitingRoomEnabled", c.provider, c.max_participants as "maxParticipants", pp.max_meeting_duration as "maxMeetingDuration" 
              FROM calls c
              LEFT JOIN businesses b ON c.business_id = b.id
              LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -652,10 +675,12 @@ export function initSocketServer(server: http.Server): void {
             endsAt = callRow.endedAt ? new Date(callRow.endedAt) : null;
             maxMeetingDuration = callRow.maxMeetingDuration;
             waitingRoomEnabled = !!callRow.waitingRoomEnabled;
+            roomProvider = callRow.provider || null;
+            roomMaxParticipants = callRow.maxParticipants || null;
           }
         } else {
           const meetingResult = await query(
-            `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
+            `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", m.provider, m.max_participants as "maxParticipants", pp.max_meeting_duration as "maxMeetingDuration" 
              FROM meetings m
              LEFT JOIN businesses b ON m.business_id = b.id
              LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -667,6 +692,8 @@ export function initSocketServer(server: http.Server): void {
             endsAt = meetingRow.endedAt ? new Date(meetingRow.endedAt) : null;
             maxMeetingDuration = meetingRow.maxMeetingDuration;
             waitingRoomEnabled = !!meetingRow.waitingRoomEnabled;
+            roomProvider = meetingRow.provider || null;
+            roomMaxParticipants = meetingRow.maxParticipants || null;
           }
         }
 
@@ -789,7 +816,27 @@ export function initSocketServer(server: http.Server): void {
           maxMeetingDuration: roomState?.maxMeetingDuration,
         };
         socket.emit("call:participants-list", participantsListPayload);
-        if (callback) callback({ success: true, roomId: resolvedRoomId });
+
+        // Provider-specific media credentials. LiveKit tokens are minted here
+        // so the client never touches provider secrets; mediasoup needs none.
+        let calling: CallingCredentials | undefined;
+        try {
+          const provider = await resolveProviderForRoom(isCall ? "call" : "meeting", resolvedRoomId, roomProvider);
+          calling = await buildCallingCredentials(provider, {
+            roomType: isCall ? "call" : "meeting",
+            roomId: resolvedRoomId,
+            title: "",
+            identity: data.userId,
+            displayName: data.userName || "User",
+            isHost: !!data.isHost,
+            remainingSeconds: computeRemainingSeconds(endsAt),
+            maxParticipants: roomMaxParticipants,
+          });
+        } catch (err) {
+          logger.warn("Failed to build calling credentials:", err);
+        }
+
+        if (callback) callback({ success: true, roomId: resolvedRoomId, calling });
 
         if (durationStarted) {
           io.to(`room:${resolvedRoomId}`).emit("call:duration-started", {
@@ -1287,7 +1334,7 @@ export function initSocketServer(server: http.Server): void {
         let waitingRoomEnabled = false;
 
         const meetingResult = await query(
-          `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", pp.max_meeting_duration as "maxMeetingDuration" 
+          `SELECT m.end_time as "endedAt", m.waiting_room_enabled as "waitingRoomEnabled", m.provider, m.max_participants as "maxParticipants", pp.max_meeting_duration as "maxMeetingDuration" 
            FROM meetings m
            LEFT JOIN businesses b ON m.business_id = b.id
            LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
@@ -1295,11 +1342,15 @@ export function initSocketServer(server: http.Server): void {
           [resolvedMeetingId]
         );
 
+        let roomProvider: string | null = null;
+        let roomMaxParticipants: number | null = null;
         if (meetingResult.rows.length > 0) {
           const meetingRow = meetingResult.rows[0];
           endsAt = meetingRow.endedAt ? new Date(meetingRow.endedAt) : null;
           maxMeetingDuration = meetingRow.maxMeetingDuration;
           waitingRoomEnabled = !!meetingRow.waitingRoomEnabled;
+          roomProvider = meetingRow.provider || null;
+          roomMaxParticipants = meetingRow.maxParticipants || null;
         }
 
         // Server-side waiting-room enforcement (clients that advertise support)
@@ -1403,7 +1454,25 @@ export function initSocketServer(server: http.Server): void {
           maxMeetingDuration: roomState?.maxMeetingDuration,
         };
         socket.emit("meeting:participants-list", participantsListPayload);
-        if (callback) callback({ success: true, meetingId: resolvedMeetingId, meetingCode: data.meetingId });
+        // Provider-specific media credentials (LiveKit token minted here).
+        let calling: CallingCredentials | undefined;
+        try {
+          const provider = await resolveProviderForRoom("meeting", resolvedMeetingId, roomProvider);
+          calling = await buildCallingCredentials(provider, {
+            roomType: "meeting",
+            roomId: resolvedMeetingId,
+            title: "",
+            identity: userId,
+            displayName: userName,
+            isHost,
+            remainingSeconds: computeRemainingSeconds(endsAt),
+            maxParticipants: roomMaxParticipants,
+          });
+        } catch (err) {
+          logger.warn("Failed to build meeting calling credentials:", err);
+        }
+
+        if (callback) callback({ success: true, meetingId: resolvedMeetingId, meetingCode: data.meetingId, calling });
 
         if (durationStarted) {
           io.to(`room:${resolvedMeetingId}`).emit("meeting:duration-started", {
@@ -1886,6 +1955,85 @@ export function initSocketServer(server: http.Server): void {
     socket.on("meeting-chat:message", handleMeetingChat);
     // Alias event used by some clients
     socket.on("meeting-chat:send", handleMeetingChat);
+
+    // ---------------------------------------------------------------------
+    // Live captions (provider-agnostic). Clients run their own speech-to-text
+    // (e.g. browser SpeechRecognition) and stream segments here; the backend
+    // relays them to everyone in the room and persists final segments for
+    // meetings so transcripts + AI notes can be generated later. Works the
+    // same whether the media provider is LiveKit or MediaSoup.
+    // ---------------------------------------------------------------------
+    socket.on(
+      "caption:segment",
+      async (
+        data: {
+          roomId: string;
+          roomType?: "call" | "meeting";
+          text: string;
+          isFinal?: boolean;
+          language?: string;
+        },
+        callback?: (response: any) => void,
+      ) => {
+        try {
+          const text = String(data?.text || "").slice(0, 2000);
+          if (!data?.roomId || !text.trim()) {
+            if (callback) callback({ success: false, error: "roomId and text are required" });
+            return;
+          }
+          const resolved = await resolveRoomId(data.roomId);
+          if (!resolved) {
+            if (callback) callback({ success: false, error: "Room not found" });
+            return;
+          }
+          const roomId = resolved.id;
+          const roomType: "call" | "meeting" = data.roomType || resolved.type;
+          const speakerId: string =
+            socket.data.userId ||
+            (socket.data.guest as any)?.guestId ||
+            socket.id;
+          const speakerName =
+            roomManager.getParticipants(roomId).find((p) => p.id === speakerId)?.name ||
+            (socket.data.guest as any)?.name ||
+            socket.data.userId ||
+            "Speaker";
+
+          const payload = {
+            roomId,
+            roomType,
+            speakerId,
+            speakerName,
+            text,
+            isFinal: data.isFinal !== false,
+            language: data.language || null,
+            ts: new Date().toISOString(),
+          };
+
+          // Relay to everyone in the room (including back to sender for UI echo).
+          io.to(`room:${roomId}`).emit("caption:updated", payload);
+          if (roomType === "meeting") {
+            io.to(`meeting:${roomId}`).emit("caption:updated", payload);
+          }
+
+          // Persist final segments for meetings → transcript + AI notes.
+          if (roomType === "meeting" && payload.isFinal) {
+            try {
+              await query(
+                `INSERT INTO meeting_transcripts (id, meeting_id, speaker_id, speaker_name, text, language, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
+                [crypto.randomUUID(), roomId, String(speakerId), String(speakerName).slice(0, 120), text, payload.language],
+              );
+            } catch (err) {
+              logger.warn("Failed to persist caption segment:", err);
+            }
+          }
+          if (callback) callback({ success: true });
+        } catch (error) {
+          logger.error("Error handling caption segment:", error);
+          if (callback) callback({ success: false, error: "Failed to relay caption" });
+        }
+      },
+    );
 
     // Disconnect
     socket.on("disconnect", async () => {

@@ -86,7 +86,10 @@ export async function hasSummarizableTranscript(meetingId: string): Promise<bool
  * Generate (or regenerate) AI notes for a meeting. No-ops (returns null)
  * when there is no GLM key or the transcript is too thin.
  */
-export async function generateMeetingNotes(meetingId: string): Promise<MeetingNotes | null> {
+export async function generateMeetingNotes(
+  meetingId: string,
+  fallbackTitle = "Meeting",
+): Promise<MeetingNotes | null> {
   if (!isGlmConfigured()) {
     logger.info("Meeting notes skipped: GLM not configured");
     return null;
@@ -102,7 +105,7 @@ export async function generateMeetingNotes(meetingId: string): Promise<MeetingNo
   const transcript = lines.join("\n").slice(0, 60_000);
 
   const mRes = await query(`SELECT title FROM meetings WHERE id = $1`, [meetingId]);
-  const title = mRes.rows[0]?.title || "Meeting";
+  const title = mRes.rows[0]?.title || fallbackTitle;
 
   const prompt = `You are Metricorex AI. Below is the transcript of a business meeting titled "${title}".
 Produce meeting notes as STRICT JSON (no markdown fences, no commentary) with exactly this shape:
@@ -159,10 +162,13 @@ ${transcript}`;
  * Fire-and-forget finalizer used when a meeting ends. Only generates notes
  * when a transcript exists (never invents content for silent meetings).
  */
-export async function generateMeetingNotesIfEligible(meetingId: string): Promise<void> {
+export async function generateMeetingNotesIfEligible(
+  meetingId: string,
+  fallbackTitle = "Meeting",
+): Promise<void> {
   try {
     if (!(await hasSummarizableTranscript(meetingId))) return;
-    const notes = await generateMeetingNotes(meetingId);
+    const notes = await generateMeetingNotes(meetingId, fallbackTitle);
     if (notes) {
       const { getSocketServer } = await import("./socket");
       const io = getSocketServer();

@@ -172,10 +172,15 @@ async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<vo
       logger.warn(`Provider endSession failed for ${roomType}:${roomId}:`, err);
     }
 
-    // Finalize meeting notes/transcript (meetings only, best effort).
+    // Finalize AI notes from the persisted transcript (meetings AND calls,
+    // best effort — needs GLM configured + a summarizable transcript).
     if (roomType === 'meeting') {
       generateMeetingNotesIfEligible(roomId).catch((err) =>
         logger.warn("Meeting notes generation failed:", err),
+      );
+    } else if (roomType === 'call') {
+      generateMeetingNotesIfEligible(roomId, 'Call').catch((err) =>
+        logger.warn("Call notes generation failed:", err),
       );
     }
 
@@ -2229,8 +2234,10 @@ export function initSocketServer(server: http.Server): void {
             io.to(`meeting:${roomId}`).emit("caption:updated", payload);
           }
 
-          // Persist final segments for meetings → transcript + AI notes.
-          if (roomType === "meeting" && payload.isFinal) {
+          // Persist final segments for meetings AND calls → transcript +
+          // AI notes / call-detail views (meeting_transcripts is keyed by the
+          // room id for both room types; GET /calls/:id/transcript reads it).
+          if (payload.isFinal) {
             try {
               await query(
                 `INSERT INTO meeting_transcripts (id, meeting_id, speaker_id, speaker_name, text, language, created_at)

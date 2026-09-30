@@ -1,7 +1,6 @@
 import {
   AccessToken,
   RoomServiceClient,
-  RoomConfiguration,
   TrackSource,
   type EgressClient,
 } from "livekit-server-sdk";
@@ -159,12 +158,10 @@ export const livekitProvider: CallingProvider = {
       hidden: false,
     });
 
-    // Enforce the plan's participant cap at the media layer too.
-    if (ctx.maxParticipants && ctx.maxParticipants > 0) {
-      token.roomConfig = new RoomConfiguration({
-        maxParticipants: ctx.maxParticipants,
-      });
-    }
+    // NOTE: do NOT set token.roomConfig (RoomConfiguration in the join token):
+    // LiveKit 1.9.x rejects such tokens with 401 "invalid token". The plan's
+    // participant cap is enforced by the Metricorex backend on every join
+    // (409 max_participants_reached), which is authoritative anyway.
 
     const jwt = await token.toJwt();
     return {

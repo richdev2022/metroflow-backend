@@ -2186,6 +2186,19 @@ export const getCallDetail: RequestHandler = async (req: AuthenticatedRequest, r
       participants.map((p: any) => p.userId),
     );
 
+    // AI notes (summary / key points / decisions / action items) — generated
+    // from the persisted transcript when the call ends (best effort).
+    let notes: any = null;
+    try {
+      const notesResult = await query(
+        `SELECT summary, key_points as "keyPoints", decisions, action_items as "actionItems",
+                important_timestamps as "importantTimestamps", model, generated_at as "generatedAt"
+         FROM meeting_notes WHERE meeting_id = $1 LIMIT 1`,
+        [call.id],
+      );
+      notes = notesResult.rows[0] || null;
+    } catch { /* notes must not break the detail view */ }
+
     // Legacy-shaped call object (top level) — delete password like enrichCall.
     const callEnvelope = { ...call };
     enrichCall(callEnvelope);
@@ -2202,6 +2215,7 @@ export const getCallDetail: RequestHandler = async (req: AuthenticatedRequest, r
         hasTranscript,
         transcriptsCount,
         recording,
+        notes,
         conversationId: conversationId || null,
       },
     };

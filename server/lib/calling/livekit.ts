@@ -2,12 +2,16 @@ import {
   AccessToken,
   RoomServiceClient,
   TrackSource,
+  EncodedFileOutput,
+  EncodedFileType,
+  S3Upload,
   type EgressClient,
 } from "livekit-server-sdk";
 import { isPlaceholderValue } from "../config-flags";
 import type {
   CallingJoinContext,
   CallingProvider,
+  ProviderRecordingStartResult,
 } from "./types";
 
 /**
@@ -82,6 +86,66 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     p,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms)),
   ]);
+}
+
+/**
+ * Cached liveness probe against the LiveKit server.
+ *
+ * `mintJoinCredentials` only signs a JWT — it never touches the network, so a
+ * deployment with LIVEKIT_* env vars pointing at a dead server (502 behind the
+ * reverse proxy) would otherwise hand out credentials clients cannot use.
+ * This probe is the gate: joins degrade to MediaSoup while the SFU is down.
+ *
+ * Results are cached (30s healthy / 10s unhealthy) so a burst of joins does
+ * not hammer the server.
+ */
+let reachabilityCache: { value: boolean; expiresAt: number } | null = null;
+export function resetLiveKitReachabilityCache(): void {
+  reachabilityCache = null;
+}
+
+export async function isLiveKitReachable(): Promise<boolean> {
+  if (!isLiveKitConfigured()) return false;
+  if (reachabilityCache && reachabilityCache.expiresAt > Date.now()) {
+    return reachabilityCache.value;
+  }
+  let reachable = false;
+  try {
+    await withTimeout(getRoomService().listRooms(), 2500);
+    reachable = true;
+  } catch {
+    reachable = false;
+  }
+  reachabilityCache = {
+    value: reachable,
+    expiresAt: Date.now() + (reachable ? 30_000 : 10_000),
+  };
+  return reachable;
+}
+
+/**
+ * S3-compatible upload target for Egress output — reuses the deployment's
+ * Cloudflare R2 credentials (same bucket/credentials the backend already
+ * uses for media uploads) so no extra egress-specific secrets are needed.
+ */
+function egressS3Upload(): S3Upload {
+  const accountId = (process.env.CLOUDFLARE_R2_ACCOUNT_ID || "").trim();
+  const accessKey = (process.env.CLOUDFLARE_R2_ACCESS_KEY_ID || "").trim();
+  const secret = (process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY || "").trim();
+  const bucket = (process.env.CLOUDFLARE_R2_BUCKET_NAME || "").trim();
+  if (!accountId || !accessKey || !secret || !bucket) {
+    throw new Error(
+      "Recording storage is not configured (CLOUDFLARE_R2_* env vars are required for server-side recording)",
+    );
+  }
+  return new S3Upload({
+    accessKey,
+    secret,
+    region: "auto",
+    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    bucket,
+    forcePathStyle: true,
+  });
 }
 
 export const livekitProvider: CallingProvider = {
@@ -208,6 +272,57 @@ export const livekitProvider: CallingProvider = {
       }
       return true;
     } catch {
+      return false;
+    }
+  },
+
+  /** Room-composite Egress recording → MP4 in R2 (key = opts.fileKey). */
+  async startRecording(roomId, opts): Promise<ProviderRecordingStartResult> {
+    if (!isLiveKitConfigured()) {
+      return { supported: false, reason: "LiveKit is not configured" };
+    }
+    const egress = getEgressClient();
+    if (!egress) {
+      return { supported: false, reason: "LiveKit egress client unavailable" };
+    }
+    let s3: S3Upload;
+    try {
+      s3 = egressS3Upload();
+    } catch (err: any) {
+      return { supported: false, reason: String(err?.message || err) };
+    }
+    try {
+      const info = await withTimeout(
+        egress.startRoomCompositeEgress(
+          roomId,
+          new EncodedFileOutput({
+            fileType: EncodedFileType.MP4,
+            filepath: opts.fileKey,
+            output: { case: "s3", value: s3 },
+          }),
+          { audioOnly: opts.audioOnly === true },
+        ),
+        8000,
+      );
+      return {
+        supported: true,
+        egressId: String(info.egressId || ""),
+        startedAt: info.startedAt ? new Date(Number(info.startedAt)).toISOString() : new Date().toISOString(),
+      };
+    } catch (err: any) {
+      throw new Error(String(err?.message || "Failed to start LiveKit egress recording"));
+    }
+  },
+
+  async stopRecording(roomId: string, egressId: string) {
+    const egress = getEgressClient();
+    if (!egress || !egressId) return false;
+    try {
+      await withTimeout(egress.stopEgress(egressId), 8000);
+      return true;
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (/not found|does not exist/i.test(msg)) return true; // already stopped
       return false;
     }
   },

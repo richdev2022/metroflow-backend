@@ -75,6 +75,7 @@ import transferRouter from "./routes/transfers";
 import payrollRouter from "./routes/payroll";
 import settingsRouter from "./routes/settings";
 import { rtcRouter } from "./lib/calling/routes";
+import { livekitWebhookRouter } from "./lib/calling/webhook";
 import kycRouter from "./routes/kyc";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
@@ -313,7 +314,12 @@ export async function createServer() {
   app.use(secureHeaders);
   app.use(rateLimiter);
 
-  app.use(express.json());
+  app.use(express.json({
+    // Capture the raw body for signature-validated webhooks (LiveKit egress events).
+    verify: (req: any, _res, buf) => {
+      req.rawBody = Buffer.from(buf);
+    },
+  }));
   app.use(express.urlencoded({ extended: true }));
 
   // Swagger Documentation
@@ -650,6 +656,9 @@ export async function createServer() {
   mainRouter.use("/subscription", subscriptionRouter);
 
   // Webhook API routes
+  // LiveKit provider webhooks FIRST (exact path, signature-validated, no auth);
+  // then the generic application webhooks.
+  mainRouter.use("/webhook/livekit", livekitWebhookRouter);
   mainRouter.use("/webhook", webhookRouter);
 
   // Transfer API routes

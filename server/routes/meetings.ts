@@ -1266,43 +1266,64 @@ export const joinMeeting: RequestHandler = async (
       });
     }
 
-    let actualId: string | undefined;
-    if (isValidUUID(id)) {
-      const idResult = await query(
-        `SELECT id, password, status, start_time, end_time, is_instant, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-         FROM meetings WHERE id = $1 AND business_id = $2`,
-        [id, businessId],
-      );
-      if (idResult.rows.length > 0) {
-        actualId = idResult.rows[0].id;
+    // Resolve the meeting: own business first (id, then code), then a
+    // cross-business fallback for hosts/co-hosts/invited attendees whose
+    // account context differs from the meeting owner's business (the strict
+    // business_id filter used to 404 "Meeting not found" on legitimate joins).
+    const JOIN_LOOKUP_COLS = `id, business_id, password, status, start_time, end_time, is_instant, waiting_room_enabled, max_participants, host_id, co_host_id, created_by`;
+    const isUuid = isValidUUID(id);
+    const codeKey = isUuid ? null : id.trim().toUpperCase();
+
+    let meetingState: any = undefined;
+    if (isUuid) {
+      meetingState = (
+        await query(
+          `SELECT ${JOIN_LOOKUP_COLS} FROM meetings WHERE id = $1 AND business_id = $2`,
+          [id, businessId],
+        )
+      ).rows[0];
+    }
+    if (!meetingState && codeKey) {
+      meetingState = (
+        await query(
+          `SELECT ${JOIN_LOOKUP_COLS} FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
+          [codeKey, businessId],
+        )
+      ).rows[0];
+    }
+    if (!meetingState) {
+      // Cross-business fallback: global lookup, allowed ONLY for the
+      // host/co-host/creator or an already-invited attendee of that meeting.
+      const candidate = (
+        isUuid
+          ? await query(`SELECT ${JOIN_LOOKUP_COLS} FROM meetings WHERE id = $1`, [id])
+          : await query(`SELECT ${JOIN_LOOKUP_COLS} FROM meetings WHERE meeting_code = $1`, [codeKey])
+      ).rows[0];
+      if (candidate) {
+        const attendeeRow = await query(
+          `SELECT 1 FROM meeting_attendees WHERE meeting_id = $1 AND user_id = $2 LIMIT 1`,
+          [candidate.id, userId],
+        );
+        if (
+          candidate.host_id === userId ||
+          candidate.co_host_id === userId ||
+          candidate.created_by === userId ||
+          attendeeRow.rows.length > 0
+        ) {
+          meetingState = candidate;
+        }
       }
     }
 
-    if (!actualId) {
-      const codeResult = await query(
-        `SELECT id, password, status, start_time, end_time, is_instant, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-         FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
-        [id, businessId],
-      );
-      if (codeResult.rows.length > 0) {
-        actualId = codeResult.rows[0].id;
-      }
-    }
-
-    if (!actualId) {
+    if (!meetingState) {
       return res.status(404).json({
         success: false,
         error: "Meeting not found",
+        errorCode: "meeting_not_found",
       });
     }
 
-    const lookupCol = isValidUUID(id) ? 'id' : 'meeting_code';
-    const validationResult = await query(
-      `SELECT id, password, status, start_time, end_time, is_instant, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-       FROM meetings WHERE ${lookupCol} = $1 AND business_id = $2`,
-      [id, businessId],
-    );
-    const meetingState = validationResult.rows[0];
+    const actualId: string = meetingState.id;
     const now = new Date();
 
     // 1) Status validation
@@ -1321,8 +1342,14 @@ export const joinMeeting: RequestHandler = async (
       });
     }
 
-    // 2) Password validation
-    if (meetingState.password && meetingState.password !== password) {
+    // 2) Password validation — hosts/co-hosts/creators are NEVER prompted
+    //    for their own meeting (the join UI doesn't even show them a password
+    //    field, so requiring one made host joins fail with "Invalid password").
+    const isHost =
+      meetingState.host_id === userId ||
+      meetingState.co_host_id === userId ||
+      meetingState.created_by === userId;
+    if (!isHost && meetingState.password && meetingState.password !== password) {
       return res.status(403).json({
         success: false,
         error: "Invalid password",
@@ -1350,10 +1377,6 @@ export const joinMeeting: RequestHandler = async (
     }
 
     // 4) Max participants check (host/co-host/created-by can always join)
-    const isHost =
-      meetingState.host_id === userId ||
-      meetingState.co_host_id === userId ||
-      meetingState.created_by === userId;
     if (!isHost && meetingState.max_participants) {
       const countRes = await query(
         `SELECT COUNT(*) FROM meeting_attendees WHERE meeting_id = $1 AND status = 'joined'`,
@@ -1404,13 +1427,14 @@ export const joinMeeting: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               screen_sharing_enabled as "screenSharingEnabled", max_participants as "maxParticipants",
               google_event_id as "googleEventId", provider, created_at as "createdAt", updated_at as "updatedAt"
-       FROM meetings WHERE id = $1 AND business_id = $2`,
-      [actualId, businessId],
+       FROM meetings WHERE id = $1`,
+      [actualId],
     );
     if (meetingResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: "Meeting not found",
+        errorCode: "meeting_not_found",
       });
     }
 
@@ -1421,7 +1445,7 @@ export const joinMeeting: RequestHandler = async (
        FROM businesses b 
        LEFT JOIN pricing_plans pp ON b.plan_id = pp.id 
        WHERE b.id = $1`,
-      [businessId]
+      [meeting.businessId || businessId]
     );
     meeting.maxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
 
@@ -1598,7 +1622,7 @@ export const validateMeetingAccess: RequestHandler = async (
   res,
 ) => {
   try {
-    const { code } = req.params;
+    const code = String(req.params.code || "");
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
@@ -1609,19 +1633,50 @@ export const validateMeetingAccess: RequestHandler = async (
       });
     }
 
-    const result = await query(
-      `SELECT id, title, description, status, start_time as "startTime", 
-              end_time as "endTime", timezone, meeting_code as "meetingCode",
-              is_instant as "isInstant", waiting_room_enabled as "waitingRoomEnabled",
-              max_participants as "maxParticipants", host_id as "hostId",
-              co_host_id as "coHostId", created_by as "createdById", password,
-              recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled"
-       FROM meetings
-       WHERE (meeting_code = $1 OR id::text = $1) AND business_id = $2`,
-      [code, businessId],
-    );
+    const VALIDATE_COLS = `id, business_id, title, description, status, start_time as "startTime", 
+            end_time as "endTime", timezone, meeting_code as "meetingCode",
+            is_instant as "isInstant", waiting_room_enabled as "waitingRoomEnabled",
+            max_participants as "maxParticipants", host_id as "hostId",
+            co_host_id as "coHostId", created_by as "createdById", password,
+            recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled"`;
+    const isUuidCode = isValidUUID(code);
+    const codeKey = isUuidCode ? null : code.trim().toUpperCase();
 
-    if (result.rows.length === 0) {
+    let raw: any = undefined;
+    // Own business first (code or id)
+    raw = (
+      await query(
+        `SELECT ${VALIDATE_COLS}
+         FROM meetings
+         WHERE (meeting_code = $1 OR id::text = $1) AND business_id = $2`,
+        [code, businessId],
+      )
+    ).rows[0];
+    if (!raw) {
+      // Cross-business fallback: hosts/co-hosts/creators and already-invited
+      // attendees may open meeting links whose business differs from theirs.
+      const candidate = (
+        isUuidCode
+          ? await query(`SELECT ${VALIDATE_COLS} FROM meetings WHERE id::text = $1`, [code])
+          : await query(`SELECT ${VALIDATE_COLS} FROM meetings WHERE meeting_code = $1`, [codeKey])
+      ).rows[0];
+      if (candidate) {
+        const attendeeRow = await query(
+          `SELECT 1 FROM meeting_attendees WHERE meeting_id = $1 AND user_id = $2 LIMIT 1`,
+          [candidate.id, userId],
+        );
+        if (
+          candidate.hostId === userId ||
+          candidate.coHostId === userId ||
+          candidate.createdById === userId ||
+          attendeeRow.rows.length > 0
+        ) {
+          raw = candidate;
+        }
+      }
+    }
+
+    if (!raw) {
       return res.status(404).json({
         success: false,
         error: "Meeting not found",
@@ -1629,7 +1684,6 @@ export const validateMeetingAccess: RequestHandler = async (
       });
     }
 
-    const raw = result.rows[0];
     const now = new Date();
     const isHost =
       raw.hostId === userId ||
@@ -1662,7 +1716,7 @@ export const validateMeetingAccess: RequestHandler = async (
       }
     }
 
-    if (accessState === 'allowed' && hasPassword) {
+    if (accessState === 'allowed' && hasPassword && !isHost) {
       accessState = 'password_required';
       reasons.push('This meeting requires a password to join');
     }

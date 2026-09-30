@@ -195,6 +195,7 @@ export async function creditRevenueWallet(
     reference?: string,
     description?: string,
     provider?: string | null,
+    mirrorDescription?: string,
 ) {
     // This is the Revenue Wallet (platform_wallet table)
     if (amount === 0) return;
@@ -215,7 +216,7 @@ export async function creditRevenueWallet(
         -amount,
         currency,
         reference,
-        description || (sign > 0 ? 'Platform Wallet Debit for Revenue' : 'Platform Wallet Credit (Revenue Reversal)'),
+        mirrorDescription || (sign > 0 ? 'Platform Wallet Debit for Revenue' : 'Platform Wallet Credit (Revenue Reversal)'),
         resolvedProvider,
     );
 

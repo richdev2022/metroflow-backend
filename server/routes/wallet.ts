@@ -3,7 +3,7 @@ import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest, check
 import { query, pool } from "../db";
 import { getProvider, resolveProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
 import { toMinorUnit } from "../services/transfer";
-import { calculateFee } from "../services/fees";
+import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { generateToken } from "../services/auth";
 import { getBankNameByCode } from "../utils/bank-codes";
 
@@ -1126,34 +1126,55 @@ router.get("/verify", async (req, res) => {
                     [settlement.id]
                 );
 
-                // 4. Credit Platform Wallet with Fee (if any)
-                if (transaction.fee > 0) {
-                     // Find Platform Wallet (Revenue Wallet)
-                     const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                     
-                     if (platformWalletRes.rows.length > 0) {
-                         const platformWalletId = platformWalletRes.rows[0].id;
-                         
-                         // Check if already credited (idempotency)
-                         const platTxCheck = await client.query(
-                            `SELECT id FROM transactions WHERE reference = $1 AND type = 'credit' AND wallet_id = $2`,
-                            [`${reference}-PLATFORM-FEE`, platformWalletId]
-                        );
-
-                        if (platTxCheck.rows.length === 0) {
-                             await client.query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [transaction.fee, platformWalletId]);
-                             
-                             await client.query(
-                                `INSERT INTO transactions 
-                                (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                VALUES ($1, 'NGN', 'success', $2, 'credit', 'Fee for Wallet Funding', 'fee', $3, 'credit')`,
-                                [transaction.fee, `${reference}-PLATFORM-FEE`, platformWalletId]
-                            );
-                        }
-                     }
-                }
-
                 await client.query('COMMIT');
+
+                // 4. Platform ledger (double-entry) — mirrors the Virtual
+                // Account webhook flow so the admin Platform Ledger records
+                // the FULL movement (gross inflow + user payout + fee ->
+                // revenue) instead of "only the fees". Runs AFTER COMMIT:
+                // the ledger helpers use the connection pool while `client`
+                // still held row locks on the wallets row inside the settlement
+                // transaction. Every helper is idempotent by reference, so a
+                // replayed verify callback cannot duplicate rows (and the
+                // status guard above means settlement only happens once).
+                try {
+                    const ledgerProvider = transaction.payment_provider || null;
+                    const netAmount = Number(transaction.amount) || 0;
+                    const feeAmount = Number(transaction.fee) || 0;
+
+                    // Gross inflow the gateway received (net + fee charged on top)
+                    await creditPlatformWallet(
+                        netAmount + feeAmount,
+                        'NGN',
+                        reference,
+                        'Customer Wallet Funding Received (Card)',
+                        ledgerProvider,
+                    );
+                    // The user's payout leaving the platform pool
+                    await debitPlatformWallet(
+                        netAmount,
+                        'NGN',
+                        `${reference}-USER`,
+                        'Platform Wallet Debit for User Funding',
+                        ledgerProvider,
+                    );
+                    // The fee moves from the pool into the revenue wallet —
+                    // this ALSO writes the wallet_id-NULL revenue row that the
+                    // admin Revenue Ledger history aggregates on.
+                    if (feeAmount > 0) {
+                        await creditRevenueWallet(
+                            feeAmount,
+                            'NGN',
+                            reference,
+                            'Revenue Credit (funding fee)',
+                            ledgerProvider,
+                        );
+                    }
+                } catch (ledgerErr) {
+                    // Never fail the user's funding because of a ledger write;
+                    // the startup backfill reconciles any missing rows.
+                    console.error('Card funding ledger entries failed:', ledgerErr);
+                }
                 
                 // Send Success Email (Async)
                 // sendEmail(...)

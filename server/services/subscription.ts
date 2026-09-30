@@ -97,12 +97,16 @@ export const processSubscriptionRenewals = async () => {
 
             const amountInMinor = Math.round(amount * 100);
             const provider = getProvider(sub.active_payment_provider || 'flutterwave');
+            // Generate the reference ONCE — previously the charge and the
+            // recorded transaction used two different Date.now() refs, so the
+            // ledger row could never be matched back to the gateway charge.
+            const recurrenceRef = `REC_${Date.now()}_${sub.business_id.substring(0, 4)}`;
 
             console.log(`Charging business ${sub.business_id} amount ${amountInMinor} via ${sub.active_payment_provider}`);
-            const chargeRes = await provider.chargeCard({ 
-                amount: amountInMinor, 
-                tokenId: sub.card_token, 
-                transactionRef: `REC_${Date.now()}_${sub.business_id.substring(0,4)}` 
+            const chargeRes = await provider.chargeCard({
+                amount: amountInMinor,
+                tokenId: sub.card_token,
+                transactionRef: recurrenceRef
             });
             
             if (chargeRes && chargeRes.success) {
@@ -125,17 +129,26 @@ export const processSubscriptionRenewals = async () => {
                     INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response, transaction_type, payment_provider)
                     VALUES ($1, $2, $3, $4, $5, 'success', $6, 'subscription', $7)
                 `, [
-                    sub.business_id, 
-                    sub.plan_id, 
-                    amount, 
+                    sub.business_id,
+                    sub.plan_id,
+                    amount,
                     'NGN', // Assuming we charged in NGN
-                    `REC_${Date.now()}_${sub.business_id.substring(0,4)}`,
+                    recurrenceRef,
                     JSON.stringify(chargeRes),
                     sub.active_payment_provider
                 ]);
 
-                // Credit Platform Revenue Wallet
-                await creditRevenueWallet(amount, 'NGN');
+                // Credit Platform Revenue Wallet — with the shared reference +
+                // explicit description so the admin Revenue Ledger history
+                // shows the actual transaction record.
+                await creditRevenueWallet(
+                    amount,
+                    'NGN',
+                    recurrenceRef,
+                    'Subscription Payment (auto-renewal)',
+                    sub.active_payment_provider || null,
+                    'Platform Wallet Debit for Subscription Revenue',
+                );
 
                 results.success++;
             } else {

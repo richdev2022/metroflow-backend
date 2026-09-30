@@ -615,6 +615,11 @@ async function ensureCallingSchema(): Promise<void> {
     )
   `);
 
+  // Server-side (Egress) recording columns on the shared recordings table.
+  await query(`ALTER TABLE recordings ADD COLUMN IF NOT EXISTS egress_id TEXT`);
+  await query(`ALTER TABLE recordings ADD COLUMN IF NOT EXISTS provider VARCHAR(20)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_recordings_egress ON recordings(egress_id) WHERE egress_id IS NOT NULL`);
+
   // Default for the admin-selected calling provider (LiveKit is the default;
   // the factory also falls back to it when the setting is absent).
   await query(`
@@ -623,5 +628,5 @@ async function ensureCallingSchema(): Promise<void> {
     ON CONFLICT (key) DO NOTHING
   `);
 
-  console.log("igrations] calling provider schema applied");
+  console.log("[migrations] calling provider schema applied");
 }

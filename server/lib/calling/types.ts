@@ -60,6 +60,18 @@ export interface ProviderHealth {
   details: Record<string, unknown>;
 }
 
+/** Result of asking a provider to start a server-side room recording. */
+export interface ProviderRecordingStartResult {
+  /** True when the provider itself can record (LiveKit Egress). False = client-side recording only. */
+  supported: boolean;
+  /** Egress id returned by the provider (supported=true). */
+  egressId?: string;
+  /** ISO timestamp when the egress started. */
+  startedAt?: string;
+  /** Why recording is unsupported / extra context for clients. */
+  reason?: string;
+}
+
 export interface CallingProvider {
   name: ProviderName;
   label: string;
@@ -74,6 +86,9 @@ export interface CallingProvider {
   /** Host controls (best effort — providers may not support them). */
   removeParticipant?(roomId: string, identity: string): Promise<boolean>;
   muteParticipant?(roomId: string, identity: string, opts?: { audio?: boolean; video?: boolean }): Promise<boolean>;
+  /** Server-side room recording (LiveKit Egress). Unsupported providers return { supported: false }. */
+  startRecording?(roomId: string, opts: { fileKey: string; audioOnly?: boolean }): Promise<ProviderRecordingStartResult>;
+  stopRecording?(roomId: string, egressId: string): Promise<boolean>;
   /** Optional diagnostics for /health. */
   diagnostics?(): Record<string, unknown>;
 }

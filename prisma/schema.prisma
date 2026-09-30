@@ -175,6 +175,7 @@ model User {
   lastLoginIp         String?   @map("last_login_ip")
   lastLoginUserAgent  String?   @map("last_login_user_agent")
   presenceStatus      String    @default("offline") @map("presence_status")
+  lastSeenAt          DateTime? @map("last_seen_at")
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @default(now()) @map("updated_at")
 
@@ -206,6 +207,10 @@ model User {
   ChatConversation ChatConversation[]
   ChatParticipant  ChatParticipant[]
   ChatMessage      ChatMessage[]
+
+  blocksIssued    UserBlock[]           @relation("UserBlocksIssued")
+  blocksReceived  UserBlock[]           @relation("UserBlocksReceived")
+  webPushSubscriptions WebPushSubscription[]
 
   createdCalls  Call[] @relation("CallCreatedBy")
   hostedCalls   Call[] @relation("CallHost")
@@ -777,6 +782,7 @@ model ChatParticipant {
   id             String    @id @default(uuid())
   conversationId String    @map("conversation_id")
   userId         String    @map("user_id")
+  role           String    @default("member") // 'admin' | 'member'
   lastReadAt     DateTime? @map("last_read_at")
   createdAt      DateTime  @default(now()) @map("created_at")
 
@@ -788,18 +794,58 @@ model ChatParticipant {
 }
 
 model ChatMessage {
-  id             String   @id @default(uuid())
-  conversationId String   @map("conversation_id")
-  senderId       String   @map("sender_id")
-  content        String?
-  attachmentUrl  String?  @map("attachment_url")
-  attachmentType String?  @map("attachment_type")
-  createdAt      DateTime @default(now()) @map("created_at")
+  id                  String    @id @default(uuid())
+  conversationId      String    @map("conversation_id")
+  senderId            String    @map("sender_id")
+  content             String?
+  attachmentUrl       String?   @map("attachment_url")
+  attachmentType      String?   @map("attachment_type")
+  editedAt            DateTime? @map("edited_at")
+  deletedForEveryone  Boolean   @default(false) @map("deleted_for_everyone")
+  deletedFor          String[]  @default([]) @db.Uuid @map("deleted_for")
+  replyToId           String?   @map("reply_to_id")
+  createdAt           DateTime  @default(now()) @map("created_at")
 
   conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User             @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  replyTo      ChatMessage?     @relation("ChatMessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies      ChatMessage[]    @relation("ChatMessageReplies")
 
+  @@index([replyToId])
   @@map("chat_messages")
+}
+
+// Contact blocking for direct conversations (WhatsApp-style)
+model UserBlock {
+  id         String   @id @default(uuid())
+  businessId String   @map("business_id")
+  blockerId  String   @map("blocker_id")
+  blockedId  String   @map("blocked_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  blocker User @relation("UserBlocksIssued", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("UserBlocksReceived", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+  @@map("user_blocks")
+}
+
+// Browser Web Push (VAPID) subscriptions
+model WebPushSubscription {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  endpoint  String   @unique
+  p256dhKey String   @map("p256dh_key")
+  authKey   String   @map("auth_key")
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("web_push_subscriptions")
 }
 
 // Calls

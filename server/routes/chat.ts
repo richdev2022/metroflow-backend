@@ -11,6 +11,11 @@ import {
 } from "../services/media-upload";
 import { getTenorApiKey } from "../lib/config-flags";
 
+// Call-log messages (WhatsApp-style call history in chat) are inserted by the
+// SHARED helper in lib/call-log.ts — used by both the REST call paths and the
+// socket call paths. Re-exported here for backward compatibility.
+export { postCallLogMessage } from "../lib/call-log";
+
 // Chat media upload (WhatsApp-style): voice notes, images, videos, documents,
 // GIFs and stickers. 100 MB covers multi-minute videos while remaining within
 // typical proxy limits (nginx client_max_body_size should be >= 100m).
@@ -58,119 +63,6 @@ const VALID_MESSAGE_TYPES = new Set([
   "text", "image", "video", "audio", "document", "gif", "sticker", "voice",
 ]);
 
-const CALL_LOG_JSON_META = Symbol("callLogJson");
-
-/**
- * Insert a WhatsApp-style call log entry into a chat conversation.
- * Used by the calls service when a call ends/misses so the conversation
- * transcript reflects call history. Never throws.
- */
-export async function postCallLogMessage(opts: {
-  businessId: string;
-  senderId: string;                     // call initiator
-  conversationId?: string | null;       // explicit conversation (when call was started from chat)
-  participantIds: string[];             // all call participants (incl. initiator)
-  callType: "audio" | "video" | string;
-  status: "completed" | "missed" | "cancelled" | string;
-  durationSeconds?: number | null;
-  callCode?: string | null;
-}): Promise<void> {
-  try {
-    const { businessId, senderId, conversationId, participantIds } = opts;
-    if (!businessId || !senderId) return;
-
-    const initiatorResult = await query(`SELECT name FROM users WHERE id = $1`, [senderId]);
-    const initiatorName = initiatorResult.rows[0]?.name || null;
-
-    const payload = JSON.stringify({
-      callType: opts.callType === "audio" ? "audio" : "video",
-      status: opts.status,
-      durationSeconds: typeof opts.durationSeconds === "number" ? Math.max(0, Math.round(opts.durationSeconds)) : null,
-      initiatorName,
-      callCode: opts.callCode || null,
-    });
-
-    const targetConversations = new Set<string>();
-
-    // Preferred: explicit conversation the call was started from.
-    if (conversationId) {
-      const valid = await ensureConversationParticipant(conversationId, businessId, senderId);
-      if (valid) targetConversations.add(conversationId);
-    }
-
-    // Fallback: every DIRECT conversation the initiator shares with another
-    // participant (covers "call initiated from chat" even when the client did
-    // not pass conversation_id).
-    const otherIds = (participantIds || []).filter(
-      (pid) => pid && pid !== senderId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pid),
-    );
-    for (const otherId of otherIds) {
-      const conv = await query(
-        `SELECT cc.id FROM chat_conversations cc
-         JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
-         JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
-         WHERE cc.business_id = $3 AND cc.type = 'direct'
-         AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
-         LIMIT 1`,
-        [senderId, otherId, businessId],
-      );
-      if (conv.rows[0]?.id) targetConversations.add(conv.rows[0].id);
-    }
-
-    if (targetConversations.size === 0) return;
-
-    for (const convId of targetConversations) {
-      const insert = await query(
-        `INSERT INTO chat_messages
-          (conversation_id, sender_id, content, message_type)
-         VALUES ($1, $2, $3, 'call-log')
-         RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
-                   content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
-                   attachment_name as "attachmentName", attachment_size as "attachmentSize",
-                   message_type as "messageType", created_at as "createdAt"`,
-        [convId, senderId, payload],
-      );
-      const message = { ...insert.rows[0], senderName: initiatorName };
-
-      await query(
-        `UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-        [convId],
-      );
-      await query(
-        `UPDATE chat_participants SET last_read_at = CURRENT_TIMESTAMP
-         WHERE conversation_id = $1 AND user_id = $2`,
-        [convId, senderId],
-      );
-
-      const participants = await query(
-        `SELECT user_id as "userId" FROM chat_participants WHERE conversation_id = $1`,
-        [convId],
-      );
-
-      const io = getSocketServer();
-      if (io) {
-        io.to(`conversation:${convId}`).emit("message:created", message);
-        for (const row of participants.rows) {
-          if (!row.userId || row.userId === senderId) continue;
-          io.to(`user:${row.userId}`).emit("chat:new-message-notification", {
-            conversationId: convId,
-            messageId: message.id,
-            senderId,
-            senderName: initiatorName || "Someone",
-            conversationName: null,
-            conversationType: "direct",
-            content: "Call log",
-            attachmentType: "call-log",
-            messageType: "call-log",
-            createdAt: message.createdAt,
-          });
-        }
-      }
-    }
-  } catch (error) {
-    console.error("postCallLogMessage error (non-fatal):", error);
-  }
-}
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
   if (userIds.length === 0) return new Set<string>();
@@ -181,6 +73,81 @@ async function getBusinessUserIds(userIds: string[], businessId: string) {
   );
 
   return new Set(result.rows.map((row) => row.id));
+}
+
+// ---------------------------------------------------------------------------
+// Block enforcement (WhatsApp-style contact blocking, direct chats only)
+// ---------------------------------------------------------------------------
+
+export const BLOCK_ERROR_BLOCKER = "You blocked this contact. Unblock to send messages.";
+export const BLOCK_ERROR_BLOCKED = "You can no longer reply to this contact.";
+
+/**
+ * For a DIRECT conversation, return the OTHER participant's user id (null for
+ * group conversations / conversations without another participant). Groups are
+ * never block-enforced.
+ */
+async function getDirectOtherParticipant(
+  conversationId: string,
+  businessId: string,
+  userId: string,
+): Promise<string | null> {
+  const result = await query(
+    `SELECT cc.type, cp.user_id as "userId"
+     FROM chat_conversations cc
+     JOIN chat_participants cp ON cp.conversation_id = cc.id
+     WHERE cc.id = $1 AND cc.business_id = $2 AND cp.user_id <> $3
+     LIMIT 1`,
+    [conversationId, businessId, userId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  if ((row.type || "direct") !== "direct") return null; // groups unaffected
+  return row.userId || null;
+}
+
+/**
+ * Direction of an existing block between the two users:
+ *  - "i-blocked-them": the requester blocked the other user
+ *  - "they-blocked-me": the other user blocked the requester
+ *  - null: no block in either direction
+ */
+async function getBlockDirection(
+  businessId: string,
+  blockerCandidate: string,
+  otherCandidate: string,
+): Promise<"i-blocked-them" | "they-blocked-me" | null> {
+  const result = await query(
+    `SELECT blocker_id as "blockerId"
+     FROM user_blocks
+     WHERE business_id = $1
+       AND ((blocker_id = $2 AND blocked_id = $3) OR (blocker_id = $3 AND blocked_id = $2))
+     LIMIT 1`,
+    [businessId, blockerCandidate, otherCandidate],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return row.blockerId === blockerCandidate ? "i-blocked-them" : "they-blocked-me";
+}
+
+/**
+ * 403 response payload when a direct conversation between the two users is
+ * blocked (either direction), or null when messaging is allowed.
+ */
+async function resolveBlockError(
+  businessId: string,
+  userId: string,
+  otherUserId: string | null,
+): Promise<{ status: number; error: string } | null> {
+  if (!otherUserId) return null;
+  const direction = await getBlockDirection(businessId, userId, otherUserId);
+  if (direction === "i-blocked-them") {
+    return { status: 403, error: BLOCK_ERROR_BLOCKER };
+  }
+  if (direction === "they-blocked-me") {
+    return { status: 403, error: BLOCK_ERROR_BLOCKED };
+  }
+  return null;
 }
 
 async function ensureConversationParticipant(
@@ -229,13 +196,14 @@ export const getConversations: RequestHandler = async (
     }
 
     const result = await query(
-      `SELECT 
-        cc.id, cc.business_id as "businessId", cc.name, cc.type, 
+      `SELECT
+        cc.id, cc.business_id as "businessId", cc.name, cc.type,
         cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
         (
           SELECT json_agg(json_build_object(
             'id', cp.id,
             'userId', cp.user_id,
+            'role', COALESCE(cp.role, 'member'),
             'lastReadAt', cp.last_read_at,
             'lastSeen', (
               SELECT us.last_activity_at
@@ -244,6 +212,8 @@ export const getConversations: RequestHandler = async (
               ORDER BY us.last_activity_at DESC
               LIMIT 1
             ),
+            'presenceStatus', COALESCE(u.presence_status, 'offline'),
+            'lastSeenAt', u.last_seen_at,
             'name', u.name,
             'email', u.email,
             'avatarUrl', u.avatar_url
@@ -252,11 +222,11 @@ export const getConversations: RequestHandler = async (
           LEFT JOIN users u ON cp.user_id = u.id
           WHERE cp.conversation_id = cc.id
         ) as participants,
-        (SELECT cm.content FROM chat_messages cm 
-         WHERE cm.conversation_id = cc.id 
+        (SELECT cm.content FROM chat_messages cm
+         WHERE cm.conversation_id = cc.id
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessage,
-        (SELECT cm.created_at FROM chat_messages cm 
-         WHERE cm.conversation_id = cc.id 
+        (SELECT cm.created_at FROM chat_messages cm
+         WHERE cm.conversation_id = cc.id
          ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt,
         (
           SELECT COUNT(*)::int
@@ -269,11 +239,26 @@ export const getConversations: RequestHandler = async (
         ) as "unreadCount"
       FROM chat_conversations cc
       WHERE cc.business_id = $1 AND EXISTS (
-        SELECT 1 FROM chat_participants cp_current 
+        SELECT 1 FROM chat_participants cp_current
         WHERE cp_current.conversation_id = cc.id AND cp_current.user_id = $2
       )
       ORDER BY cc.updated_at DESC`,
       [businessId, userId],
+    );
+
+    // Blocks involving the requester (both directions) — one query for the
+    // whole list; direct conversations surface blockedByMe/blockedMe flags.
+    const blocksResult = await query(
+      `SELECT blocker_id as "blockerId", blocked_id as "blockedId"
+       FROM user_blocks
+       WHERE business_id = $1 AND (blocker_id = $2 OR blocked_id = $2)`,
+      [businessId, userId],
+    );
+    const blockedByMeIds = new Set(
+      blocksResult.rows.filter((r: any) => r.blockerId === userId).map((r: any) => r.blockedId),
+    );
+    const blockedMeIds = new Set(
+      blocksResult.rows.filter((r: any) => r.blockedId === userId).map((r: any) => r.blockerId),
     );
 
     // Derive display helpers: direct chats show the OTHER participant's name
@@ -281,12 +266,19 @@ export const getConversations: RequestHandler = async (
     const data = result.rows.map((conv: any) => {
       const participants = Array.isArray(conv.participants) ? conv.participants : [];
       const other = participants.find((p: any) => p && p.userId && String(p.userId) !== String(userId));
+      const mine = participants.find((p: any) => p && p.userId && String(p.userId) === String(userId));
       const isGroup = (conv.type || 'direct') !== 'direct' || participants.length > 2;
+      const isDirect = !isGroup && !!other;
       return {
         ...conv,
         isGroup,
         displayName: isGroup ? (conv.name || 'Group chat') : (other?.name || conv.name || 'Direct chat'),
         displayAvatarUrl: isGroup ? null : (other?.avatarUrl || null),
+        myRole: mine?.role || 'member',
+        otherUserLastSeenAt: isDirect ? (other?.lastSeenAt || null) : null,
+        otherUserPresenceStatus: isDirect ? (other?.presenceStatus || 'offline') : null,
+        blockedByMe: isDirect ? blockedByMeIds.has(other.userId) : false,
+        blockedMe: isDirect ? blockedMeIds.has(other.userId) : false,
       };
     });
 
@@ -376,24 +368,73 @@ export const getConversationMessages: RequestHandler = async (
     );
 
     const result = await query(
-      `SELECT 
-        cm.id, cm.conversation_id as "conversationId", cm.sender_id as "senderId", 
-        cm.content, cm.attachment_url as "attachmentUrl", cm.attachment_type as "attachmentType", 
+      `SELECT
+        cm.id, cm.conversation_id as "conversationId", cm.sender_id as "senderId",
+        cm.content, cm.attachment_url as "attachmentUrl", cm.attachment_type as "attachmentType",
         cm.attachment_name as "attachmentName", cm.attachment_size as "attachmentSize",
         cm.message_type as "messageType",
         cm.created_at as "createdAt",
-        u.name as "senderName"
+        cm.edited_at as "editedAt",
+        cm.deleted_for_everyone as "deletedForEveryone",
+        cm.reply_to_id as "replyToId",
+        (cm.sender_id = $2) as "canDeleteForEveryone",
+        ($2 = ANY(cm.deleted_for)) as "deletedForMe",
+        u.name as "senderName",
+        rm.sender_id as "replyToSenderId",
+        ru.name as "replyToSenderName",
+        rm.content as "replyToContent",
+        rm.message_type as "replyToMessageType",
+        rm.attachment_type as "replyToAttachmentType"
       FROM chat_messages cm
       JOIN users u ON cm.sender_id = u.id
+      LEFT JOIN chat_messages rm ON rm.id = cm.reply_to_id
+      LEFT JOIN users ru ON ru.id = rm.sender_id
       WHERE cm.conversation_id = $1
       ORDER BY cm.created_at DESC
-      LIMIT $2 OFFSET $3`,
-      [conversationId, limit, offset],
+      LIMIT $3 OFFSET $4`,
+      [conversationId, userId, limit, offset],
     );
+
+    // Reshape the flat reply columns into a nested replyTo preview and strip
+    // content from messages this requester deleted for themselves (the row is
+    // kept so clients can render a tombstone in the correct position).
+    // NOTE: the query is DESC and the public contract is ascending, keep .reverse().
+    const messages = result.rows.reverse().map((row: any) => {
+      const isDeletedForMe = !!row.deletedForMe;
+      const message: any = {
+        id: row.id,
+        conversationId: row.conversationId,
+        senderId: row.senderId,
+        senderName: row.senderName,
+        // Tombstone: content/attachments hidden for messages deleted for me.
+        content: isDeletedForMe ? null : row.content,
+        attachmentUrl: isDeletedForMe ? null : row.attachmentUrl,
+        attachmentType: isDeletedForMe ? null : row.attachmentType,
+        attachmentName: isDeletedForMe ? null : row.attachmentName,
+        attachmentSize: isDeletedForMe ? null : row.attachmentSize,
+        messageType: row.messageType,
+        createdAt: row.createdAt,
+        editedAt: row.editedAt || null,
+        deletedForEveryone: !!row.deletedForEveryone,
+        deletedForMe: isDeletedForMe,
+        canDeleteForEveryone: !!row.canDeleteForEveryone,
+        replyTo: row.replyToId
+          ? {
+              id: row.replyToId,
+              senderId: row.replyToSenderId || null,
+              senderName: row.replyToSenderName || null,
+              content: row.replyToContent,
+              messageType: row.replyToMessageType || null,
+              attachmentType: row.replyToAttachmentType || null,
+            }
+          : null,
+      };
+      return message;
+    });
 
     const response: ApiResponse<{ messages: any[]; total: number }> = {
       success: true,
-      data: { messages: result.rows.reverse(), total },
+      data: { messages, total },
     };
     res.json(response);
   } catch (error) {
@@ -484,6 +525,18 @@ export const createConversation: RequestHandler = async (
       });
     }
 
+    // Block enforcement: a direct conversation with a blocked contact cannot
+    // be created (or reopened) — groups are unaffected.
+    if (type === "direct" && providedIds.length === 1) {
+      const blockError = await resolveBlockError(businessId, userId, providedIds[0]);
+      if (blockError) {
+        return res.status(blockError.status).json({
+          success: false,
+          error: blockError.error,
+        });
+      }
+    }
+
     // For direct messages, check if conversation already exists
     if (type === "direct" && providedIds.length === 1) {
       const existingResult = await query(
@@ -521,11 +574,14 @@ export const createConversation: RequestHandler = async (
 
     const participants = [];
     for (const pid of uniqueParticipantIds) {
+      // Group creators become the conversation admin (direct chats keep
+      // everyone as 'member').
+      const participantRole = (type || "direct") !== "direct" && pid === userId ? "admin" : "member";
       const participantResult = await query(
-        `INSERT INTO chat_participants (conversation_id, user_id)
-         VALUES ($1, $2)
-         RETURNING id, user_id as "userId", last_read_at as "lastReadAt"`,
-        [conversation.id, pid],
+        `INSERT INTO chat_participants (conversation_id, user_id, role)
+         VALUES ($1, $2, $3)
+         RETURNING id, user_id as "userId", role, last_read_at as "lastReadAt"`,
+        [conversation.id, pid, participantRole],
       );
       participants.push(participantResult.rows[0]);
     }
@@ -615,6 +671,41 @@ export const sendMessage: RequestHandler = async (
       });
     }
 
+    // Block enforcement: direct chats with a blocked contact cannot receive
+    // messages (either direction). Group conversations are unaffected.
+    const otherParticipantId = await getDirectOtherParticipant(conversationId, businessId, userId);
+    const blockError = await resolveBlockError(businessId, userId, otherParticipantId);
+    if (blockError) {
+      return res.status(blockError.status).json({
+        success: false,
+        error: blockError.error,
+      });
+    }
+
+    // Reply threading: replyToId must reference a message in the SAME
+    // conversation (otherwise the client could stitch together fake quotes).
+    let replyToId: string | null = null;
+    if (req.body?.replyToId != null && req.body.replyToId !== "") {
+      const candidate = String(req.body.replyToId);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate)) {
+        return res.status(400).json({
+          success: false,
+          error: "replyToId must be a valid message id",
+        });
+      }
+      const replyCheck = await query(
+        `SELECT id FROM chat_messages WHERE id = $1 AND conversation_id = $2 LIMIT 1`,
+        [candidate, conversationId],
+      );
+      if (replyCheck.rows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "replyToId must reference a message in the same conversation",
+        });
+      }
+      replyToId = candidate;
+    }
+
     // message_type: clients may send explicit kinds (image/video/document/gif/
     // sticker/voice); call-log is RESERVED for the internal calls service so a
     // forged request cannot fabricate fake call history.
@@ -630,14 +721,15 @@ export const sendMessage: RequestHandler = async (
     }
 
     const result = await query(
-      `INSERT INTO chat_messages 
+      `INSERT INTO chat_messages
         (conversation_id, sender_id, content, attachment_url, attachment_type,
-         attachment_name, attachment_size, message_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, conversation_id as "conversationId", sender_id as "senderId", 
+         attachment_name, attachment_size, message_type, reply_to_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
                  content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
                  attachment_name as "attachmentName", attachment_size as "attachmentSize",
-                 message_type as "messageType",
+                 message_type as "messageType", reply_to_id as "replyToId",
+                 edited_at as "editedAt", deleted_for_everyone as "deletedForEveryone",
                  created_at as "createdAt"`,
       [
         conversationId,
@@ -650,6 +742,7 @@ export const sendMessage: RequestHandler = async (
           ? Math.round(Number(attachmentSize))
           : null,
         resolvedType,
+        replyToId,
       ],
     );
 
@@ -996,4 +1089,449 @@ export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest,
       res.status(500).json({ success: false, error: "Failed to upload media" });
     }
   });
+};
+
+// ---------------------------------------------------------------------------
+// Message edit / delete (WhatsApp-style)
+// ---------------------------------------------------------------------------
+
+const MESSAGE_EDIT_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
+const MAX_MESSAGE_LENGTH = 4000;
+
+/** Shared SELECT for one message inside a conversation (member-scoped). */
+async function getConversationMessage(conversationId: string, messageId: string) {
+  const result = await query(
+    `SELECT cm.id, cm.conversation_id as "conversationId", cm.sender_id as "senderId",
+            cm.content, cm.message_type as "messageType", cm.created_at as "createdAt",
+            cm.edited_at as "editedAt", cm.deleted_for_everyone as "deletedForEveryone",
+            u.name as "senderName"
+     FROM chat_messages cm
+     JOIN users u ON u.id = cm.sender_id
+     WHERE cm.id = $1 AND cm.conversation_id = $2
+     LIMIT 1`,
+    [messageId, conversationId],
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * PATCH /chat/conversations/:conversationId/messages/:messageId
+ * Edit a message's text. Sender only, never call-logs, within 24h of sending.
+ * Emits `message:updated` to the conversation room.
+ */
+export const editMessage: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId, messageId } = req.params as { conversationId: string; messageId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const message = await getConversationMessage(conversationId, messageId);
+    if (!message) {
+      return res.status(404).json({ success: false, error: "Message not found" });
+    }
+    if (message.senderId !== userId) {
+      return res.status(403).json({ success: false, error: "Only the sender can edit this message" });
+    }
+    if (message.messageType === "call-log") {
+      return res.status(403).json({ success: false, error: "Call log messages cannot be edited" });
+    }
+    if (message.deletedForEveryone) {
+      return res.status(403).json({ success: false, error: "This message was deleted" });
+    }
+    const createdAtMs = new Date(message.createdAt).getTime();
+    if (!Number.isFinite(createdAtMs) || Date.now() - createdAtMs > MESSAGE_EDIT_WINDOW_MS) {
+      return res.status(403).json({ success: false, error: "Messages can only be edited within 24 hours" });
+    }
+
+    const rawContent = typeof req.body?.content === "string" ? req.body.content : "";
+    const content = rawContent.trim();
+    if (!content) {
+      return res.status(400).json({ success: false, error: "Message content cannot be empty" });
+    }
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({ success: false, error: `Message content cannot exceed ${MAX_MESSAGE_LENGTH} characters` });
+    }
+
+    const updateResult = await query(
+      `UPDATE chat_messages
+       SET content = $1, edited_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
+                 content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
+                 attachment_name as "attachmentName", attachment_size as "attachmentSize",
+                 message_type as "messageType", created_at as "createdAt",
+                 edited_at as "editedAt", deleted_for_everyone as "deletedForEveryone",
+                 reply_to_id as "replyToId"`,
+      [content, messageId],
+    );
+    const row = updateResult.rows[0];
+
+    const updated = {
+      ...row,
+      senderName: message.senderName || null,
+      deletedForMe: false,
+      canDeleteForEveryone: row.senderId === userId,
+      replyTo: null,
+    };
+
+    const io = getSocketServer();
+    if (io) {
+      io.to(`conversation:${conversationId}`).emit("message:updated", {
+        conversationId,
+        message: updated,
+      });
+    }
+
+    const response: ApiResponse<any> = { success: true, data: updated };
+    res.json(response);
+  } catch (error) {
+    console.error("Edit message error:", error);
+    res.status(500).json({ success: false, error: "Failed to edit message" });
+  }
+};
+
+/**
+ * DELETE /chat/conversations/:conversationId/messages/:messageId?scope=me|everyone
+ *  - scope=everyone: sender only. Tombstones the message (content/attachments
+ *    nulled, deleted_for_everyone=TRUE) and broadcasts `message:updated`.
+ *  - scope=me: any participant. Appends the requester to deleted_for
+ *    (idempotent, no broadcast) — the message disappears only for them.
+ * Call-log messages can be deleted for me but never for everyone.
+ */
+export const deleteMessage: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId, messageId } = req.params as { conversationId: string; messageId: string };
+    const scope = req.query.scope === "everyone" ? "everyone" : "me";
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const message = await getConversationMessage(conversationId, messageId);
+    if (!message) {
+      return res.status(404).json({ success: false, error: "Message not found" });
+    }
+
+    if (scope === "everyone") {
+      if (message.senderId !== userId) {
+        return res.status(403).json({ success: false, error: "Only the sender can delete this message for everyone" });
+      }
+      if (message.messageType === "call-log") {
+        return res.status(403).json({ success: false, error: "Call log messages cannot be deleted for everyone" });
+      }
+
+      const updateResult = await query(
+        `UPDATE chat_messages
+         SET deleted_for_everyone = TRUE, content = NULL,
+             attachment_url = NULL, attachment_name = NULL, attachment_size = NULL
+         WHERE id = $1
+         RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
+                   content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
+                   attachment_name as "attachmentName", attachment_size as "attachmentSize",
+                   message_type as "messageType", created_at as "createdAt",
+                   edited_at as "editedAt", deleted_for_everyone as "deletedForEveryone"`,
+        [messageId],
+      );
+
+      const updated = {
+        ...updateResult.rows[0],
+        senderName: null,
+        deletedForMe: false,
+        canDeleteForEveryone: true,
+        replyTo: null,
+      };
+
+      const io = getSocketServer();
+      if (io) {
+        io.to(`conversation:${conversationId}`).emit("message:updated", {
+          conversationId,
+          message: updated,
+        });
+      }
+
+      const response: ApiResponse<any> = { success: true, data: updated };
+      return res.json(response);
+    }
+
+    // scope=me — idempotent array append, NO broadcast.
+    await query(
+      `UPDATE chat_messages
+       SET deleted_for = ARRAY_APPEND(deleted_for, $2)
+       WHERE id = $1 AND NOT ($2 = ANY(deleted_for))`,
+      [messageId, userId],
+    );
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        id: messageId,
+        conversationId,
+        deletedForMe: true,
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Delete message error:", error);
+    res.status(500).json({ success: false, error: "Failed to delete message" });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Participants: list / leave / roles / remove
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /chat/conversations/:conversationId/participants
+ * Participant roster with roles, presence and last-seen (WhatsApp-style).
+ */
+export const getParticipants: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const result = await query(
+      `SELECT cp.user_id as "userId", u.name, u.avatar_url as "avatarUrl",
+              COALESCE(cp.role, 'member') as role,
+              COALESCE(u.presence_status, 'offline') as "presenceStatus",
+              u.last_seen_at as "lastSeenAt",
+              cp.created_at as "joinedAt"
+       FROM chat_participants cp
+       LEFT JOIN users u ON u.id = cp.user_id
+       WHERE cp.conversation_id = $1
+       ORDER BY cp.created_at ASC`,
+      [conversationId],
+    );
+
+    const response: ApiResponse<{ participants: any[] }> = {
+      success: true,
+      data: {
+        participants: result.rows.map((row: any) => ({
+          userId: row.userId,
+          name: row.name || null,
+          avatarUrl: row.avatarUrl || null,
+          role: row.role || "member",
+          presenceStatus: row.presenceStatus || "offline",
+          lastSeenAt: row.lastSeenAt || null,
+          joinedAt: row.joinedAt || null,
+        })),
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get participants error:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch participants" });
+  }
+};
+
+/**
+ * POST /chat/conversations/:conversationId/leave
+ * The requester removes their own membership. The room is told via
+ * `conversation:participant-left`.
+ */
+export const leaveConversation: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const nameResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const userName = nameResult.rows[0]?.name || null;
+
+    const deleteResult = await query(
+      `DELETE FROM chat_participants
+       WHERE conversation_id = $1 AND user_id = $2
+       RETURNING id`,
+      [conversationId, userId],
+    );
+    if (deleteResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Participant record not found" });
+    }
+
+    const io = getSocketServer();
+    if (io) {
+      io.to(`conversation:${conversationId}`).emit("conversation:participant-left", {
+        conversationId,
+        userId,
+        userName,
+      });
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: { conversationId, userId, userName },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Leave conversation error:", error);
+    res.status(500).json({ success: false, error: "Failed to leave conversation" });
+  }
+};
+
+/** Is the requester allowed to manage participants of this conversation? */
+async function isConversationAdmin(
+  conversationId: string,
+  businessId: string,
+  userId: string,
+): Promise<boolean> {
+  const result = await query(
+    `SELECT (cc.created_by = $3) as "isCreator", COALESCE(cp.role, 'member') as "myRole"
+     FROM chat_conversations cc
+     LEFT JOIN chat_participants cp ON cp.conversation_id = cc.id AND cp.user_id = $3
+     WHERE cc.id = $1 AND cc.business_id = $2
+     LIMIT 1`,
+    [conversationId, businessId, userId],
+  );
+  const row = result.rows[0];
+  if (!row) return false;
+  return row.isCreator === true || row.myRole === "admin";
+}
+
+/**
+ * PATCH /chat/conversations/:conversationId/participants/:userId
+ * Promote/demote a participant. Admins (or the conversation creator) only.
+ * Body: { role: 'admin' | 'member' }
+ */
+export const updateParticipantRole: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId, userId: targetUserId } = req.params as {
+      conversationId: string;
+      userId: string;
+    };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const role = req.body?.role;
+    if (role !== "admin" && role !== "member") {
+      return res.status(400).json({ success: false, error: "role must be 'admin' or 'member'" });
+    }
+
+    if (!(await isConversationAdmin(conversationId, businessId, userId))) {
+      return res.status(403).json({ success: false, error: "Only conversation admins can change participant roles" });
+    }
+
+    const updateResult = await query(
+      `UPDATE chat_participants
+       SET role = $1
+       WHERE conversation_id = $2 AND user_id = $3
+       RETURNING id, user_id as "userId", role`,
+      [role, conversationId, targetUserId],
+    );
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Participant not found" });
+    }
+
+    const response: ApiResponse<any> = { success: true, data: updateResult.rows[0] };
+    res.json(response);
+  } catch (error) {
+    console.error("Update participant role error:", error);
+    res.status(500).json({ success: false, error: "Failed to update participant role" });
+  }
+};
+
+/**
+ * DELETE /chat/conversations/:conversationId/participants/:userId
+ * Admins (or the conversation creator) remove a participant. The room is told
+ * via `conversation:participant-removed`.
+ */
+export const removeParticipant: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId, userId: targetUserId } = req.params as {
+      conversationId: string;
+      userId: string;
+    };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    if (!(await isConversationAdmin(conversationId, businessId, userId))) {
+      return res.status(403).json({ success: false, error: "Only conversation admins can remove participants" });
+    }
+
+    if (targetUserId === userId) {
+      return res.status(400).json({ success: false, error: "Use the leave endpoint to remove yourself" });
+    }
+
+    const nameResult = await query(`SELECT name FROM users WHERE id = $1`, [targetUserId]);
+    const userName = nameResult.rows[0]?.name || null;
+
+    const deleteResult = await query(
+      `DELETE FROM chat_participants
+       WHERE conversation_id = $1 AND user_id = $2
+       RETURNING id`,
+      [conversationId, targetUserId],
+    );
+    if (deleteResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Participant not found" });
+    }
+
+    const io = getSocketServer();
+    if (io) {
+      io.to(`conversation:${conversationId}`).emit("conversation:participant-removed", {
+        conversationId,
+        userId: targetUserId,
+        userName,
+      });
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: { conversationId, userId: targetUserId, userName },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Remove participant error:", error);
+    res.status(500).json({ success: false, error: "Failed to remove participant" });
+  }
 };

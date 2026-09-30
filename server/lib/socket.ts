@@ -28,129 +28,10 @@ import {
   type CallingCredentials,
 } from "./calling/factory";
 import { generateMeetingNotesIfEligible } from "./meeting-notes";
+import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "./call-log";
+import { pushIncomingCall, pushMissedCall } from "./call-push";
 
 let io: Server | null = null;
-
-/**
- * WhatsApp-style call log: when a call reaches its FIRST final state through
- * the socket end path, append a 'call-log' message to the linked conversation
- * (or every direct conversation between the initiator and each participant).
- *
- * Mirrors `postCallLogMessage` in routes/chat.ts — kept self-contained here to
- * avoid a routes → lib → routes import cycle. Never throws.
- */
-async function postCallLogForSocketEndedCall(
-  call: {
-    id?: string;
-    business_id?: string;
-    type?: string;
-    status?: string;
-    duration?: number | string | null;
-    call_code?: string;
-    created_by?: string;
-    conversation_id?: string | null;
-  },
-  fallbackSenderId?: string,
-): Promise<void> {
-  try {
-    const businessId = call.business_id;
-    const senderId = call.created_by || fallbackSenderId;
-    if (!businessId || !senderId) return;
-    if (isValidUUID(senderId) === false) return;
-
-    const FINAL = ["completed", "missed", "cancelled"];
-    if (!call.status || FINAL.includes(call.status) === false) return;
-
-    const initiatorResult = await query(`SELECT name FROM users WHERE id = $1`, [senderId]);
-    const initiatorName = initiatorResult.rows[0]?.name || null;
-
-    const durationSeconds =
-      call.duration == null ? null : Math.max(0, Math.round(Number(call.duration) || 0));
-    const payload = JSON.stringify({
-      callType: call.type === "audio" ? "audio" : "video",
-      status: call.status,
-      durationSeconds,
-      initiatorName,
-      callCode: call.call_code || null,
-    });
-
-    const targetConversations = new Set<string>();
-
-    // Preferred: explicit conversation the call was started from.
-    if (call.conversation_id && isValidUUID(call.conversation_id)) {
-      const valid = await query(
-        `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
-        [call.conversation_id, senderId],
-      );
-      if (valid.rows[0]) targetConversations.add(call.conversation_id);
-    }
-
-    // Fallback: direct conversations between the initiator and participants.
-    const parts = await query(
-      `SELECT user_id FROM call_participants WHERE call_id = $1`,
-      [call.id],
-    );
-    const otherIds = (parts.rows.map((r: any) => r.user_id) || []).filter(
-      (pid: string) => pid && pid !== senderId && isValidUUID(pid),
-    );
-    for (const otherId of otherIds) {
-      const conv = await query(
-        `SELECT cc.id FROM chat_conversations cc
-         JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
-         JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
-         WHERE cc.business_id = $3 AND cc.type = 'direct'
-         AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
-         LIMIT 1`,
-        [senderId, otherId, businessId],
-      );
-      if (conv.rows[0]?.id) targetConversations.add(conv.rows[0].id);
-    }
-
-    if (targetConversations.size === 0) return;
-
-    for (const convId of targetConversations) {
-      const insert = await query(
-        `INSERT INTO chat_messages
-          (conversation_id, sender_id, content, message_type)
-         VALUES ($1, $2, $3, 'call-log')
-         RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
-                   content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
-                   attachment_name as "attachmentName", attachment_size as "attachmentSize",
-                   message_type as "messageType", created_at as "createdAt"`,
-        [convId, senderId, payload],
-      );
-      const message = { ...insert.rows[0], senderName: initiatorName };
-
-      await query(`UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [convId]);
-
-      const participants = await query(
-        `SELECT user_id as "userId" FROM chat_participants WHERE conversation_id = $1`,
-        [convId],
-      );
-
-      if (io) {
-        io.to(`conversation:${convId}`).emit("message:created", message);
-        for (const row of participants.rows) {
-          if (!row.userId || row.userId === senderId) continue;
-          io.to(`user:${row.userId}`).emit("chat:new-message-notification", {
-            conversationId: convId,
-            messageId: message.id,
-            senderId,
-            senderName: initiatorName || "Someone",
-            conversationName: null,
-            conversationType: "direct",
-            content: "Call log",
-            attachmentType: "call-log",
-            messageType: "call-log",
-            createdAt: message.createdAt,
-          });
-        }
-      }
-    }
-  } catch (error) {
-    logger.error("postCallLogForSocketEndedCall failed (non-fatal):", error);
-  }
-}
 
 function isValidUUID(str: string): boolean {
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -185,11 +66,58 @@ async function resolveRoomId(inputId: string): Promise<{ id: string; type: 'call
   return null;
 }
 
+/**
+ * Persist presence for a user (users.presence_status + last_seen_at) and
+ * broadcast `presence:update` to every conversation room they belong to —
+ * WhatsApp-style online / last-seen chips. Never throws.
+ */
+async function broadcastPresence(
+  userId: string | null | undefined,
+  presenceStatus: "online" | "offline",
+): Promise<void> {
+  if (!userId || !io) return;
+  try {
+    const updated = await query(
+      `UPDATE users SET presence_status = $2, last_seen_at = NOW()
+       WHERE id = $1
+       RETURNING last_seen_at as "lastSeenAt"`,
+      [userId, presenceStatus],
+    );
+    const conversations = await query(
+      `SELECT conversation_id FROM chat_participants WHERE user_id = $1`,
+      [userId],
+    );
+    const payload = {
+      userId,
+      lastSeenAt: updated.rows[0]?.lastSeenAt || new Date().toISOString(),
+      presenceStatus,
+    };
+    for (const row of conversations.rows) {
+      io.to(`conversation:${row.conversation_id}`).emit("presence:update", payload);
+    }
+  } catch (err) {
+    logger.warn(`Presence broadcast failed for user ${userId}:`, err);
+  }
+}
+
 // Function to end call/meeting automatically
 async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<void> {
   try {
     let storedProvider: string | null = null;
+    // Snapshot the pre-end row so the call-log below posts only on the FIRST
+    // final-state transition (timeout / no-answer auto-close).
+    let preEnd: any = null;
     if (roomType === 'call') {
+      try {
+        const pre = await query(
+          `SELECT id, business_id, type, status, duration, call_code, created_by, conversation_id
+           FROM calls WHERE id = $1`,
+          [roomId],
+        );
+        preEnd = pre.rows[0] || null;
+      } catch (err) {
+        logger.warn(`Failed to snapshot call before auto-end for ${roomId}:`, err);
+      }
       const r = await query(`UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING provider`, [roomId]);
       storedProvider = r.rows[0]?.provider || null;
     } else {
@@ -207,6 +135,33 @@ async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<vo
       }
     }
 
+    // Timeout/no-answer lifecycle path: the auto-closed call also gets its
+    // WhatsApp-style call-log message (first transition only). Fire-and-forget.
+    if (roomType === 'call' && preEnd && !CALL_LOG_FINAL_STATUSES.has(preEnd.status)) {
+      try {
+        const parts = await query(`SELECT user_id FROM call_participants WHERE call_id = $1`, [roomId]);
+        const durationSeconds =
+          preEnd.duration == null ? null : Math.max(0, Math.round(Number(preEnd.duration) || 0));
+        postCallLogMessage(
+          {
+            businessId: preEnd.business_id,
+            senderId: preEnd.created_by,
+            conversationId: preEnd.conversation_id || undefined,
+            participantIds: (parts.rows.map((r: any) => r.user_id) || []).filter(Boolean),
+            callType: preEnd.type,
+            status: "completed",
+            durationSeconds,
+            callCode: preEnd.call_code,
+            callId: roomId,
+            endedAt: new Date(),
+          },
+          ioServer,
+        ).catch(() => undefined);
+      } catch (err) {
+        logger.warn("Call-log posting for auto-ended call failed (non-fatal):", err);
+      }
+    }
+
     // Tear down the media session at the provider so nobody stays connected
     // after the backend-enforced deadline (a malicious client cannot extend
     // the meeting by keeping its socket/media connection alive).
@@ -217,10 +172,15 @@ async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<vo
       logger.warn(`Provider endSession failed for ${roomType}:${roomId}:`, err);
     }
 
-    // Finalize meeting notes/transcript (meetings only, best effort).
+    // Finalize AI notes from the persisted transcript (meetings AND calls,
+    // best effort — needs GLM configured + a summarizable transcript).
     if (roomType === 'meeting') {
       generateMeetingNotesIfEligible(roomId).catch((err) =>
         logger.warn("Meeting notes generation failed:", err),
+      );
+    } else if (roomType === 'call') {
+      generateMeetingNotesIfEligible(roomId, 'Call').catch((err) =>
+        logger.warn("Call notes generation failed:", err),
       );
     }
 
@@ -663,6 +623,13 @@ export function initSocketServer(server: http.Server): void {
 
     // 0. Waiting-room state kept per socket
     socket.data.waitingRoom = false;
+
+    // 0-prec. Presence: an AUTHENTICATED connect flips the user online and
+    // stamps last_seen_at; every conversation room they belong to hears
+    // `presence:update` { userId, lastSeenAt, presenceStatus }.
+    if (socket.data.authenticated && socket.data.userId) {
+      broadcastPresence(socket.data.userId, "online").catch(() => undefined);
+    }
 
     // 0a. Optional authentication middleware support: clients may pass
     // { auth: { token } } in io() options. Guests connect without tokens.
@@ -1325,6 +1292,18 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
+    // WhatsApp-style last-seen keepalive from chat clients: bump
+    // users.last_seen_at so the conversation list shows a fresh timestamp.
+    socket.on("presence:ping", async () => {
+      const pingUserId = socket.data.userId;
+      if (!pingUserId) return;
+      try {
+        await query(`UPDATE users SET last_seen_at = NOW() WHERE id = $1`, [pingUserId]);
+      } catch (err) {
+        logger.warn(`presence:ping failed for user ${pingUserId}:`, err);
+      }
+    });
+
     socket.on("join-conversation", (conversationId: string) => {
       socket.join(`conversation:${conversationId}`);
       logger.info(`Socket ${socket.id} joined conversation:${conversationId}`);
@@ -1369,10 +1348,17 @@ export function initSocketServer(server: http.Server): void {
       // Resolve the caller's display name so clients (especially mobile) can
       // render "John is calling" instead of a raw user UUID.
       let callerName: string | null = null;
+      let callConversationId: string | null = null;
       try {
         const callerRes = await query(`SELECT name FROM users WHERE id = $1`, [socket.data.userId]);
         callerName = callerRes.rows[0]?.name || null;
       } catch { /* best-effort */ }
+      if (resolvedCallId) {
+        try {
+          const convRes = await query(`SELECT conversation_id FROM calls WHERE id = $1`, [resolvedCallId]);
+          callConversationId = convRes.rows[0]?.conversation_id || null;
+        } catch { /* best-effort */ }
+      }
       socket.to(`user:${data.targetUserId}`).emit("call:incoming", {
         callId: finalCallId,
         callCode: data.callId,
@@ -1380,6 +1366,18 @@ export function initSocketServer(server: http.Server): void {
         callerName: callerName || data.callerName || undefined,
         type: data.type,
       });
+      // Ring the callee's OTHER devices too (FCM + Web Push). Fire-and-forget:
+      // a push failure must never break the live call flow.
+      if (data.targetUserId && data.targetUserId !== socket.data.userId) {
+        pushIncomingCall([data.targetUserId], {
+          callId: finalCallId,
+          callType: data.type,
+          callerName: callerName || data.callerName || "Someone",
+          callerId: socket.data.userId || "",
+          callCode: data.callId,
+          conversationId: callConversationId,
+        });
+      }
     });
 
     socket.on("call:accept", async (data: { callId: string }) => {
@@ -1405,10 +1403,68 @@ export function initSocketServer(server: http.Server): void {
       const resolvedCallId = await resolveCallId(data.callId);
       if (!resolvedCallId) return;
       let creatorId: string | null = null;
+      let preReject: any = null;
       try {
-        const callRes = await query(`SELECT created_by FROM calls WHERE id = $1`, [resolvedCallId]);
-        creatorId = callRes.rows[0]?.created_by || null;
+        const callRes = await query(
+          `SELECT id, business_id, type, status, duration, call_code, created_by, conversation_id
+           FROM calls WHERE id = $1`,
+          [resolvedCallId],
+        );
+        preReject = callRes.rows[0] || null;
+        creatorId = preReject?.created_by || null;
       } catch { /* best-effort */ }
+
+      // Decline lifecycle path: the FIRST decline closes the call as MISSED
+      // (the conventional status for an unanswered call) so history stops
+      // showing it as ongoing, the chat gets its call-log message and the
+      // callee side gets a "Missed call" notification. All best-effort.
+      if (preReject && !CALL_LOG_FINAL_STATUSES.has(preReject.status)) {
+        try {
+          await query(
+            `UPDATE calls SET status = 'missed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status NOT IN ('completed','missed','cancelled')`,
+            [resolvedCallId],
+          );
+        } catch (error) {
+          logger.error(`Failed to persist missed status for ${resolvedCallId}:`, error);
+        }
+        try {
+          const parts = await query(`SELECT user_id FROM call_participants WHERE call_id = $1`, [resolvedCallId]);
+          const participantIds = (parts.rows.map((r: any) => r.user_id) || []).filter(Boolean);
+          postCallLogMessage(
+            {
+              businessId: preReject.business_id,
+              senderId: preReject.created_by,
+              conversationId: preReject.conversation_id || undefined,
+              participantIds,
+              callType: preReject.type,
+              status: "missed",
+              durationSeconds: null,
+              callCode: preReject.call_code,
+              callId: resolvedCallId,
+              endedAt: new Date(),
+            },
+            io,
+          ).catch(() => undefined);
+
+          const calleeIds = participantIds.filter((pid: string) => pid !== preReject.created_by);
+          let callerName: string | null = null;
+          try {
+            const nameRes = await query(`SELECT name FROM users WHERE id = $1`, [preReject.created_by]);
+            callerName = nameRes.rows[0]?.name || null;
+          } catch { /* best-effort */ }
+          pushMissedCall(calleeIds, {
+            callId: resolvedCallId,
+            callerName: callerName || "Someone",
+            callerId: preReject.created_by,
+            callCode: preReject.call_code,
+            status: "missed",
+          });
+        } catch (err) {
+          logger.warn("call:reject side effects failed (non-fatal):", err);
+        }
+      }
+
       io.to(`room:${resolvedCallId}`).emit("call:rejected", { callId: resolvedCallId, userId: socket.data.userId });
       if (creatorId && creatorId !== socket.data.userId) {
         io.to(`user:${creatorId}`).emit("call:rejected", { callId: resolvedCallId, userId: socket.data.userId });
@@ -1422,6 +1478,7 @@ export function initSocketServer(server: http.Server): void {
       // Fetch the pre-end row FIRST — needed to detect the first final-state
       // transition for the WhatsApp-style chat call-log below.
       let preEnd: any = null;
+      let preEndParticipantIds: string[] = [];
       try {
         const r = await query(
           `SELECT id, business_id, type, status, duration, call_code, created_by, conversation_id
@@ -1432,11 +1489,18 @@ export function initSocketServer(server: http.Server): void {
       } catch (error) {
         logger.error(`Failed to load call row before end for ${resolvedCallId}:`, error);
       }
-      // Persist the ended state so history lists stop showing the call as ongoing.
+      try {
+        const parts = await query(`SELECT user_id FROM call_participants WHERE call_id = $1`, [resolvedCallId]);
+        preEndParticipantIds = (parts.rows.map((row: any) => row.user_id) || []).filter(Boolean);
+      } catch { /* best-effort */ }
+      // Persist the ended state so history lists stop showing the call as
+      // ongoing. Calls that already reached a final state (missed/cancelled)
+      // keep that status — the caller ending a declined call must not
+      // rewrite it to 'completed'.
       try {
         await query(
           `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-           WHERE id = $1 AND status <> 'completed'`,
+           WHERE id = $1 AND status NOT IN ('completed','missed','cancelled')`,
           [resolvedCallId]
         );
       } catch (error) {
@@ -1444,8 +1508,24 @@ export function initSocketServer(server: http.Server): void {
       }
       // Call-log message into the linked chat (first transition only) —
       // fire-and-forget: must never block or fail the end flow.
-      if (preEnd && preEnd.status !== "completed") {
-        postCallLogForSocketEndedCall(preEnd, socket.data.userId).catch(() => undefined);
+      if (preEnd && !CALL_LOG_FINAL_STATUSES.has(preEnd.status)) {
+        const durationSeconds =
+          preEnd.duration == null ? null : Math.max(0, Math.round(Number(preEnd.duration) || 0));
+        postCallLogMessage(
+          {
+            businessId: preEnd.business_id,
+            senderId: preEnd.created_by || socket.data.userId,
+            conversationId: preEnd.conversation_id || undefined,
+            participantIds: preEndParticipantIds,
+            callType: preEnd.type,
+            status: "completed",
+            durationSeconds,
+            callCode: preEnd.call_code,
+            callId: resolvedCallId,
+            endedAt: new Date(),
+          },
+          io,
+        ).catch(() => undefined);
       }
       // Broadcast to the LIVE room (`room:{id}`) — `call:{id}` is never joined.
       io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
@@ -2154,8 +2234,10 @@ export function initSocketServer(server: http.Server): void {
             io.to(`meeting:${roomId}`).emit("caption:updated", payload);
           }
 
-          // Persist final segments for meetings → transcript + AI notes.
-          if (roomType === "meeting" && payload.isFinal) {
+          // Persist final segments for meetings AND calls → transcript +
+          // AI notes / call-detail views (meeting_transcripts is keyed by the
+          // room id for both room types; GET /calls/:id/transcript reads it).
+          if (payload.isFinal) {
             try {
               await query(
                 `INSERT INTO meeting_transcripts (id, meeting_id, speaker_id, speaker_name, text, language, created_at)
@@ -2221,6 +2303,10 @@ export function initSocketServer(server: http.Server): void {
           userId,
           status: "offline",
         });
+
+        // Persist offline presence + last_seen_at and tell the conversation
+        // rooms (WhatsApp-style "last seen" chips). Fire-and-forget.
+        broadcastPresence(userId, "offline").catch(() => undefined);
 
         logger.info(`User ${userId} marked as offline in business ${businessId}`);
       }

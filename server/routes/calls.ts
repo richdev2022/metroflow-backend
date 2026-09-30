@@ -6,7 +6,8 @@ import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
-import { postCallLogMessage } from "./chat";
+import { postCallLogMessage } from "../lib/call-log";
+import { pushIncomingCall, pushMissedCall } from "../lib/call-push";
 import crypto from "crypto";
 import {
   buildCallingCredentials,
@@ -63,6 +64,17 @@ function enrichCall(call: any): any {
     delete call.password;
   }
   return call;
+}
+
+// Resolve a display name for push payloads (best-effort, never throws).
+async function resolveUserName(userId: string | null | undefined): Promise<string> {
+  if (!userId) return "Someone";
+  try {
+    const r = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    return r.rows[0]?.name || "Someone";
+  } catch {
+    return "Someone";
+  }
 }
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
@@ -451,6 +463,19 @@ export const createCall: RequestHandler = async (
       console.error("Create call: socket emission failed (call still created):", socketError);
     }
 
+    // Fire-and-forget device push (FCM + Web Push) so callees ring even with
+    // the app in the background. Never blocks the response, never the caller.
+    if (invitedParticipantIds.length > 0) {
+      pushIncomingCall(invitedParticipantIds, {
+        callId: call.id,
+        callType: call.type,
+        callerName: currentUserName,
+        callerId: userId,
+        callCode: call.callCode,
+        conversationId: conversationId || null,
+      });
+    }
+
     const response: ApiResponse<any> = {
       success: true,
       data: call,
@@ -804,7 +829,25 @@ export const updateCall: RequestHandler = async (
         status,
         durationSeconds: call.duration ?? null,
         callCode: call.callCode,
-      }).catch((e) => console.error("Call-log insert failed:", e));
+        callId: call.id,
+        endedAt: call.endedAt || new Date(),
+      }, getSocketServer()).catch((e) => console.error("Call-log insert failed:", e));
+
+      // Missed / cancelled calls: notify the callee side (in-app + push) that
+      // they missed a call from this caller.
+      if (status === "missed" || status === "cancelled") {
+        const calleeIds = participantsResult.rows
+          .map((r: any) => r.userId)
+          .filter((pid: any) => pid && pid !== call.createdById);
+        const callerName = await resolveUserName(call.createdById || userId);
+        pushMissedCall(calleeIds, {
+          callId: call.id,
+          callerName,
+          callerId: call.createdById || userId,
+          callCode: call.callCode,
+          status,
+        });
+      }
     }
 
     const io = getSocketServer();
@@ -1576,6 +1619,18 @@ export const addCallParticipants: RequestHandler = async (
       });
     }
 
+    // Fire-and-forget device push for the newly added callees.
+    if (newParticipantIds.length > 0) {
+      pushIncomingCall(newParticipantIds, {
+        callId: actualCallId,
+        callType: callDetails?.type || 'video',
+        callerName: currentUserName,
+        callerId: userId,
+        callCode: call.call_code,
+        conversationId: null,
+      });
+    }
+
     res.json({
       success: true,
       message: [
@@ -1982,5 +2037,247 @@ export const guestValidateCall: RequestHandler = async (req, res) => {
   } catch (error) {
     console.error("Guest validate call error:", error);
     res.status(500).json({ success: false, error: "Failed to validate call link" });
+  }
+};
+
+// ==================== CALL DETAIL (rich view) ====================
+
+/**
+ * Resolve a call row by UUID or call code (no business filter — access is
+ * decided by the caller: same business OR call participant).
+ */
+async function resolveCallRow(idOrCode: string) {
+  const baseSelect = `SELECT id, business_id as "businessId", type, status, started_at as "startedAt",
+        ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+        co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
+        waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+        conversation_id as "conversationId", provider,
+        created_at as "createdAt", updated_at as "updatedAt",
+        duration_started_at as "durationStartedAt",
+        CASE WHEN status IN ('completed','missed','cancelled') AND ended_at IS NOT NULL
+          THEN GREATEST(0, EXTRACT(EPOCH FROM (ended_at - COALESCE(duration_started_at, started_at, created_at)))::int)
+          ELSE NULL END AS duration
+   FROM calls`;
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (UUID_RE.test(idOrCode)) {
+    const r = await query(`${baseSelect} WHERE id = $1`, [idOrCode]);
+    if (r.rows[0]) return r.rows[0];
+  }
+  const byCode = await query(`${baseSelect} WHERE call_code = $1`, [idOrCode]);
+  return byCode.rows[0] || null;
+}
+
+/** Rich participant rows for the call detail view. */
+async function getCallDetailParticipants(callId: string) {
+  const result = await query(
+    `SELECT cp.id, cp.user_id as "userId", u.name, u.avatar_url as "avatarUrl",
+            cp.joined_at as "joinedAt", cp.left_at as "leftAt", cp.status,
+            CASE
+              WHEN cp.joined_at IS NOT NULL AND cp.left_at IS NOT NULL
+                THEN GREATEST(0, EXTRACT(EPOCH FROM (cp.left_at - cp.joined_at))::int)
+              WHEN cp.joined_at IS NOT NULL
+                THEN GREATEST(0, EXTRACT(EPOCH FROM (NOW() - cp.joined_at))::int)
+              ELSE NULL
+            END as "durationSeconds"
+     FROM call_participants cp
+     LEFT JOIN users u ON u.id = cp.user_id
+     WHERE cp.call_id = $1
+     ORDER BY cp.joined_at NULLS LAST`,
+    [callId],
+  );
+  return result.rows;
+}
+
+/** Call transcripts: captions persisted per room id (meeting_transcripts). */
+async function getCallTranscriptStats(callId: string) {
+  try {
+    const result = await query(
+      `SELECT COUNT(*)::int AS count,
+              EXISTS(SELECT 1 FROM meeting_transcripts WHERE meeting_id = $1) AS has_transcript
+       FROM meeting_transcripts WHERE meeting_id = $1`,
+      [callId],
+    );
+    const row = result.rows[0];
+    return { hasTranscript: !!row?.has_transcript, transcriptsCount: row?.count || 0 };
+  } catch {
+    return { hasTranscript: false, transcriptsCount: 0 };
+  }
+}
+
+/** Direct conversation shared by the call participants (first two), if any. */
+async function findSharedDirectConversation(
+  businessId: string,
+  conversationId: string | null | undefined,
+  participantUserIds: string[],
+): Promise<string | null> {
+  if (conversationId) return conversationId;
+  const pair = participantUserIds.filter(Boolean).slice(0, 2);
+  if (pair.length !== 2) return null;
+  try {
+    const result = await query(
+      `SELECT cc.id FROM chat_conversations cc
+       JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
+       JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
+       WHERE cc.business_id = $3 AND cc.type = 'direct'
+         AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
+       LIMIT 1`,
+      [pair[0], pair[1], businessId],
+    );
+    return result.rows[0]?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GET /calls/:id — rich call detail.
+ * Membership check: call participant OR same business.
+ * The payload is a SUPERSET of the legacy GET /calls/:id response: every
+ * legacy top-level call field (callLink, participants, duration, ...) is kept
+ * while adding the { call, participants, hasTranscript, transcriptsCount,
+ * recording, conversationId } envelope used by the new call-detail screens.
+ */
+export const getCallDetail: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const call = await resolveCallRow(id);
+    if (!call) {
+      return res.status(404).json({ success: false, error: "Call not found" });
+    }
+
+    // Membership: same business OR explicit call participant.
+    let isParticipant = call.businessId === businessId;
+    if (!isParticipant) {
+      const membership = await query(
+        `SELECT 1 FROM call_participants WHERE call_id = $1 AND user_id = $2 LIMIT 1`,
+        [call.id, userId],
+      );
+      isParticipant = membership.rows.length > 0;
+    }
+    if (!isParticipant) {
+      return res.status(404).json({ success: false, error: "Call not found" });
+    }
+
+    const participants = await getCallDetailParticipants(call.id);
+    const { hasTranscript, transcriptsCount } = await getCallTranscriptStats(call.id);
+
+    let recording: any = null;
+    try {
+      const recordingResult = await query(
+        `SELECT id, storage_url as "storageUrl", duration, size, status
+         FROM recordings WHERE call_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [call.id],
+      );
+      recording = recordingResult.rows[0] || null;
+    } catch { /* recordings table issue must not break the detail view */ }
+
+    const conversationId = await findSharedDirectConversation(
+      call.businessId,
+      call.conversationId,
+      participants.map((p: any) => p.userId),
+    );
+
+    // AI notes (summary / key points / decisions / action items) — generated
+    // from the persisted transcript when the call ends (best effort).
+    let notes: any = null;
+    try {
+      const notesResult = await query(
+        `SELECT summary, key_points as "keyPoints", decisions, action_items as "actionItems",
+                important_timestamps as "importantTimestamps", model, generated_at as "generatedAt"
+         FROM meeting_notes WHERE meeting_id = $1 LIMIT 1`,
+        [call.id],
+      );
+      notes = notesResult.rows[0] || null;
+    } catch { /* notes must not break the detail view */ }
+
+    // Legacy-shaped call object (top level) — delete password like enrichCall.
+    const callEnvelope = { ...call };
+    enrichCall(callEnvelope);
+    enrichCall(call);
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        // Legacy top-level fields (backward compatible)
+        ...callEnvelope,
+        participants,
+        // New detail envelope
+        call: { ...callEnvelope, participants },
+        hasTranscript,
+        transcriptsCount,
+        recording,
+        notes,
+        conversationId: conversationId || null,
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get call detail error:", error);
+    res.status(500).json({ success: false, error: "Failed to get call" });
+  }
+};
+
+/**
+ * GET /calls/:id/transcript — transcript segments for a call, ordered
+ * ascending. Calls reuse the meeting_transcripts storage keyed by room id;
+ * when no transcript pipeline ran for this call the list is simply empty.
+ */
+export const getCallTranscript: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const call = await resolveCallRow(id);
+    if (!call) {
+      return res.status(404).json({ success: false, error: "Call not found" });
+    }
+    let allowed = call.businessId === businessId;
+    if (!allowed) {
+      const membership = await query(
+        `SELECT 1 FROM call_participants WHERE call_id = $1 AND user_id = $2 LIMIT 1`,
+        [call.id, userId],
+      );
+      allowed = membership.rows.length > 0;
+    }
+    if (!allowed) {
+      return res.status(404).json({ success: false, error: "Call not found" });
+    }
+
+    let transcripts: any[] = [];
+    try {
+      const result = await query(
+        `SELECT t.id, t.speaker_id as "speakerId", t.speaker_name as "speakerName",
+                t.text, t.created_at as "createdAt"
+         FROM meeting_transcripts t
+         WHERE t.meeting_id = $1
+         ORDER BY t.created_at ASC
+         LIMIT 2000`,
+        [call.id],
+      );
+      transcripts = result.rows;
+    } catch { /* no transcript storage yet — empty list */ }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: { callId: call.id, transcripts },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get call transcript error:", error);
+    res.status(500).json({ success: false, error: "Failed to load transcript" });
   }
 };

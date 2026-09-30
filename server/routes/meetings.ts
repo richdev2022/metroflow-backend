@@ -2197,3 +2197,185 @@ export const generateMeetingNotesEndpoint: RequestHandler = async (req: Authenti
     res.status(500).json({ success: false, error: "Failed to generate meeting notes" });
   }
 };
+
+// ==================== MEETING REPORT (summary view) ====================
+
+/**
+ * GET /meetings/:id/report
+ * One-shot "meeting report" payload for the post-meeting screen: meeting
+ * metadata, attendee join/leave timeline, AI notes (with action-item owners
+ * resolved to names), transcript segments and recordings.
+ * Access mirrors getMeetingById (business-scoped; host/co-host/attendee rows
+ * also carry user ids from the same business).
+ */
+export const getMeetingReport: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params as { id: string };
+    const businessId = req.user?.businessId;
+    if (!businessId || !req.user?.userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    // Resolve by UUID first, then by meeting code (clients send either).
+    let result = isValidUUID(id)
+      ? await query(
+        `SELECT id, title, description, start_time as "startTime", end_time as "endTime",
+                timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+                status, meeting_code as "meetingCode", is_instant as "isInstant",
+                max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+                recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+                created_at as "createdAt", updated_at as "updatedAt"
+         FROM meetings WHERE id = $1 AND business_id = $2`,
+        [id, businessId],
+      )
+      : { rows: [] as any[] };
+    if (result.rows.length === 0) {
+      result = await query(
+        `SELECT id, title, description, start_time as "startTime", end_time as "endTime",
+                timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+                status, meeting_code as "meetingCode", is_instant as "isInstant",
+                max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+                recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+                created_at as "createdAt", updated_at as "updatedAt"
+         FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
+        [id, businessId],
+      );
+    }
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Meeting not found" });
+    }
+    const meeting = result.rows[0];
+
+    // Attendee timeline (joined_at/left_at written by join/leave endpoints).
+    let attendees: any[] = [];
+    try {
+      const attendeesResult = await query(
+        `SELECT ma.user_id as "userId", u.name, u.avatar_url as "avatarUrl",
+                ma.joined_at as "joinedAt", ma.left_at as "leftAt", ma.status
+         FROM meeting_attendees ma
+         LEFT JOIN users u ON u.id = ma.user_id
+         WHERE ma.meeting_id = $1
+         ORDER BY ma.joined_at NULLS LAST, ma.created_at ASC`,
+        [meeting.id],
+      );
+      attendees = attendeesResult.rows;
+    } catch { /* join/leave columns may be missing on very old schemas */ }
+
+    // AI notes (generated at meeting end / on demand).
+    let notes: any = null;
+    try {
+      const notesResult = await query(
+        `SELECT id, summary, key_points as "keyPoints", decisions,
+                action_items as "actionItems", important_timestamps as "importantTimestamps",
+                model, generated_at as "generatedAt"
+         FROM meeting_notes WHERE meeting_id = $1
+         LIMIT 1`,
+        [meeting.id],
+      );
+      const rawNotes = notesResult.rows[0] || null;
+      if (rawNotes) {
+        // Resolve action-item owners/assignees (stored as user ids) to names,
+        // keeping the raw fields intact.
+        const actionItems = Array.isArray(rawNotes.actionItems) ? rawNotes.actionItems : [];
+        const ownerIds = new Set<string>();
+        const pickOwnerId = (item: any): string | null => {
+          const candidate = item?.owner ?? item?.ownerId ?? item?.assignee ?? item?.assigneeId ?? null;
+          const asString = candidate && typeof candidate === "object"
+            ? (candidate.id ?? null)
+            : candidate;
+          return asString && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(asString))
+            ? String(asString)
+            : null;
+        };
+        for (const item of actionItems) {
+          const ownerId = pickOwnerId(item);
+          if (ownerId) ownerIds.add(ownerId);
+        }
+        const ownerNames = new Map<string, string>();
+        if (ownerIds.size > 0) {
+          try {
+            const usersResult = await query(
+              `SELECT id, name FROM users WHERE id = ANY($1::uuid[])`,
+              [[...ownerIds]],
+            );
+            for (const row of usersResult.rows) ownerNames.set(row.id, row.name);
+          } catch { /* keep raw ids when lookup fails */ }
+        }
+        const resolvedActionItems = actionItems.map((item: any) => {
+          const ownerId = pickOwnerId(item);
+          const ownerName = ownerId ? (ownerNames.get(ownerId) || null) : null;
+          return ownerName ? { ...item, ownerName } : item;
+        });
+        notes = { ...rawNotes, actionItems: resolvedActionItems };
+      }
+    } catch { /* notes table may not exist yet */ }
+
+    // Transcript segments (persisted captions), ascending.
+    let transcripts: any[] = [];
+    try {
+      const transcriptResult = await query(
+        `SELECT t.id, t.speaker_id as "speakerId", t.speaker_name as "speakerName",
+                t.text, t.created_at as "createdAt"
+         FROM meeting_transcripts t
+         WHERE t.meeting_id = $1
+         ORDER BY t.created_at ASC
+         LIMIT 2000`,
+        [meeting.id],
+      );
+      transcripts = transcriptResult.rows;
+    } catch { /* transcript table may not exist yet */ }
+
+    // Recordings for this meeting.
+    let recordings: any[] = [];
+    try {
+      const recordingsResult = await query(
+        `SELECT id, storage_url as "storageUrl", duration, size, status, created_at as "createdAt"
+         FROM recordings WHERE meeting_id = $1
+         ORDER BY created_at ASC`,
+        [meeting.id],
+      );
+      recordings = recordingsResult.rows;
+    } catch { /* recordings table may not exist yet */ }
+
+    // Duration: completed meetings measure end_time - start_time; ongoing
+    // meetings measure from start_time to now.
+    let durationSeconds: number | null = null;
+    const startTime = meeting.startTime ? new Date(meeting.startTime) : null;
+    const endTime = meeting.endTime ? new Date(meeting.endTime) : null;
+    if (startTime) {
+      const reference = meeting.status === "completed" && endTime ? endTime : new Date();
+      durationSeconds = Math.max(0, Math.round((reference.getTime() - startTime.getTime()) / 1000));
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: {
+        meeting: {
+          id: meeting.id,
+          title: meeting.title,
+          description: meeting.description,
+          status: meeting.status,
+          meetingCode: meeting.meetingCode,
+          timezone: meeting.timezone,
+          scheduledAt: meeting.startTime,
+          startedAt: meeting.startTime,
+          endedAt: meeting.endTime,
+          durationSeconds,
+          createdById: meeting.createdById,
+          hostId: meeting.hostId,
+          coHostId: meeting.coHostId,
+          recordingEnabled: meeting.recordingEnabled,
+          waitingRoomEnabled: meeting.waitingRoomEnabled,
+        },
+        attendees,
+        notes,
+        transcripts,
+        recordings,
+      },
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get meeting report error:", error);
+    res.status(500).json({ success: false, error: "Failed to load meeting report" });
+  }
+};

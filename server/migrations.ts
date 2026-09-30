@@ -10,11 +10,13 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensurePayrollVerificationColumns();
   await ensureSystemSettingsDefaults();
   await ensureChatAndAiSchema();
+  await ensureChatCallUxSchema();
   await ensureAiLimitsSchema();
   await ensureSupportSchema();
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
   await ensureCallingSchema();
+  await ensureVapidKeys();
 }
 
 /**
@@ -629,4 +631,89 @@ async function ensureCallingSchema(): Promise<void> {
   `);
 
   console.log("[migrations] calling provider schema applied");
+}
+
+/**
+ * Chat social features (WhatsApp-style UX):
+ *  1. chat_messages — edits (edited_at), delete-for-me/everyone tombstones
+ *     (deleted_for / deleted_for_everyone) and replies (reply_to_id).
+ *  2. chat_participants.role — 'admin' | 'member'; group creators become admins.
+ *  3. users.last_seen_at (+ presence_status) — online/offline + "last seen" chips.
+ *  4. user_blocks — block contact enforcement for direct conversations.
+ *  5. web_push_subscriptions — Web Push (VAPID) endpoints for browsers.
+ * Everything idempotent, safe on every boot.
+ */
+async function ensureChatCallUxSchema(): Promise<void> {
+  // --- chat_messages: edit / delete / reply ---
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_for_everyone BOOLEAN DEFAULT FALSE`);
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_for UUID[] NOT NULL DEFAULT '{}'`);
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_id UUID REFERENCES chat_messages(id) ON DELETE SET NULL`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_chat_messages_reply_to ON chat_messages(reply_to_id)`);
+
+  // --- chat_participants: role ('admin' | 'member') ---
+  await query(`ALTER TABLE chat_participants ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'member'`);
+  // One-time backfill (idempotent by construction): the creator of a GROUP
+  // conversation is its admin. Direct conversations keep everyone as 'member'.
+  await query(
+    `UPDATE chat_participants cp
+     SET role = 'admin'
+     FROM chat_conversations cc
+     WHERE cp.conversation_id = cc.id
+       AND cc.type <> 'direct'
+       AND cc.created_by = cp.user_id
+       AND cp.role <> 'admin'`,
+  );
+
+  // --- users: last seen + presence (chat list chips, WhatsApp-style) ---
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS presence_status VARCHAR(20) DEFAULT 'offline'`);
+
+  // --- user_blocks: contact blocking for direct conversations ---
+  // NOTE: business_id intentionally mirrors the rest of the schema
+  // (VARCHAR(255) referencing businesses.id) instead of UUID — every existing
+  // table stores business ids that way.
+  await query(`
+    CREATE TABLE IF NOT EXISTS user_blocks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(blocker_id, blocked_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON user_blocks(blocker_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON user_blocks(blocked_id)`);
+
+  // --- web_push_subscriptions: browser Web Push (VAPID) endpoints ---
+  await query(`
+    CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      endpoint TEXT UNIQUE NOT NULL,
+      p256dh_key TEXT NOT NULL,
+      auth_key TEXT NOT NULL,
+      user_agent TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_web_push_subscriptions_user ON web_push_subscriptions(user_id)`);
+
+  console.log("[migrations] chat social features schema applied");
+}
+
+/**
+ * Web Push (VAPID) keys: prefer env (VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY),
+ * fall back to system_settings, otherwise generate once and persist so
+ * restarts keep the same keys (subscriptions are bound to the public key).
+ * Non-fatal: Web Push is an enhancement, never a boot blocker.
+ */
+async function ensureVapidKeys(): Promise<void> {
+  try {
+    const { ensureVapidKeys: bootstrap } = await import("./services/webPush");
+    await bootstrap();
+  } catch (err: any) {
+    console.error(`[migrations] VAPID key bootstrap skipped: ${err?.message || err}`);
+  }
 }

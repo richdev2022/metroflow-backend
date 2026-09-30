@@ -864,8 +864,10 @@ model Recording {
   recordedById String   @map("recorded_by")
   storageUrl   String   @map("storage_url")
   duration     Int // in seconds
-  status       String // recording, paused, completed, failed
+  status       String // recording, processing, paused, completed, failed
   size         Int? // in bytes
+  egressId     String?  @map("egress_id") // LiveKit Egress id (server-side recordings)
+  provider     String?  @map("provider") // media provider that produced the recording
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @default(now()) @map("updated_at")
 

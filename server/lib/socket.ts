@@ -31,6 +31,127 @@ import { generateMeetingNotesIfEligible } from "./meeting-notes";
 
 let io: Server | null = null;
 
+/**
+ * WhatsApp-style call log: when a call reaches its FIRST final state through
+ * the socket end path, append a 'call-log' message to the linked conversation
+ * (or every direct conversation between the initiator and each participant).
+ *
+ * Mirrors `postCallLogMessage` in routes/chat.ts — kept self-contained here to
+ * avoid a routes → lib → routes import cycle. Never throws.
+ */
+async function postCallLogForSocketEndedCall(
+  call: {
+    id?: string;
+    business_id?: string;
+    type?: string;
+    status?: string;
+    duration?: number | string | null;
+    call_code?: string;
+    created_by?: string;
+    conversation_id?: string | null;
+  },
+  fallbackSenderId?: string,
+): Promise<void> {
+  try {
+    const businessId = call.business_id;
+    const senderId = call.created_by || fallbackSenderId;
+    if (!businessId || !senderId) return;
+    if (isValidUUID(senderId) === false) return;
+
+    const FINAL = ["completed", "missed", "cancelled"];
+    if (!call.status || FINAL.includes(call.status) === false) return;
+
+    const initiatorResult = await query(`SELECT name FROM users WHERE id = $1`, [senderId]);
+    const initiatorName = initiatorResult.rows[0]?.name || null;
+
+    const durationSeconds =
+      call.duration == null ? null : Math.max(0, Math.round(Number(call.duration) || 0));
+    const payload = JSON.stringify({
+      callType: call.type === "audio" ? "audio" : "video",
+      status: call.status,
+      durationSeconds,
+      initiatorName,
+      callCode: call.call_code || null,
+    });
+
+    const targetConversations = new Set<string>();
+
+    // Preferred: explicit conversation the call was started from.
+    if (call.conversation_id && isValidUUID(call.conversation_id)) {
+      const valid = await query(
+        `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+        [call.conversation_id, senderId],
+      );
+      if (valid.rows[0]) targetConversations.add(call.conversation_id);
+    }
+
+    // Fallback: direct conversations between the initiator and participants.
+    const parts = await query(
+      `SELECT user_id FROM call_participants WHERE call_id = $1`,
+      [call.id],
+    );
+    const otherIds = (parts.rows.map((r: any) => r.user_id) || []).filter(
+      (pid: string) => pid && pid !== senderId && isValidUUID(pid),
+    );
+    for (const otherId of otherIds) {
+      const conv = await query(
+        `SELECT cc.id FROM chat_conversations cc
+         JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
+         JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
+         WHERE cc.business_id = $3 AND cc.type = 'direct'
+         AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
+         LIMIT 1`,
+        [senderId, otherId, businessId],
+      );
+      if (conv.rows[0]?.id) targetConversations.add(conv.rows[0].id);
+    }
+
+    if (targetConversations.size === 0) return;
+
+    for (const convId of targetConversations) {
+      const insert = await query(
+        `INSERT INTO chat_messages
+          (conversation_id, sender_id, content, message_type)
+         VALUES ($1, $2, $3, 'call-log')
+         RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
+                   content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
+                   attachment_name as "attachmentName", attachment_size as "attachmentSize",
+                   message_type as "messageType", created_at as "createdAt"`,
+        [convId, senderId, payload],
+      );
+      const message = { ...insert.rows[0], senderName: initiatorName };
+
+      await query(`UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [convId]);
+
+      const participants = await query(
+        `SELECT user_id as "userId" FROM chat_participants WHERE conversation_id = $1`,
+        [convId],
+      );
+
+      if (io) {
+        io.to(`conversation:${convId}`).emit("message:created", message);
+        for (const row of participants.rows) {
+          if (!row.userId || row.userId === senderId) continue;
+          io.to(`user:${row.userId}`).emit("chat:new-message-notification", {
+            conversationId: convId,
+            messageId: message.id,
+            senderId,
+            senderName: initiatorName || "Someone",
+            conversationName: null,
+            conversationType: "direct",
+            content: "Call log",
+            attachmentType: "call-log",
+            messageType: "call-log",
+            createdAt: message.createdAt,
+          });
+        }
+      }
+    }
+  } catch (error) {
+    logger.error("postCallLogForSocketEndedCall failed (non-fatal):", error);
+  }
+}
+
 function isValidUUID(str: string): boolean {
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   return uuidRegex.test(str);
@@ -1298,6 +1419,19 @@ export function initSocketServer(server: http.Server): void {
       logger.info(`Call ended: ${data.callId}`);
       const resolvedCallId = await resolveCallId(data.callId);
       if (!resolvedCallId) return;
+      // Fetch the pre-end row FIRST — needed to detect the first final-state
+      // transition for the WhatsApp-style chat call-log below.
+      let preEnd: any = null;
+      try {
+        const r = await query(
+          `SELECT id, business_id, type, status, duration, call_code, created_by, conversation_id
+           FROM calls WHERE id = $1`,
+          [resolvedCallId],
+        );
+        preEnd = r.rows[0] || null;
+      } catch (error) {
+        logger.error(`Failed to load call row before end for ${resolvedCallId}:`, error);
+      }
       // Persist the ended state so history lists stop showing the call as ongoing.
       try {
         await query(
@@ -1307,6 +1441,11 @@ export function initSocketServer(server: http.Server): void {
         );
       } catch (error) {
         logger.error(`Failed to persist call end for ${resolvedCallId}:`, error);
+      }
+      // Call-log message into the linked chat (first transition only) —
+      // fire-and-forget: must never block or fail the end flow.
+      if (preEnd && preEnd.status !== "completed") {
+        postCallLogForSocketEndedCall(preEnd, socket.data.userId).catch(() => undefined);
       }
       // Broadcast to the LIVE room (`room:{id}`) — `call:{id}` is never joined.
       io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });

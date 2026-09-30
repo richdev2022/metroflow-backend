@@ -169,7 +169,10 @@ const handleSquadWebhook = async (event: any) => {
                         );
 
                         const subAmount = parseFloat(transaction.amount);
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'squad');
+                        // Reference + explicit description so the admin Revenue
+                        // Ledger history shows the actual transaction record
+                        // (previously an unlinked 'Revenue Credit (fee)' row).
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'squad', 'Platform Wallet Debit for Subscription Revenue');
                     }
                 }
             }
@@ -351,7 +354,7 @@ const handleMonnifyWebhook = async (event: any) => {
                         );
                         
                         const subAmount = parseFloat(transaction.amount);
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'monnify');
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'monnify', 'Platform Wallet Debit for Subscription Revenue');
                     }
                 }
             }
@@ -787,7 +790,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 );
 
                 const subAmount = parseFloat(transaction.amount);
-                await creditRevenueWallet(subAmount, transaction.currency || 'NGN', undefined, undefined, 'flutterwave');
+                await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'flutterwave', 'Platform Wallet Debit for Subscription Revenue');
             }
 
             return;

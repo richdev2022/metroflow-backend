@@ -490,7 +490,60 @@ async function backfillLedgerHistory(): Promise<void> {
       }
     }
 
-    // ---- 3. Reconcile internal platform wallet balances ----
+    // ---- 3. Successful wallet fundings missing their platform-side rows ----
+    // The card-funding settlement historically wrote ONLY a wallet_id-attached
+    // fee row: the admin Platform Ledger showed no gross inflow / user payout,
+    // and the fee was invisible to the Revenue Ledger (wallet_id NOT NULL).
+    // Reconstruct the full double-entry for every successful funding that has
+    // no platform credit row yet (the VA webhook flow already writes them).
+    const fundingsRes = await query(
+      `SELECT id, reference, amount, fee, currency, description, created_at, payment_provider
+       FROM transactions
+       WHERE transaction_type = 'wallet_funding' AND status = 'success'
+       ORDER BY created_at ASC`,
+    );
+    for (const f of fundingsRes.rows) {
+      const ref = f.reference;
+      if (!ref) continue;
+      const cur = f.currency || "NGN";
+      const walletId = await getPlatformWallet(cur);
+      const net = Number(f.amount) || 0;
+      const fee = Number(f.fee) || 0;
+      const gross = Math.round((net + fee) * 100) / 100;
+
+      const grossExists = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' AND type = 'credit' LIMIT 1`,
+        [ref],
+      );
+      if (grossExists.rows.length > 0) continue; // webhook path already recorded the full flow
+
+      if (walletId && gross > 0) {
+        await query(
+          `INSERT INTO transactions
+           (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
+           VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6, $7)`,
+          [gross, cur, ref, f.description || "Customer Wallet Funding Received (backfill)", walletId, f.payment_provider || null, f.created_at],
+        );
+      }
+      if (walletId && net > 0) {
+        await query(
+          `INSERT INTO transactions
+           (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
+           VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6, $7)`,
+          [net, cur, `${ref}-USER-BACKFILL`, "Platform Wallet Debit for User Funding (backfill)", walletId, f.payment_provider || null, f.created_at],
+        );
+      }
+      if (fee > 0) {
+        await query(
+          `INSERT INTO transactions
+           (amount, currency, status, reference, type, description, transaction_type, direction, payment_provider, created_at)
+           VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5, $6)`,
+          [fee, cur, `${ref}-FEE-BACKFILL`, "Wallet funding fee revenue (backfill)", f.payment_provider || null, f.created_at],
+        );
+      }
+    }
+
+    // ---- 4. Reconcile internal platform wallet balances ----
     const internalWallets = await query(
       `SELECT id, currency, balance FROM wallets WHERE business_id IS NULL AND user_id IS NULL`,
     );

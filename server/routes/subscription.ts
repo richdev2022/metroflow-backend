@@ -1122,7 +1122,14 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
           [transaction.plan_id, transaction.business_id, tokenId, nextBillingDate, providerName]
         );
 
-        await creditRevenueWallet(Number(transaction.amount), transaction.currency || 'NGN');
+        await creditRevenueWallet(
+            Number(transaction.amount),
+            transaction.currency || 'NGN',
+            transaction.reference,
+            'Subscription Payment',
+            (providerName as string) || null,
+            'Platform Wallet Debit for Subscription Revenue',
+        );
 
         try {
             const businessRes = await query(`SELECT name, email FROM businesses WHERE id = $1`, [transaction.business_id]);

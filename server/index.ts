@@ -74,6 +74,7 @@ import dashboardRouter from "./routes/dashboard";
 import transferRouter from "./routes/transfers";
 import payrollRouter from "./routes/payroll";
 import settingsRouter from "./routes/settings";
+import { rtcRouter } from "./lib/calling/routes";
 import kycRouter from "./routes/kyc";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
@@ -81,7 +82,7 @@ import feesRouter from "./routes/fees";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
-import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting } from "./routes/meetings";
+import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs } from "./routes/chat";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallById, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
@@ -498,6 +499,13 @@ export async function createServer() {
         : getCloudStorage()
           ? "configured"
           : "local-disk";
+    const { getActiveProviderName, listProviderNames, getProviderByName } = await import("./lib/calling/factory");
+    const activeCallingProvider = await getActiveProviderName().catch(() => "livekit");
+    const callingProviders: Record<string, unknown> = {};
+    for (const name of listProviderNames()) {
+      const p = getProviderByName(name);
+      callingProviders[name] = { configured: p.isConfigured(), active: name === activeCallingProvider };
+    }
     res.json({
       success: true,
       data: {
@@ -506,6 +514,7 @@ export async function createServer() {
         metricAi: { configured: isGlmConfigured() },
         gifs: { configured: isTenorConfigured() },
         rtc: getMediasoupDiagnostics(),
+        calling: { activeProvider: activeCallingProvider, providers: callingProviders },
         redis: { configured: !!process.env.REDIS_URL && !process.env.DISABLE_REDIS },
         storage,
         uptimeSeconds: Math.round(process.uptime()),
@@ -649,6 +658,9 @@ export async function createServer() {
   // Payroll API routes
   mainRouter.use("/payroll", payrollRouter);
 
+  // RTC session routes (media token refresh + host moderation) — provider-agnostic
+  mainRouter.use("/rtc", authenticateToken, checkSubscriptionStatus, rtcRouter);
+
   // Settings API routes
   mainRouter.use("/settings", settingsRouter);
 
@@ -680,6 +692,10 @@ export async function createServer() {
   mainRouter.post("/meetings/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), leaveMeeting);
   mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
   mainRouter.post("/meetings/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingInvite);
+  // Transcript + AI meeting notes (provider-agnostic — fed by caption segments)
+  mainRouter.get("/meetings/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingTranscript);
+  mainRouter.get("/meetings/:id/notes", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingNotes);
+  mainRouter.post("/meetings/:id/notes/generate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingNotesEndpoint);
   // Public guest access (must be before any conflicting authenticated routes)
   mainRouter.get("/meetings/guest/validate/:code", guestValidateMeeting);
   // Guest join (public, no auth): guests join via meeting link + name (+password if set)

@@ -8,6 +8,12 @@ import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage } from "./chat";
 import crypto from "crypto";
+import {
+  buildCallingCredentials,
+  computeRemainingSeconds,
+  getActiveProviderName,
+  resolveProviderForRoom,
+} from "../lib/calling/factory";
 
 interface CallUserFromDb {
   id: string;
@@ -283,6 +289,11 @@ export const createCall: RequestHandler = async (
     const planMaxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
     const planMaxParticipants = planResult.rows[0]?.planMaxParticipants || null;
 
+    // The calling provider is resolved ONCE at creation time and stored on the
+    // row, so an admin switching providers later never migrates an in-flight
+    // room (the room keeps its original provider until it ends).
+    const callingProvider = await getActiveProviderName();
+
     const now = new Date();
     const endedAt = null;
 
@@ -306,15 +317,15 @@ export const createCall: RequestHandler = async (
 
     const result = await query(
       `INSERT INTO calls 
-        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants, conversation_id)
-       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants, conversation_id, provider)
+       VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
-                 max_participants as "maxParticipants", conversation_id as "conversationId",
+                 max_participants as "maxParticipants", conversation_id as "conversationId", provider,
                  created_at as "createdAt", updated_at as "updatedAt"`,
-      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null, planMaxParticipants, conversationId || null],
+      [businessId, type || "video", userId, userId, callCode, password || null, isGroupCall || false, waitingRoomEnabled || false, recordingEnabled || false, now.toISOString(), endedAt ? endedAt.toISOString() : null, planMaxParticipants, conversationId || null, callingProvider],
     );
 
     const call = result.rows[0];
@@ -1020,6 +1031,25 @@ export const joinCall: RequestHandler = async (
 
     call.inWaitingRoom = useWaitingRoom;
     call.isHost = joiningAsHost;
+
+    // Provider-specific media credentials for the joining participant
+    // (LiveKit JWT minted server-side; mediasoup requires none).
+    try {
+      const userRes = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const provider = await resolveProviderForRoom("call", actualId, (call as any).provider || null);
+      call.calling = await buildCallingCredentials(provider, {
+        roomType: "call",
+        roomId: actualId,
+        title: call.callCode || "",
+        identity: userId,
+        displayName: userRes.rows[0]?.name || "User",
+        isHost: joiningAsHost,
+        remainingSeconds: computeRemainingSeconds(call.endedAt),
+        maxParticipants: call.maxParticipants || null,
+      });
+    } catch (err) {
+      console.error("Failed to build calling credentials for join:", err);
+    }
 
     const io = getSocketServer();
     if (io) {
@@ -1824,6 +1854,25 @@ export const guestJoinCall: RequestHandler = async (req, res) => {
       ttlMinutes: 6 * 60,
     });
 
+    // Provider-specific media credentials for the guest (LiveKit JWT minted
+    // here; mediasoup requires none). Guests never get host grants.
+    let calling: unknown;
+    try {
+      const provider = await resolveProviderForRoom("call", call.id, (call as any).provider || null);
+      calling = await buildCallingCredentials(provider, {
+        roomType: "call",
+        roomId: call.id,
+        title: call.call_code || "",
+        identity: payload.guestId,
+        displayName: guestName,
+        isHost: false,
+        remainingSeconds: computeRemainingSeconds(call.ended_at),
+        maxParticipants: call.max_participants || null,
+      });
+    } catch (err) {
+      console.error("Failed to build guest calling credentials:", err);
+    }
+
     res.json({
       success: true,
       data: {
@@ -1844,6 +1893,7 @@ export const guestJoinCall: RequestHandler = async (req, res) => {
         roomId: call.id,
         socketRoom: `room:${call.id}`,
         expiresAt: new Date(payload.exp * 1000).toISOString(),
+        calling,
       },
     });
   } catch (error) {

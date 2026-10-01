@@ -1325,6 +1325,20 @@ export const leaveCall: RequestHandler = async (
               callId: actualId,
               userId,
             });
+            // Participants who never joined the live room (still ringing, or
+            // on another route) must hear the end too — personal user rooms.
+            const endedReason = finalStatus;
+            for (const row of participantsResult.rows) {
+              const pid = row?.userId;
+              if (pid) {
+                io.to(`user:${pid}`).emit("call:ended", {
+                  roomId: actualId,
+                  callId: actualId,
+                  callCode: call.callCode,
+                  reason: endedReason,
+                });
+              }
+            }
           }
         }
       }

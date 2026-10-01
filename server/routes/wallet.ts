@@ -349,11 +349,15 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
         }
         
         let businessWallet = null;
+        // Invited members must NEVER see the business wallet — only the
+        // business owner and admins do. The flag also lets the web/mobile
+        // clients decide whether to render the business wallet card (and the
+        // "Create VA" affordance for owners before the wallet exists).
+        let canManageBusinessWallet = false;
         if (businessId) {
-             // Check permission? Assuming all members can see business wallet? Or just admins?
-             // Usually only admins.
              const roleCheck = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
-             if (['owner', 'admin'].includes(roleCheck.rows[0]?.role)) {
+             canManageBusinessWallet = ['owner', 'admin'].includes(roleCheck.rows[0]?.role);
+             if (canManageBusinessWallet) {
                  const bwRes = await query(`SELECT * FROM wallets WHERE business_id = $1`, [businessId]);
                  if (bwRes.rows.length > 0) {
                      businessWallet = {
@@ -367,7 +371,8 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
         res.json({
             success: true,
             user_wallet: userWallet,
-            business_wallet: businessWallet
+            business_wallet: businessWallet,
+            canManageBusinessWallet
         });
 
     } catch (error) {

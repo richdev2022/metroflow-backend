@@ -651,6 +651,9 @@ async function ensureChatCallUxSchema(): Promise<void> {
   await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_for UUID[] NOT NULL DEFAULT '{}'`);
   await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_id UUID REFERENCES chat_messages(id) ON DELETE SET NULL`);
   await query(`CREATE INDEX IF NOT EXISTS idx_chat_messages_reply_to ON chat_messages(reply_to_id)`);
+  // Forwarding: WhatsApp-style "Forwarded" label on messages copied into
+  // another conversation via the multi-select forward flow.
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS forwarded BOOLEAN DEFAULT FALSE`);
 
   // --- chat_participants: role ('admin' | 'member') ---
   await query(`ALTER TABLE chat_participants ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'member'`);

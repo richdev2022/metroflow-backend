@@ -10,6 +10,7 @@ import {
   detectMediaKind,
 } from "../services/media-upload";
 import { getTenorApiKey } from "../lib/config-flags";
+import { glmChat, isGlmConfigured } from "../lib/glm";
 
 // Call-log messages (WhatsApp-style call history in chat) are inserted by the
 // SHARED helper in lib/call-log.ts — used by both the REST call paths and the
@@ -373,6 +374,7 @@ export const getConversationMessages: RequestHandler = async (
         cm.content, cm.attachment_url as "attachmentUrl", cm.attachment_type as "attachmentType",
         cm.attachment_name as "attachmentName", cm.attachment_size as "attachmentSize",
         cm.message_type as "messageType",
+        cm.forwarded as "forwarded",
         cm.created_at as "createdAt",
         cm.edited_at as "editedAt",
         cm.deleted_for_everyone as "deletedForEveryone",
@@ -413,6 +415,7 @@ export const getConversationMessages: RequestHandler = async (
         attachmentName: isDeletedForMe ? null : row.attachmentName,
         attachmentSize: isDeletedForMe ? null : row.attachmentSize,
         messageType: row.messageType,
+        forwarded: !!row.forwarded,
         createdAt: row.createdAt,
         editedAt: row.editedAt || null,
         deletedForEveryone: !!row.deletedForEveryone,
@@ -723,12 +726,13 @@ export const sendMessage: RequestHandler = async (
     const result = await query(
       `INSERT INTO chat_messages
         (conversation_id, sender_id, content, attachment_url, attachment_type,
-         attachment_name, attachment_size, message_type, reply_to_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         attachment_name, attachment_size, message_type, reply_to_id, forwarded)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, conversation_id as "conversationId", sender_id as "senderId",
                  content, attachment_url as "attachmentUrl", attachment_type as "attachmentType",
                  attachment_name as "attachmentName", attachment_size as "attachmentSize",
                  message_type as "messageType", reply_to_id as "replyToId",
+                 forwarded as "forwarded",
                  edited_at as "editedAt", deleted_for_everyone as "deletedForEveryone",
                  created_at as "createdAt"`,
       [
@@ -743,6 +747,7 @@ export const sendMessage: RequestHandler = async (
           : null,
         resolvedType,
         replyToId,
+        req.body?.forwarded === true,
       ],
     );
 
@@ -1594,5 +1599,194 @@ export const removeParticipant: RequestHandler = async (req: AuthenticatedReques
   } catch (error) {
     console.error("Remove participant error:", error);
     res.status(500).json({ success: false, error: "Failed to remove participant" });
+  }
+};
+
+// =============================================================================
+// MetricAi chat intelligence — WhatsApp-surpassing AI helpers.
+//   POST /chat/ai/translate        { text, targetLanguage? } -> { translation }
+//   POST /chat/ai/smart-replies    { conversationId }        -> { suggestions[] }
+//   POST /chat/conversations/:conversationId/ai/summarize     -> { summary }
+// All three are soft features: when GLM is unconfigured they answer 503 and
+// the UI hides them (web probes /ai/status through the MetricAi chip).
+// =============================================================================
+
+const AI_TEXT_LIMIT = 4000;
+const AI_LANG_NAMES: Record<string, string> = {
+  en: "English", fr: "French", es: "Spanish", pt: "Portuguese", ar: "Arabic",
+  de: "German", ig: "Igbo", ha: "Hausa", yo: "Yoruba", zu: "Zulu", sw: "Swahili",
+  am: "Amharic", zh: "Chinese", hi: "Hindi", it: "Italian", tr: "Turkish",
+};
+
+/** Strip reply/attachment noise and clamp a chat message for AI prompts. */
+function aiCleanMessage(m: any): string {
+  const who = m?.senderName || "Someone";
+  const body = String(m?.content || "").replace(/\s+/g, " ").trim();
+  const kind = m?.messageType || m?.message_type;
+  if (!body) {
+    if (kind === "voice") return `${who}: [voice note]`;
+    if (kind) return `${who}: [${kind}]`;
+    return `${who}: [attachment]`;
+  }
+  return `${who}: ${body.slice(0, 500)}`;
+}
+
+export const aiTranslateMessage: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user?.userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    if (!isGlmConfigured()) {
+      return res.status(503).json({ success: false, error: "ai_not_configured" });
+    }
+    const text = String(req.body?.text || "").trim();
+    if (!text) {
+      return res.status(400).json({ success: false, error: "text is required" });
+    }
+    if (text.length > AI_TEXT_LIMIT) {
+      return res.status(400).json({ success: false, error: `text must be <= ${AI_TEXT_LIMIT} characters` });
+    }
+    const langCode = String(req.body?.targetLanguage || "en").slice(0, 8).toLowerCase();
+    const langName = AI_LANG_NAMES[langCode] || req.body?.targetLanguage || "English";
+
+    const raw = await glmChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a precise translation engine inside a business chat app. " +
+            "Translate the user's text faithfully. Preserve tone, greetings, names, " +
+            "currency amounts and emojis. Reply with ONLY the translation — no quotes, " +
+            "no notes, no language labels.",
+        },
+        { role: "user", content: `Translate to ${langName}:\n\n${text}` },
+      ],
+      temperature: 0.1,
+      maxTokens: 1200,
+    });
+    const translation = String(raw || "").trim().replace(/^["']|["']$/g, "");
+    res.json({ success: true, data: { translation, language: langCode } });
+  } catch (error) {
+    console.error("Chat AI translate error:", error);
+    res.status(502).json({ success: false, error: "Translation failed. Please try again." });
+  }
+};
+
+export const aiSmartReplies: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    if (!isGlmConfigured()) {
+      return res.status(503).json({ success: false, error: "ai_not_configured" });
+    }
+    const conversationId = String(req.body?.conversationId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(conversationId)) {
+      return res.status(400).json({ success: false, error: "conversationId is required" });
+    }
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const recent = await query(
+      `SELECT cm.content, cm.message_type as "messageType", cm.sender_id as "senderId", u.name as "senderName"
+       FROM chat_messages cm
+       JOIN users u ON cm.sender_id = u.id
+       WHERE cm.conversation_id = $1
+         AND cm.deleted_for_everyone = FALSE
+         AND NOT ($2 = ANY(cm.deleted_for))
+       ORDER BY cm.created_at DESC
+       LIMIT 12`,
+      [conversationId, userId],
+    );
+    const transcript = recent.rows.reverse().map(aiCleanMessage).join("\n").slice(-AI_TEXT_LIMIT);
+    if (!transcript.trim()) {
+      return res.json({ success: true, data: { suggestions: [] } });
+    }
+
+    const raw = await glmChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You suggest three short chat replies for the LAST speaker exchange in this " +
+            "business conversation. The replies are sent by the person whose messages are " +
+            "NOT at the end (the user). Each reply: <= 20 words, natural, courteous, " +
+            "context-aware, matches the conversation's language. Reply with EXACTLY three " +
+            "lines, one suggestion per line, no numbering, no quotes, no emojis.",
+        },
+        { role: "user", content: `Recent messages (oldest first):\n${transcript}` },
+      ],
+      temperature: 0.6,
+      maxTokens: 220,
+    });
+    const suggestions = String(raw || "")
+      .split("\n")
+      .map((line) => line.replace(/^[\s\d.)\-*•]+/, "").trim().replace(/^["']|["']$/g, ""))
+      .filter((line) => line.length > 1 && line.length <= 200)
+      .slice(0, 3);
+    res.json({ success: true, data: { suggestions } });
+  } catch (error) {
+    console.error("Chat AI smart replies error:", error);
+    res.status(502).json({ success: false, error: "Could not generate smart replies." });
+  }
+};
+
+export const aiSummarizeConversation: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    if (!isGlmConfigured()) {
+      return res.status(503).json({ success: false, error: "ai_not_configured" });
+    }
+    const { conversationId } = req.params as { conversationId: string };
+    const hasAccess = await ensureConversationParticipant(conversationId, businessId, userId);
+    if (!hasAccess) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+
+    const rows = await query(
+      `SELECT cm.content, cm.message_type as "messageType", cm.sender_id as "senderId", u.name as "senderName"
+       FROM chat_messages cm
+       JOIN users u ON cm.sender_id = u.id
+       WHERE cm.conversation_id = $1
+         AND cm.deleted_for_everyone = FALSE
+         AND NOT ($2 = ANY(cm.deleted_for))
+       ORDER BY cm.created_at DESC
+       LIMIT 150`,
+      [conversationId, userId],
+    );
+    if (rows.rows.length === 0) {
+      return res.status(409).json({ success: false, error: "Nothing to summarize yet" });
+    }
+    const transcript = rows.rows.reverse().map(aiCleanMessage).join("\n").slice(-48000);
+
+    const raw = await glmChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            "Summarize this business chat thread for a busy professional. Reply with " +
+            "3 short markdown sections exactly:\n" +
+            "**Summary** — 2-3 sentences.\n" +
+            "**Key points** — up to 5 bullets.\n" +
+            "**Action items** — up to 4 bullets as 'Owner: task'. Write 'None' if none. " +
+            "Use the thread's language. Be concrete; keep names and numbers.",
+        },
+        { role: "user", content: transcript },
+      ],
+      temperature: 0.3,
+      maxTokens: 700,
+    });
+    res.json({ success: true, data: { summary: String(raw || "").trim(), messagesAnalyzed: rows.rows.length } });
+  } catch (error) {
+    console.error("Chat AI summarize error:", error);
+    res.status(502).json({ success: false, error: "Could not summarize the conversation." });
   }
 };

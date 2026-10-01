@@ -7,6 +7,7 @@ import { getSocketServer } from "../lib/socket";
 import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage } from "../lib/call-log";
+import { resolveSpeakerNames } from "../lib/speaker-names";
 import { pushIncomingCall, pushMissedCall } from "../lib/call-push";
 import crypto from "crypto";
 import {
@@ -1630,7 +1631,78 @@ export const addCallParticipants: RequestHandler = async (
         .map((e: string) => String(e || '').trim().toLowerCase())
         .filter((e: string) => emailRegex.test(e)))] as string[];
 
-      for (const email of validEmails) {
+      // Email→team-member lookup FIRST: an email typed into the invite box that
+      // belongs to an existing business user becomes a real call participant
+      // (roster + notification + invitation email), never a one-off guest.
+      const guestEmailsOnly: string[] = [];
+      if (validEmails.length > 0) {
+        let byEmail = new Map<string, CallUserFromDb>();
+        try {
+          const usersRes = await query(
+            `SELECT id, name, email FROM users WHERE business_id = $1 AND lower(email) = ANY($2::text[])`,
+            [businessId, validEmails],
+          );
+          for (const row of usersRes.rows) byEmail.set(String(row.email).toLowerCase(), row);
+        } catch { /* keep every email on the guest path if lookup fails */ }
+
+        for (const email of validEmails) {
+          const user = byEmail.get(email);
+          if (user && !existingUserIds.has(user.id)) {
+            try {
+              const inserted = await query(
+                `INSERT INTO call_participants (call_id, user_id, status)
+                 VALUES ($1, $2, 'invited')
+                 RETURNING id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"`,
+                [actualCallId, user.id],
+              );
+              if (inserted.rows.length > 0) {
+                existingUserIds.add(user.id);
+                newParticipantIds.push(user.id);
+                addedParticipants.push(inserted.rows[0]);
+                try {
+                  await createNotification({
+                    businessId: businessId,
+                    userId: user.id,
+                    type: "call",
+                    title: `${currentUserName} added you to a call`,
+                    message: `You've been added to a ${callDetails?.type || 'video'} call by ${currentUserName}`,
+                    actionUrl: `/calls/${call.call_code}`,
+                    actionType: "join_call",
+                    metadata: { callId: actualCallId, callCode: call.call_code },
+                    isActionable: true,
+                    expiresInHours: 1,
+                  });
+                } catch (notifyError) {
+                  console.error(`Add call participants: failed to notify ${email}:`, notifyError);
+                }
+                if (user.email) {
+                  try {
+                    const emailHtml = generateCallInvitationEmailHtml(
+                      user.name || 'User',
+                      (callDetails?.type || 'video') as 'audio' | 'video',
+                      new Date(callDetails?.started_at || new Date()),
+                      call.call_code,
+                      currentUserName,
+                      callLink,
+                      callDetails?.password || null,
+                      !!callDetails?.waiting_room_enabled
+                    );
+                    await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
+                  } catch (emailError) {
+                    console.error(`Add call participants: failed to email ${email}:`, emailError);
+                  }
+                }
+                continue;
+              }
+            } catch (insertError) {
+              console.error(`Add call participants: failed to add ${email} as participant:`, insertError);
+            }
+          }
+          guestEmailsOnly.push(email);
+        }
+      }
+
+      for (const email of guestEmailsOnly) {
         try {
           const emailHtml = generateCallInvitationEmailHtml(
             email.split('@')[0],
@@ -2357,7 +2429,7 @@ export const getCallTranscript: RequestHandler = async (req: AuthenticatedReques
          LIMIT 2000`,
         [call.id],
       );
-      transcripts = result.rows;
+      transcripts = await resolveSpeakerNames(result.rows);
     } catch { /* no transcript storage yet — empty list */ }
 
     const response: ApiResponse<any> = {

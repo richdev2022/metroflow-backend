@@ -97,11 +97,16 @@ export async function generateMeetingNotes(
   if (!(await hasSummarizableTranscript(meetingId))) return null;
 
   const tRes = await query(
-    `SELECT speaker_name, text, created_at FROM meeting_transcripts
+    `SELECT speaker_id as "speakerId", speaker_name as "speakerName", text, created_at
+     FROM meeting_transcripts
      WHERE meeting_id = $1 ORDER BY created_at ASC LIMIT 400`,
     [meetingId],
   );
-  const lines = tRes.rows.map((r: any) => `${r.speaker_name || "Speaker"}: ${r.text}`);
+  // UUID-looking speaker names confuse the model AND the rendered notes —
+  // resolve them to human names first (cached, best-effort).
+  const { resolveSpeakerNames } = await import("./speaker-names");
+  const resolvedRows = await resolveSpeakerNames(tRes.rows as any[]);
+  const lines = resolvedRows.map((r: any) => `${r.speakerName || "Speaker"}: ${r.text}`);
   const transcript = lines.join("\n").slice(0, 60_000);
 
   const mRes = await query(`SELECT title FROM meetings WHERE id = $1`, [meetingId]);

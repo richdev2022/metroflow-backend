@@ -84,7 +84,7 @@ import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
@@ -742,6 +742,12 @@ export async function createServer() {
   mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), uploadChatMedia);
   // GIF picker (Tenor proxy — key stays server-side)
   mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), searchChatGifs);
+
+  // MetricAi chat intelligence: translate a message / smart reply chips /
+  // whole-conversation summary (all GLM-backed, graceful 503 when unset)
+  mainRouter.post("/chat/ai/translate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiTranslateMessage);
+  mainRouter.post("/chat/ai/smart-replies", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiSmartReplies);
+  mainRouter.post("/chat/conversations/:conversationId/ai/summarize", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiSummarizeConversation);
 
   // Chat message edit / delete (WhatsApp-style)
   mainRouter.patch("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), editMessage);

@@ -174,4 +174,10 @@ export const AVAILABLE_PERMISSIONS = [
     name: "RTC Analytics",
     description: "View analytics for calls and meetings",
   },
+  {
+    id: "manage_growth",
+    name: "Wishlist & Email Notifications",
+    description:
+      "View the site wishlist, manage email subscribers per category and send email notification campaigns",
+  },
 ];

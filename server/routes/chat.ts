@@ -1110,10 +1110,10 @@ export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest,
     if (err) {
       // Multer size errors arrive as generic MulterError — surface a friendly message
       const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
-      return res.status(400).json({
+      return res.status(isTooLarge ? 413 : 400).json({
         success: false,
         error: isTooLarge
-          ? `File exceeds the ${CHAT_MEDIA_LIMIT_MB} MB upload limit`
+          ? `That file is too large — attachments are limited to ${CHAT_MEDIA_LIMIT_MB} MB. Trim the video or compress it, then try again.`
           : err.message || "File upload error",
       });
     }

@@ -18,6 +18,70 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureCallingSchema();
   await ensureMeetingSchedulingSchema();
   await ensureVapidKeys();
+  await ensureSiteGrowthSchema();
+}
+
+/**
+ * Site growth tables: marketing-site wishlist entries, email subscribers
+ * (per-category, e.g. monthly product updates) and the campaign send history.
+ * Backs the public /public/wishlist + /public/subscribe endpoints and the
+ * admin "Growth" pages (wishlist list, subscriber manager, campaign sender).
+ */
+async function ensureSiteGrowthSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS site_wishlist_entries (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(255),
+      email VARCHAR(320) NOT NULL,
+      features JSONB DEFAULT '[]'::jsonb,
+      note TEXT,
+      source VARCHAR(60) DEFAULT 'website',
+      welcome_email_sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_site_wishlist_email ON site_wishlist_entries (LOWER(email))`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_site_wishlist_created ON site_wishlist_entries (created_at DESC)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS site_subscribers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(255),
+      email VARCHAR(320) NOT NULL,
+      categories TEXT[] DEFAULT '{}',
+      source VARCHAR(60) DEFAULT 'website',
+      is_active BOOLEAN DEFAULT TRUE,
+      welcome_email_sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_site_subscribers_email ON site_subscribers (LOWER(email))`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_site_subscribers_active ON site_subscribers (is_active, created_at DESC)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS site_email_campaigns (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      category VARCHAR(60) NOT NULL,
+      subject VARCHAR(255) NOT NULL,
+      body_html TEXT NOT NULL,
+      recipients_count INTEGER DEFAULT 0,
+      sent_count INTEGER DEFAULT 0,
+      failed_count INTEGER DEFAULT 0,
+      created_by UUID,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_site_campaigns_created ON site_email_campaigns (created_at DESC)`);
+
+  // Permission gating the admin Growth pages (wishlist + subscribers + campaigns)
+  await query(`
+    INSERT INTO admin_permissions (slug, name, description)
+    VALUES ('manage_growth', 'Wishlist & Email Notifications', 'View wishlist entries, manage email subscribers and send email notifications per category')
+    ON CONFLICT (slug) DO NOTHING
+  `);
 }
 
 /**

@@ -1533,6 +1533,17 @@ export function initSocketServer(server: http.Server): void {
       }
       // Broadcast to the LIVE room (`room:{id}`) — `call:{id}` is never joined.
       io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+      // A callee who is still RINGING (or browsing any other route) has NOT
+      // joined room:{id} yet — reach their personal user rooms too, otherwise
+      // their phone keeps ringing until the local 45s timeout.
+      for (const pid of preEndParticipantIds) {
+        if (pid) {
+          io.to(`user:${pid}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+        }
+      }
+      if (preEnd?.created_by) {
+        io.to(`user:${preEnd.created_by}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+      }
       socket.leave(`room:${resolvedCallId}`);
     });
 

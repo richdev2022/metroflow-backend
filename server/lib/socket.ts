@@ -1533,11 +1533,17 @@ export function initSocketServer(server: http.Server): void {
     });
 
     // Meeting events (with roomManager integration and duration support)
-    socket.on("meeting:join", async (data: { meetingId: string; userId: string; userName?: string; isHost?: boolean; audioEnabled?: boolean; videoEnabled?: boolean }, callback?: (response: any) => void) => {
+    socket.on("meeting:join", async (data: { meetingId?: string; roomId?: string; userId: string; userName?: string; isHost?: boolean; audioEnabled?: boolean; videoEnabled?: boolean; waitingRoomSupport?: boolean }, callback?: (response: any) => void) => {
       try {
-        const resolvedMeetingId = await resolveMeetingId(data.meetingId);
+        // Accept BOTH payload keys: the web CallRoom historically emitted
+        // `roomId` (mirroring call:join) while mobile/native clients send
+        // `meetingId`. Keying on `data.meetingId` alone made every web meeting
+        // join fail with "Meeting not found" and forced users through the
+        // error screen's retry path (media-only, no presence).
+        const inputId = data.meetingId || data.roomId;
+        const resolvedMeetingId = await resolveMeetingId(inputId ?? "");
         if (!resolvedMeetingId) {
-          logger.warn(`meeting:join failed - cannot resolve meetingId/code: ${data.meetingId}`);
+          logger.warn(`meeting:join failed - cannot resolve meetingId/code: ${inputId}`);
           if (callback) callback({ success: false, error: "Meeting not found" });
           return;
         }
@@ -1729,9 +1735,10 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    socket.on("meeting:leave", async (data: { meetingId: string; userId: string; userName?: string }) => {
+    socket.on("meeting:leave", async (data: { meetingId?: string; roomId?: string; userId: string; userName?: string }) => {
       try {
-        const resolvedMeetingId = await resolveMeetingId(data.meetingId);
+        // Key-agnostic resolve (see meeting:join) — the web emits `roomId`.
+        const resolvedMeetingId = await resolveMeetingId(data.meetingId || data.roomId || "");
         if (!resolvedMeetingId) return;
 
         const userId = data.userId || socket.data.userId;
@@ -1766,9 +1773,10 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    socket.on("meeting:end", async (data: { meetingId: string }) => {
+    socket.on("meeting:end", async (data: { meetingId?: string; roomId?: string }) => {
       try {
-        const resolvedMeetingId = await resolveMeetingId(data.meetingId);
+        // Key-agnostic resolve (see meeting:join).
+        const resolvedMeetingId = await resolveMeetingId(data.meetingId || data.roomId || "");
         if (!resolvedMeetingId) return;
 
         await query(

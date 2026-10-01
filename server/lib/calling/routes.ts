@@ -237,15 +237,34 @@ const postRecordingStart: RequestHandler[] = [
       const isHost = room.host_id === userId || room.co_host_id === userId || room.created_by === userId;
       if (!isHost) return res.status(403).json({ success: false, error: "Only hosts can start recordings" });
 
-      // One active recording per room.
+      // One active recording per room. Before enforcing it, reconcile stale
+      // rows — one crashed attempt must never brick recording for the room:
+      //  - client-mode rows (no egress_id) stuck in 'recording' for > 10 min
+      //    mean the browser died before uploading → mark failed;
+      //  - 'processing' rows older than 3 h mean the finalization webhook
+      //    never arrived → mark failed.
+      await query(
+        `UPDATE recordings SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+         WHERE (meeting_id = $1 OR call_id = $1)
+           AND (
+             (status = 'recording' AND egress_id IS NULL AND created_at < NOW() - INTERVAL '10 minutes')
+             OR (status = 'processing' AND updated_at < NOW() - INTERVAL '3 hours')
+           )`,
+        [room.id],
+      ).catch(() => undefined);
       const active = await query(
-        `SELECT id, egress_id FROM recordings
+        `SELECT id, egress_id, EXTRACT(EPOCH FROM (NOW() - created_at))::int AS age_s FROM recordings
          WHERE (meeting_id = $1 OR call_id = $1) AND status IN ('recording','processing')
-         LIMIT 1`,
+         ORDER BY created_at DESC LIMIT 1`,
         [room.id],
       );
       if (active.rows.length > 0) {
-        return res.status(409).json({ success: false, error: "This room is already being recorded", errorCode: "already_recording" });
+        return res.status(409).json({
+          success: false,
+          error: "This room is already being recorded",
+          errorCode: "already_recording",
+          activeAgeSeconds: Number(active.rows[0]?.age_s ?? 0) || undefined,
+        });
       }
 
       const provider = await resolveProviderForRoom(roomType, room.id, room.provider);
@@ -303,9 +322,17 @@ const postRecordingStart: RequestHandler[] = [
           data: { mode: "server", recordingId, egressId: result.egressId, startedAt: result.startedAt, provider: provider.name },
         });
       } catch (err) {
-        // Roll the placeholder row back so the room can retry cleanly.
+        // Egress failed to start (worker down, storage error, timeout…).
+        // Roll the placeholder row back and degrade GRACEFULLY to the client
+        // composite recorder instead of hard-failing the whole feature —
+        // recording must keep working even when egress infra is unhealthy.
         await query(`DELETE FROM recordings WHERE id = $1`, [recordingId]).catch(() => undefined);
-        throw err;
+        const reason = String((err as any)?.message || "egress unavailable").slice(0, 200);
+        console.warn("RTC recording egress start failed — falling back to client recorder:", reason);
+        return res.json({
+          success: true,
+          data: { mode: "client", provider: provider.name, reason: `egress_unavailable: ${reason}` },
+        });
       }
     } catch (error) {
       console.error("RTC recording start error:", error);

@@ -275,6 +275,23 @@ export async function createServer() {
     startTransferMonitor();
   }
 
+  // Meeting reminders (push + email at 60/15 minutes before start).
+  // VPS/PM2 only — serverless cannot run per-minute crons. Each tick atomically
+  // claims due meeting_reminders rows (sent=FALSE) so ticks never double-send.
+  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+    cron.schedule("* * * * *", async () => {
+      try {
+        const { processDueMeetingReminders } = await import("./services/meetingReminders");
+        const result = await processDueMeetingReminders();
+        if (result.processed > 0) {
+          logger.info(`[meetingReminders] delivered ${result.processed} reminder(s)`);
+        }
+      } catch (error) {
+        logger.error("Meeting reminders cron error:", error);
+      }
+    });
+  }
+
   // Serverless fallback: in serverless environments there is no persistent
   // process, so a per-minute cron stands in for the poller. On a persistent
   // server (PM2/VPS) this MUST NOT run - the poller above already covers it,

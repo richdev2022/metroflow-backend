@@ -16,6 +16,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
   await ensureCallingSchema();
+  await ensureMeetingSchedulingSchema();
   await ensureVapidKeys();
 }
 
@@ -716,4 +717,40 @@ async function ensureVapidKeys(): Promise<void> {
   } catch (err: any) {
     console.error(`[migrations] VAPID key bootstrap skipped: ${err?.message || err}`);
   }
+}
+
+/**
+ * Google-style meeting scheduling schema:
+ *  1. meetings.recurrence_rule        — JSON string describing the series
+ *                                        { frequency, interval, customDays?, endDate?, count? }
+ *  2. meetings.recurrence_parent_id   — links each occurrence to the series head
+ *  3. meetings.occurrence_index       — 0 for the series head
+ *  4. meeting_guests                  — external (non-team) participants by email
+ *  5. meeting_reminders.remind_at     — absolute timestamp the per-minute cron
+ *                                       fires on (push + email reminder)
+ */
+async function ensureMeetingSchedulingSchema(): Promise<void> {
+  await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS recurrence_rule TEXT`);
+  await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS recurrence_parent_id UUID`);
+  await query(`ALTER TABLE meetings ADD COLUMN IF NOT EXISTS occurrence_index INTEGER`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meeting_guests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      name TEXT,
+      status TEXT DEFAULT 'invited',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(meeting_id, email)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_meeting_guests_meeting ON meeting_guests(meeting_id)`);
+
+  // Absolute fire time for the reminder cron (the legacy `minutes` column is
+  // kept for compatibility — remind_at is authoritative).
+  await query(`ALTER TABLE meeting_reminders ADD COLUMN IF NOT EXISTS remind_at TIMESTAMPTZ`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_meeting_reminders_due ON meeting_reminders (remind_at) WHERE sent = FALSE`);
+
+  console.log("[migrations] meeting scheduling schema applied");
 }

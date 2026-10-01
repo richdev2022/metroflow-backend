@@ -97,6 +97,20 @@ export interface PushPayload {
   androidChannelId?: string;
 }
 
+/**
+ * DATA-ONLY FCM delivery.
+ *
+ * Messages that carry an FCM `notification` block are displayed by the OS
+ * tray on Android/iOS and the app's background handler (FirebaseMessaging
+ * onBackgroundMessage) is NEVER invoked for them. Our clients render their
+ * own rich notifications (full-screen incoming-call ring, chat style,
+ * launcher badge count), so every push must arrive as a pure data message:
+ *  - Android: high-priority data message wakes the background isolate.
+ *  - iOS:     `content-available: 1` wakes the background handler.
+ * `title`/`body` are still folded INTO the data payload so any client-side
+ * generic handler can display them.
+ */
+
 async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ sent: number; failed: number }> {
   if (tokens.length === 0) return { sent: 0, failed: 0 };
 
@@ -111,6 +125,13 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
     const accessToken = await getAccessToken();
     if (!accessToken) return { sent: 0, failed: tokens.length };
 
+    // title/body folded into data — clients render notifications themselves.
+    const dataPayload: Record<string, string> = {
+      ...(payload.data || {}),
+      title: payload.title,
+      body: payload.body,
+    };
+
     let sent = 0;
     let failed = 0;
     for (const token of tokens) {
@@ -120,18 +141,19 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
           {
             message: {
               token,
-              notification: { title: payload.title, body: payload.body },
-              data: payload.data || {},
+              // NO `notification` block — see the doc comment above. A
+              // notification+data message is shown by the OS tray and the
+              // app's background handler never runs (no ring, no badge).
+              data: dataPayload,
               android: {
                 priority: "high",
-                notification: {
-                  channel_id: payload.androidChannelId || "general",
-                  sound: "default",
-                },
               },
               apns: {
+                headers: { "apns-priority": "5" },
                 payload: {
-                  aps: { sound: "default", alert: { title: payload.title, body: payload.body } },
+                  aps: {
+                    "content-available": 1,
+                  },
                 },
               },
             },
@@ -162,10 +184,11 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
         "https://fcm.googleapis.com/fcm/send",
         {
           registration_ids: tokens,
-          notification: { title: payload.title, body: payload.body },
-          data: payload.data || {},
+          // Data-only (see doc comment on PushPayload).
+          data: { ...(payload.data || {}), title: payload.title, body: payload.body },
           android: { priority: "high" },
           priority: "high",
+          content_available: true,
         },
         {
           headers: { Authorization: `key=${serverKey}`, "Content-Type": "application/json" },

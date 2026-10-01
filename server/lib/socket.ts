@@ -29,6 +29,7 @@ import {
   type CallingCredentials,
 } from "./calling/factory";
 import { generateMeetingNotesIfEligible } from "./meeting-notes";
+import { resolveSingleSpeakerName, looksLikeUuid } from "./speaker-names";
 import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "./call-log";
 import { pushIncomingCall, pushMissedCall } from "./call-push";
 
@@ -2222,11 +2223,23 @@ export function initSocketServer(server: http.Server): void {
             socket.data.userId ||
             (socket.data.guest as any)?.guestId ||
             socket.id;
-          const speakerName =
-            roomManager.getParticipants(roomId).find((p) => p.id === speakerId)?.name ||
-            (socket.data.guest as any)?.name ||
-            socket.data.userId ||
-            "Speaker";
+          // Resolve a human speaker name: room roster → guest profile → cached
+          // users-table lookup (UUID speaker ids used to leak into transcripts).
+          const rosterName = roomManager.getParticipants(roomId).find((p) => p.id === speakerId)?.name;
+          const guestName = (socket.data.guest as any)?.name;
+          let speakerName =
+            (rosterName && !looksLikeUuid(rosterName) && rosterName) ||
+            (guestName && !looksLikeUuid(guestName) && guestName) ||
+            "";
+          if (!speakerName) {
+            try {
+              speakerName = (await resolveSingleSpeakerName(speakerId)) || "";
+            } catch { /* keep fallback below */ }
+          }
+          if (!speakerName) {
+            const fallback = socket.data.userId || (socket.data.guest as any)?.name || "Speaker";
+            speakerName = looksLikeUuid(fallback) ? "Participant" : String(fallback);
+          }
 
           const payload = {
             roomId,

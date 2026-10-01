@@ -31,7 +31,7 @@ ok()   { printf "  \033[0;32m✔ %s\033[0m\n" "$*"; }
 warn() { printf "  \033[1;33m⚠ %s\033[0m\n" "$*"; }
 fail() { printf "  \033[0;31m✖ %s\033[0m\n" "$*"; }
 
-step "1/5  Preparing working tree + pulling latest code"
+step "1/6  Preparing working tree + pulling latest code"
 
 # ---------------------------------------------------------------------
 # 0. Preflight: validate DATABASE_URL BEFORE touching anything.
@@ -96,7 +96,7 @@ else
   ok "Updated: ${OLD_REV:0:8} -> ${NEW_REV:0:8}"
 fi
 
-step "2/5  Installing dependencies"
+step "2/6  Installing dependencies"
 if npm ci --no-audit --no-fund; then
   ok "npm ci done"
 else
@@ -104,11 +104,11 @@ else
   npm install --no-audit --no-fund || { fail "dependency install failed"; [ "$STASHED" = "1" ] && git stash pop; exit 1; }
 fi
 
-step "3/5  Building (swagger + server bundle)"
+step "3/6  Building (swagger + server bundle)"
 npm run build || { fail "build failed — old process left untouched"; [ "$STASHED" = "1" ] && git stash pop; exit 1; }
 ok "build complete (dist/server/node-build.mjs)"
 
-step "4/5  Restarting pm2 process '$APP_NAME'"
+step "4/6  Restarting pm2 process '$APP_NAME'"
 if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
   pm2 restart "$APP_NAME" --update-env
   pm2 save
@@ -120,7 +120,7 @@ else
   exit 1
 fi
 
-step "5/5  Verifying the new build is serving"
+step "5/6  Verifying the new build is serving"
 echo "  Waiting for boot (migrations run automatically, all idempotent)..."
 DEAD=0
 while [ $DEAD -lt 30 ]; do
@@ -208,6 +208,118 @@ else
   echo "  • Firewall check: ensure UDP ${RTC_MIN}-${RTC_MAX} is reachable (cloud firewall + ufw) for calls/meetings."
 fi
 
+# ---------------------------------------------------------------------
+# 6/6 nginx upload limit (client_max_body_size).
+# nginx defaults to 1m — every chat attachment above 1MB (ANY video,
+# most photos) was rejected by the proxy with 413 before reaching the
+# API, surfacing in the apps as "Internal server error". This step
+# makes every deploy self-heal the limit for vhosts proxying to the
+# API port. Idempotent + safe: nginx -t must pass or changes revert.
+# ---------------------------------------------------------------------
+if command -v nginx >/dev/null 2>&1 && [ -d /etc/nginx ]; then
+  step "6/6  nginx upload limit (client_max_body_size)"
+  STAMP="$(date +%Y%m%d%H%M%S)"
+  MIN_BODY_MB=100
+  TARGET="client_max_body_size ${MIN_BODY_MB}m"
+
+  nginx_mb_to_mib() {
+    # "1m" / "1024k" / "2g" -> mebibytes (integer)
+    local v="$1" n u
+    n="$(echo "$v" | tr -d '[:space:]' | sed -E 's/[kKmMgG]$//')"
+    u="$(echo "$v" | sed -E 's/.*([kKmMgG])$/\1/')"
+    case "$u" in
+      g|G) echo $(( n * 1024 )) ;;
+      m|M) echo "$n" ;;
+      k|K) echo $(( n / 1024 )) ;;
+      *)   echo 0 ;;
+    esac
+  }
+
+  CONF_DIRS=("/etc/nginx/sites-enabled" "/etc/nginx/conf.d")
+  PROXY_FILES=""
+  for d in "${CONF_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    FOUND="$(grep -rIlE "proxy_pass[^;]*:${PORT}([^/]|$)" "$d" 2>/dev/null || true)"
+    [ -n "$FOUND" ] && PROXY_FILES="$PROXY_FILES $FOUND"
+  done
+
+  MODIFIED=0
+  BACKUPS=()
+  if [ -n "$PROXY_FILES" ]; then
+    for f in $PROXY_FILES; do
+      VALS="$(grep -hoE 'client_max_body_size\s+[0-9]+[kKmMgG]?' "$f" 2>/dev/null | awk '{print $2}')"
+      if [ -z "$VALS" ]; then
+        continue  # no per-vhost override — http-level default below covers it
+      fi
+      NEEDS_FIX=0
+      for v in $VALS; do
+        MB="$(nginx_mb_to_mib "$v")"
+        if [ "$MB" -lt "$MIN_BODY_MB" ]; then NEEDS_FIX=1; break; fi
+      done
+      if [ "$NEEDS_FIX" = "1" ]; then
+        cp "$f" "$f.bak-$STAMP" && BACKUPS+=("$f.bak-$STAMP")
+        sed -i -E "s/client_max_body_size\s+[0-9]+[kKmMgG]?/$TARGET/g" "$f"
+        MODIFIED=1
+        ok "raised client_max_body_size to ${MIN_BODY_MB}m in $f"
+      fi
+    done
+  fi
+
+  # http-level default (covers vhosts without an explicit limit).
+  if [ "$MODIFIED" = "0" ]; then
+    HTTP_VAL=""
+    for f in /etc/nginx/nginx.conf "${CONF_DIRS[@]}"; do
+      [ -f "$f" ] || [ -d "$f" ] || continue
+      HTTP_VAL="$(grep -rhoE 'client_max_body_size\s+[0-9]+[kKmMgG]?' "$f" 2>/dev/null | head -1 | awk '{print $2}')"
+      [ -n "$HTTP_VAL" ] && break
+    done
+    if [ -z "$HTTP_VAL" ] || [ "$(nginx_mb_to_mib "$HTTP_VAL")" -lt "$MIN_BODY_MB" ]; then
+      echo "client_max_body_size ${MIN_BODY_MB}m;" > /etc/nginx/conf.d/00-metricorex-client-max-body.conf
+      BACKUPS+=("/etc/nginx/conf.d/00-metricorex-client-max-body.conf")
+      MODIFIED=1
+      ok "http-level default set to ${MIN_BODY_MB}m (conf.d/00-metricorex-client-max-body.conf)"
+    else
+      ok "nginx upload limit already >= ${MIN_BODY_MB}m ($HTTP_VAL)"
+    fi
+  fi
+
+  if [ "$MODIFIED" = "1" ]; then
+    if nginx -t > /dev/null 2>&1; then
+      if nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null; then
+        ok "nginx reloaded — uploads up to ${MIN_BODY_MB}MB now accepted"
+      else
+        warn "nginx config updated but reload failed — run: nginx -s reload"
+      fi
+    else
+      warn "nginx -t FAILED after edit — reverting changes"
+      for b in "${BACKUPS[@]}"; do
+        case "$b" in
+          *.bak-*) cp "$b" "${b%.bak-$STAMP}" ;;
+          /etc/nginx/conf.d/00-metricorex-client-max-body.conf) rm -f "$b" ;;
+        esac
+      done
+      nginx -t > /dev/null 2>&1 || true
+      warn "nginx restored. Raise client_max_body_size manually (see docs)."
+    fi
+  fi
+
+  # External verification: a 2MB POST must NOT be rejected with 413.
+  PUBLIC_HOST="$(grep -E '^(API_PUBLIC_BASE_URL|APP_BASE_URL)=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"'"'"'')"
+  PUBLIC_HOST="$(echo "$PUBLIC_HOST" | sed -E 's#^https?://##; s#/$##')"
+  PROBE_URL="${PUBLIC_HOST:-api.metricorex.com}"
+  PROBE_CODE="$(dd if=/dev/zero bs=1M count=2 2>/dev/null | curl -s -o /dev/null -w "%{http_code}" -m 15 -X POST "https://${PROBE_URL}/api/auth/login" -H "Content-Type: application/json" --data-binary @- || echo curl_err)"
+  if [ "$PROBE_CODE" = "413" ]; then
+    warn "2MB upload probe STILL 413 at $PROBE_URL — a vhost outside sites-enabled/conf.d overrides the limit."
+    echo "       Fix manually: add 'client_max_body_size 100m;' to that server block, then: nginx -s reload"
+  elif [ "$PROBE_CODE" = "curl_err" ]; then
+    warn "could not reach https://$PROBE_URL for the 2MB upload probe (network?)"
+  else
+    ok "2MB upload probe -> $PROBE_CODE (not 413) — proxy no longer blocks chat media"
+  fi
+else
+  echo "  • nginx not present — skipping upload-limit check (client_max_body_size)."
+fi
+
 [ "$STASHED" = "1" ] && warn "remember: your pre-deploy local edits are in 'git stash' (git stash pop / git stash drop)"
 
 if [ "$STALE" = "1" ]; then
@@ -217,6 +329,5 @@ fi
 
 printf "\n\033[0;32mDeploy verified. MetricAi + support desk + attachments are live.\033[0m\n"
 echo "Reminders:"
-echo "  • nginx: client_max_body_size >= 100m for large chat video uploads"
 echo "  • Optional env: TENOR_API_KEY (GIF tab), SUPPORT_ALERT_EMAIL (new-support email ping)"
 echo "  • Swagger UI: http://127.0.0.1:${PORT}/api-docs  |  Health: /api/health"

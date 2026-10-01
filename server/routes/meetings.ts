@@ -14,6 +14,7 @@ import {
   resolveProviderForRoom,
 } from "../lib/calling/factory";
 import { generateMeetingNotes, hasSummarizableTranscript } from "../lib/meeting-notes";
+import { resolveSpeakerNames } from "../lib/speaker-names";
 import {
   computeOccurrences,
   isRecurrenceInput,
@@ -1408,7 +1409,77 @@ export const addMeetingParticipants: RequestHandler = async (
         .map((e: string) => String(e || '').trim().toLowerCase())
         .filter((e: string) => emailRegex.test(e)))] as string[];
 
-      for (const email of validEmails) {
+      // Email→team-member lookup FIRST: an email typed into the invite box that
+      // belongs to an existing business user becomes a real attendee (roster +
+      // notification + invitation email), never a one-off guest.
+      const guestEmailsOnly: string[] = [];
+      if (validEmails.length > 0) {
+        let byEmail = new Map<string, any>();
+        try {
+          const usersRes = await query(
+            `SELECT id, name, email FROM users WHERE business_id = $1 AND lower(email) = ANY($2::text[])`,
+            [businessId, validEmails],
+          );
+          for (const row of usersRes.rows) byEmail.set(String(row.email).toLowerCase(), row);
+        } catch { /* keep every email on the guest path if lookup fails */ }
+
+        for (const email of validEmails) {
+          const user = byEmail.get(email);
+          if (user && !existingUserIds.has(user.id)) {
+            try {
+              const inserted = await query(
+                `INSERT INTO meeting_attendees (meeting_id, user_id)
+                 VALUES ($1, $2)
+                 RETURNING id, user_id as "userId", status`,
+                [actualMeetingId, user.id],
+              );
+              if (inserted.rows.length > 0) {
+                existingUserIds.add(user.id);
+                newParticipantIds.push(user.id);
+                try {
+                  await createNotification({
+                    businessId: businessId,
+                    userId: user.id,
+                    type: "meeting",
+                    title: "Meeting Invitation",
+                    message: `You've been invited to a meeting: ${meeting.title}`,
+                    actionUrl: `/meetings/${meeting.meeting_code}`,
+                    actionType: "view_meeting",
+                    metadata: { meetingId: actualMeetingId },
+                    isActionable: false,
+                    expiresInHours: 24,
+                  });
+                } catch (notifyError) {
+                  console.error(`Add meeting participants: failed to notify ${email}:`, notifyError);
+                }
+                try {
+                  const emailHtml = generateMeetingInvitationEmailHtml(
+                    user.name || 'User',
+                    meeting.title,
+                    null,
+                    new Date(meeting.start_time),
+                    new Date(meeting.end_time),
+                    meeting.meeting_code || '',
+                    currentUserName,
+                    meetingLink,
+                    fullMeeting?.password || null,
+                    !!fullMeeting?.waiting_room_enabled
+                  );
+                  await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${meeting.title}`, emailHtml);
+                } catch (emailError) {
+                  console.error(`Add meeting participants: failed to email invitee ${email}:`, emailError);
+                }
+                continue;
+              }
+            } catch (insertError) {
+              console.error(`Add meeting participants: failed to add ${email} as attendee:`, insertError);
+            }
+          }
+          guestEmailsOnly.push(email);
+        }
+      }
+
+      for (const email of guestEmailsOnly) {
         try {
           const emailHtml = generateMeetingInvitationEmailHtml(
             email.split('@')[0],
@@ -2395,7 +2466,7 @@ export const getMeetingTranscript: RequestHandler = async (req: AuthenticatedReq
       [actualId],
     );
 
-    res.json({ success: true, data: { meetingId: actualId, segments: transcript.rows } });
+    res.json({ success: true, data: { meetingId: actualId, segments: await resolveSpeakerNames(transcript.rows) } });
   } catch (error) {
     console.error("Get meeting transcript error:", error);
     res.status(500).json({ success: false, error: "Failed to load transcript" });
@@ -2572,7 +2643,7 @@ export const getMeetingReport: RequestHandler = async (req: AuthenticatedRequest
         const actionItems = Array.isArray(rawNotes.actionItems) ? rawNotes.actionItems : [];
         const ownerIds = new Set<string>();
         const pickOwnerId = (item: any): string | null => {
-          const candidate = item?.owner ?? item?.ownerId ?? item?.assignee ?? item?.assigneeId ?? null;
+          const candidate = item?.owner ?? item?.ownerId ?? item?.assignee ?? item?.assigneeId ?? item?.assignedTo ?? null;
           const asString = candidate && typeof candidate === "object"
             ? (candidate.id ?? null)
             : candidate;
@@ -2615,7 +2686,7 @@ export const getMeetingReport: RequestHandler = async (req: AuthenticatedRequest
          LIMIT 2000`,
         [meeting.id],
       );
-      transcripts = transcriptResult.rows;
+      transcripts = await resolveSpeakerNames(transcriptResult.rows);
     } catch { /* transcript table may not exist yet */ }
 
     // Recordings for this meeting.

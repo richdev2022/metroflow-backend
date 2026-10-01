@@ -807,6 +807,67 @@ export const sendMessage: RequestHandler = async (
             notificationPayload,
           );
         }
+
+        // FCM push for OTHER participants (WhatsApp-style): without this,
+        // chat messages only ever reached devices through the socket — a
+        // killed app never saw any chat notification. Fire-and-forget;
+        // carries the recipient's TOTAL unread count so the mobile launcher
+        // badge stays exact.
+        try {
+          const { sendPushToUsers } = await import("../services/push");
+          const recipientIds = participantsResult.rows
+            .map((row: any) => row.userId)
+            .filter((id: any): id is string => !!id && id !== userId);
+          if (recipientIds.length > 0) {
+            const pushTitle = conversationType === "group"
+              ? `${message.senderName || "Someone"} · ${conversationName || "Group"}`
+              : message.senderName || "New message";
+            const pushBody = conversationType === "group" && conversationName
+              ? `${message.senderName || "Someone"}: ${preview}`
+              : preview || "Sent you a message";
+            const unreadByUser = new Map<string, number>();
+            await Promise.all(
+              recipientIds.map(async (recipientId: string) => {
+                try {
+                  const unreadRes = await query(
+                    `SELECT COUNT(*)::int AS unread
+                     FROM chat_messages cm
+                     JOIN chat_participants cp
+                       ON cp.conversation_id = cm.conversation_id AND cp.user_id = $1
+                     WHERE cm.sender_id <> $1
+                       AND cm.created_at > COALESCE(cp.last_read_at, cp.created_at, to_timestamp(0))`,
+                    [recipientId],
+                  );
+                  unreadByUser.set(recipientId, unreadRes.rows[0]?.unread || 1);
+                } catch {
+                  unreadByUser.set(recipientId, 1);
+                }
+              }),
+            );
+            await sendPushToUsers(
+              recipientIds.map((recipientId: string) => ({ userId: recipientId })),
+              {
+                title: pushTitle,
+                body: pushBody,
+                data: {
+                  type: "chat-message",
+                  conversationId,
+                  messageId: message.id,
+                  senderId: userId,
+                  senderName: message.senderName || "Someone",
+                  conversationName: conversationName || "",
+                  conversationType,
+                  message: preview,
+                  badge: String(unreadByUser.size > 0 ? Math.max(...unreadByUser.values()) : 1),
+                },
+                androidChannelId: "general",
+              },
+              { inApp: false, type: "chat_message" },
+            ).catch(() => {});
+          }
+        } catch (chatPushError) {
+          console.error("Chat FCM push error:", chatPushError);
+        }
       } catch (notifyError) {
         console.error("Chat notification push error:", notifyError);
       }

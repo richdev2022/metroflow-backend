@@ -14,6 +14,12 @@ import {
   resolveProviderForRoom,
 } from "../lib/calling/factory";
 import { generateMeetingNotes, hasSummarizableTranscript } from "../lib/meeting-notes";
+import {
+  computeOccurrences,
+  isRecurrenceInput,
+  scheduleMeetingReminders,
+  type RecurrenceInput,
+} from "../services/meetingReminders";
 
 // Helper to check if string is valid UUID v4
 function isValidUUID(str: string): boolean {
@@ -57,6 +63,112 @@ async function getBusinessUserIds(userIds: string[], businessId: string) {
   return new Set(result.rows.map((row) => row.id));
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Normalise + validate a client-supplied guest email list (cap 50). */
+function sanitizeGuestEmails(raw: unknown): { emails: string[]; error?: string } {
+  if (raw === undefined || raw === null) return { emails: [] };
+  if (!Array.isArray(raw)) return { emails: [], error: "guestEmails must be an array of email addresses" };
+  const emails = Array.from(
+    new Set(
+      raw
+        .map((e) => (typeof e === "string" ? e.trim().toLowerCase() : ""))
+        .filter(Boolean),
+    ),
+  );
+  if (emails.length > 50) return { emails: [], error: "A meeting can have at most 50 guest email participants" };
+  for (const email of emails) {
+    if (!EMAIL_RE.test(email)) return { emails: [], error: `Invalid guest email: ${email}` };
+  }
+  return { emails };
+}
+
+/**
+ * Insert one meeting row (series head OR a recurrence occurrence) and return
+ * the enriched-shaped row. Shared by the single-meeting and recurring paths so
+ * both always persist the same columns.
+ */
+async function insertMeetingOccurrence(params: {
+  businessId: string;
+  userId: string;
+  title: string;
+  description: string | null;
+  startTime: Date;
+  endTime: Date | null;
+  timezone: string;
+  meetingCode?: string;
+  isInstant: boolean;
+  password: string | null;
+  maxParticipants: number | null;
+  waitingRoomEnabled: boolean;
+  recordingEnabled: boolean;
+  screenSharingEnabled: boolean;
+  provider: string | null;
+  recurrenceRule: string | null;
+  recurrenceParentId: string | null;
+  occurrenceIndex: number;
+}) {
+  // Each occurrence needs its own unique code (join links are per-occurrence)
+  let meetingCode = params.meetingCode;
+  if (!meetingCode) {
+    let isUnique = false;
+    while (!isUnique) {
+      meetingCode = generateMeetingCode();
+      const check = await query(`SELECT id FROM meetings WHERE meeting_code = $1`, [meetingCode]);
+      if (check.rows.length === 0) isUnique = true;
+    }
+  }
+
+  const result = await query(
+    `INSERT INTO meetings 
+      (business_id, title, description, start_time, end_time, timezone, created_by, host_id, meeting_code, 
+       is_instant, password, max_participants, waiting_room_enabled, recording_enabled, screen_sharing_enabled, provider,
+       recurrence_rule, recurrence_parent_id, occurrence_index)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
+               timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
+               status, meeting_code as "meetingCode", is_instant as "isInstant", password,
+               max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
+               recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
+               google_event_id as "googleEventId", provider,
+               recurrence_rule as "recurrenceRule", recurrence_parent_id as "recurrenceParentId",
+               occurrence_index as "occurrenceIndex",
+               created_at as "createdAt", updated_at as "updatedAt"`,
+    [
+      params.businessId,
+      params.title,
+      params.description,
+      params.startTime.toISOString(),
+      params.endTime ? params.endTime.toISOString() : null,
+      params.timezone,
+      params.userId,
+      params.userId,
+      meetingCode,
+      params.isInstant,
+      params.password,
+      params.maxParticipants,
+      params.waitingRoomEnabled,
+      params.recordingEnabled,
+      params.screenSharingEnabled,
+      params.provider,
+      params.recurrenceRule,
+      params.recurrenceParentId,
+      params.occurrenceIndex,
+    ],
+  );
+  return result.rows[0];
+}
+
+/** Attach guest list (meeting_guests rows) to a meeting object. */
+async function attachGuests(meeting: any): Promise<void> {
+  if (!meeting?.id) return;
+  const guestsRes = await query(
+    `SELECT id, email, name, status FROM meeting_guests WHERE meeting_id = $1 ORDER BY created_at ASC`,
+    [meeting.id],
+  );
+  meeting.guests = guestsRes.rows;
+}
+
 /**
  * @swagger
  * /meetings:
@@ -96,8 +208,26 @@ export const getMeetings: RequestHandler = async (
     }
 
     const page = parseInt(req.query.page as string) || 1;
+    // Default limit stays 10 (contract tested by rtc-scoping.spec.ts); the
+    // Calendar clients pass an explicit limit when fetching a month window.
     const limit = parseInt(req.query.limit as string) || 10;
     const offset = (page - 1) * limit;
+
+    // Optional calendar window filters (ISO dates). Used by the Calendar page
+    // to fetch exactly the meetings inside a month/week view.
+    const fromParam = req.query.from as string | undefined;
+    const toParam = req.query.to as string | undefined;
+    let fromFilter = "";
+    let toFilter = "";
+    const filterParams: any[] = [businessId, userId];
+    if (fromParam && !isNaN(new Date(fromParam).getTime())) {
+      filterParams.push(new Date(fromParam).toISOString());
+      fromFilter = ` AND m.start_time >= $${filterParams.length}`;
+    }
+    if (toParam && !isNaN(new Date(toParam).getTime())) {
+      filterParams.push(new Date(toParam).toISOString());
+      toFilter = ` AND m.start_time <= $${filterParams.length}`;
+    }
 
     const countResult = await query(
       `SELECT COUNT(*) as total
@@ -111,11 +241,12 @@ export const getMeetings: RequestHandler = async (
            SELECT 1 FROM meeting_attendees ma
            WHERE ma.meeting_id = m.id AND ma.user_id = $2
          )
-       )`,
-      [businessId, userId],
+       )${fromFilter}${toFilter}`,
+      filterParams,
     );
     const total = parseInt(countResult.rows[0].total);
 
+    const listParams = [...filterParams, limit, offset];
     const result = await query(
       `SELECT 
         m.id, m.title, m.description, m.start_time as "startTime", m.end_time as "endTime", 
@@ -123,12 +254,21 @@ export const getMeetings: RequestHandler = async (
         m.status, m.meeting_code as "meetingCode", m.is_instant as "isInstant", m.password,
         m.max_participants as "maxParticipants", m.waiting_room_enabled as "waitingRoomEnabled",
         m.recording_enabled as "recordingEnabled", m.screen_sharing_enabled as "screenSharingEnabled",
-        m.google_event_id as "googleEventId", m.created_at as "createdAt", m.updated_at as "updatedAt",
+        m.google_event_id as "googleEventId",
+        m.recurrence_rule as "recurrenceRule", m.recurrence_parent_id as "recurrenceParentId",
+        m.occurrence_index as "occurrenceIndex",
+        m.created_at as "createdAt", m.updated_at as "updatedAt",
         json_agg(json_build_object(
           'id', ma.id,
           'userId', ma.user_id,
           'status', ma.status
-        )) FILTER (WHERE ma.id IS NOT NULL) as attendees
+        )) FILTER (WHERE ma.id IS NOT NULL) as attendees,
+        (SELECT json_agg(json_build_object(
+          'id', g.id,
+          'email', g.email,
+          'name', g.name,
+          'status', g.status
+        )) FROM meeting_guests g WHERE g.meeting_id = m.id) as guests
       FROM meetings m
       LEFT JOIN meeting_attendees ma ON m.id = ma.meeting_id
       WHERE m.business_id = $1
@@ -140,11 +280,11 @@ export const getMeetings: RequestHandler = async (
           SELECT 1 FROM meeting_attendees current_ma
           WHERE current_ma.meeting_id = m.id AND current_ma.user_id = $2
         )
-      )
+      )${fromFilter}${toFilter}
       GROUP BY m.id
       ORDER BY m.start_time DESC
-      LIMIT $3 OFFSET $4`,
-      [businessId, userId, limit, offset],
+      LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams,
     );
 
     const meetings = result.rows.map(enrichMeeting);
@@ -233,7 +373,7 @@ export const createMeeting: RequestHandler = async (
   res,
 ) => {
   try {
-    const { title, description, startTime, endTime, timezone, isInstant, attendeeIds, password, maxParticipants, waitingRoomEnabled, recordingEnabled, screenSharingEnabled } =
+    const { title, description, startTime, endTime, timezone, isInstant, attendeeIds, guestEmails, recurrence, password, maxParticipants, waitingRoomEnabled, recordingEnabled, screenSharingEnabled } =
       req.body;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
@@ -268,6 +408,29 @@ export const createMeeting: RequestHandler = async (
         success: false,
         error: "All meeting attendees must belong to this business",
       });
+    }
+
+    // Google-style guest participants: plain email addresses that are not (yet)
+    // team members. They get email invitations + reminders only.
+    const guestCheck = sanitizeGuestEmails(guestEmails);
+    if (guestCheck.error) {
+      return res.status(400).json({ success: false, error: guestCheck.error });
+    }
+    const guestEmailList = guestCheck.emails;
+
+    // Recurrence: only meaningful for scheduled meetings. Validated up-front so
+    // a malformed payload never half-creates a series.
+    let recurrenceInput: RecurrenceInput | null = null;
+    if (recurrence !== undefined && recurrence !== null) {
+      if (!isInstant && recurrence !== null) {
+        if (!isRecurrenceInput(recurrence)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid recurrence. frequency must be DAILY, WEEKLY, MONTHLY, YEARLY or CUSTOM",
+          });
+        }
+        recurrenceInput = recurrence as RecurrenceInput;
+      }
     }
 
     const planResult = await query(
@@ -320,49 +483,74 @@ export const createMeeting: RequestHandler = async (
       }
     }
 
-    // Generate unique meeting code
-    let meetingCode;
-    let isUnique = false;
-    while (!isUnique) {
-      meetingCode = generateMeetingCode();
-      const check = await query(`SELECT id FROM meetings WHERE meeting_code = $1`, [meetingCode]);
-      if (check.rows.length === 0) {
-        isUnique = true;
+    // Materialise the full series (single meeting = one occurrence). The head
+    // is occurrence 0; every further occurrence becomes its own meeting row
+    // (own join code) linked back via recurrence_parent_id so the Calendar can
+    // show and remind each one independently.
+    const occurrenceTimes: Array<{ start: Date; end: Date | null }> = [
+      { start: finalStartTime, end: finalEndTime },
+    ];
+    if (!isInstant && recurrenceInput) {
+      try {
+        occurrenceTimes.push(...computeOccurrences(finalStartTime, finalEndTime, recurrenceInput));
+      } catch (err: any) {
+        console.error("computeOccurrences error:", err);
+        return res.status(400).json({ success: false, error: "Invalid recurrence schedule" });
       }
     }
+    const recurrenceRuleJson = recurrenceInput ? JSON.stringify(recurrenceInput) : null;
 
-    const result = await query(
-      `INSERT INTO meetings 
-        (business_id, title, description, start_time, end_time, timezone, created_by, host_id, meeting_code, 
-         is_instant, password, max_participants, waiting_room_enabled, recording_enabled, screen_sharing_enabled, provider)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-       RETURNING id, title, description, start_time as "startTime", end_time as "endTime", 
-                 timezone, created_by as "createdById", host_id as "hostId", co_host_id as "coHostId",
-                 status, meeting_code as "meetingCode", is_instant as "isInstant", password,
-                 max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
-                 recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
-                 google_event_id as "googleEventId", provider, created_at as "createdAt", updated_at as "updatedAt"`,
-      [
-        businessId,
-        title,
-        description || null,
-        finalStartTime.toISOString(),
-        finalEndTime ? finalEndTime.toISOString() : null,
-        timezone || 'UTC',
-        userId,
-        userId,
-        meetingCode,
-        isInstant || false,
-        password || null,
-        effectiveMaxParticipants,
-        waitingRoomEnabled || false,
-        recordingEnabled || false,
-        screenSharingEnabled !== undefined ? screenSharingEnabled : true,
-        callingProvider,
-      ],
-    );
+    const insertParams = {
+      businessId,
+      userId,
+      title,
+      description: description || null,
+      timezone: timezone || 'UTC',
+      isInstant: isInstant || false,
+      password: password || null,
+      maxParticipants: effectiveMaxParticipants,
+      waitingRoomEnabled: waitingRoomEnabled || false,
+      recordingEnabled: recordingEnabled || false,
+      screenSharingEnabled: screenSharingEnabled !== undefined ? screenSharingEnabled : true,
+      provider: callingProvider,
+      recurrenceRule: recurrenceRuleJson,
+    };
 
-    const meeting = result.rows[0];
+    const meeting = await insertMeetingOccurrence({
+      ...insertParams,
+      startTime: occurrenceTimes[0].start,
+      endTime: occurrenceTimes[0].end,
+      recurrenceParentId: null,
+      occurrenceIndex: 0,
+    });
+
+    // Remaining occurrences of the series
+    for (let i = 1; i < occurrenceTimes.length; i++) {
+      const occurrence = occurrenceTimes[i];
+      const occurrenceRow = await insertMeetingOccurrence({
+        ...insertParams,
+        startTime: occurrence.start,
+        endTime: occurrence.end,
+        recurrenceParentId: meeting.id,
+        occurrenceIndex: i,
+      });
+      // Attendees mirror onto every occurrence
+      for (const attendeeId of uniqueAttendeeIds) {
+        await query(
+          `INSERT INTO meeting_attendees (meeting_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [occurrenceRow.id, attendeeId],
+        );
+      }
+      // Guests mirror onto every occurrence (invitation email fires once for
+      // the series head — reminders keep later occurrences visible)
+      for (const email of guestEmailList) {
+        await query(
+          `INSERT INTO meeting_guests (meeting_id, email) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [occurrenceRow.id, email],
+        );
+      }
+      await scheduleMeetingReminders(occurrenceRow.id, occurrence.start);
+    }
 
     // Add attendees - deduplicate IDs to avoid unique constraint violation
     const attendees = [];
@@ -431,8 +619,48 @@ export const createMeeting: RequestHandler = async (
       }
     }
 
+    // Guest (external email) participants on the series head — email invitation
+    // (they have no app account, so no in-app notification is possible)
+    for (const guestEmail of guestEmailList) {
+      await query(
+        `INSERT INTO meeting_guests (meeting_id, email) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [meeting.id, guestEmail],
+      );
+    }
+    if (guestEmailList.length > 0) {
+      const currentUserResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const inviterName = currentUserResult.rows[0]?.name || 'Someone';
+      const guestLink = buildMeetingLink(meeting.meetingCode);
+      for (const guestEmail of guestEmailList) {
+        const emailHtml = generateMeetingInvitationEmailHtml(
+          guestEmail,
+          title,
+          description || null,
+          finalStartTime,
+          finalEndTime || new Date(finalStartTime.getTime() + 60 * 60000),
+          meeting.meetingCode,
+          inviterName,
+          guestLink,
+          password || null,
+          waitingRoomEnabled || false
+        );
+        await sendEmail(guestEmail, guestEmail, `Meeting Invitation: ${title}`, emailHtml).catch((err: any) =>
+          console.error("Guest invitation email error:", err?.message || err),
+        );
+      }
+    }
+
+    // Reminder rows (push + email at 60 and 15 minutes before) for the head;
+    // occurrence rows already got theirs above.
+    await scheduleMeetingReminders(meeting.id, finalStartTime);
+
     meeting.attendees = attendees;
+    await attachGuests(meeting);
     meeting.maxMeetingDuration = planMaxMeetingDuration;
+    if (recurrenceInput) {
+      meeting.recurrence = recurrenceInput;
+      meeting.occurrencesCreated = occurrenceTimes.length;
+    }
     enrichMeeting(meeting);
 
     // Log activity
@@ -506,7 +734,10 @@ export const getMeetingByCode: RequestHandler = async (
               status, meeting_code as "meetingCode", is_instant as "isInstant", password,
               max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
               recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
-              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+              google_event_id as "googleEventId",
+              recurrence_rule as "recurrenceRule", recurrence_parent_id as "recurrenceParentId",
+              occurrence_index as "occurrenceIndex",
+              created_at as "createdAt", updated_at as "updatedAt"
        FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
       [code, businessId],
     );
@@ -524,6 +755,7 @@ export const getMeetingByCode: RequestHandler = async (
       [meeting.id],
     );
     meeting.attendees = attendeeResult.rows;
+    await attachGuests(meeting);
     enrichMeeting(meeting);
 
     const response: ApiResponse<any> = {
@@ -582,7 +814,10 @@ export const getMeetingById: RequestHandler = async (
               status, meeting_code as "meetingCode", is_instant as "isInstant", password,
               max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
               recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
-              google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+              google_event_id as "googleEventId",
+              recurrence_rule as "recurrenceRule", recurrence_parent_id as "recurrenceParentId",
+              occurrence_index as "occurrenceIndex",
+              created_at as "createdAt", updated_at as "updatedAt"
        FROM meetings WHERE id = $1 AND business_id = $2`,
       [id, businessId],
     )
@@ -595,7 +830,10 @@ export const getMeetingById: RequestHandler = async (
                 status, meeting_code as "meetingCode", is_instant as "isInstant", password,
                 max_participants as "maxParticipants", waiting_room_enabled as "waitingRoomEnabled",
                 recording_enabled as "recordingEnabled", screen_sharing_enabled as "screenSharingEnabled",
-                google_event_id as "googleEventId", created_at as "createdAt", updated_at as "updatedAt"
+                google_event_id as "googleEventId",
+                recurrence_rule as "recurrenceRule", recurrence_parent_id as "recurrenceParentId",
+                occurrence_index as "occurrenceIndex",
+                created_at as "createdAt", updated_at as "updatedAt"
          FROM meetings WHERE meeting_code = $1 AND business_id = $2`,
         [id, businessId],
       );
@@ -614,6 +852,7 @@ export const getMeetingById: RequestHandler = async (
       [meeting.id],
     );
     meeting.attendees = attendeeResult.rows;
+    await attachGuests(meeting);
     enrichMeeting(meeting);
 
     const response: ApiResponse<any> = {

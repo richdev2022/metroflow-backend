@@ -744,6 +744,107 @@ export function generateMeetingInvitationEmailHtml(
   `;
 }
 
+interface MeetingReminderEmailInput {
+  name: string;
+  title: string;
+  description: string | null;
+  startTime: Date;
+  endTime: Date | null;
+  timezone: string;
+  minutes: number;
+  meetingCode: string;
+  link: string;
+  recurrenceNote?: string;
+}
+
+export function generateMeetingReminderEmailHtml(input: MeetingReminderEmailInput): string {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
+  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+
+  const formatDateTime = (date: Date) => {
+    return date.toLocaleString('en-NG', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const whenLabel = input.minutes >= 60
+    ? `${Math.round(input.minutes / 60)} hour${input.minutes >= 120 ? 's' : ''}`
+    : `${input.minutes} minutes`;
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Upcoming Meeting Reminder</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            Hi ${input.name},
+          </p>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
+            <strong>${input.title}</strong> starts in <strong>${whenLabel}</strong>.
+          </p>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <p style="margin: 0 0 12px 0; color: #111827; font-weight: 600; font-size: 18px;">${input.title}</p>
+            ${input.description ? `<p style="margin: 0 0 16px 0; color: #6b7280;">${input.description}</p>` : ''}
+            <div style="margin-bottom: 8px;">
+              <span style="color: #6b7280; font-weight: 600;">Start:</span>
+              <span style="color: #111827; margin-left: 8px;">${formatDateTime(input.startTime)}</span>
+            </div>
+            ${input.endTime ? `
+            <div style="margin-bottom: 8px;">
+              <span style="color: #6b7280; font-weight: 600;">End:</span>
+              <span style="color: #111827; margin-left: 8px;">${formatDateTime(input.endTime)}</span>
+            </div>
+            ` : ''}
+            ${input.timezone ? `
+            <div style="margin-bottom: 8px;">
+              <span style="color: #6b7280; font-weight: 600;">Timezone:</span>
+              <span style="color: #111827; margin-left: 8px;">${input.timezone}</span>
+            </div>
+            ` : ''}
+            ${input.recurrenceNote ? `
+            <div style="margin-bottom: 12px;">
+              <span style="color: #6b7280; font-weight: 600;">Repeats:</span>
+              <span style="color: #111827; margin-left: 8px;">${input.recurrenceNote}</span>
+            </div>
+            ` : ''}
+            <div style="background-color: #eff6ff; padding: 12px; border-radius: 6px;">
+              <span style="color: #1e40af; font-weight: 600;">Meeting Code:</span>
+              <span style="color: #1e40af; font-family: monospace; margin-left: 8px; font-size: 18px;">${input.meetingCode}</span>
+            </div>
+          </div>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${input.link}" style="background-color: #2563eb; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">
+              Join Meeting
+            </a>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 12px; margin-bottom: 24px;">
+            If the button doesn't work, copy this link: <br/>
+            <span style="word-break: break-all; color: #2563eb;">${input.link}</span>
+          </p>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
+            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+          </p>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 export function generateCallInvitationEmailHtml(
   userName: string,
   callType: 'audio' | 'video',

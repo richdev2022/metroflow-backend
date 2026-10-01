@@ -4109,4 +4109,254 @@ protectedRouter.put("/ai/limits/:planId", requirePermission('manage_plans'), asy
     }
 });
 
+// ============================================================================
+// GROWTH — site wishlist, email subscribers, notification campaigns
+// (gated by the 'manage_growth' permission)
+// ============================================================================
+
+import {
+  SUBSCRIBER_CATEGORIES,
+  sendCategoryCampaign,
+  normalizeCategories,
+} from "../services/siteGrowth";
+
+protectedRouter.get("/growth/categories", requirePermission('manage_growth'), async (_req: AuthenticatedAdminRequest, res) => {
+    res.json({ success: true, data: SUBSCRIBER_CATEGORIES });
+});
+
+protectedRouter.get("/growth/overview", requirePermission('manage_growth'), async (_req: AuthenticatedAdminRequest, res) => {
+    try {
+        const wishlistRes = await query(`SELECT COUNT(*)::int AS total FROM site_wishlist_entries`);
+        const subscribersRes = await query(`SELECT COUNT(*)::int AS total FROM site_subscribers WHERE is_active = TRUE`);
+        const perCategory = await query(
+            `SELECT c AS category, COUNT(*)::int AS total
+             FROM site_subscribers, unnest(categories) AS c
+             WHERE is_active = TRUE
+             GROUP BY c ORDER BY total DESC`
+        );
+        const campaignsRes = await query(
+            `SELECT COUNT(*)::int AS total, COALESCE(SUM(sent_count), 0)::int AS emails_sent FROM site_email_campaigns`
+        );
+        const last7 = await query(
+            `SELECT COUNT(*)::int AS total FROM site_wishlist_entries WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'`
+        );
+        res.json({
+            success: true,
+            data: {
+                wishlist_total: wishlistRes.rows[0].total,
+                wishlist_last_7_days: last7.rows[0].total,
+                subscribers_total: subscribersRes.rows[0].total,
+                subscribers_per_category: perCategory.rows,
+                campaigns_total: campaignsRes.rows[0].total,
+                emails_sent_total: campaignsRes.rows[0].emails_sent,
+            },
+        });
+    } catch (error: any) {
+        console.error("Admin growth overview error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load growth overview" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/growth/wishlist:
+ *   get:
+ *     summary: List all Personal wishlist entries (searchable, paginated)
+ *     tags: [Admin]
+ */
+protectedRouter.get("/growth/wishlist", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+        const offset = (page - 1) * limit;
+
+        const params: unknown[] = [];
+        let where = "";
+        if (search) {
+            params.push(`%${search}%`);
+            where = `WHERE name ILIKE $1 OR email ILIKE $1 OR note ILIKE $1`;
+        }
+
+        const totalRes = await query(`SELECT COUNT(*)::int AS total FROM site_wishlist_entries ${where}`, params);
+        const rowsRes = await query(
+            `SELECT id, name, email, features, note, source, welcome_email_sent_at as "welcomeEmailSentAt", created_at as "createdAt"
+             FROM site_wishlist_entries ${where}
+             ORDER BY created_at DESC
+             LIMIT ${limit} OFFSET ${offset}`,
+            params,
+        );
+        res.json({
+            success: true,
+            data: {
+                items: rowsRes.rows,
+                total: totalRes.rows[0].total,
+                page,
+                limit,
+            },
+        });
+    } catch (error: any) {
+        console.error("Admin wishlist list error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load wishlist" });
+    }
+});
+
+protectedRouter.delete("/growth/wishlist/:id", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`DELETE FROM site_wishlist_entries WHERE id = $1 RETURNING id`, [req.params.id]);
+        if (result.rows.length === 0) return res.status(404).json({ success: false, error: "Wishlist entry not found" });
+        res.json({ success: true, message: "Wishlist entry removed" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete wishlist entry" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/growth/subscribers:
+ *   get:
+ *     summary: List email subscribers (filter by category, searchable)
+ *     tags: [Admin]
+ */
+protectedRouter.get("/growth/subscribers", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const category = String(req.query.category || "").trim();
+        const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+        const offset = (page - 1) * limit;
+
+        const params: unknown[] = [];
+        const clauses: string[] = [];
+        if (search) {
+            params.push(`%${search}%`);
+            clauses.push(`(name ILIKE $${params.length} OR email ILIKE $${params.length})`);
+        }
+        if (category) {
+            params.push(category);
+            clauses.push(`$${params.length} = ANY(categories)`);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+        const totalRes = await query(`SELECT COUNT(*)::int AS total FROM site_subscribers ${where}`, params);
+        const rowsRes = await query(
+            `SELECT id, name, email, categories, source, is_active as "isActive",
+                    welcome_email_sent_at as "welcomeEmailSentAt", created_at as "createdAt"
+             FROM site_subscribers ${where}
+             ORDER BY created_at DESC
+             LIMIT ${limit} OFFSET ${offset}`,
+            params,
+        );
+        res.json({
+            success: true,
+            data: { items: rowsRes.rows, total: totalRes.rows[0].total, page, limit },
+        });
+    } catch (error: any) {
+        console.error("Admin subscribers list error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load subscribers" });
+    }
+});
+
+/** Admin manually adds a subscriber. */
+protectedRouter.post("/growth/subscribers", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { addSubscriber, isValidEmail } = await import("../services/siteGrowth");
+        const email = String(req.body?.email || "").trim();
+        if (!isValidEmail(email)) return res.status(400).json({ success: false, error: "A valid email address is required" });
+        const result = await addSubscriber({
+            name: req.body?.name,
+            email,
+            categories: normalizeCategories(req.body?.categories).length
+                ? normalizeCategories(req.body?.categories)
+                : ["product_updates"],
+            source: "admin",
+        });
+        res.json({ success: true, data: result, message: "Subscriber added" });
+    } catch (error: any) {
+        res.status(400).json({ success: false, error: error.message || "Could not add subscriber" });
+    }
+});
+
+/** Update a subscriber's categories / active flag. */
+protectedRouter.put("/growth/subscribers/:id", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const sets: string[] = [];
+        const params: unknown[] = [];
+        if (Array.isArray(req.body?.categories)) {
+            const cats = normalizeCategories(req.body.categories);
+            params.push(cats);
+            sets.push(`categories = $${params.length}`);
+        }
+        if (typeof req.body?.isActive === "boolean") {
+            params.push(req.body.isActive);
+            sets.push(`is_active = $${params.length}`);
+        }
+        if (sets.length === 0) return res.status(400).json({ success: false, error: "Nothing to update" });
+        params.push(req.params.id);
+        const result = await query(
+            `UPDATE site_subscribers SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = $${params.length}
+             RETURNING id, email, categories, is_active`,
+            params,
+        );
+        if (result.rows.length === 0) return res.status(404).json({ success: false, error: "Subscriber not found" });
+        res.json({ success: true, data: result.rows[0], message: "Subscriber updated" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update subscriber" });
+    }
+});
+
+protectedRouter.delete("/growth/subscribers/:id", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`DELETE FROM site_subscribers WHERE id = $1 RETURNING id`, [req.params.id]);
+        if (result.rows.length === 0) return res.status(404).json({ success: false, error: "Subscriber not found" });
+        res.json({ success: true, message: "Subscriber removed" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete subscriber" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/growth/campaigns/send:
+ *   post:
+ *     summary: Send an email notification to every subscriber of a category
+ *     tags: [Admin]
+ */
+protectedRouter.post("/growth/campaigns/send", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await sendCategoryCampaign({
+            category: req.body?.category,
+            subject: req.body?.subject,
+            bodyHtml: req.body?.bodyHtml,
+            createdBy: req.admin!.adminId,
+        });
+        res.json({
+            success: true,
+            message: `Campaign sent — ${result.sent}/${result.recipients} delivered`,
+            data: result,
+        });
+    } catch (error: any) {
+        res.status(400).json({ success: false, error: error.message || "Campaign failed" });
+    }
+});
+
+protectedRouter.get("/growth/campaigns", requirePermission('manage_growth'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "25"), 10) || 25));
+        const offset = (page - 1) * limit;
+        const totalRes = await query(`SELECT COUNT(*)::int AS total FROM site_email_campaigns`);
+        const rowsRes = await query(
+            `SELECT id, category, subject, recipients_count as "recipientsCount", sent_count as "sentCount",
+                    failed_count as "failedCount", created_at as "createdAt", completed_at as "completedAt"
+             FROM site_email_campaigns
+             ORDER BY created_at DESC
+             LIMIT ${limit} OFFSET ${offset}`,
+        );
+        res.json({ success: true, data: { items: rowsRes.rows, total: totalRes.rows[0].total, page, limit } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load campaigns" });
+    }
+});
+
 export default router;

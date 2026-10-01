@@ -3769,6 +3769,151 @@ protectedRouter.post("/virtual-accounts/:walletId/regenerate", requirePermission
 
 
 /**
+ * POST /admin/virtual-accounts/regenerate-bulk
+ * Regenerate business-wallet virtual accounts so the account NAME is the
+ * BUSINESS name (not the owner's personal name).
+ * Body:
+ *   { all: true }                      -> every business wallet
+ *   { businessId }                     -> one business
+ *   { userId }                         -> the business that user belongs to
+ *                                        (as owner/admin)
+ * Uses the ACTIVE payment provider; per-wallet results are returned.
+ */
+protectedRouter.post("/virtual-accounts/regenerate-bulk", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { all, businessId, userId } = req.body || {};
+        let walletIds: string[] = [];
+
+        if (all) {
+            const r = await query(
+                `SELECT id FROM wallets WHERE business_id IS NOT NULL ORDER BY created_at DESC`,
+            );
+            walletIds = r.rows.map((row: any) => row.id);
+        } else if (businessId) {
+            const r = await query(`SELECT id FROM wallets WHERE business_id = $1`, [businessId]);
+            walletIds = r.rows.map((row: any) => row.id);
+        } else if (userId) {
+            const userRes = await query(`SELECT business_id FROM users WHERE id = $1`, [userId]);
+            const userBizId = userRes.rows[0]?.business_id;
+            if (!userBizId) {
+                return res.status(400).json({ success: false, error: "User has no business" });
+            }
+            const r = await query(`SELECT id FROM wallets WHERE business_id = $1`, [userBizId]);
+            walletIds = r.rows.map((row: any) => row.id);
+        } else {
+            return res.status(400).json({ success: false, error: "Provide all=true, businessId or userId" });
+        }
+
+        const { getProvider, getActiveProviderName } = await import("../services/providers/factory");
+        const activeProviderName = await getActiveProviderName().catch(() => null);
+
+        const results: any[] = [];
+        for (const walletId of walletIds) {
+            try {
+                const walletRes = await query(
+                    `SELECT w.*, b.name AS business_name FROM wallets w JOIN businesses b ON b.id = w.business_id WHERE w.id = $1`,
+                    [walletId],
+                );
+                if (walletRes.rows.length === 0) {
+                    results.push({ wallet_id: walletId, success: false, error: "Wallet not found" });
+                    continue;
+                }
+                const wallet = walletRes.rows[0];
+
+                const ownerRes = await query(
+                    `SELECT id, bvn, nin, phone_number FROM users WHERE business_id = $1 AND role IN ('owner','admin') ORDER BY CASE WHEN role = 'owner' THEN 0 ELSE 1 END LIMIT 1`,
+                    [wallet.business_id],
+                );
+                const owner = ownerRes.rows[0];
+                if (!owner?.bvn) {
+                    results.push({ wallet_id: walletId, business: wallet.business_name, success: false, error: "No owner/admin BVN on file" });
+                    continue;
+                }
+
+                const provider = getProvider(activeProviderName || undefined);
+                const vaResponse = await provider.createBusinessVirtualAccount({
+                    bvn: owner.bvn,
+                    nin: owner.nin || "12345678901",
+                    businessName: wallet.business_name,
+                    customerIdentifier: `BIZ-${String(wallet.business_id).substring(0, 8)}`,
+                    phoneNumber: owner.phone_number || "08000000000",
+                    beneficiaryAccount: wallet.beneficiary_account || "0000000000",
+                } as any);
+
+                let vaNumber: string | null = null;
+                let bankCode = '058';
+                if (provider.name === 'flutterwave') {
+                    if (vaResponse?.status === 'success' && vaResponse?.data?.account_number) {
+                        vaNumber = String(vaResponse.data.account_number);
+                        bankCode = vaResponse.data.bank_code || '058';
+                    }
+                } else if (provider.name === 'monnify') {
+                    if (vaResponse?.requestSuccessful) {
+                        const accounts = vaResponse?.responseBody?.accounts;
+                        vaNumber = accounts?.[0]?.accountNumber || null;
+                        bankCode = accounts?.[0]?.bankCode || '058';
+                    }
+                } else if (provider.name === 'squad') {
+                    if (vaResponse?.success && vaResponse?.data) {
+                        vaNumber = vaResponse.data.virtual_account_number;
+                        bankCode = vaResponse.data.bank_code || '058';
+                    }
+                }
+
+                if (!vaNumber) {
+                    const errMsg = vaResponse?.responseMessage || vaResponse?.message || "Provider failed to recreate the virtual account";
+                    results.push({ wallet_id: walletId, business: wallet.business_name, success: false, error: errMsg });
+                    continue;
+                }
+
+                // Legacy columns on the wallets row.
+                await query(
+                    `UPDATE wallets SET virtual_account_number = $1, bank_code = $2, account_name = $3, payment_provider = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5`,
+                    [vaNumber, bankCode, wallet.business_name, provider.name, walletId],
+                );
+                // AND the virtual_accounts row the wallet screen actually reads —
+                // keep it in sync so both surfaces show the business name.
+                const existingVa = await query(
+                    `SELECT id FROM virtual_accounts WHERE wallet_id = $1 AND payment_provider = $2`,
+                    [walletId, provider.name],
+                );
+                if (existingVa.rows.length > 0) {
+                    await query(
+                        `UPDATE virtual_accounts SET virtual_account_number = $1, bank_code = $2, account_name = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
+                        [vaNumber, bankCode, wallet.business_name, existingVa.rows[0].id],
+                    );
+                } else {
+                    await query(
+                        `INSERT INTO virtual_accounts (wallet_id, payment_provider, virtual_account_number, bank_code, account_name, customer_identifier, beneficiary_account, provider_metadata)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                        [walletId, provider.name, vaNumber, bankCode, wallet.business_name, `BIZ-${String(wallet.business_id).substring(0, 8)}`, "0000000000", JSON.stringify(vaResponse)],
+                    );
+                }
+
+                results.push({
+                    wallet_id: walletId,
+                    business: wallet.business_name,
+                    success: true,
+                    account_number: vaNumber,
+                    bank_code: bankCode,
+                    account_name: wallet.business_name,
+                });
+            } catch (err: any) {
+                results.push({ wallet_id: walletId, success: false, error: err?.message || "Regeneration failed" });
+            }
+        }
+
+        res.json({
+            success: true,
+            message: `Regenerated ${results.filter((r) => r.success).length}/${results.length} business wallet(s)`,
+            data: results,
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to regenerate business wallets" });
+    }
+});
+
+/**
  * POST /admin/virtual-accounts/clear
  * Deletes virtual accounts, optionally scoped:
  *   { provider }                                  -> EVERY VA on that provider

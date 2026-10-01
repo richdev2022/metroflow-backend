@@ -208,7 +208,9 @@ export const getMeetings: RequestHandler = async (
     }
 
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 50;
+    // Default limit stays 10 (contract tested by rtc-scoping.spec.ts); the
+    // Calendar clients pass an explicit limit when fetching a month window.
+    const limit = parseInt(req.query.limit as string) || 10;
     const offset = (page - 1) * limit;
 
     // Optional calendar window filters (ISO dates). Used by the Calendar page

@@ -528,10 +528,32 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
 
     // Validate Wallet (accept both snake_case and camelCase wallet id)
     let walletId = wallet_id || camelWalletId;
+    const neededCurrency = (dbDebitCurrency || currency).toUpperCase();
     if (!walletId) {
-      const wRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
-      if (wRes.rows.length > 0) walletId = wRes.rows[0].id;
-      else return res.status(400).json({ success: false, error: "Wallet ID required" });
+      // Prefer a wallet in the currency we're actually paying out
+      const wRes = await query(
+        `SELECT id FROM wallets WHERE business_id = $1 AND UPPER(currency) = $2 LIMIT 1`,
+        [businessId, neededCurrency],
+      );
+      if (wRes.rows.length > 0) {
+        walletId = wRes.rows[0].id;
+      } else {
+        const anyRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
+        if (anyRes.rows.length > 0) walletId = anyRes.rows[0].id;
+        else return res.status(400).json({ success: false, error: "Wallet ID required" });
+      }
+    }
+
+    // Currency guard: an NGN wallet cannot fund a USD payout (and vice versa)
+    const walletCurRes = await query(`SELECT currency FROM wallets WHERE id = $1`, [walletId]);
+    if (walletCurRes.rows.length > 0) {
+      const walletCurrency = String(walletCurRes.rows[0].currency || 'NGN').toUpperCase();
+      if (walletCurrency !== neededCurrency) {
+        return res.status(400).json({
+          success: false,
+          error: `Source wallet is ${walletCurrency} but this transfer pays out in ${neededCurrency}. Select the ${neededCurrency} wallet.`,
+        });
+      }
     }
 
     // Calculate Fee (international payouts use the intl_transfer fee config)
@@ -983,6 +1005,25 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     if (transfersToQueue.length === 0) {
       return res.json({ success: true, message: "No eligible transfers found to queue", data: { queued: 0, transfers: [], unverified_employees: unverifiedEmployees } });
+    }
+
+    // Currency guard: every queued transfer is debited from the SAME source
+    // wallet. A mixed NGN/USD salary batch would silently debit the wrong
+    // wallet by the wrong magnitude — reject it up-front with a clear message
+    // instead of corrupting balances during processing.
+    {
+      const walletCurRes = await query(`SELECT currency FROM wallets WHERE id = $1`, [walletId]);
+      const walletCurrency = String(walletCurRes.rows[0]?.currency || 'NGN').toUpperCase();
+      const mismatched = transfersToQueue.filter(
+        (t: any) => String(t.currency || 'NGN').toUpperCase() !== walletCurrency,
+      );
+      if (mismatched.length > 0) {
+        const badCurrencies = [...new Set(mismatched.map((t: any) => String(t.currency || 'NGN').toUpperCase()))];
+        return res.status(400).json({
+          success: false,
+          error: `The selected wallet is ${walletCurrency} but ${mismatched.length} payout(s) are in ${badCurrencies.join(', ')}. Fund those payouts from the matching wallet — run NGN and USD payouts separately.`,
+        });
+      }
     }
 
     // 2. Insert into transfer_queue

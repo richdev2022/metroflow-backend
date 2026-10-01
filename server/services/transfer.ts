@@ -638,7 +638,7 @@ export async function processAllPending(businessId: string) {
     try {
       // 2. Check Wallet & Debit
       if (transfer.wallet_id) {
-          const walletRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [transfer.wallet_id]);
+          const walletRes = await query(`SELECT balance, currency FROM wallets WHERE id = $1`, [transfer.wallet_id]);
           if (walletRes.rows.length === 0) {
               throw new Error("Source wallet not found");
           }
@@ -646,6 +646,16 @@ export async function processAllPending(businessId: string) {
           const amount = parseFloat(transfer.amount);
           const fee = parseFloat(transfer.fee || '0');
           const totalDebit = amount + fee;
+
+          // Currency guard: the wallet MUST be in the same currency as the debit
+          // (post-normalization transfer.currency IS the debit currency). Without
+          // this a mixed NGN/USD salary batch debits the wrong wallet by the wrong
+          // magnitude (e.g. NGN wallet charged a raw USD amount).
+          const walletCurrency = String(walletRes.rows[0].currency || 'NGN').toUpperCase();
+          const debitCurrency = String(transfer.currency || 'NGN').toUpperCase();
+          if (walletCurrency !== debitCurrency) {
+              throw new Error(`Wallet currency mismatch: source wallet is ${walletCurrency} but transfer requires ${debitCurrency}`);
+          }
 
           if (balance < totalDebit) {
               throw new Error("Insufficient wallet balance");
@@ -977,7 +987,11 @@ export async function processAllPending(businessId: string) {
       const reason = error.message || "Internal processing error";
       
       const noRefundErrors = ["Insufficient wallet balance", "Source wallet not found"];
-      if (!noRefundErrors.includes(reason) && transfer.wallet_id) {
+      if (
+        !noRefundErrors.includes(reason) &&
+        !reason.startsWith("Wallet currency mismatch") &&
+        transfer.wallet_id
+      ) {
           // Check if we actually debited? 
            const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`, [transfer.reference]);
            if (txnCheck.rows.length > 0) {

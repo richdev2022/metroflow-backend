@@ -21,6 +21,7 @@ import { verifyToken } from "../services/auth";
 import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
 import { isCorsOriginAllowed } from "../cors";
 import crypto from "crypto";
+import { glmChat, isGlmConfigured } from "./glm";
 import {
   buildCallingCredentials,
   computeRemainingSeconds,
@@ -103,6 +104,8 @@ async function broadcastPresence(
 // Function to end call/meeting automatically
 async function endRoom(roomId: string, roomType: 'call' | 'meeting'): Promise<void> {
   try {
+    // MetricAi Call Copilot: drop the live-insights scheduler for this room.
+    clearLiveInsightsForRoom(roomId);
     let storedProvider: string | null = null;
     // Snapshot the pre-end row so the call-log below posts only on the FIRST
     // final-state transition (timeout / no-answer auto-close).
@@ -2255,6 +2258,19 @@ export function initSocketServer(server: http.Server): void {
             } catch (err) {
               logger.warn("Failed to persist caption segment:", err);
             }
+            // MetricAi Call Copilot: per-user translated captions + live AI
+            // insights. Both are enhancements — they must NEVER break the
+            // caption relay, so every failure is swallowed.
+            try {
+              void deliverTranslatedCaption(io, roomId, payload);
+            } catch (err) {
+              logger.warn("Translated caption dispatch failed:", err);
+            }
+            try {
+              scheduleLiveInsights(io, roomId);
+            } catch (err) {
+              logger.warn("Live insights scheduling failed:", err);
+            }
           }
           if (callback) callback({ success: true });
         } catch (error) {
@@ -2264,8 +2280,22 @@ export function initSocketServer(server: http.Server): void {
       },
     );
 
+    // MetricAi Call Copilot — the language THIS participant wants live captions
+    // translated into ("" disables translation). Final caption segments are
+    // translated via GLM and unicast as `caption:translated`.
+    socket.on(
+      "caption:set-language",
+      (data: { language?: string }, callback?: (response: any) => void) => {
+        const lang = String(data?.language || "").trim().slice(0, 8).toLowerCase();
+        if (lang) captionLanguageBySocket.set(socket.id, lang);
+        else captionLanguageBySocket.delete(socket.id);
+        if (callback) callback({ success: true, language: lang || null });
+      },
+    );
+
     // Disconnect
     socket.on("disconnect", async () => {
+      captionLanguageBySocket.delete(socket.id);
       const { userId, businessId, waitingRoom: wasWaiting, waitingRoomId } = socket.data;
 
       // Remove this socket from all room-tracking maps so multi-device
@@ -2327,4 +2357,202 @@ export function initSocketServer(server: http.Server): void {
 
 export function getSocketServer(): Server | null {
   return io;
+}
+
+// =============================================================================
+// MetricAi Call Copilot — never-existed-before live call intelligence.
+//
+// 1. TRANSLATED CAPTIONS: each participant picks a caption language
+//    (`caption:set-language`); every FINAL caption segment is translated via
+//    GLM and unicast only to the sockets that asked for that language
+//    (`caption:translated`). Two people in one call can each read captions in
+//    their own language — a WhatsApp-level differentiator for calls.
+//
+// 2. LIVE AI INSIGHTS: while the call is running, the accumulating transcript
+//    is summarized every ~45s (min 3 new finals) and broadcast as
+//    `call:ai-insights` { summary, keyPoints[], actionItems[] } so late
+//    joiners and busy participants see a living digest DURING the call — not
+//    only in the post-call notes.
+//
+// All of it is fail-soft: when GLM is unconfigured or a call errors, the room
+// simply gets no translations/insights and the plain caption relay continues.
+// =============================================================================
+
+/** socket.id -> requested caption language (lowercase ISO-ish code, or unset). */
+const captionLanguageBySocket = new Map<string, string>();
+
+/** (text|targetLang) -> translation cache, so repeated segments/echoes cost one call. */
+const captionTranslationCache = new Map<string, string>();
+
+/** roomId -> live insights scheduler state. */
+const liveInsightsRooms = new Map<string, { lastRunAt: number; pendingFinals: number; running: boolean }>();
+
+const LIVE_INSIGHTS_INTERVAL_MS = 45_000;
+const LIVE_INSIGHTS_MIN_FINALS = 3;
+
+function stashTranslation(key: string, value: string): void {
+  if (captionTranslationCache.size > 200) captionTranslationCache.clear();
+  captionTranslationCache.set(key, value);
+}
+
+/** Translate one final caption for the sockets in the room that opted in. */
+async function deliverTranslatedCaption(
+  io: Server,
+  roomId: string,
+  payload: { speakerName: string; text: string; language?: string | null; roomId: string; roomType: string; ts: string },
+): Promise<void> {
+  const room = io.of("/").adapter.rooms?.get(`room:${roomId}`);
+  if (!room || captionLanguageBySocket.size === 0) return;
+
+  // Collect the distinct target languages actually wanted in this room.
+  const wanted = new Map<string, string[]>(); // lang -> socketIds
+  for (const socketId of room) {
+    const lang = captionLanguageBySocket.get(socketId);
+    if (!lang) continue;
+    const source = (payload.language || "").toLowerCase();
+    if (lang === source) continue; // already reading the source language
+    const list = wanted.get(lang) || [];
+    list.push(socketId);
+    wanted.set(lang, list);
+  }
+  if (wanted.size === 0) return;
+
+  for (const [lang, socketIds] of wanted) {
+    const cacheKey = `${lang}|${payload.text}`;
+    let translation = captionTranslationCache.get(cacheKey) || "";
+    if (!translation) {
+      const raw = await glmChat({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a real-time translation engine inside a live call. Translate the " +
+              "user's spoken sentence faithfully and idiomatically. Preserve names, numbers " +
+              "and tone. Reply with ONLY the translation — no quotes, no labels, no notes.",
+          },
+          { role: "user", content: payload.text },
+        ],
+        temperature: 0.1,
+        maxTokens: 600,
+      });
+      translation = String(raw || "").trim().replace(/^["']|["']$/g, "");
+      if (!translation) continue;
+      stashTranslation(cacheKey, translation);
+    }
+    const translatedPayload = {
+      roomId,
+      roomType: payload.roomType,
+      speakerName: payload.speakerName,
+      text: payload.text,
+      translation,
+      targetLanguage: lang,
+      sourceLanguage: payload.language || null,
+      ts: payload.ts,
+    };
+    for (const socketId of socketIds) {
+      io.of("/").sockets.get(socketId)?.emit("caption:translated", translatedPayload);
+    }
+  }
+}
+
+/** Throttled live-insights scheduler: ≥45s apart and ≥3 new finals. */
+function scheduleLiveInsights(io: Server, roomId: string): void {
+  const state = liveInsightsRooms.get(roomId) || { lastRunAt: 0, pendingFinals: 0, running: false };
+  state.pendingFinals += 1;
+  const since = Date.now() - state.lastRunAt;
+  liveInsightsRooms.set(roomId, state);
+  if (state.running) return;
+  if (since < LIVE_INSIGHTS_INTERVAL_MS || state.pendingFinals < LIVE_INSIGHTS_MIN_FINALS) {
+    // Retry shortly after the interval elapses even if speech pauses.
+    if (since < LIVE_INSIGHTS_INTERVAL_MS) {
+      const wait = LIVE_INSIGHTS_INTERVAL_MS - since + 500;
+      state.running = true;
+      setTimeout(() => {
+        state.running = false;
+        const cur = liveInsightsRooms.get(roomId);
+        if (cur && cur.pendingFinals >= 1) {
+          cur.lastRunAt = Date.now();
+          cur.pendingFinals = 0;
+          void runLiveInsights(io, roomId);
+        }
+      }, wait).unref?.();
+    }
+    return;
+  }
+  state.lastRunAt = Date.now();
+  state.pendingFinals = 0;
+  void runLiveInsights(io, roomId);
+}
+
+/** Summarize the transcript-so-far and broadcast `call:ai-insights`. */
+async function runLiveInsights(io: Server, roomId: string): Promise<void> {
+  try {
+    if (!isGlmConfigured()) return;
+    const rows = await query(
+      `SELECT speaker_name, text, created_at
+       FROM meeting_transcripts
+       WHERE meeting_id = $1
+       ORDER BY created_at DESC
+       LIMIT 80`,
+      [roomId],
+    );
+    if (!rows.rows || rows.rows.length < 4) return; // not enough signal yet
+    const transcript = rows.rows
+      .reverse()
+      .map((r: any) => `${r.speaker_name}: ${r.text}`.slice(0, 400))
+      .join("\n")
+      .slice(-44000);
+
+    const raw = await glmChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are the live meeting-intelligence copilot for an ongoing call. Using the " +
+            "transcript so far, reply with STRICT JSON only (no markdown fences):\n" +
+            '{"summary": "2-3 sentence running summary", "keyPoints": ["up to 5 short bullets"], "actionItems": ["Owner: task"]}.\n' +
+            "Rules: use the transcript's language; be concrete with names/numbers; keyPoints " +
+            "max 5 items, each <= 16 words; actionItems max 4, use [] when none. This is a " +
+            "LIVE feed — reflect the current state, not a final report.",
+        },
+        { role: "user", content: transcript },
+      ],
+      temperature: 0.2,
+      maxTokens: 650,
+    });
+
+    let summary = String(raw || "").trim();
+    let keyPoints: string[] = [];
+    let actionItems: string[] = [];
+    try {
+      const jsonStart = summary.indexOf("{");
+      const jsonEnd = summary.lastIndexOf("}");
+      if (jsonStart > -1 && jsonEnd > jsonStart) {
+        const parsed = JSON.parse(summary.slice(jsonStart, jsonEnd + 1));
+        if (parsed?.summary) summary = String(parsed.summary);
+        if (Array.isArray(parsed?.keyPoints)) keyPoints = parsed.keyPoints.slice(0, 5).map(String);
+        if (Array.isArray(parsed?.actionItems)) actionItems = parsed.actionItems.slice(0, 4).map(String);
+      }
+    } catch {
+      // Keep the raw text as the summary when the model returned prose.
+    }
+    if (!summary.trim()) return;
+
+    io.to(`room:${roomId}`).emit("call:ai-insights", {
+      roomId,
+      summary,
+      keyPoints,
+      actionItems,
+      generatedAt: new Date().toISOString(),
+      transcriptLines: rows.rows.length,
+    });
+  } catch (err) {
+    logger.warn("Live insights generation failed:", err);
+  }
+}
+
+/** Drop scheduler state once a room is gone (called from endRoom cleanup). */
+export function clearLiveInsightsForRoom(roomId: string): void {
+  liveInsightsRooms.delete(roomId);
+  captionTranslationCache.clear();
 }

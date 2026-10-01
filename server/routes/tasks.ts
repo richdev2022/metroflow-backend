@@ -12,7 +12,7 @@ import { uploadMediaBuffer } from "../services/media-upload";
 // Task file attachments (same pipeline as chat media: R2 -> Cloudinary -> local)
 // ---------------------------------------------------------------------------
 
-const TASK_ATTACHMENT_MAX_MB = 50;
+const TASK_ATTACHMENT_MAX_MB = 100;
 const TASK_ATTACHMENT_MAX_FILES = 10;
 
 const taskAttachmentUpload = multer({
@@ -1302,10 +1302,10 @@ export const uploadTaskAttachments: RequestHandler = async (req: AuthenticatedRe
     if (err) {
       const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
       const tooMany = err?.code === "LIMIT_UNEXPECTED_FILE";
-      return res.status(400).json({
+      return res.status(isTooLarge ? 413 : 400).json({
         success: false,
         error: isTooLarge
-          ? `Each file must be ${TASK_ATTACHMENT_MAX_MB}MB or smaller`
+          ? `That file is too large — attachments are limited to ${TASK_ATTACHMENT_MAX_MB} MB each. Compress the file or split it, then try again.`
           : tooMany
             ? `You can attach up to ${TASK_ATTACHMENT_MAX_FILES} files at once`
             : err.message || "File upload error",

@@ -754,12 +754,14 @@ import multer from "multer";
 import path from "path";
 import crypto from "crypto";
 
+const AVATAR_MAX_MB = 100;
+
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  limits: { fileSize: AVATAR_MAX_MB * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
-    if (/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype)) cb(null, true);
-    else cb(new Error("Only PNG, JPG, WEBP or GIF images are allowed"));
+    if (/^image\/(png|jpe?g|webp|gif|avif|heic|heif)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error("Only image files (PNG, JPG, WEBP, GIF and similar) are allowed"));
   },
 } as multer.Options);
 
@@ -811,7 +813,13 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
 router.post("/profile/avatar", authenticateToken, (req: AuthenticatedRequest, res) => {
     avatarUpload.single('file')(req as any, res as any, async (err: any) => {
         if (err) {
-            return res.status(400).json({ success: false, error: err.message || "Upload failed" });
+            const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
+            return res.status(isTooLarge ? 413 : 400).json({
+                success: false,
+                error: isTooLarge
+                    ? `That image is too large — profile pictures are limited to ${AVATAR_MAX_MB} MB. Try a smaller image.`
+                    : err.message || "Upload failed",
+            });
         }
         try {
             const userId = req.user!.userId;

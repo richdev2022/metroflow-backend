@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { sendPayrollAdjustmentNotification, sendEmail, generateInviteEmailHtml } from "../services/email";
 import { accountLookup } from "../services/transfer";
 import crypto from "crypto";
@@ -50,7 +51,7 @@ const router = express.Router();
  *       200:
  *         description: Adjustment added
  */
-router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { userId, type, amount, reason, currency } = req.body;
@@ -145,7 +146,7 @@ router.post("/adjustments", authenticateToken, checkSubscriptionStatus, checkFea
  *       200:
  *         description: List of adjustments
  */
-router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { userId } = req.query;
@@ -191,7 +192,7 @@ router.get("/adjustments", authenticateToken, checkSubscriptionStatus, checkFeat
  *       200:
  *         description: Adjustment deleted
  */
-router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;
@@ -259,7 +260,7 @@ router.delete("/adjustments/:id", authenticateToken, checkSubscriptionStatus, ch
  *       200:
  *         description: List of team members with payroll calculations
  */
-router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { search, role, startDate, endDate, page = 1, limit = 10 } = req.query;
@@ -509,7 +510,7 @@ router.get("/summary", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *       200:
  *         description: User payroll details updated
  */
-router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;
@@ -550,7 +551,7 @@ router.put("/user/:id", authenticateToken, checkSubscriptionStatus, checkFeature
  *       200:
  *         description: Current payroll configuration
  */
-router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const result = await query(`SELECT salary_interval, salary_custom_date FROM businesses WHERE id = $1`, [businessId]);
@@ -594,7 +595,7 @@ router.get("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePe
  *       200:
  *         description: Configuration updated
  */
-router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { salary_interval, salary_custom_date } = req.body;
@@ -626,7 +627,7 @@ router.put("/config", authenticateToken, checkSubscriptionStatus, checkFeaturePe
  * creates invited users (or updates existing ones) with their payroll details
  * and sends invite emails best-effort.
  */
-router.post("/employees/import", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/employees/import", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const userId = req.user?.userId;
@@ -838,7 +839,7 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
  * Filters: verification_status (unverified|verified|failed), search, currency,
  * status, salary has-bank-details filter, pagination.
  */
-router.get("/employees", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.get("/employees", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { verification_status, search, currency, status, page = '1', limit = '50' } = req.query as Record<string, string>;
@@ -902,7 +903,7 @@ router.get("/employees", authenticateToken, checkSubscriptionStatus, checkFeatur
  * Runs an account-name lookup against the active transfer provider and stores
  * the verification result on the employee record.
  */
-router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const employeeId = req.params.id;
@@ -965,7 +966,7 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
  * Verify all pending/unverified employees at once (or a provided list of ids).
  * Returns per-employee results.
  */
-router.post("/employees/verify-bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/employees/verify-bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const ids: string[] | undefined = Array.isArray(req.body?.employee_ids) ? req.body.employee_ids : undefined;

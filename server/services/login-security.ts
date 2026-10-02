@@ -1,6 +1,13 @@
 import { query } from "../db";
 import { sendEmail } from "./email";
 
+// Official brand logo used across every email template. Always points at
+// the official Metricorex artwork hosted on the marketing site — app-host
+// copies can go stale (and older templates referenced dead builder.io /
+// placeholder URLs). Override with APP_LOGO_URL if the brand asset moves.
+const EMAIL_LOGO_URL =
+  process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
+
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -140,7 +147,7 @@ function parseUserAgent(userAgent?: string) {
 async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddress?: string, userAgent?: string) {
   const lockoutEndLocal = lockoutEnd.toLocaleString();
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
   const userAgentInfo = parseUserAgent(userAgent);
 
   const html = `
@@ -190,7 +197,7 @@ async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddres
 
 async function sendLoginNotificationEmail(email: string, ipAddress?: string, userAgent?: string) {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
   const userAgentInfo = parseUserAgent(userAgent);
 
   const html = `

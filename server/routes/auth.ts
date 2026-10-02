@@ -1636,6 +1636,34 @@ export const biometricLogin: RequestHandler = async (req, res) => {
 };
 
 /**
+ * POST /auth/biometric/status (no auth — same trust level as biometric/login)
+ * Body: { device_id }
+ * Soft probe so clients can reconcile local biometric state with what the
+ * server still holds for this device. Only ever returns a boolean; lets the
+ * app self-heal (e.g. after a DB restore wiped credentials) by clearing its
+ * local token and silently re-enrolling on the next password/Google login.
+ */
+export const biometricStatus: RequestHandler = async (req, res) => {
+  try {
+    const deviceId = String(req.body?.device_id || "").trim();
+    if (!deviceId) {
+      return res.status(400).json({ success: false, message: "device_id is required" });
+    }
+    const result = await query(
+      `SELECT 1 FROM biometric_credentials
+        WHERE device_id = $1 AND revoked_at IS NULL
+        LIMIT 1`,
+      [deviceId],
+    );
+    res.json({ success: true, enrolled: result.rows.length > 0 });
+  } catch (error: any) {
+    console.error("Biometric status error:", error);
+    // Soft-success: a broken probe must never brick biometric unlock.
+    res.json({ success: true, enrolled: true });
+  }
+};
+
+/**
  * DELETE /auth/biometric/enroll (auth required)
  * Body: { device_id? } - revokes all credentials for the caller (or one device).
  */

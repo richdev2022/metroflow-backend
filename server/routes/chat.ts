@@ -435,9 +435,22 @@ export const getConversationMessages: RequestHandler = async (
       return message;
     });
 
-    const response: ApiResponse<{ messages: any[]; total: number }> = {
+    // Read-receipt support: expose every participant's last-read timestamp so
+    // clients can render Teams-style sent (1 tick) vs read (double tick)
+    // states for own messages. lastReadAt is ISO or null (never read).
+    const participantsResult = await query(
+      `SELECT cp.user_id AS "userId",
+              u.name AS "userName",
+              cp.last_read_at AS "lastReadAt"
+         FROM chat_participants cp
+         LEFT JOIN users u ON u.id = cp.user_id
+        WHERE cp.conversation_id = $1`,
+      [conversationId],
+    );
+
+    const response: ApiResponse<{ messages: any[]; total: number; participants: any[] }> = {
       success: true,
-      data: { messages, total },
+      data: { messages, total, participants: participantsResult.rows },
     };
     res.json(response);
   } catch (error) {

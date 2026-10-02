@@ -943,9 +943,14 @@ router.post("/business/regenerate-va", authenticateToken, checkKycStatus, requir
  */
 router.get("/verify", async (req, res) => {
     try {
-        const { reference, redirect_url } = req.query;
+        // Flutterwave's standard redirect appends `tx_ref` (NOT `reference`)
+        // to the callback URL — accept both so the browser-facing callback
+        // never dead-ends on a missing-reference error page.
+        const queryReference = req.query.reference || req.query.tx_ref;
+        const reference = typeof queryReference === 'string' ? queryReference : undefined;
+        const redirect_url = req.query.redirect_url;
         
-        if (!reference || typeof reference !== 'string') {
+        if (!reference) {
             return res.status(400).send(`
                 <html>
                     <body style="font-family: sans-serif; text-align: center; padding: 50px;">
@@ -982,7 +987,9 @@ router.get("/verify", async (req, res) => {
                 // Not an absolute URL (e.g. relative base) - treat as origin
                 hasLandingPath = false;
             }
-            if (!hasLandingPath) base += `/wallet`;
+            // Bare origins land on the dedicated client callback route,
+            // which knows how to re-verify and display the outcome.
+            if (!hasLandingPath) base += `/payment/callback`;
             const params = new URLSearchParams({ status, reference });
             if (withToken && token) params.set("token", token);
             return `${base}?${params.toString()}`;

@@ -83,6 +83,8 @@ import feesRouter from "./routes/fees";
 import paymentLinksRouter from "./routes/payment_links";
 import aiCreditsRouter from "./routes/ai_credits";
 import invoicesRouter from "./routes/invoices";
+import billsRouter from "./routes/bills";
+import savingsRouter from "./routes/savings";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
@@ -291,6 +293,21 @@ export async function createServer() {
         }
       } catch (error) {
         logger.error("Meeting reminders cron error:", error);
+      }
+    });
+
+    // Savings Vaults auto-save engine — runs every 5 minutes, debits each due
+    // vault's wallet and credits the vault. Idempotent per vault via the
+    // auto_save_next_run claim inside processDueAutoSaves.
+    cron.schedule("*/5 * * * *", async () => {
+      try {
+        const { processDueAutoSaves } = await import("./routes/savings");
+        const result = await processDueAutoSaves();
+        if (result.processed > 0) {
+          logger.info(`[Savings] auto-save processed ${result.processed}: ${result.succeeded} ok, ${result.failed} skipped`);
+        }
+      } catch (error) {
+        logger.error("Savings auto-save cron error:", error);
       }
     });
   }
@@ -672,6 +689,8 @@ export async function createServer() {
   mainRouter.use("/payment-links", paymentLinksRouter);
   mainRouter.use("/ai-credits", aiCreditsRouter);
   mainRouter.use("/invoices", invoicesRouter);
+  mainRouter.use("/bills", billsRouter);
+  mainRouter.use("/savings", savingsRouter);
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);

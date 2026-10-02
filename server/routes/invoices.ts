@@ -92,7 +92,30 @@ function computeTotals(items: { amount: number }[], taxPercent: number) {
 // Authenticated endpoints (invoice owners)
 // ---------------------------------------------------------------------------
 
-/** List the business's invoices with payment stats. */
+/**
+ * @openapi
+ * tags:
+ *   name: Smart Invoices
+ *   description: Itemised invoices with public checkout pages — a revenue feature
+ *     (settlement fee lands in the platform revenue wallet, plan-configurable)
+ */
+
+/**
+ * @openapi
+ * /invoices:
+ *   get:
+ *     summary: List the business's invoices with payment stats
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [draft, pending, paid, cancelled, overdue, all] }
+ *     responses:
+ *       200:
+ *         description: Invoices (newest first)
+ */
 router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -128,6 +151,42 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  * Create an invoice. Body: client_name, client_email, client_phone?, items[],
  * tax_percent?, due_date?, notes?, status? ('pending' default | 'draft').
  * Totals are always recomputed server-side from the line items.
+ *
+ * @openapi
+ * /invoices:
+ *   post:
+ *     summary: Create an invoice (line items + tax + due date, plan-gated)
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [client_name, client_email, items]
+ *             properties:
+ *               client_name: { type: string }
+ *               client_email: { type: string }
+ *               client_phone: { type: string }
+ *               items:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   properties:
+ *                     description: { type: string }
+ *                     quantity: { type: number }
+ *                     unit_price: { type: number }
+ *               tax_percent: { type: number }
+ *               due_date: { type: string, format: date }
+ *               notes: { type: string }
+ *               status: { type: string, enum: [pending, draft] }
+ *     responses:
+ *       200:
+ *         description: Created invoice (invoice_number returned)
+ *       403:
+ *         description: Monthly quota reached or feature disabled (PLAN_UPGRADE_REQUIRED)
  */
 router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
@@ -212,7 +271,25 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     }
 });
 
-/** Invoice detail (owner): line items + payment history. */
+/**
+ * @openapi
+ * /invoices/{id}:
+ *   get:
+ *     summary: Invoice detail (owner) — line items + payment history
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Invoice, items and payments
+ *       404:
+ *         description: Invoice not found
+ */
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
@@ -233,7 +310,25 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
     }
 });
 
-/** Edit a draft/pending invoice that hasn't received any successful payment. */
+/**
+ * @openapi
+ * /invoices/{id}:
+ *   put:
+ *     summary: Edit a draft/pending invoice that has not received any payment
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Updated invoice
+ *       400:
+ *         description: Paid invoices cannot be edited
+ */
 router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
@@ -313,7 +408,25 @@ router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
     }
 });
 
-/** Delete an invoice (only when nothing has been paid against it). */
+/**
+ * @openapi
+ * /invoices/{id}:
+ *   delete:
+ *     summary: Delete an invoice (only when nothing has been paid against it)
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Deleted
+ *       400:
+ *         description: Paid invoices cannot be deleted
+ */
 router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
@@ -338,7 +451,25 @@ router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: Au
     }
 });
 
-/** Cancel an unpaid invoice. */
+/**
+ * @openapi
+ * /invoices/{id}/cancel:
+ *   post:
+ *     summary: Cancel an unpaid invoice
+ *     tags: [Smart Invoices]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Cancelled invoice
+ *       400:
+ *         description: Only unpaid invoices can be cancelled
+ */
 router.post("/:id/cancel", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
@@ -363,7 +494,24 @@ router.post("/:id/cancel", authenticateToken, checkSubscriptionStatus, async (re
 // Public endpoints (no auth — clients paying an invoice)
 // ---------------------------------------------------------------------------
 
-/** Public invoice view: the client sees line items, totals and due date. */
+/**
+ * @openapi
+ * /invoices/public/{id}:
+ *   get:
+ *     summary: Public invoice view (no auth — the client sees items, totals, due date)
+ *     tags: [Smart Invoices]
+ *     security: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Public invoice payload
+ *       404:
+ *         description: Invoice not found
+ */
 router.get("/public/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -419,6 +567,34 @@ router.get("/public/:id", async (req, res) => {
  * Initiate a client payment: creates the pending payment record + pending
  * transaction (transaction_type 'invoice') and returns the provider's hosted
  * checkout URL. The amount is always the server-computed invoice total.
+ *
+ * @openapi
+ * /invoices/public/{id}/initiate:
+ *   post:
+ *     summary: Initiate a client payment (returns hosted checkout URL, settled by webhook)
+ *     tags: [Smart Invoices]
+ *     security: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               payer_name: { type: string }
+ *               payer_email: { type: string }
+ *               provider: { type: string, description: "Optional provider override" }
+ *     responses:
+ *       200:
+ *         description: checkout_url + reference
+ *       400:
+ *         description: Invoice already paid / no amount due
+ *       404:
+ *         description: Invoice not found
  */
 router.post("/public/:id/initiate", async (req, res) => {
     try {

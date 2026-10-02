@@ -6,9 +6,13 @@ const options = {
   definition: {
     openapi: "3.0.0",
     info: {
-      title: "MetricFlow API",
-      version: "1.0.0",
-      description: "API documentation for MetricFlow Backend",
+      title: "Metricorex API",
+      version: "2.0.0",
+      description:
+        "Metricorex (Metroflow) backend — personal + business work OS with fintech rails. " +
+        "Revenue features: Bills Hub (airtime/data/TV/electricity/betting), Savings Vaults " +
+        "(auto-save + early-break fee), Payment Links, Smart Invoices and MetricAi Credit " +
+        "Packs — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens.",
     },
     servers: [
       {

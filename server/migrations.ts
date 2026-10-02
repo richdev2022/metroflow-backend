@@ -22,6 +22,9 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureRevenueFeaturesSchema();
   await ensurePlanPricingLadder();
   await ensureInvoicesSchema();
+  await ensureBillsSchema();
+  await ensureSavingsSchema();
+  await ensureDailyRevenueKnobLadder();
 }
 
 /**
@@ -1155,4 +1158,214 @@ async function ensureInvoicesSchema(): Promise<void> {
   `);
 
   console.log("[migrations] Smart Invoices schema applied");
+}
+
+/**
+ * Bills Hub — the fourth revenue feature (daily-use).
+ *
+ * Users pay airtime, data, TV, electricity and betting top-ups straight from
+ * any of their wallets (personal or business). The platform earns a flat
+ * convenience fee per transaction (fee_configurations 'bill' — ₦50 by
+ * default, reduced by the plan-level bill_fee_discount_percent) which lands
+ * in the platform revenue wallet via creditRevenueWallet. Fulfilment is
+ * delegated to a pluggable bills provider; when none is configured the
+ * built-in simulator settles the bill instantly so the flow stays testable.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - bills_enabled               (feature toggle)
+ *   - max_bills_per_day           (NULL/999999+ = unlimited; daily cap)
+ *   - bill_fee_discount_percent
+ */
+async function ensureBillsSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS bill_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255),
+      user_id UUID,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      category VARCHAR(30) NOT NULL, -- airtime | data | tv | electricity | betting
+      provider_code VARCHAR(60) NOT NULL, -- e.g. mtn, dstv, ikedc
+      provider_name VARCHAR(120),
+      plan_code VARCHAR(60),         -- data/TV plan code when applicable
+      plan_name VARCHAR(160),
+      customer_ref VARCHAR(160) NOT NULL, -- phone | smartcard | meter | user id
+      customer_phone VARCHAR(50),
+      amount DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending', -- pending | success | failed | refunded
+      fulfilment_mode VARCHAR(20),   -- provider | simulated
+      provider_reference VARCHAR(120),
+      provider_response JSONB,
+      failure_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_business ON bill_payments(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_user ON bill_payments(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_status ON bill_payments(status)`);
+
+  // Plan configuration knobs for the Bills Hub
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS bills_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_bills_per_day INTEGER DEFAULT 3`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS bill_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Flat convenience fee per bill transaction (idempotent seed).
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Bill Payment Convenience Fee', 'bill', 'flat',
+           '{"amount": 50}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'bill')
+  `);
+
+  console.log("[migrations] Bills Hub schema applied");
+}
+
+/**
+ * Savings Vaults — the fifth revenue feature (daily-use).
+ *
+ * Users create goal-based savings vaults, fund them from any wallet and can
+ * switch on auto-save (daily/weekly/monthly) that pulls from a chosen wallet.
+ * Withdrawing before the vault's target date charges an early-break fee
+ * (fee_configurations 'savings_break' — 2% capped ₦5,000 by default, reduced
+ * by the plan-level savings_break_fee_discount_percent) which lands in the
+ * platform revenue wallet. Auto-save keeps users in the app every single day.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - savings_enabled                    (feature toggle)
+ *   - max_savings_vaults                 (NULL/999999+ = unlimited)
+ *   - savings_break_fee_discount_percent
+ */
+async function ensureSavingsSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_vaults (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255),
+      user_id UUID,
+      name VARCHAR(120) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+      goal_amount DECIMAL(15,2),
+      target_date DATE,
+      status VARCHAR(20) DEFAULT 'active', -- active | paused | closed
+      auto_save_enabled BOOLEAN DEFAULT FALSE,
+      auto_save_amount DECIMAL(12,2),
+      auto_save_frequency VARCHAR(20),     -- daily | weekly | monthly
+      auto_save_wallet_id UUID,
+      auto_save_next_run TIMESTAMP,
+      auto_save_last_run TIMESTAMP,
+      auto_save_failures INTEGER DEFAULT 0,
+      withdrawn_at TIMESTAMP,
+      total_deposited DECIMAL(15,2) NOT NULL DEFAULT 0,
+      total_withdrawn DECIMAL(15,2) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_business ON savings_vaults(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_user ON savings_vaults(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_autosave ON savings_vaults(auto_save_next_run) WHERE auto_save_enabled = TRUE AND status = 'active'`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_transactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      vault_id UUID NOT NULL REFERENCES savings_vaults(id) ON DELETE CASCADE,
+      type VARCHAR(30) NOT NULL,   -- deposit | withdrawal | auto_save | break_fee
+      amount DECIMAL(15,2) NOT NULL,
+      fee DECIMAL(15,2) NOT NULL DEFAULT 0,
+      balance_after DECIMAL(15,2) NOT NULL,
+      wallet_id UUID,
+      reference VARCHAR(255) UNIQUE,
+      status VARCHAR(20) DEFAULT 'success',
+      note TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_transactions_vault ON savings_transactions(vault_id)`);
+
+  // Plan configuration knobs for Savings Vaults
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS savings_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_savings_vaults INTEGER DEFAULT 1`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS savings_break_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Early-withdrawal fee: 2% capped ₦5,000 (idempotent seed).
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Savings Early Withdrawal Fee', 'savings_break', 'percentage_cap',
+           '{"percentage": 2.0, "cap": 5000}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'savings_break')
+  `);
+
+  console.log("[migrations] Savings Vaults schema applied");
+}
+
+/**
+ * Daily-use revenue knob ladder — the bills/savings knobs are new columns, so
+ * the legacy-gated ensurePlanPricingLadder UPDATEs (which match only the old
+ * USD seed prices) no longer fire. This one-off ladder seeds the NEW columns
+ * per plan, gated on the columns still being at their freshly-added defaults
+ * (IS NULL or the global default), so an admin's later re-pricing is never
+ * clobbered. Also appends the Bills/Savings bullets to each plan's feature
+ * list exactly once (when they are not mentioned yet).
+ */
+async function ensureDailyRevenueKnobLadder(): Promise<void> {
+  // ---------- Knobs (gated on untouched defaults) ----------
+  await query(`
+    UPDATE pricing_plans SET
+      bills_enabled = TRUE,
+      max_bills_per_day = 3,
+      bill_fee_discount_percent = 0,
+      savings_enabled = TRUE,
+      max_savings_vaults = 1,
+      savings_break_fee_discount_percent = 0
+    WHERE name = 'Free Trial' AND (max_bills_per_day IS NULL OR max_bills_per_day = 3)
+      AND (max_savings_vaults IS NULL OR max_savings_vaults = 1)
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      bills_enabled = TRUE,
+      max_bills_per_day = 20,
+      bill_fee_discount_percent = 10,
+      savings_enabled = TRUE,
+      max_savings_vaults = 5,
+      savings_break_fee_discount_percent = 10
+    WHERE name = 'Starter' AND (max_bills_per_day IS NULL OR max_bills_per_day = 20)
+      AND (max_savings_vaults IS NULL OR max_savings_vaults = 5)
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      bills_enabled = TRUE,
+      max_bills_per_day = 999999,
+      bill_fee_discount_percent = 25,
+      savings_enabled = TRUE,
+      max_savings_vaults = 999999,
+      savings_break_fee_discount_percent = 25
+    WHERE name = 'Pro' AND (max_bills_per_day IS NULL OR max_bills_per_day = 999999)
+      AND (max_savings_vaults IS NULL OR max_savings_vaults = 999999)
+  `);
+
+  // ---------- Feature bullets (append once per plan) ----------
+  try {
+    const plans = await query(`SELECT id, name, max_bills_per_day, max_savings_vaults, features FROM pricing_plans`);
+    for (const plan of plans.rows) {
+      const features: string[] = Array.isArray(plan.features) ? plan.features : [];
+      const hasBills = features.some((f: string) => /bill payment/i.test(f));
+      const hasSavings = features.some((f: string) => /savings vault/i.test(f));
+      if (hasBills && hasSavings) continue;
+
+      const fmt = (n: any, noun: string) =>
+        n == null || Number(n) >= 999999 ? `Unlimited ${noun}` : `${Number(n)} ${noun}${Number(n) === 1 ? "" : "s"}`;
+      const next = [...features];
+      if (!hasBills) next.push(`${fmt(plan.max_bills_per_day, "bill payment")} per day (airtime, data, TV, electricity)`);
+      if (!hasSavings) next.push(`${fmt(plan.max_savings_vaults, "savings vault")} with auto-save`);
+      await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+    }
+  } catch (err) {
+    console.error("[migrations] daily revenue feature-bullet append failed:", err);
+  }
+
+  console.log("[migrations] daily-use revenue knob ladder applied");
 }

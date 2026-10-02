@@ -23,7 +23,26 @@ function genReference(prefix: string): string {
     return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 }
 
-/** Public (authed) pack catalogue + the buyer's current balance. */
+/**
+ * @openapi
+ * tags:
+ *   name: MetricAi Credits
+ *   description: One-time MetricAi credit pack top-ups purchasable from wallets —
+ *     a revenue feature (plan-level ai_credit_discount_percent applies)
+ */
+
+/**
+ * @openapi
+ * /ai-credits/packs:
+ *   get:
+ *     summary: Credit pack catalogue with plan discount + buyer's credit balance
+ *     tags: [MetricAi Credits]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Packs (price, discount_percent, discounted_price) + balance
+ */
 router.get("/packs", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
@@ -66,6 +85,18 @@ router.get("/packs", authenticateToken, checkSubscriptionStatus, async (req: Aut
     }
 });
 
+/**
+ * @openapi
+ * /ai-credits/balance:
+ *   get:
+ *     summary: Current MetricAi credit balance for the caller
+ *     tags: [MetricAi Credits]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Credit balance
+ */
 router.get("/balance", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const balance = await getAiCreditBalance(req.user!.userId);
@@ -76,6 +107,18 @@ router.get("/balance", authenticateToken, checkSubscriptionStatus, async (req: A
     }
 });
 
+/**
+ * @openapi
+ * /ai-credits/purchases:
+ *   get:
+ *     summary: Purchase history for the caller
+ *     tags: [MetricAi Credits]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Recent credit purchases (newest first)
+ */
 router.get("/purchases", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
@@ -97,6 +140,31 @@ router.get("/purchases", authenticateToken, checkSubscriptionStatus, async (req:
  * Purchase a credit pack. Charged from the best available wallet (business
  * first, then personal) — the same resolver used for OTP fees. Atomic credit
  * grant; revenue lands in the platform revenue wallet.
+ *
+ * @openapi
+ * /ai-credits/purchase:
+ *   post:
+ *     summary: Purchase a MetricAi credit pack from a wallet
+ *     tags: [MetricAi Credits]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [pack_id]
+ *             properties:
+ *               pack_id: { type: string, format: uuid }
+ *               wallet_id: { type: string, format: uuid, description: "Optional — auto-resolved when omitted" }
+ *     responses:
+ *       200:
+ *         description: Purchase succeeded, credits granted
+ *       400:
+ *         description: Insufficient balance / no wallet
+ *       404:
+ *         description: Pack not found
  */
 router.post("/purchase", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {

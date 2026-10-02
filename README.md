@@ -49,6 +49,15 @@ The backend powering **Metricorex** (project: Metroflow) — an all-in-one busin
 - Payroll: employees (NGN & USD recipients), Excel import, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
 - Transaction OTP/PIN, KYC (BVN/NIN/business docs via Prembly), biometric unlock, login-attempt alert emails.
 
+### Revenue Features (all plan-configurable via /admin/pricing)
+Five monetised surfaces, each wired into `pricing_plans` (feature toggles + limits + fee discounts that admins control per plan) and settled through the platform revenue wallet:
+
+1. **Bills Hub** (`/api/bills`) — daily-use bill payments: airtime, data bundles, TV (DStv/GOtv/StarTimes), electricity (all Discos) and betting top-ups, paid straight from any personal or business wallet. Flat convenience fee per transaction (fee type `bill`, ₦50 default) reduced by the plan's `bill_fee_discount_percent`, daily volume capped by `max_bills_per_day`. Fulfilment is pluggable (`BILLS_PROVIDER_URL`); a built-in simulator settles instantly when no provider is configured, and failed fulfilments auto-refund. Admin overview: `GET /api/admin/bills`.
+2. **Savings Vaults** (`/api/savings`) — goal-based vaults with **auto-save** schedules (daily/weekly/monthly) that pull from a chosen wallet, keeping users in the app every day. Early withdrawal before the vault's target date charges a break fee (fee type `savings_break`, 2% capped ₦5,000) reduced by `savings_break_fee_discount_percent`; plan limits vault count via `max_savings_vaults`. The auto-save engine runs on a 5-minute cron (`processDueAutoSaves`, idempotent via next-run claiming). Admin overview: `GET /api/admin/savings`.
+3. **Payment Links** (`/api/payment-links`) — shareable checkout links (fixed or customer-chosen amount) with public `/pay/:slug` pages; 1.5% capped ₦2,000 collection fee (type `payment_link`) reduced by `payment_link_fee_discount_percent`, link count limited by `max_payment_links`. Settled by the payment webhooks. Admin overview: `GET /api/admin/payment-links`.
+4. **Smart Invoices** (`/api/invoices`) — itemised invoices (line items, tax, due date) with public `/invoices/:id/pay` checkout; 1% capped ₦2,500 settlement fee (type `invoice`) reduced by `invoice_fee_discount_percent`, monthly creation capped by `max_invoices_per_month`. Overdue is computed on read; settled by the payment webhooks. Admin overview: `GET /api/admin/invoices`.
+5. **MetricAi Credit Packs** (`/api/ai-credits`) — one-time AI credit top-ups purchasable from any wallet when a plan's MetricAi allowance runs out; plan-level `ai_credit_discount_percent` prices packs per plan. Admin manages packs via `/api/admin/ai-credit-packs`.
+
 ### Platform Operations (Admin)
 - Role & permission management (roles carry permission slugs; includes `support`), admin management.
 - Payment provider toggles (global + transfer provider), fees & international transfer config, platform/revenue ledgers with movements + reconciliation.
@@ -88,6 +97,8 @@ Key variables (see `ENVIRONMENT_SETUP.md` for the full list):
 | `BREVO_API_KEY` | Transactional email |
 | `FCM_*` | Push notifications |
 | `SUPPORT_ALERT_EMAIL` | Optional email ping on new support requests |
+| `BILLS_PROVIDER_URL` / `BILLS_PROVIDER_API_KEY` | Optional — live VTU/bills aggregator for the Bills Hub; when absent the built-in simulator settles bills instantly |
+| `JOBS_SECRET` | Optional shared secret for `/internal/jobs/*` endpoints |
 
 ## Local Development
 
@@ -136,4 +147,9 @@ Migrations run automatically on boot (`runPostInitializeMigrations`): support-de
 
 ## API Documentation
 
-Swagger UI: `/api-docs`. The spec covers auth, team, tasks (+attachments), epics, comments, chat (+media/GIFs), calls, meetings, recordings, MetricAi (+public Ask), support desk, wallet, transfers, payroll, KYC, settings, notifications, subscriptions and the admin API.
+Swagger UI: `/api-docs`. The spec is generated from JSDoc annotations in `server/routes/*.ts` (`npm run generate-swagger`) and served from `server/swagger-output.json`.
+
+Coverage now includes **every endpoint of the five revenue features** — Bills (`Bills`), Savings Vaults (`Savings`), Payment Links (`Payment Links`), Smart Invoices (`Smart Invoices`) and MetricAi Credits (`MetricAi Credits`), plus their admin overviews (`/admin/bills`, `/admin/savings`, `/admin/invoices`) — alongside auth, team, tasks (+attachments), epics, comments, chat (+media/GIFs), calls, meetings, recordings, MetricAi (+public Ask), support desk, wallet, transfers, payroll, KYC, settings, notifications, subscriptions and the admin API.
+
+### Plan configuration (admin)
+All five revenue features are wired into `pricing_plans` and editable per plan through `PUT /admin/pricing` with: `bills_enabled`, `max_bills_per_day`, `bill_fee_discount_percent`, `savings_enabled`, `max_savings_vaults`, `savings_break_fee_discount_percent`, `payment_links_enabled`, `max_payment_links`, `payment_link_fee_discount_percent`, `invoices_enabled`, `max_invoices_per_month`, `invoice_fee_discount_percent`, and `ai_credit_discount_percent`.

@@ -51,6 +51,26 @@ function effectiveFee(gross: number, baseFee: number, discountPercent: number): 
 // Authenticated endpoints (link owners)
 // ---------------------------------------------------------------------------
 
+/**
+ * @openapi
+ * tags:
+ *   name: Payment Links
+ *   description: Shareable checkout links for businesses — a revenue feature
+ *     (collection fee lands in the platform revenue wallet, plan-configurable)
+ */
+
+/**
+ * @openapi
+ * /payment-links:
+ *   get:
+ *     summary: List the business's payment links with payment stats
+ *     tags: [Payment Links]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Payment links (newest first)
+ */
 router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -72,6 +92,33 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
     }
 });
 
+/**
+ * @openapi
+ * /payment-links:
+ *   post:
+ *     summary: Create a payment link (fixed or custom amount, plan-gated)
+ *     tags: [Payment Links]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [title]
+ *             properties:
+ *               title: { type: string }
+ *               description: { type: string }
+ *               amount: { type: number, description: "Required unless allow_custom_amount is true" }
+ *               currency: { type: string, default: NGN }
+ *               allow_custom_amount: { type: boolean }
+ *     responses:
+ *       200:
+ *         description: Created link (shareable slug returned)
+ *       403:
+ *         description: Plan limit reached or feature disabled (PLAN_UPGRADE_REQUIRED)
+ */
 router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -129,6 +176,25 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     }
 });
 
+/**
+ * @openapi
+ * /payment-links/{id}:
+ *   put:
+ *     summary: Update a payment link (title, description, amount, custom-amount, active state)
+ *     tags: [Payment Links]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Updated link
+ *       404:
+ *         description: Link not found
+ */
 router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -159,6 +225,25 @@ router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
     }
 });
 
+/**
+ * @openapi
+ * /payment-links/{id}:
+ *   delete:
+ *     summary: Delete a payment link
+ *     tags: [Payment Links]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Deleted
+ *       404:
+ *         description: Link not found
+ */
 router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -172,6 +257,25 @@ router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: Au
     }
 });
 
+/**
+ * @openapi
+ * /payment-links/{id}/payments:
+ *   get:
+ *     summary: List payments received through a link
+ *     tags: [Payment Links]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Link payments (newest first)
+ *       404:
+ *         description: Link not found
+ */
 router.get("/:id/payments", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
@@ -194,6 +298,24 @@ router.get("/:id/payments", authenticateToken, checkSubscriptionStatus, async (r
 // Public endpoints (no auth — customers paying a link)
 // ---------------------------------------------------------------------------
 
+/**
+ * @openapi
+ * /payment-links/public/{slug}:
+ *   get:
+ *     summary: Public payment link view (no auth — customer checkout)
+ *     tags: [Payment Links]
+ *     security: []
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Link details + business name
+ *       404:
+ *         description: Link not found or inactive
+ */
 router.get("/public/:slug", async (req, res) => {
     try {
         const { slug } = req.params;
@@ -230,6 +352,38 @@ router.get("/public/:slug", async (req, res) => {
 /**
  * Initiate a customer payment: creates the pending payment record + pending
  * transaction and returns the provider's hosted checkout URL.
+ */
+/**
+ * @openapi
+ * /payment-links/public/{slug}/initiate:
+ *   post:
+ *     summary: Initiate a customer payment (returns hosted checkout URL, settled by webhook)
+ *     tags: [Payment Links]
+ *     security: []
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [payer_email]
+ *             properties:
+ *               amount: { type: number, description: "Required for custom-amount links" }
+ *               payer_name: { type: string }
+ *               payer_email: { type: string }
+ *               provider: { type: string, description: "Optional provider override" }
+ *     responses:
+ *       200:
+ *         description: checkout_url + reference
+ *       404:
+ *         description: Link not found or inactive
+ *       502:
+ *         description: Provider initiation failed
  */
 router.post("/public/:slug/initiate", async (req, res) => {
     try {

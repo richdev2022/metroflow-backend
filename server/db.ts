@@ -355,6 +355,43 @@ const EXPECTED_TABLES = [
   "users",
   "virtual_accounts",
   "wallets",
+  // ---- Revenue / Get Paid features (ensureRevenueFeaturesSchema) ----
+  "payment_links",
+  "payment_link_payments",
+  "ai_credit_packs",
+  "ai_credit_balances",
+  "ai_credit_purchases",
+  // ---- Invoices / Storefront / Recurring billing ----
+  "invoices",
+  "invoice_items",
+  "invoice_payments",
+  "store_products",
+  "store_orders",
+  "store_order_items",
+  "customer_subscription_plans",
+  "customer_subscribers",
+  "subscription_charges",
+  // ---- MetricAi (ensureChatAndAiSchema / ensureAiLimitsSchema) ----
+  "ai_messages",
+  "metric_ai_video_jobs",
+  "metric_ai_usage",
+  // ---- Support / growth / notifications ----
+  "support_conversations",
+  "support_messages",
+  "admin_notifications",
+  "announcements",
+  "user_devices",
+  "web_push_subscriptions",
+  "biometric_credentials",
+  "site_wishlist_entries",
+  "site_subscribers",
+  "site_email_campaigns",
+  // ---- Team RBAC / calling extras / blocks ----
+  "team_roles",
+  "meeting_guests",
+  "meeting_transcripts",
+  "meeting_notes",
+  "user_blocks",
 ];
 
 /**
@@ -384,9 +421,19 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "avatar_url",
     "failed_login_attempts",
     "locked_until",
+    // Team Roles & Permissions (ensureTeamRolesSchema)
+    "role_id",
   ],
   businesses: ["id", "name", "email", "plan_id", "owner_id", "trial_ends_at"],
   login_attempts: ["id", "email", "success"],
+  // Team RBAC
+  team_roles: ["id", "business_id", "name", "permissions", "is_system"],
+  // Payment Links (ensureRevenueFeaturesSchema)
+  payment_links: ["id", "business_id", "slug", "amount", "currency", "is_active"],
+  // Invoices
+  invoices: ["id", "business_id", "invoice_number", "status", "total"],
+  // MetricAi per-member private chat
+  ai_messages: ["id", "user_id", "business_id", "role", "content"],
 };
 
 export async function verifySchema(): Promise<string[]> {

@@ -1,10 +1,10 @@
 import express from "express";
-import { query } from "../db";
-import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
-import { createNotification } from "../services/notifications";
-import { verifyPassword } from "../services/auth";
-import { fulfilBill, isBillsProviderConfigured } from "../services/bills-provider";
+import { query } from "../../db";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
+import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
+import { createNotification } from "../../services/notifications";
+import { verifyPassword } from "../../services/auth";
+import { fulfilBill, isBillsProviderConfigured } from "./bills-provider";
 
 const router = express.Router();
 

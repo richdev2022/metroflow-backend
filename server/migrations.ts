@@ -22,9 +22,9 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureRevenueFeaturesSchema();
   await ensurePlanPricingLadder();
   await ensureInvoicesSchema();
-  await ensureBillsSchema();
-  await ensureSavingsSchema();
-  await ensureDailyRevenueKnobLadder();
+  await ensureStoreSchema();
+  await ensureRecurringBillingSchema();
+  await ensureBusinessRevenueLadder();
 }
 
 /**
@@ -1161,211 +1161,270 @@ async function ensureInvoicesSchema(): Promise<void> {
 }
 
 /**
- * Bills Hub — the fourth revenue feature (daily-use).
+ * Storefront ("Metroflow Store") — a BUSINESS revenue feature.
  *
- * Users pay airtime, data, TV, electricity and betting top-ups straight from
- * any of their wallets (personal or business). The platform earns a flat
- * convenience fee per transaction (fee_configurations 'bill' — ₦50 by
- * default, reduced by the plan-level bill_fee_discount_percent) which lands
- * in the platform revenue wallet via creditRevenueWallet. Fulfilment is
- * delegated to a pluggable bills provider; when none is configured the
- * built-in simulator settles the bill instantly so the flow stays testable.
+ * Businesses list products/services in a shareable storefront (public page
+ * /store/:publicId). Customers place orders and pay through the active
+ * payment provider's hosted checkout; the webhook credits the business
+ * wallet minus an order fee (fee_configurations 'store_order' — 2.5% capped
+ * ₦2,500 by default, reduced by the plan-level store_fee_discount_percent).
+ * The fee lands in the platform revenue wallet via creditRevenueWallet and
+ * every settlement is double-entered through the platform ledger.
  *
  * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
- *   - bills_enabled               (feature toggle)
- *   - max_bills_per_day           (NULL/999999+ = unlimited; daily cap)
- *   - bill_fee_discount_percent
+ *   - store_enabled              (feature toggle)
+ *   - max_store_products         (NULL/999999+ = unlimited)
+ *   - store_fee_discount_percent
  */
-async function ensureBillsSchema(): Promise<void> {
+async function ensureStoreSchema(): Promise<void> {
   await query(`
-    CREATE TABLE IF NOT EXISTS bill_payments (
+    CREATE TABLE IF NOT EXISTS store_products (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      business_id VARCHAR(255),
-      user_id UUID,
-      wallet_id UUID NOT NULL,
-      reference VARCHAR(255) UNIQUE NOT NULL,
-      category VARCHAR(30) NOT NULL, -- airtime | data | tv | electricity | betting
-      provider_code VARCHAR(60) NOT NULL, -- e.g. mtn, dstv, ikedc
-      provider_name VARCHAR(120),
-      plan_code VARCHAR(60),         -- data/TV plan code when applicable
-      plan_name VARCHAR(160),
-      customer_ref VARCHAR(160) NOT NULL, -- phone | smartcard | meter | user id
-      customer_phone VARCHAR(50),
-      amount DECIMAL(12,2) NOT NULL,
-      fee DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total DECIMAL(12,2) NOT NULL,
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      name VARCHAR(160) NOT NULL,
+      description TEXT,
+      price DECIMAL(15,2) NOT NULL,
       currency VARCHAR(3) DEFAULT 'NGN',
-      status VARCHAR(20) DEFAULT 'pending', -- pending | success | failed | refunded
-      fulfilment_mode VARCHAR(20),   -- provider | simulated
-      provider_reference VARCHAR(120),
-      provider_response JSONB,
-      failure_reason TEXT,
+      stock INTEGER,
+      image_url TEXT,
+      status VARCHAR(20) DEFAULT 'active', -- active | paused | draft
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_business ON bill_payments(business_id)`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_user ON bill_payments(user_id)`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_bill_payments_status ON bill_payments(status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_products_business ON store_products(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_products_status ON store_products(business_id, status)`);
 
-  // Plan configuration knobs for the Bills Hub
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS bills_enabled BOOLEAN DEFAULT TRUE`);
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_bills_per_day INTEGER DEFAULT 3`);
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS bill_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS store_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      order_number VARCHAR(40) UNIQUE NOT NULL,
+      checkout_reference VARCHAR(255) UNIQUE NOT NULL,
+      customer_name VARCHAR(160) NOT NULL,
+      customer_email VARCHAR(200),
+      customer_phone VARCHAR(50),
+      subtotal DECIMAL(15,2) NOT NULL DEFAULT 0,
+      fee DECIMAL(15,2) NOT NULL DEFAULT 0,
+      net_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      total DECIMAL(15,2) NOT NULL DEFAULT 0,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending', -- pending | paid | fulfilled | cancelled | failed
+      payment_provider VARCHAR(40),
+      note TEXT,
+      paid_at TIMESTAMP,
+      fulfilled_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_orders_business ON store_orders(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_orders_status ON store_orders(status)`);
 
-  // Flat convenience fee per bill transaction (idempotent seed).
+  await query(`
+    CREATE TABLE IF NOT EXISTS store_order_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      order_id UUID NOT NULL REFERENCES store_orders(id) ON DELETE CASCADE,
+      product_id UUID,
+      product_name VARCHAR(160) NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      unit_price DECIMAL(15,2) NOT NULL,
+      amount DECIMAL(15,2) NOT NULL
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_order_items_order ON store_order_items(order_id)`);
+
+  // Plan configuration knobs for the Storefront
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS store_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_store_products INTEGER DEFAULT 5`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS store_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Storefront order fee: 2.5% capped ₦2,500 (idempotent seed).
   await query(`
     INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
-    SELECT 'Bill Payment Convenience Fee', 'bill', 'flat',
-           '{"amount": 50}'::jsonb, 'NGN'
-    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'bill')
+    SELECT 'Storefront Order Fee', 'store_order', 'percentage_cap',
+           '{"percentage": 2.5, "cap": 2500}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'store_order')
   `);
 
-  console.log("[migrations] Bills Hub schema applied");
+  console.log("[Migrations] Storefront schema applied");
 }
 
 /**
- * Savings Vaults — the fifth revenue feature (daily-use).
+ * Recurring Billing (Customer Subscriptions) — a BUSINESS revenue feature.
  *
- * Users create goal-based savings vaults, fund them from any wallet and can
- * switch on auto-save (daily/weekly/monthly) that pulls from a chosen wallet.
- * Withdrawing before the vault's target date charges an early-break fee
- * (fee_configurations 'savings_break' — 2% capped ₦5,000 by default, reduced
- * by the plan-level savings_break_fee_discount_percent) which lands in the
- * platform revenue wallet. Auto-save keeps users in the app every single day.
+ * Businesses create subscription plans (daily / weekly / monthly) and share
+ * a public subscribe link. Subscribers either auto-pay from their Metroflow
+ * wallet (when the subscriber email maps to a platform user, mandate style —
+ * charged by the 5-minute cron engine) or pay each cycle through the hosted
+ * checkout link emailed to them. Every successful charge credits the
+ * merchant wallet minus a platform fee (fee_configurations 'subscription' —
+ * 2% capped ₦2,000 by default, reduced by the plan-level
+ * subscription_fee_discount_percent) which lands in the platform revenue
+ * wallet via creditRevenueWallet.
  *
  * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
- *   - savings_enabled                    (feature toggle)
- *   - max_savings_vaults                 (NULL/999999+ = unlimited)
- *   - savings_break_fee_discount_percent
+ *   - recurring_enabled                   (feature toggle)
+ *   - max_subscription_plans              (NULL/999999+ = unlimited)
+ *   - subscription_fee_discount_percent
  */
-async function ensureSavingsSchema(): Promise<void> {
+async function ensureRecurringBillingSchema(): Promise<void> {
   await query(`
-    CREATE TABLE IF NOT EXISTS savings_vaults (
+    CREATE TABLE IF NOT EXISTS customer_subscription_plans (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      business_id VARCHAR(255),
-      user_id UUID,
-      name VARCHAR(120) NOT NULL,
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      name VARCHAR(160) NOT NULL,
+      description TEXT,
+      amount DECIMAL(15,2) NOT NULL,
       currency VARCHAR(3) DEFAULT 'NGN',
-      balance DECIMAL(15,2) NOT NULL DEFAULT 0,
-      goal_amount DECIMAL(15,2),
-      target_date DATE,
-      status VARCHAR(20) DEFAULT 'active', -- active | paused | closed
-      auto_save_enabled BOOLEAN DEFAULT FALSE,
-      auto_save_amount DECIMAL(12,2),
-      auto_save_frequency VARCHAR(20),     -- daily | weekly | monthly
-      auto_save_wallet_id UUID,
-      auto_save_next_run TIMESTAMP,
-      auto_save_last_run TIMESTAMP,
-      auto_save_failures INTEGER DEFAULT 0,
-      withdrawn_at TIMESTAMP,
-      total_deposited DECIMAL(15,2) NOT NULL DEFAULT 0,
-      total_withdrawn DECIMAL(15,2) NOT NULL DEFAULT 0,
+      interval VARCHAR(20) NOT NULL DEFAULT 'monthly', -- daily | weekly | monthly
+      status VARCHAR(20) DEFAULT 'active',             -- active | paused
+      public_id UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_business ON savings_vaults(business_id)`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_user ON savings_vaults(user_id)`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_savings_vaults_autosave ON savings_vaults(auto_save_next_run) WHERE auto_save_enabled = TRUE AND status = 'active'`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_plans_business ON customer_subscription_plans(business_id)`);
 
   await query(`
-    CREATE TABLE IF NOT EXISTS savings_transactions (
+    CREATE TABLE IF NOT EXISTS customer_subscribers (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      vault_id UUID NOT NULL REFERENCES savings_vaults(id) ON DELETE CASCADE,
-      type VARCHAR(30) NOT NULL,   -- deposit | withdrawal | auto_save | break_fee
+      business_id VARCHAR(255) NOT NULL,
+      plan_id UUID NOT NULL REFERENCES customer_subscription_plans(id) ON DELETE CASCADE,
+      customer_user_id UUID,
+      wallet_id UUID,
+      customer_name VARCHAR(160) NOT NULL,
+      customer_email VARCHAR(200) NOT NULL,
+      customer_phone VARCHAR(50),
+      status VARCHAR(20) DEFAULT 'active', -- active | past_due | cancelled
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      next_charge_date DATE,
+      last_charged_at TIMESTAMP,
+      last_charge_reference VARCHAR(255),
+      unsubscribe_token UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_business ON customer_subscribers(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_plan ON customer_subscribers(plan_id)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_csub_subscribers_plan_email ON customer_subscribers(plan_id, customer_email)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_due ON customer_subscribers(next_charge_date) WHERE status = 'active'`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS subscription_charges (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      subscriber_id UUID NOT NULL REFERENCES customer_subscribers(id) ON DELETE CASCADE,
+      plan_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
       amount DECIMAL(15,2) NOT NULL,
       fee DECIMAL(15,2) NOT NULL DEFAULT 0,
-      balance_after DECIMAL(15,2) NOT NULL,
-      wallet_id UUID,
-      reference VARCHAR(255) UNIQUE,
-      status VARCHAR(20) DEFAULT 'success',
-      note TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      net_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      charge_path VARCHAR(20) NOT NULL DEFAULT 'checkout', -- wallet | checkout
+      status VARCHAR(20) DEFAULT 'pending',                -- pending | awaiting_payment | success | failed
+      period_start DATE,
+      period_end DATE,
+      failure_reason TEXT,
+      paid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_savings_transactions_vault ON savings_transactions(vault_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sub_charges_subscriber ON subscription_charges(subscriber_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sub_charges_business ON subscription_charges(business_id)`);
 
-  // Plan configuration knobs for Savings Vaults
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS savings_enabled BOOLEAN DEFAULT TRUE`);
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_savings_vaults INTEGER DEFAULT 1`);
-  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS savings_break_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+  // Plan configuration knobs for Recurring Billing
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS recurring_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_subscription_plans INTEGER DEFAULT 2`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS subscription_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
 
-  // Early-withdrawal fee: 2% capped ₦5,000 (idempotent seed).
+  // Subscription charge fee: 2% capped ₦2,000 (idempotent seed).
   await query(`
     INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
-    SELECT 'Savings Early Withdrawal Fee', 'savings_break', 'percentage_cap',
-           '{"percentage": 2.0, "cap": 5000}'::jsonb, 'NGN'
-    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'savings_break')
+    SELECT 'Subscription Charge Fee', 'subscription', 'percentage_cap',
+           '{"percentage": 2.0, "cap": 2000}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'subscription')
   `);
 
-  console.log("[migrations] Savings Vaults schema applied");
+  console.log("[Migrations] Recurring Billing schema applied");
 }
 
 /**
- * Daily-use revenue knob ladder — the bills/savings knobs are new columns, so
- * the legacy-gated ensurePlanPricingLadder UPDATEs (which match only the old
- * USD seed prices) no longer fire. This one-off ladder seeds the NEW columns
- * per plan, gated on the columns still being at their freshly-added defaults
- * (IS NULL or the global default), so an admin's later re-pricing is never
- * clobbered. Also appends the Bills/Savings bullets to each plan's feature
- * list exactly once (when they are not mentioned yet).
+ * Business revenue knob ladder — seeds the Storefront / Recurring Billing
+ * knobs per plan and refreshes each plan's feature list:
+ *   1. strips the Personal-app bullets (bill payments / savings vaults) —
+ *      those features moved out of the business app into the dormant
+ *      personal feature folder (server/features/personal);
+ *   2. appends the Storefront + Recurring Billing bullets exactly once.
+ * Knob UPDATEs are gated on the columns still being at their freshly-added
+ * defaults so an admin's later re-pricing is never clobbered.
  */
-async function ensureDailyRevenueKnobLadder(): Promise<void> {
+async function ensureBusinessRevenueLadder(): Promise<void> {
   // ---------- Knobs (gated on untouched defaults) ----------
   await query(`
     UPDATE pricing_plans SET
-      bills_enabled = TRUE,
-      max_bills_per_day = 3,
-      bill_fee_discount_percent = 0,
-      savings_enabled = TRUE,
-      max_savings_vaults = 1,
-      savings_break_fee_discount_percent = 0
-    WHERE name = 'Free Trial' AND (max_bills_per_day IS NULL OR max_bills_per_day = 3)
-      AND (max_savings_vaults IS NULL OR max_savings_vaults = 1)
+      store_enabled = TRUE,
+      max_store_products = 3,
+      store_fee_discount_percent = 0,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 1,
+      subscription_fee_discount_percent = 0
+    WHERE name = 'Free Trial' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 2)
   `);
   await query(`
     UPDATE pricing_plans SET
-      bills_enabled = TRUE,
-      max_bills_per_day = 20,
-      bill_fee_discount_percent = 10,
-      savings_enabled = TRUE,
-      max_savings_vaults = 5,
-      savings_break_fee_discount_percent = 10
-    WHERE name = 'Starter' AND (max_bills_per_day IS NULL OR max_bills_per_day = 20)
-      AND (max_savings_vaults IS NULL OR max_savings_vaults = 5)
+      store_enabled = TRUE,
+      max_store_products = 15,
+      store_fee_discount_percent = 10,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 10,
+      subscription_fee_discount_percent = 10
+    WHERE name = 'Starter' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 10)
   `);
   await query(`
     UPDATE pricing_plans SET
-      bills_enabled = TRUE,
-      max_bills_per_day = 999999,
-      bill_fee_discount_percent = 25,
-      savings_enabled = TRUE,
-      max_savings_vaults = 999999,
-      savings_break_fee_discount_percent = 25
-    WHERE name = 'Pro' AND (max_bills_per_day IS NULL OR max_bills_per_day = 999999)
-      AND (max_savings_vaults IS NULL OR max_savings_vaults = 999999)
+      store_enabled = TRUE,
+      max_store_products = 999999,
+      store_fee_discount_percent = 25,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 999999,
+      subscription_fee_discount_percent = 25
+    WHERE name = 'Pro' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 999999)
   `);
 
-  // ---------- Feature bullets (append once per plan) ----------
+  // ---------- Feature bullets (strip personal, append business once) ----------
   try {
-    const plans = await query(`SELECT id, name, max_bills_per_day, max_savings_vaults, features FROM pricing_plans`);
+    const plans = await query(`SELECT id, name, max_store_products, max_subscription_plans, features FROM pricing_plans`);
     for (const plan of plans.rows) {
       const features: string[] = Array.isArray(plan.features) ? plan.features : [];
-      const hasBills = features.some((f: string) => /bill payment/i.test(f));
-      const hasSavings = features.some((f: string) => /savings vault/i.test(f));
-      if (hasBills && hasSavings) continue;
+      const next = features.filter(
+        (f: string) => !/bill payment/i.test(f) && !/savings vault/i.test(f)
+      );
+      const hasStore = next.some((f: string) => /storefront/i.test(f));
+      const hasRecurring = next.some((f: string) => /recurring billing/i.test(f));
+      if (hasStore && hasRecurring) {
+        if (next.length !== features.length) {
+          await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+        }
+        continue;
+      }
 
       const fmt = (n: any, noun: string) =>
         n == null || Number(n) >= 999999 ? `Unlimited ${noun}` : `${Number(n)} ${noun}${Number(n) === 1 ? "" : "s"}`;
-      const next = [...features];
-      if (!hasBills) next.push(`${fmt(plan.max_bills_per_day, "bill payment")} per day (airtime, data, TV, electricity)`);
-      if (!hasSavings) next.push(`${fmt(plan.max_savings_vaults, "savings vault")} with auto-save`);
+      if (!hasStore) next.push(`${fmt(plan.max_store_products, "storefront product")} with hosted checkout`);
+      if (!hasRecurring) next.push(`${fmt(plan.max_subscription_plans, "recurring billing plan")} on any interval`);
       await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
     }
   } catch (err) {
-    console.error("[migrations] daily revenue feature-bullet append failed:", err);
+    console.error("[Migrations] business revenue feature-bullet refresh failed:", err);
   }
 
-  console.log("[migrations] daily-use revenue knob ladder applied");
+  console.log("[Migrations] business revenue knob ladder applied");
 }

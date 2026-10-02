@@ -83,8 +83,8 @@ import feesRouter from "./routes/fees";
 import paymentLinksRouter from "./routes/payment_links";
 import aiCreditsRouter from "./routes/ai_credits";
 import invoicesRouter from "./routes/invoices";
-import billsRouter from "./routes/bills";
-import savingsRouter from "./routes/savings";
+import storeRouter from "./routes/store";
+import recurringRouter from "./routes/recurring";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
@@ -296,18 +296,20 @@ export async function createServer() {
       }
     });
 
-    // Savings Vaults auto-save engine — runs every 5 minutes, debits each due
-    // vault's wallet and credits the vault. Idempotent per vault via the
-    // auto_save_next_run claim inside processDueAutoSaves.
+    // Recurring Billing charge engine — runs every 5 minutes, charges each
+    // due customer subscription (wallet path debits the subscriber's wallet
+    // instantly; checkout path queues a hosted-checkout charge and emails the
+    // pay link). Idempotent via the next_charge_date claim inside
+    // processDueSubscriptionCharges.
     cron.schedule("*/5 * * * *", async () => {
       try {
-        const { processDueAutoSaves } = await import("./routes/savings");
-        const result = await processDueAutoSaves();
+        const { processDueSubscriptionCharges } = await import("./routes/recurring");
+        const result = await processDueSubscriptionCharges();
         if (result.processed > 0) {
-          logger.info(`[Savings] auto-save processed ${result.processed}: ${result.succeeded} ok, ${result.failed} skipped`);
+          logger.info(`[Recurring] charges processed ${result.processed}: ${result.succeeded} ok, ${result.failed} failed`);
         }
       } catch (error) {
-        logger.error("Savings auto-save cron error:", error);
+        logger.error("Recurring billing cron error:", error);
       }
     });
   }
@@ -689,8 +691,11 @@ export async function createServer() {
   mainRouter.use("/payment-links", paymentLinksRouter);
   mainRouter.use("/ai-credits", aiCreditsRouter);
   mainRouter.use("/invoices", invoicesRouter);
-  mainRouter.use("/bills", billsRouter);
-  mainRouter.use("/savings", savingsRouter);
+  // Business revenue features: Storefront + Recurring Billing (Customer Subscriptions).
+  // (Bills Hub & Savings Vaults live in server/features/personal — dormant until
+  // the Personal app ships; see server/features/personal/README.md.)
+  mainRouter.use("/store", storeRouter);
+  mainRouter.use("/recurring", recurringRouter);
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);

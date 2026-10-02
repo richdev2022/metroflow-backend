@@ -857,8 +857,8 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
             aiCreditDiscountPercent,
             invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent,
-            billsEnabled, maxBillsPerDay, billFeeDiscountPercent,
-            savingsEnabled, maxSavingsVaults, savingsBreakFeeDiscountPercent
+            storeEnabled, maxStoreProducts, storeFeeDiscountPercent,
+            recurringEnabled, maxSubscriptionPlans, subscriptionFeeDiscountPercent
         } = req.body;
 
         // Dynamic update
@@ -986,34 +986,34 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             params.push(Number(invoiceFeeDiscountPercent) || 0);
             paramCount++;
         }
-        if (billsEnabled !== undefined) {
-            queryStr += `, bills_enabled = $${paramCount}`;
-            params.push(billsEnabled === true);
+        if (storeEnabled !== undefined) {
+            queryStr += `, store_enabled = $${paramCount}`;
+            params.push(storeEnabled === true);
             paramCount++;
         }
-        if (maxBillsPerDay !== undefined) {
-            queryStr += `, max_bills_per_day = $${paramCount}`;
-            params.push(Number(maxBillsPerDay) || 0);
+        if (maxStoreProducts !== undefined) {
+            queryStr += `, max_store_products = $${paramCount}`;
+            params.push(Number(maxStoreProducts) || 0);
             paramCount++;
         }
-        if (billFeeDiscountPercent !== undefined) {
-            queryStr += `, bill_fee_discount_percent = $${paramCount}`;
-            params.push(Number(billFeeDiscountPercent) || 0);
+        if (storeFeeDiscountPercent !== undefined) {
+            queryStr += `, store_fee_discount_percent = $${paramCount}`;
+            params.push(Number(storeFeeDiscountPercent) || 0);
             paramCount++;
         }
-        if (savingsEnabled !== undefined) {
-            queryStr += `, savings_enabled = $${paramCount}`;
-            params.push(savingsEnabled === true);
+        if (recurringEnabled !== undefined) {
+            queryStr += `, recurring_enabled = $${paramCount}`;
+            params.push(recurringEnabled === true);
             paramCount++;
         }
-        if (maxSavingsVaults !== undefined) {
-            queryStr += `, max_savings_vaults = $${paramCount}`;
-            params.push(Number(maxSavingsVaults) || 0);
+        if (maxSubscriptionPlans !== undefined) {
+            queryStr += `, max_subscription_plans = $${paramCount}`;
+            params.push(Number(maxSubscriptionPlans) || 0);
             paramCount++;
         }
-        if (savingsBreakFeeDiscountPercent !== undefined) {
-            queryStr += `, savings_break_fee_discount_percent = $${paramCount}`;
-            params.push(Number(savingsBreakFeeDiscountPercent) || 0);
+        if (subscriptionFeeDiscountPercent !== undefined) {
+            queryStr += `, subscription_fee_discount_percent = $${paramCount}`;
+            params.push(Number(subscriptionFeeDiscountPercent) || 0);
             paramCount++;
         }
 
@@ -4576,84 +4576,90 @@ protectedRouter.get("/invoices", requirePermission('manage_plans', 'manage_finan
 
 /**
  * @openapi
- * /admin/bills:
+ * /admin/store:
  *   get:
- *     summary: Platform-wide Bills Hub overview (volumes, convenience-fee revenue, recent bills)
+ *     summary: Platform-wide Storefront overview (products, orders, order-fee revenue, recent orders)
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: Bills summary + money stats + recent activity
+ *         description: Store summary + money stats + recent activity
  */
-protectedRouter.get("/bills", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+protectedRouter.get("/store", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
         const summary = await query(
-            `SELECT COUNT(*)::int AS total_bills,
-                    COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)::int AS successful_bills,
-                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_bills
-             FROM bill_payments`
+            `SELECT COUNT(*)::int AS total_products,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_products
+             FROM store_products`
         );
-        const money = await query(
-            `SELECT COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) AS gross,
-                    COALESCE(SUM(CASE WHEN status = 'success' THEN fee ELSE 0 END), 0) AS revenue,
-                    COALESCE(SUM(CASE WHEN status = 'success' THEN total ELSE 0 END), 0) AS collected
-             FROM bill_payments`
+        const orders = await query(
+            `SELECT COUNT(*)::int AS total_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN 1 ELSE 0 END), 0)::int AS paid_orders,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)::int AS pending_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN total ELSE 0 END), 0) AS gross,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN fee ELSE 0 END), 0) AS revenue
+             FROM store_orders`
         );
         const recent = await query(
-            `SELECT b.reference, b.category, b.provider_name, b.plan_name, b.customer_ref,
-                    b.amount, b.fee, b.total, b.currency, b.status, b.fulfilment_mode, b.created_at,
-                    bu.name AS business_name, u.name AS user_name
-             FROM bill_payments b
-             LEFT JOIN businesses bu ON bu.id = b.business_id
-             LEFT JOIN users u ON u.id = b.user_id
-             ORDER BY b.created_at DESC LIMIT 50`
+            `SELECT o.order_number, o.customer_name, o.total, o.fee, o.currency, o.status, o.payment_provider, o.created_at,
+                    b.name AS business_name
+             FROM store_orders o
+             LEFT JOIN businesses b ON b.id = o.business_id
+             ORDER BY o.created_at DESC LIMIT 50`
         );
-        res.json({ success: true, summary: summary.rows[0], money: money.rows[0], recent: recent.rows });
+        res.json({ success: true, summary: summary.rows[0], orders: orders.rows[0], recent: recent.rows });
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message || "Failed to load bills overview" });
+        res.status(500).json({ success: false, error: error.message || "Failed to load store overview" });
     }
 });
 
 /**
  * @openapi
- * /admin/savings:
+ * /admin/subscriptions:
  *   get:
- *     summary: Platform-wide Savings Vaults overview (balances, auto-save adoption, break fees)
+ *     summary: Platform-wide Recurring Billing overview (plans, subscribers, charge-fee revenue, recent charges)
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: Savings summary + fee stats + recent activity
+ *         description: Subscription summary + money stats + recent activity
  */
-protectedRouter.get("/savings", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+protectedRouter.get("/subscriptions", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
         const summary = await query(
-            `SELECT COUNT(*)::int AS total_vaults,
-                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_vaults,
-                    COALESCE(SUM(CASE WHEN auto_save_enabled AND status = 'active' THEN 1 ELSE 0 END), 0)::int as auto_save_vaults,
-                    COALESCE(SUM(balance), 0) AS total_balance,
-                    COALESCE(SUM(total_deposited), 0) AS total_deposited,
-                    COALESCE(SUM(total_withdrawn), 0) AS total_withdrawn
-             FROM savings_vaults`
+            `SELECT COUNT(*)::int AS total_plans,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_plans
+             FROM customer_subscription_plans`
         );
-        const fees = await query(
-            `SELECT COALESCE(SUM(fee), 0) AS break_fees, COUNT(*)::int AS withdrawals
-             FROM savings_transactions WHERE type = 'withdrawal' AND status = 'success'`
+        const subscribers = await query(
+            `SELECT COUNT(*)::int AS total_subscribers,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_subscribers,
+                    COALESCE(SUM(CASE WHEN status = 'past_due' THEN 1 ELSE 0 END), 0)::int AS past_due,
+                    COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0)::int AS cancelled
+             FROM customer_subscribers`
+        );
+        const money = await query(
+            `SELECT COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) AS gross,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN fee ELSE 0 END), 0) AS revenue,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN net_amount ELSE 0 END), 0) AS net,
+                    COUNT(*)::int AS successful_charges
+             FROM subscription_charges`
         );
         const recent = await query(
-            `SELECT t.reference, t.type, t.amount, t.fee, t.balance_after, t.status, t.created_at,
-                    v.name AS vault_name, b.name AS business_name, u.name AS user_name
-             FROM savings_transactions t
-             JOIN savings_vaults v ON v.id = t.vault_id
-             LEFT JOIN businesses b ON b.id = v.business_id
-             LEFT JOIN users u ON u.id = v.user_id
-             ORDER BY t.created_at DESC LIMIT 50`
+            `SELECT c.reference, c.amount, c.fee, c.net_amount, c.currency, c.status, c.charge_path, c.created_at,
+                    s.customer_name, s.customer_email, p.name AS plan_name, p.interval,
+                    b.name AS business_name
+             FROM subscription_charges c
+             JOIN customer_subscribers s ON s.id = c.subscriber_id
+             JOIN customer_subscription_plans p ON p.id = c.plan_id
+             LEFT JOIN businesses b ON b.id = c.business_id
+             ORDER BY c.created_at DESC LIMIT 50`
         );
-        res.json({ success: true, summary: summary.rows[0], fees: fees.rows[0], recent: recent.rows });
+        res.json({ success: true, summary: summary.rows[0], subscribers: subscribers.rows[0], money: money.rows[0], recent: recent.rows });
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message || "Failed to load savings overview" });
+        res.status(500).json({ success: false, error: error.message || "Failed to load subscriptions overview" });
     }
 });
 

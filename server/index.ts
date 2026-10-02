@@ -82,6 +82,7 @@ import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
 import paymentLinksRouter from "./routes/payment_links";
 import aiCreditsRouter from "./routes/ai_credits";
+import invoicesRouter from "./routes/invoices";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
@@ -667,9 +668,10 @@ export async function createServer() {
   mainRouter.use("/fees", feesRouter);
   mainRouter.use("/admin/fees", adminFeesRouter);
 
-  // Revenue features: Payment Links ("Get Paid") + MetricAi Credit Packs
+  // Revenue features: Payment Links ("Get Paid") + MetricAi Credit Packs + Smart Invoices
   mainRouter.use("/payment-links", paymentLinksRouter);
   mainRouter.use("/ai-credits", aiCreditsRouter);
+  mainRouter.use("/invoices", invoicesRouter);
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);

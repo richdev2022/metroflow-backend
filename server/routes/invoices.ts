@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
@@ -188,7 +189,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *       403:
  *         description: Monthly quota reached or feature disabled (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_invoices"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;
@@ -329,7 +330,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
  *       400:
  *         description: Paid invoices cannot be edited
  */
-router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_invoices"), async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
         const businessId = req.user!.businessId;
@@ -427,7 +428,7 @@ router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
  *       400:
  *         description: Paid invoices cannot be deleted
  */
-router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_invoices"), async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
         const businessId = req.user!.businessId;
@@ -470,7 +471,7 @@ router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: Au
  *       400:
  *         description: Only unpaid invoices can be cancelled
  */
-router.post("/:id/cancel", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/cancel", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_invoices"), async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
         const businessId = req.user!.businessId;

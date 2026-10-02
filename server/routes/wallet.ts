@@ -1,5 +1,6 @@
 import express from "express";
 import { authenticateToken, checkSubscriptionStatus, AuthenticatedRequest, checkKycStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
 import { toMinorUnit } from "../services/transfer";
@@ -41,7 +42,7 @@ const router = express.Router();
  *       200:
  *         description: Virtual Account created successfully
  */
-router.post("/create-virtual-account", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/create-virtual-account", authenticateToken, checkKycStatus, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
@@ -562,7 +563,7 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
  *       200:
  *         description: Payment link generated
  */
-router.post("/fund/card", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
@@ -837,7 +838,7 @@ router.post("/business/create", authenticateToken, checkKycStatus, async (req: A
  * created with their personal (BVN) name, this recreates it so the account
  * name reflects the business name. Owner-only, best-effort provider call.
  */
-router.post("/business/regenerate-va", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/business/regenerate-va", authenticateToken, checkKycStatus, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;

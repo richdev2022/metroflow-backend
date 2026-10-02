@@ -856,7 +856,9 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             metricAiEnabled,
             paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
             aiCreditDiscountPercent,
-            invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent
+            invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent,
+            billsEnabled, maxBillsPerDay, billFeeDiscountPercent,
+            savingsEnabled, maxSavingsVaults, savingsBreakFeeDiscountPercent
         } = req.body;
 
         // Dynamic update
@@ -982,6 +984,36 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
         if (invoiceFeeDiscountPercent !== undefined) {
             queryStr += `, invoice_fee_discount_percent = $${paramCount}`;
             params.push(Number(invoiceFeeDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (billsEnabled !== undefined) {
+            queryStr += `, bills_enabled = $${paramCount}`;
+            params.push(billsEnabled === true);
+            paramCount++;
+        }
+        if (maxBillsPerDay !== undefined) {
+            queryStr += `, max_bills_per_day = $${paramCount}`;
+            params.push(Number(maxBillsPerDay) || 0);
+            paramCount++;
+        }
+        if (billFeeDiscountPercent !== undefined) {
+            queryStr += `, bill_fee_discount_percent = $${paramCount}`;
+            params.push(Number(billFeeDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (savingsEnabled !== undefined) {
+            queryStr += `, savings_enabled = $${paramCount}`;
+            params.push(savingsEnabled === true);
+            paramCount++;
+        }
+        if (maxSavingsVaults !== undefined) {
+            queryStr += `, max_savings_vaults = $${paramCount}`;
+            params.push(Number(maxSavingsVaults) || 0);
+            paramCount++;
+        }
+        if (savingsBreakFeeDiscountPercent !== undefined) {
+            queryStr += `, savings_break_fee_discount_percent = $${paramCount}`;
+            params.push(Number(savingsBreakFeeDiscountPercent) || 0);
             paramCount++;
         }
 
@@ -4502,7 +4534,18 @@ protectedRouter.get("/payment-links", requirePermission('manage_plans', 'manage_
     }
 });
 
-/** Platform-wide Smart Invoices overview (admin). */
+/**
+ * @openapi
+ * /admin/invoices:
+ *   get:
+ *     summary: Platform-wide Smart Invoices overview (revenue, volumes, recent payments)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Invoice summary + payments + recent activity
+ */
 protectedRouter.get("/invoices", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
         const summary = await query(
@@ -4528,6 +4571,89 @@ protectedRouter.get("/invoices", requirePermission('manage_plans', 'manage_finan
         res.json({ success: true, summary: summary.rows[0], payments: payments.rows[0], recent: recent.rows });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load invoices overview" });
+    }
+});
+
+/**
+ * @openapi
+ * /admin/bills:
+ *   get:
+ *     summary: Platform-wide Bills Hub overview (volumes, convenience-fee revenue, recent bills)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Bills summary + money stats + recent activity
+ */
+protectedRouter.get("/bills", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_bills,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)::int AS successful_bills,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_bills
+             FROM bill_payments`
+        );
+        const money = await query(
+            `SELECT COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) AS gross,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN fee ELSE 0 END), 0) AS revenue,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN total ELSE 0 END), 0) AS collected
+             FROM bill_payments`
+        );
+        const recent = await query(
+            `SELECT b.reference, b.category, b.provider_name, b.plan_name, b.customer_ref,
+                    b.amount, b.fee, b.total, b.currency, b.status, b.fulfilment_mode, b.created_at,
+                    bu.name AS business_name, u.name AS user_name
+             FROM bill_payments b
+             LEFT JOIN businesses bu ON bu.id = b.business_id
+             LEFT JOIN users u ON u.id = b.user_id
+             ORDER BY b.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], money: money.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load bills overview" });
+    }
+});
+
+/**
+ * @openapi
+ * /admin/savings:
+ *   get:
+ *     summary: Platform-wide Savings Vaults overview (balances, auto-save adoption, break fees)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Savings summary + fee stats + recent activity
+ */
+protectedRouter.get("/savings", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_vaults,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_vaults,
+                    COALESCE(SUM(CASE WHEN auto_save_enabled AND status = 'active' THEN 1 ELSE 0 END), 0)::int as auto_save_vaults,
+                    COALESCE(SUM(balance), 0) AS total_balance,
+                    COALESCE(SUM(total_deposited), 0) AS total_deposited,
+                    COALESCE(SUM(total_withdrawn), 0) AS total_withdrawn
+             FROM savings_vaults`
+        );
+        const fees = await query(
+            `SELECT COALESCE(SUM(fee), 0) AS break_fees, COUNT(*)::int AS withdrawals
+             FROM savings_transactions WHERE type = 'withdrawal' AND status = 'success'`
+        );
+        const recent = await query(
+            `SELECT t.reference, t.type, t.amount, t.fee, t.balance_after, t.status, t.created_at,
+                    v.name AS vault_name, b.name AS business_name, u.name AS user_name
+             FROM savings_transactions t
+             JOIN savings_vaults v ON v.id = t.vault_id
+             LEFT JOIN businesses b ON b.id = v.business_id
+             LEFT JOIN users u ON u.id = v.user_id
+             ORDER BY t.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], fees: fees.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load savings overview" });
     }
 });
 

@@ -1,9 +1,9 @@
 {
   "openapi": "3.0.0",
   "info": {
-    "title": "MetricFlow API",
-    "version": "1.0.0",
-    "description": "API documentation for MetricFlow Backend"
+    "title": "Metricorex API",
+    "version": "2.0.0",
+    "description": "Metricorex (Metroflow) backend — personal + business work OS with fintech rails. Revenue features: Bills Hub (airtime/data/TV/electricity/betting), Savings Vaults (auto-save + early-break fee), Payment Links, Smart Invoices and MetricAi Credit Packs — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens."
   },
   "servers": [
     {
@@ -4207,6 +4207,342 @@
         }
       }
     },
+    "/api/savings/vaults": {
+      "get": {
+        "summary": "List the caller's savings vaults with progress + stats",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vaults (newest first) with aggregate stats"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a savings vault (plan-gated)",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "example": "New Shop Rent"
+                  },
+                  "goal_amount": {
+                    "type": "number"
+                  },
+                  "target_date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Withdrawals before this date attract the early-break fee"
+                  },
+                  "auto_save_enabled": {
+                    "type": "boolean"
+                  },
+                  "auto_save_amount": {
+                    "type": "number"
+                  },
+                  "auto_save_frequency": {
+                    "type": "string",
+                    "enum": [
+                      "daily",
+                      "weekly",
+                      "monthly"
+                    ]
+                  },
+                  "auto_save_wallet_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Vault created"
+          },
+          "403": {
+            "description": "Savings disabled or vault limit reached on the current plan (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/savings/vaults/{id}": {
+      "get": {
+        "summary": "Vault detail with its transaction history",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vault + transactions"
+          },
+          "404": {
+            "description": "Vault not found"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update a vault (name, goal, target date, auto-save settings, pause/resume)",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "goal_amount": {
+                    "type": "number"
+                  },
+                  "target_date": {
+                    "type": "string",
+                    "format": "date"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "paused"
+                    ]
+                  },
+                  "auto_save_enabled": {
+                    "type": "boolean"
+                  },
+                  "auto_save_amount": {
+                    "type": "number"
+                  },
+                  "auto_save_frequency": {
+                    "type": "string",
+                    "enum": [
+                      "daily",
+                      "weekly",
+                      "monthly"
+                    ]
+                  },
+                  "auto_save_wallet_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated vault"
+          },
+          "404": {
+            "description": "Vault not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a vault (only when its balance is zero)",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vault deleted"
+          },
+          "400": {
+            "description": "Vault still has funds"
+          }
+        }
+      }
+    },
+    "/api/savings/vaults/{id}/deposit": {
+      "post": {
+        "summary": "Fund a vault from one of your wallets",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "amount",
+                  "wallet_id"
+                ],
+                "properties": {
+                  "amount": {
+                    "type": "number"
+                  },
+                  "wallet_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deposit settled into the vault"
+          },
+          "400": {
+            "description": "Insufficient balance or invalid vault/wallet"
+          }
+        }
+      }
+    },
+    "/api/savings/vaults/{id}/withdraw": {
+      "post": {
+        "summary": "Withdraw from a vault to a wallet (early withdrawal charges the break fee)",
+        "tags": [
+          "Savings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "amount",
+                  "wallet_id"
+                ],
+                "properties": {
+                  "amount": {
+                    "type": "number"
+                  },
+                  "wallet_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Withdrawal settled (fee included when breaking early)"
+          },
+          "400": {
+            "description": "Amount exceeds balance or invalid vault/wallet"
+          }
+        }
+      }
+    },
     "/api/recordings": {
       "get": {
         "summary": "Get recordings",
@@ -4413,6 +4749,105 @@
         }
       }
     },
+    "/api/push/subscribe": {
+      "post": {
+        "summary": "Register a Web Push (VAPID) subscription for the authenticated user",
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "endpoint",
+                  "keys"
+                ],
+                "properties": {
+                  "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "keys": {
+                    "type": "object",
+                    "properties": {
+                      "p256dh": {
+                        "type": "string"
+                      },
+                      "auth": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "userAgent": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription saved (upsert by endpoint)"
+          }
+        }
+      }
+    },
+    "/api/push/unsubscribe": {
+      "post": {
+        "summary": "Remove a Web Push subscription (by endpoint) for the authenticated user",
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription removed (or nothing to remove)"
+          }
+        }
+      }
+    },
+    "/api/push/vapid-public-key": {
+      "get": {
+        "summary": "Web Push VAPID public key (for PushManager.subscribe)",
+        "tags": [
+          "Push"
+        ],
+        "responses": {
+          "200": {
+            "description": "VAPID public key (or publicKey null when Web Push is unavailable)"
+          }
+        }
+      }
+    },
     "/api/public/app-config": {
       "get": {
         "summary": "Public app configuration (maintenance mode + active announcement)",
@@ -4423,6 +4858,88 @@
         "responses": {
           "200": {
             "description": "Maintenance flag + latest active announcement"
+          }
+        }
+      }
+    },
+    "/api/public/wishlist": {
+      "post": {
+        "summary": "Join the MetriCorex Personal wishlist",
+        "tags": [
+          "Public"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "features": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "productUpdates": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Wishlist entry stored; confirmation email queued"
+          }
+        }
+      }
+    },
+    "/api/public/subscribe": {
+      "post": {
+        "summary": "Subscribe to email categories (e.g. monthly product updates)",
+        "tags": [
+          "Public"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "categories": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscriber stored; welcome email queued"
           }
         }
       }
@@ -5086,6 +5603,255 @@
         "responses": {
           "200": {
             "description": "Configuration updated"
+          }
+        }
+      }
+    },
+    "/api/payment-links": {
+      "get": {
+        "summary": "List the business's payment links with payment stats",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment links (newest first)"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a payment link (fixed or custom amount, plan-gated)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "amount": {
+                    "type": "number",
+                    "description": "Required unless allow_custom_amount is true"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "default": "NGN"
+                  },
+                  "allow_custom_amount": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created link (shareable slug returned)"
+          },
+          "403": {
+            "description": "Plan limit reached or feature disabled (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/payment-links/{id}": {
+      "put": {
+        "summary": "Update a payment link (title, description, amount, custom-amount, active state)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated link"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a payment link",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      }
+    },
+    "/api/payment-links/{id}/payments": {
+      "get": {
+        "summary": "List payments received through a link",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Link payments (newest first)"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      }
+    },
+    "/api/payment-links/public/{slug}": {
+      "get": {
+        "summary": "Public payment link view (no auth — customer checkout)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Link details + business name"
+          },
+          "404": {
+            "description": "Link not found or inactive"
+          }
+        }
+      }
+    },
+    "/api/payment-links/public/{slug}/initiate": {
+      "post": {
+        "summary": "Initiate a customer payment (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "payer_email"
+                ],
+                "properties": {
+                  "amount": {
+                    "type": "number",
+                    "description": "Required for custom-amount links"
+                  },
+                  "payer_name": {
+                    "type": "string"
+                  },
+                  "payer_email": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional provider override"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url + reference"
+          },
+          "404": {
+            "description": "Link not found or inactive"
+          },
+          "502": {
+            "description": "Provider initiation failed"
           }
         }
       }
@@ -5863,6 +6629,324 @@
         "responses": {
           "200": {
             "description": "Business KYC submitted"
+          }
+        }
+      }
+    },
+    "/api/invoices": {
+      "get": {
+        "summary": "List the business's invoices with payment stats",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "pending",
+                "paid",
+                "cancelled",
+                "overdue",
+                "all"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoices (newest first)"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an invoice (line items + tax + due date, plan-gated)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "client_name",
+                  "client_email",
+                  "items"
+                ],
+                "properties": {
+                  "client_name": {
+                    "type": "string"
+                  },
+                  "client_email": {
+                    "type": "string"
+                  },
+                  "client_phone": {
+                    "type": "string"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "description": {
+                          "type": "string"
+                        },
+                        "quantity": {
+                          "type": "number"
+                        },
+                        "unit_price": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  },
+                  "tax_percent": {
+                    "type": "number"
+                  },
+                  "due_date": {
+                    "type": "string",
+                    "format": "date"
+                  },
+                  "notes": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "draft"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created invoice (invoice_number returned)"
+          },
+          "403": {
+            "description": "Monthly quota reached or feature disabled (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/invoices/{id}": {
+      "get": {
+        "summary": "Invoice detail (owner) — line items + payment history",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice, items and payments"
+          },
+          "404": {
+            "description": "Invoice not found"
+          }
+        }
+      },
+      "put": {
+        "summary": "Edit a draft/pending invoice that has not received any payment",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated invoice"
+          },
+          "400": {
+            "description": "Paid invoices cannot be edited"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an invoice (only when nothing has been paid against it)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "Paid invoices cannot be deleted"
+          }
+        }
+      }
+    },
+    "/api/invoices/{id}/cancel": {
+      "post": {
+        "summary": "Cancel an unpaid invoice",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled invoice"
+          },
+          "400": {
+            "description": "Only unpaid invoices can be cancelled"
+          }
+        }
+      }
+    },
+    "/api/invoices/public/{id}": {
+      "get": {
+        "summary": "Public invoice view (no auth — the client sees items, totals, due date)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public invoice payload"
+          },
+          "404": {
+            "description": "Invoice not found"
+          }
+        }
+      }
+    },
+    "/api/invoices/public/{id}/initiate": {
+      "post": {
+        "summary": "Initiate a client payment (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "payer_name": {
+                    "type": "string"
+                  },
+                  "payer_email": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional provider override"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url + reference"
+          },
+          "400": {
+            "description": "Invoice already paid / no amount due"
+          },
+          "404": {
+            "description": "Invoice not found"
           }
         }
       }
@@ -7322,6 +8406,276 @@
         }
       }
     },
+    "/api/users/{userId}/block": {
+      "post": {
+        "summary": "Block a contact",
+        "description": "Blocks a user in the same business. Direct conversations between the two users stop accepting messages in both directions. 409 when the block already exists.",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contact blocked"
+          },
+          "400": {
+            "description": "Invalid target / cannot block yourself"
+          },
+          "404": {
+            "description": "Target user not found in this business"
+          },
+          "409": {
+            "description": "Contact already blocked"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Unblock a contact",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contact unblocked"
+          },
+          "404": {
+            "description": "No such block"
+          }
+        }
+      }
+    },
+    "/api/users/blocked": {
+      "get": {
+        "summary": "List blocked contacts",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Blocked contacts fetched successfully"
+          }
+        }
+      }
+    },
+    "/api/bills/catalog": {
+      "get": {
+        "summary": "Bills service catalog (airtime, data, TV, electricity, betting providers + plans)",
+        "tags": [
+          "Bills"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Catalog with all providers, plans and configured provider mode"
+          }
+        }
+      }
+    },
+    "/api/bills": {
+      "get": {
+        "summary": "List the caller's bill payments (history)",
+        "tags": [
+          "Bills"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "success",
+                "failed",
+                "all"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "airtime",
+                "data",
+                "tv",
+                "electricity",
+                "betting"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bill payment history (newest first)"
+          }
+        }
+      }
+    },
+    "/api/bills/pay": {
+      "post": {
+        "summary": "Pay a bill (airtime, data, TV, electricity or betting) from a wallet",
+        "tags": [
+          "Bills"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "category",
+                  "provider_code",
+                  "customer_ref",
+                  "wallet_id",
+                  "amount",
+                  "pin"
+                ],
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "airtime",
+                      "data",
+                      "tv",
+                      "electricity",
+                      "betting"
+                    ]
+                  },
+                  "provider_code": {
+                    "type": "string",
+                    "example": "mtn | dstv | ikedc | bet9ja"
+                  },
+                  "plan_code": {
+                    "type": "string",
+                    "description": "Required for data and TV (fixed-price plans)"
+                  },
+                  "customer_ref": {
+                    "type": "string",
+                    "description": "Phone number, smartcard/IUC, meter number or betting user ID"
+                  },
+                  "customer_phone": {
+                    "type": "string",
+                    "description": "Optional contact phone for receipts"
+                  },
+                  "wallet_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "amount": {
+                    "type": "number",
+                    "description": "Required when the provider has no fixed plan (airtime, electricity, betting)"
+                  },
+                  "pin": {
+                    "type": "string",
+                    "description": "Transaction PIN (same PIN verified for transfers)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bill paid and fulfilled"
+          },
+          "400": {
+            "description": "Validation failed / invalid PIN / plan cap reached"
+          },
+          "403": {
+            "description": "Bills disabled on the current plan (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/bills/{id}": {
+      "get": {
+        "summary": "Bill payment detail",
+        "tags": [
+          "Bills"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bill payment record"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
     "/api/auth/register": {
       "post": {
         "summary": "Register a new business and admin user",
@@ -7939,6 +9293,108 @@
           },
           "500": {
             "description": "Server error"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/packs": {
+      "get": {
+        "summary": "Credit pack catalogue with plan discount + buyer's credit balance",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Packs (price, discount_percent, discounted_price) + balance"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/balance": {
+      "get": {
+        "summary": "Current MetricAi credit balance for the caller",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Credit balance"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/purchases": {
+      "get": {
+        "summary": "Purchase history for the caller",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent credit purchases (newest first)"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/purchase": {
+      "post": {
+        "summary": "Purchase a MetricAi credit pack from a wallet",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pack_id"
+                ],
+                "properties": {
+                  "pack_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "wallet_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Optional — auto-resolved when omitted"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Purchase succeeded, credits granted"
+          },
+          "400": {
+            "description": "Insufficient balance / no wallet"
+          },
+          "404": {
+            "description": "Pack not found"
           }
         }
       }
@@ -10128,6 +11584,84 @@
         }
       }
     },
+    "/api/admin/growth/wishlist": {
+      "get": {
+        "summary": "List all Personal wishlist entries (searchable, paginated)",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/growth/subscribers": {
+      "get": {
+        "summary": "List email subscribers (filter by category, searchable)",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/growth/campaigns/send": {
+      "post": {
+        "summary": "Send an email notification to every subscriber of a category",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/invoices": {
+      "get": {
+        "summary": "Platform-wide Smart Invoices overview (revenue, volumes, recent payments)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice summary + payments + recent activity"
+          }
+        }
+      }
+    },
+    "/api/admin/bills": {
+      "get": {
+        "summary": "Platform-wide Bills Hub overview (volumes, convenience-fee revenue, recent bills)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bills summary + money stats + recent activity"
+          }
+        }
+      }
+    },
+    "/api/admin/savings": {
+      "get": {
+        "summary": "Platform-wide Savings Vaults overview (balances, auto-save adoption, break fees)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Savings summary + fee stats + recent activity"
+          }
+        }
+      }
+    },
     "/api/activity-logs": {
       "get": {
         "summary": "Get activity logs",
@@ -10239,8 +11773,16 @@
       "description": "Payroll management and adjustments"
     },
     {
+      "name": "Payment Links",
+      "description": "Shareable checkout links for businesses — a revenue feature (collection fee lands in the platform revenue wallet, plan-configurable)"
+    },
+    {
       "name": "KYC",
       "description": "Know Your Customer verification endpoints"
+    },
+    {
+      "name": "Smart Invoices",
+      "description": "Itemised invoices with public checkout pages — a revenue feature (settlement fee lands in the platform revenue wallet, plan-configurable)"
     },
     {
       "name": "Fees",
@@ -10261,6 +11803,10 @@
     {
       "name": "Auth",
       "description": "Authentication endpoints"
+    },
+    {
+      "name": "MetricAi Credits",
+      "description": "One-time MetricAi credit pack top-ups purchasable from wallets — a revenue feature (plan-level ai_credit_discount_percent applies)"
     },
     {
       "name": "Admin Fees",

@@ -25,6 +25,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureStoreSchema();
   await ensureRecurringBillingSchema();
   await ensureBusinessRevenueLadder();
+  await ensureBusinessRevenueLadderV2();
 }
 
 /**
@@ -1427,4 +1428,109 @@ async function ensureBusinessRevenueLadder(): Promise<void> {
   }
 
   console.log("[Migrations] business revenue knob ladder applied");
+}
+
+/**
+ * Business revenue knob ladder V2 — a rebalanced, revenue-driven ladder for
+ * the Storefront / Recurring Billing knobs plus softer fee caps.
+ *
+ * Why: the V1 ladder was written defensively small (Free Trial 3 products /
+ * 1 subscription plan, Starter 15/10 at 10% fee discounts). The approved
+ * monetisation ladder widens the funnel and makes the paid step-ups
+ * unmistakable:
+ *
+ *   Plan         max_store_products  max_subscription_plans  fee discounts
+ *   Free Trial    3  -> 5             1  -> 2                 0%
+ *   Starter      15  -> 25           10 -> 25                10% -> 15%
+ *   Pro          unlimited           unlimited               25% -> 35%
+ *
+ * Fee caps (fee_configurations, platform-wide):
+ *   store_order  2.5% cap ₦2,500 -> 2.5% cap ₦2,000  (competitive with the
+ *                ₦2,000 local cap tier used by NGN PSPs for large baskets)
+ *   subscription 2.0% cap ₦2,000 -> 2.0% cap ₦1,500  (recurring volume play —
+ *                keeps per-charge fees predictable for merchants)
+ *
+ * Every UPDATE is gated on the exact V1 value so an admin's later re-pricing
+ * (via /admin/pricing) is never clobbered on reboot. The plan feature
+ * bullets for both surfaces are regenerated to match the new numbers.
+ */
+async function ensureBusinessRevenueLadderV2(): Promise<void> {
+  // ---------- Fee caps (gated on the V1 configs) ----------
+  await query(`
+    UPDATE fee_configurations
+    SET config = '{"percentage": 2.5, "cap": 2000}'::jsonb, updated_at = CURRENT_TIMESTAMP
+    WHERE fee_type = 'store_order'
+      AND config_type = 'percentage_cap'
+      AND config->>'percentage' = '2.5'
+      AND config->>'cap' = '2500'
+  `);
+  await query(`
+    UPDATE fee_configurations
+    SET config = '{"percentage": 2.0, "cap": 1500}'::jsonb, updated_at = CURRENT_TIMESTAMP
+    WHERE fee_type = 'subscription'
+      AND config_type = 'percentage_cap'
+      AND (config->>'percentage' = '2' OR config->>'percentage' = '2.0')
+      AND config->>'cap' = '2000'
+  `);
+
+  // ---------- Knobs (gated on the V1 ladder) ----------
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 5,
+      store_fee_discount_percent = 0,
+      max_subscription_plans = 2,
+      subscription_fee_discount_percent = 0
+    WHERE name = 'Free Trial'
+      AND max_store_products = 3 AND max_subscription_plans = 1
+      AND store_fee_discount_percent = 0 AND subscription_fee_discount_percent = 0
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 25,
+      store_fee_discount_percent = 15,
+      max_subscription_plans = 25,
+      subscription_fee_discount_percent = 15
+    WHERE name = 'Starter'
+      AND max_store_products = 15 AND max_subscription_plans = 10
+      AND store_fee_discount_percent = 10 AND subscription_fee_discount_percent = 10
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 999999,
+      store_fee_discount_percent = 35,
+      max_subscription_plans = 999999,
+      subscription_fee_discount_percent = 35
+    WHERE name = 'Pro'
+      AND max_store_products = 999999 AND max_subscription_plans = 999999
+      AND store_fee_discount_percent = 25 AND subscription_fee_discount_percent = 25
+  `);
+
+  // ---------- Feature bullets (regenerate store/recurring once) ----------
+  try {
+    const plans = await query(`SELECT id, name, max_store_products, max_subscription_plans, store_fee_discount_percent, subscription_fee_discount_percent, features FROM pricing_plans`);
+    for (const plan of plans.rows) {
+      const features: string[] = Array.isArray(plan.features) ? plan.features : [];
+      const others = features.filter(
+        (f: string) => !/storefront/i.test(f) && !/recurring billing/i.test(f)
+      );
+      const fmt = (n: any, noun: string) =>
+        n == null || Number(n) >= 999999 ? `Unlimited ${noun}` : `${Number(n)} ${noun}${Number(n) === 1 ? "" : "s"}`;
+      const storeDiscount = Number(plan.store_fee_discount_percent) || 0;
+      const subDiscount = Number(plan.subscription_fee_discount_percent) || 0;
+      const next = [
+        ...others,
+        `${fmt(plan.max_store_products, "storefront product")} with hosted checkout` +
+          (storeDiscount > 0 ? ` · ${storeDiscount}% off order fees` : ""),
+        `${fmt(plan.max_subscription_plans, "recurring billing plan")} on any interval` +
+          (subDiscount > 0 ? ` · ${subDiscount}% off subscription fees` : ""),
+      ];
+      if (JSON.stringify(next) !== JSON.stringify(features)) {
+        await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+      }
+    }
+  } catch (err) {
+    console.error("[Migrations] business revenue V2 feature-bullet refresh failed:", err);
+  }
+
+  console.log("[Migrations] business revenue knob ladder V2 applied");
 }

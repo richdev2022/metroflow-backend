@@ -6,6 +6,13 @@ import { query } from "./db";
  * Everything here is idempotent - safe to run on every boot.
  */
 export async function runPostInitializeMigrations(): Promise<void> {
+  // ---- 1. Schema DDL (tables + columns) -------------------------------
+  // EVERY schema-creating migration must run before any data ladder: the
+  // pricing ladder below UPDATEs columns owned by the revenue schemas, and
+  // running it first crashed every boot with SQLSTATE 42703
+  // ("column invoices_enabled of relation pricing_plans does not exist"),
+  // which also starved every later migration (invoices/store/recurring/
+  // team_roles never got created).
   await ensureAppTables();
   await ensurePayrollVerificationColumns();
   await ensureSystemSettingsDefaults();
@@ -13,20 +20,24 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureChatCallUxSchema();
   await ensureAiLimitsSchema();
   await ensureSupportSchema();
-  await ensureLedgerAndVirtualAccountFixes();
-  await backfillLedgerHistory();
   await ensureCallingSchema();
   await ensureMeetingSchedulingSchema();
   await ensureVapidKeys();
   await ensureSiteGrowthSchema();
-  await ensureRevenueFeaturesSchema();
-  await ensurePlanPricingLadder();
-  await ensureInvoicesSchema();
-  await ensureStoreSchema();
-  await ensureRecurringBillingSchema();
+  await ensureRevenueFeaturesSchema(); // + payment_links_enabled etc.
+  await ensureInvoicesSchema(); // + invoices_enabled etc.
+  await ensureStoreSchema(); // + store_enabled etc.
+  await ensureRecurringBillingSchema(); // + recurring_enabled etc.
+  await ensureTeamRolesSchema(); // + users.role_id
+
+  // ---- 2. Ledger repairs (data, idempotent) ---------------------------
+  await ensureLedgerAndVirtualAccountFixes();
+  await backfillLedgerHistory();
+
+  // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
-  await ensureTeamRolesSchema();
+  await ensurePlanPricingLadder();
 }
 
 /**
@@ -637,7 +648,8 @@ async function backfillLedgerHistory(): Promise<void> {
           await query(
             `INSERT INTO transactions
              (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, created_at)
-             VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6)`,
+             VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6)
+           ON CONFLICT (reference) DO NOTHING`,
             [amount, cur, t.reference, t.description || "Transfer platform debit (backfill)", walletId, t.created_at],
           );
         }
@@ -653,7 +665,8 @@ async function backfillLedgerHistory(): Promise<void> {
           await query(
             `INSERT INTO transactions
              (amount, currency, status, reference, type, description, transaction_type, direction, created_at)
-             VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5)`,
+             VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5)
+             ON CONFLICT (reference) DO NOTHING`,
             [fee, cur, revRef, "Transfer fee revenue (backfill)", t.created_at],
           );
         }
@@ -680,7 +693,8 @@ async function backfillLedgerHistory(): Promise<void> {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, direction, created_at)
-           VALUES ($1, $2, 'success', $3, 'credit', $4, 'subscription', 'credit', $5)`,
+           VALUES ($1, $2, 'success', $3, 'credit', $4, 'subscription', 'credit', $5)
+           ON CONFLICT (reference) DO NOTHING`,
           [Number(s.amount) || 0, s.currency || "NGN", revRef, s.description || "Subscription revenue (backfill)", s.created_at],
         );
       }
@@ -717,7 +731,8 @@ async function backfillLedgerHistory(): Promise<void> {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
-           VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6, $7)`,
+           VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6, $7)
+           ON CONFLICT (reference) DO NOTHING`,
           [gross, cur, ref, f.description || "Customer Wallet Funding Received (backfill)", walletId, f.payment_provider || null, f.created_at],
         );
       }
@@ -725,7 +740,8 @@ async function backfillLedgerHistory(): Promise<void> {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
-           VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6, $7)`,
+           VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6, $7)
+           ON CONFLICT (reference) DO NOTHING`,
           [net, cur, `${ref}-USER-BACKFILL`, "Platform Wallet Debit for User Funding (backfill)", walletId, f.payment_provider || null, f.created_at],
         );
       }
@@ -733,7 +749,8 @@ async function backfillLedgerHistory(): Promise<void> {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, direction, payment_provider, created_at)
-           VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5, $6)`,
+           VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5, $6)
+           ON CONFLICT (reference) DO NOTHING`,
           [fee, cur, `${ref}-FEE-BACKFILL`, "Wallet funding fee revenue (backfill)", f.payment_provider || null, f.created_at],
         );
       }
@@ -758,7 +775,8 @@ async function backfillLedgerHistory(): Promise<void> {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-           VALUES ($1, $2, 'success', $3, $4, 'Historical balance reconciliation', 'platform', $5, $6)`,
+           VALUES ($1, $2, 'success', $3, $4, 'Historical balance reconciliation', 'platform', $5, $6)
+           ON CONFLICT (reference) DO NOTHING`,
           [Math.abs(diff), w.currency || "NGN", `platform-reconcile-${w.id}-${Date.now()}`, direction, w.id, direction],
         );
       }
@@ -963,8 +981,20 @@ async function ensureMeetingSchedulingSchema(): Promise<void> {
  *
  * Idempotent: each UPDATE only matches the legacy USD seed values, so rows an
  * admin has already re-priced are never clobbered on reboot.
+ *
+ * OPT-IN: this ladder rewrites price, currency, descriptions, feature lists,
+ * meeting limits and MetricAi allowances in one sweep. An admin configuring
+ * plans via /admin/pricing that keeps the seed price (e.g. USD 29/99) would
+ * still match the guards and get overwritten — so the ladder only runs when
+ * explicitly requested with APPLY_PLAN_PRICING_LADDER=true. It has never run
+ * in production (it 42703-crashed every boot before the ordering fix), and
+ * the live plans were configured via the admin panel afterwards.
  */
 async function ensurePlanPricingLadder(): Promise<void> {
+  if (process.env.APPLY_PLAN_PRICING_LADDER !== "true") {
+    console.log("[migrations] plan pricing ladder skipped (opt-in: set APPLY_PLAN_PRICING_LADDER=true to apply)");
+    return;
+  }
   // ---------- Free Trial ----------
   await query(`
     UPDATE pricing_plans SET

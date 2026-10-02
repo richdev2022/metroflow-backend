@@ -1796,9 +1796,11 @@ export async function initializeDatabase() {
 
     await fixExistingUuidIdDefaults();
 
-    // Post-init safety net: confirm every expected table actually exists.
-    // Catches partial schema creation at boot instead of at first request.
-    await verifySchema();
+    // NOTE: verifySchema() is NOT called here on purpose. Several expected
+    // tables (invoices/store/recurring/team_roles) are created by
+    // runPostInitializeMigrations(), which runs AFTER this function — checking
+    // now always reported them missing. index.ts calls verifySchema() after
+    // the migrations complete instead.
 
     console.log("Database tables initialized successfully");
   } catch (error: any) {

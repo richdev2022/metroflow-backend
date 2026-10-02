@@ -4,6 +4,8 @@ import { getProvider, resolveProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
 import { settlePaymentLinkPayment } from "./payment_links";
 import { settleInvoicePayment } from "./invoices";
+import { settleStoreOrderPayment } from "./store";
+import { settleSubscriptionCharge } from "./recurring";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
@@ -135,6 +137,18 @@ const handleSquadWebhook = async (event: any) => {
                     // wallet net of settlement fee; fee → revenue wallet.
                     if (transaction.transaction_type === 'invoice') {
                         await settleInvoicePayment(reference, 'squad');
+                    }
+
+                    // Handle Storefront orders (revenue feature) — settles merchant
+                    // wallet net of order fee; fee → revenue wallet.
+                    if (transaction.transaction_type === 'store_order') {
+                        await settleStoreOrderPayment(reference, 'squad');
+                    }
+
+                    // Handle Recurring Billing charges (revenue feature) — settles
+                    // merchant wallet net of subscription fee; fee → revenue wallet.
+                    if (transaction.transaction_type === 'subscription') {
+                        await settleSubscriptionCharge(reference, 'squad');
                     }
 
                     // Handle Wallet Funding
@@ -341,6 +355,16 @@ const handleMonnifyWebhook = async (event: any) => {
                     // Handle Smart Invoices (revenue feature)
                     if (transaction.transaction_type === 'invoice') {
                         await settleInvoicePayment(reference, 'monnify');
+                    }
+
+                    // Handle Storefront orders (revenue feature)
+                    if (transaction.transaction_type === 'store_order') {
+                        await settleStoreOrderPayment(reference, 'monnify');
+                    }
+
+                    // Handle Recurring Billing charges (revenue feature)
+                    if (transaction.transaction_type === 'subscription') {
+                        await settleSubscriptionCharge(reference, 'monnify');
                     }
 
                     // Handle Wallet Funding
@@ -763,6 +787,16 @@ const handleFlutterwaveWebhook = async (event: any) => {
             // Smart Invoices settle through their own path too.
             if (transaction.transaction_type === 'invoice') {
                 await settleInvoicePayment(reference, 'flutterwave');
+                return;
+            }
+            // Storefront orders settle through their own path as well.
+            if (transaction.transaction_type === 'store_order') {
+                await settleStoreOrderPayment(reference, 'flutterwave');
+                return;
+            }
+            // Recurring Billing charges settle through their own path too.
+            if (transaction.transaction_type === 'subscription') {
+                await settleSubscriptionCharge(reference, 'flutterwave');
                 return;
             }
             const credited = await creditWalletFundingTransaction(transaction, 'flutterwave');

@@ -6,7 +6,7 @@ import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib
 import { accountLookup, processAllPending } from "../services/transfer";
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
-import { calculateFee, creditRevenueWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
 import { getIntlTransferConfig } from "../services/app-config";
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
@@ -216,38 +216,21 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
                  return res.status(400).json({ success: false, error: "User phone number required for SMS OTP. Please update your profile." });
             }
             
-            // Charge Fee
+            // Charge Fee — wallet resolution accepts personal + business wallets
+            // and falls back to any funded wallet (fixes "No NGN wallet found
+            // to charge OTP fee" for personal-wallet-only users).
             const feeAmt = await calculateFee(1, 'otp_sms'); 
             if (feeAmt > 0) {
-                 // Find wallet
-                 let wallet;
-                 if (wallet_id) {
-                     const wRes = await query(`SELECT * FROM wallets WHERE id = $1 AND business_id = $2`, [wallet_id, businessId]);
-                     wallet = wRes.rows[0];
-                 } else {
-                     const wRes = await query(`SELECT * FROM wallets WHERE business_id = $1 AND currency = 'NGN' LIMIT 1`, [businessId]);
-                     wallet = wRes.rows[0];
-                 }
-
-                 if (!wallet) return res.status(400).json({ success: false, error: "No NGN wallet found to charge OTP fee" });
-                 
-                 if (parseFloat(wallet.balance) < feeAmt) {
-                     return res.status(400).json({ success: false, error: "Insufficient wallet balance for OTP SMS fee" });
-                 }
-
-                 // Debit
-                 await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [feeAmt, wallet.id]);
-                 
-                 // Record Transaction
-                 await query(
-                    `INSERT INTO transactions 
-                     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                     VALUES ($1, $2, $3, 'success', $4, 'debit', 'OTP SMS Fee', 'fee', $5, 'debit', $6)`,
-                    [businessId, feeAmt, 'NGN', `OTP-FEE-${Date.now()}`, wallet.id, feeAmt]
-                 );
-                 
-                 await creditRevenueWallet(feeAmt, 'NGN');
-                 feeCharged = feeAmt;
+                 const charge = await chargeAncillaryFee({
+                     businessId,
+                     userId,
+                     walletId: wallet_id,
+                     amount: feeAmt,
+                     description: 'OTP SMS Fee',
+                     referencePrefix: 'OTP-FEE',
+                 });
+                 if (isFeeChargeFailure(charge)) return res.status(400).json({ success: false, error: charge.error });
+                 feeCharged = charge.amount;
             }
 
             await sendSMS(user.phone_number, `Your Transfer OTP is: ${otpCode}`);
@@ -258,34 +241,19 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
                  return res.status(400).json({ success: false, error: "User phone number required for WhatsApp OTP. Please update your profile." });
             }
             
-            // Charge WhatsApp OTP fee
+            // Charge WhatsApp OTP fee — same resilient wallet resolution as SMS
             const feeAmt = await calculateFee(1, 'otp_whatsapp'); 
             if (feeAmt > 0) {
-                 let wallet;
-                 if (wallet_id) {
-                     const wRes = await query(`SELECT * FROM wallets WHERE id = $1 AND business_id = $2`, [wallet_id, businessId]);
-                     wallet = wRes.rows[0];
-                 } else {
-                     const wRes = await query(`SELECT * FROM wallets WHERE business_id = $1 AND currency = 'NGN' LIMIT 1`, [businessId]);
-                     wallet = wRes.rows[0];
-                 }
-
-                 if (!wallet) return res.status(400).json({ success: false, error: "No NGN wallet found to charge OTP WhatsApp fee" });
-                 
-                 if (parseFloat(wallet.balance) < feeAmt) {
-                     return res.status(400).json({ success: false, error: "Insufficient wallet balance for OTP WhatsApp fee" });
-                 }
-
-                 await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [feeAmt, wallet.id]);
-                 await query(
-                    `INSERT INTO transactions 
-                     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                     VALUES ($1, $2, $3, 'success', $4, 'debit', 'OTP WhatsApp Fee', 'fee', $5, 'debit', $6)`,
-                    [businessId, feeAmt, 'NGN', `OTP-WHATSAPP-FEE-${Date.now()}`, wallet.id, feeAmt]
-                 );
-                 
-                 await creditRevenueWallet(feeAmt, 'NGN');
-                 feeCharged = feeAmt;
+                 const charge = await chargeAncillaryFee({
+                     businessId,
+                     userId,
+                     walletId: wallet_id,
+                     amount: feeAmt,
+                     description: 'OTP WhatsApp Fee',
+                     referencePrefix: 'OTP-WHATSAPP-FEE',
+                 });
+                 if (isFeeChargeFailure(charge)) return res.status(400).json({ success: false, error: charge.error });
+                 feeCharged = charge.amount;
             }
 
             await sendWhatsApp(user.phone_number, `Your Transfer OTP is: ${otpCode}`);
@@ -530,7 +498,9 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     let walletId = wallet_id || camelWalletId;
     const neededCurrency = (dbDebitCurrency || currency).toUpperCase();
     if (!walletId) {
-      // Prefer a wallet in the currency we're actually paying out
+      // Prefer a wallet in the currency we're actually paying out.
+      // Search business wallets first, then the acting user's personal wallet
+      // (previously business-only → "Wallet ID required" for personal-only users).
       const wRes = await query(
         `SELECT id FROM wallets WHERE business_id = $1 AND UPPER(currency) = $2 LIMIT 1`,
         [businessId, neededCurrency],
@@ -538,9 +508,20 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       if (wRes.rows.length > 0) {
         walletId = wRes.rows[0].id;
       } else {
-        const anyRes = await query(`SELECT id FROM wallets WHERE business_id = $1 LIMIT 1`, [businessId]);
-        if (anyRes.rows.length > 0) walletId = anyRes.rows[0].id;
-        else return res.status(400).json({ success: false, error: "Wallet ID required" });
+        const personalRes = await query(
+          `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = $2 LIMIT 1`,
+          [userId, neededCurrency],
+        );
+        if (personalRes.rows.length > 0) {
+          walletId = personalRes.rows[0].id;
+        } else {
+          const anyRes = await query(
+            `SELECT id FROM wallets WHERE business_id = $1 OR (user_id = $2 AND business_id IS NULL) LIMIT 1`,
+            [businessId, userId],
+          );
+          if (anyRes.rows.length > 0) walletId = anyRes.rows[0].id;
+          else return res.status(400).json({ success: false, error: "Wallet ID required" });
+        }
       }
     }
 
@@ -834,7 +815,10 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  */
 router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { type, data, source_wallet_id, otp, pin } = req.body;
+    const { type, data, otp, pin } = req.body;
+    // Accept both snake_case and camelCase source wallet id (validation schema
+    // allows sourceWalletId but the handler previously only read source_wallet_id)
+    const source_wallet_id = req.body.source_wallet_id || req.body.sourceWalletId;
     const businessId = req.user?.businessId;
     
     if (!businessId) {

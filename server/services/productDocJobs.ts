@@ -58,6 +58,19 @@ export async function processPendingProductDocJobs(limit: number = 5) {
          WHERE id = $1`,
         [job.id, error?.message || String(error)]
       );
+
+      // Also mark the doc row itself as failed so it never stays 'pending'
+      // forever when every AI provider failed.
+      try {
+        await query(
+          `UPDATE product_documentation
+           SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 AND business_id = $2 AND status = 'pending'`,
+          [job.doc_id, job.business_id]
+        );
+      } catch (docErr) {
+        console.error("Failed to mark product documentation row as failed:", docErr);
+      }
     }
   }
 

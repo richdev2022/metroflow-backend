@@ -61,6 +61,119 @@ export async function calculateFee(amount: number, feeType: string): Promise<num
     }
 }
 
+export interface ChargeableWallet {
+    id: string;
+    currency: string;
+    balance: string;
+    business_id: string | null;
+    user_id: string | null;
+}
+
+/**
+ * Resolve the wallet an ancillary fee (OTP fee, feature fee, ...) should be
+ * charged from. Resilient to every real-world wallet topology:
+ *  1. Explicit wallet_id (personal OR business — previously business-only,
+ *     which produced "No NGN wallet found to charge OTP fee" for users who
+ *     only have a personal wallet).
+ *  2. Business NGN wallet.
+ *  3. Business wallet in any currency.
+ *  4. The acting user's personal NGN wallet.
+ *  5. The acting user's personal wallet in any currency.
+ */
+export async function resolveFeeWallet(
+    businessId: string | null | undefined,
+    userId: string | null | undefined,
+    walletId?: string | null,
+): Promise<ChargeableWallet | null> {
+    if (walletId) {
+        const explicit = await query(
+            `SELECT * FROM wallets
+             WHERE id = $1 AND (business_id = $2 OR user_id = $3 OR ($2 IS NULL AND user_id IS NULL))
+             LIMIT 1`,
+            [walletId, businessId || null, userId || null]
+        );
+        if (explicit.rows[0]) return explicit.rows[0];
+    }
+
+    const candidates: string[] = [];
+    const params: any[] = [];
+    if (businessId) {
+        params.push(businessId);
+        candidates.push(
+            `(business_id = $${params.length} AND currency = 'NGN')`,
+            `(business_id = $${params.length})`
+        );
+    }
+    if (userId) {
+        params.push(userId);
+        candidates.push(
+            `(user_id = $${params.length} AND business_id IS NULL AND currency = 'NGN')`,
+            `(user_id = $${params.length} AND business_id IS NULL)`
+        );
+    }
+    if (candidates.length === 0) return null;
+
+    // Prefer NGN wallets, then any wallet, both ordered by balance so a funded
+    // wallet wins when several exist.
+    const res = await query(
+        `SELECT * FROM wallets WHERE ${candidates.join(' OR ')}
+         ORDER BY (currency = 'NGN') DESC, balance DESC
+         LIMIT 1`,
+        params
+    );
+    return res.rows[0] || null;
+}
+
+/**
+ * Charge an ancillary fee from the best available wallet (see resolveFeeWallet).
+ * Records the debit transaction in the wallet's own currency and mirrors the
+ * revenue into the platform revenue ledger. Returns the wallet used + amount,
+ * or an error string when no wallet can cover the fee.
+ */
+export type AncillaryFeeResult =
+    | { ok: true; wallet: ChargeableWallet; amount: number; currency: string }
+    | { ok: false; error: string };
+
+export function isFeeChargeFailure(r: AncillaryFeeResult): r is Extract<AncillaryFeeResult, { ok: false }> {
+    return r.ok === false;
+}
+
+export async function chargeAncillaryFee(
+    opts: {
+        businessId?: string | null;
+        userId?: string | null;
+        walletId?: string | null;
+        amount: number;
+        description: string;
+        referencePrefix: string;
+        revenueCurrency?: string;
+    }
+): Promise<AncillaryFeeResult> {
+    const { businessId, userId, walletId, amount, description, referencePrefix } = opts;
+    if (!(amount > 0)) return { ok: true, wallet: null as any, amount: 0, currency: 'NGN' };
+
+    const wallet = await resolveFeeWallet(businessId, userId, walletId);
+    if (!wallet) {
+        return { ok: false, error: `No wallet found to charge ${description}. Please fund a wallet and try again.` };
+    }
+    if (parseFloat(wallet.balance) < amount) {
+        return { ok: false, error: `Insufficient wallet balance for ${description} (fee: ${amount} ${wallet.currency}). Please fund your wallet.` };
+    }
+
+    await query(
+        `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [amount, wallet.id]
+    );
+    await query(
+        `INSERT INTO transactions
+         (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+         VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+        [businessId || null, amount, wallet.currency, `${referencePrefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`, description, wallet.id, amount]
+    );
+    await creditRevenueWallet(amount, opts.revenueCurrency || wallet.currency, undefined, `${description} (revenue)`);
+    return { ok: true, wallet, amount, currency: wallet.currency };
+}
+
 export async function getAllFees() {
     const res = await query(`SELECT * FROM fee_configurations ORDER BY created_at DESC`);
     return res.rows;

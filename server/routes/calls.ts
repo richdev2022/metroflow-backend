@@ -1110,6 +1110,21 @@ export const joinCall: RequestHandler = async (
         userId,
         status: effectiveStatus,
       });
+
+      // Belt-and-braces for MOBILE-TO-MOBILE calls: a callee answering via
+      // REST (push tap -> accept) must also stop the caller's ringback.
+      // Mirror the socket call:accept broadcast to the creator's personal
+      // room; the client handler is idempotent (stops ringing when the id
+      // matches the outbound call).
+      const creatorId = callState.created_by || callState.host_id;
+      if (creatorId && creatorId !== userId) {
+        io.to(`user:${creatorId}`).emit("call:accepted", {
+          callId: actualId,
+          call_id: actualId,
+          userId,
+          status: effectiveStatus,
+        });
+      }
     }
 
     const response: ApiResponse<any> = {

@@ -23,9 +23,9 @@ import {
   AiPlanLimits,
   getAiUsageSnapshot,
   getPlanAiLimits,
-  assertWithinAiUsage,
+  assertWithinAiUsageWithCredits,
   recordAiUsage,
-  tryConsumeAiUsage,
+  tryConsumeAiUsageWithCredits,
 } from "../lib/ai-usage";
 
 /**
@@ -591,7 +591,8 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
     const { userId, businessId, limits } = req.aiAccess!;
 
     // ---- Usage limit: every chat message consumes one 'chat' slot --------
-    const chatGate = await tryConsumeAiUsage(userId, businessId, "chat", limits);
+    // Falls back to purchased MetricAi credit packs when the plan cap is hit.
+    const chatGate = await tryConsumeAiUsageWithCredits(userId, businessId, "chat", limits);
     if (chatGate.ok === false) {
       const blocked = limitReached(chatGate);
       return res.status(blocked.status).json(blocked.body);
@@ -682,7 +683,7 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
       // Video generation path — CogVideoX is an upstream ASYNC job: create now,
       // poll in the background, drop the finished video into the chat history.
       // Usage: checked before the job, recorded only when a job actually starts.
-      const videoGate = await assertWithinAiUsage(userId, "video", limits);
+      const videoGate = await assertWithinAiUsageWithCredits(userId, businessId, "video", limits);
       if (videoGate.ok === false) {
         const blocked = limitReached(videoGate);
         return res.status(blocked.status).json(blocked.body);
@@ -730,7 +731,7 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
     } else if (wantsImage) {
       // Image generation path — the reply accompanies the generated artwork.
       // Usage: checked before generating, recorded only on success.
-      const imageGate = await assertWithinAiUsage(userId, "image", limits);
+      const imageGate = await assertWithinAiUsageWithCredits(userId, businessId, "image", limits);
       if (imageGate.ok === false) {
         const blocked = limitReached(imageGate);
         return res.status(blocked.status).json(blocked.body);

@@ -49,6 +49,15 @@ The backend powering **Metricorex** (project: Metroflow) — an all-in-one busin
 - Payroll: employees (NGN & USD recipients), Excel import, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
 - Transaction OTP/PIN, KYC (BVN/NIN/business docs via Prembly), biometric unlock, login-attempt alert emails.
 
+### Revenue Features (all plan-configurable via /admin/pricing)
+Five monetised surfaces, each wired into `pricing_plans` (feature toggles + limits + fee discounts that admins control per plan) and settled through the platform revenue wallet. (Bills Hub and Savings Vaults were reclassified as **Personal app** features and moved to the dormant `server/features/personal/` folder — see that folder's README.)
+
+1. **Storefront** (`/api/store`) — the Metroflow Store: businesses list products/services in a shareable storefront; customers order through the public page (`/store/public/:businessId`) and pay via hosted checkout. Every successful order credits the merchant wallet net of an order fee (fee type `store_order`, 2.5% capped ₦2,000 default) reduced by the plan's `store_fee_discount_percent`; stock decrements automatically and paid orders are fulfilment-tracked. Plan cap via `max_store_products` (ladder: 5 on Free Trial · 25 on Starter · unlimited on Pro). Admin overview: `GET /api/admin/store`.
+2. **Recurring Billing** (`/api/recurring`) — customer subscriptions: merchants create daily/weekly/monthly plans and share public subscribe links. Subscribers whose email maps to a Metroflow user are auto-charged from their wallet by the 5-minute cron engine (`processDueSubscriptionCharges`, idempotent via `next_charge_date` claiming); everyone else receives an emailed hosted-checkout link per cycle. Each successful charge credits the merchant net of the platform fee (fee type `subscription`, 2% capped ₦1,500 default) reduced by `subscription_fee_discount_percent`; plan caps via `max_subscription_plans` (ladder: 2 on Free Trial · 25 on Starter · unlimited on Pro), and 3 consecutive failed wallet charges pause the subscriber as `past_due`. Admin overview: `GET /api/admin/subscriptions`.
+3. **Payment Links** (`/api/payment-links`) — shareable checkout links (fixed or customer-chosen amount) with public `/pay/:slug` pages; 1.5% capped ₦2,000 collection fee (type `payment_link`) reduced by `payment_link_fee_discount_percent`, link count limited by `max_payment_links`. Settled by the payment webhooks. Admin overview: `GET /api/admin/payment-links`.
+4. **Smart Invoices** (`/api/invoices`) — itemised invoices (line items, tax, due date) with public `/invoices/:id/pay` checkout; 1% capped ₦2,500 settlement fee (type `invoice`) reduced by `invoice_fee_discount_percent`, monthly creation capped by `max_invoices_per_month`. Overdue is computed on read; settled by the payment webhooks. Admin overview: `GET /api/admin/invoices`.
+5. **MetricAi Credit Packs** (`/api/ai-credits`) — one-time AI credit top-ups purchasable from any wallet when a plan's MetricAi allowance runs out; plan-level `ai_credit_discount_percent` prices packs per plan. Admin manages packs via `/api/admin/ai-credit-packs`.
+
 ### Platform Operations (Admin)
 - Role & permission management (roles carry permission slugs; includes `support`), admin management.
 - Payment provider toggles (global + transfer provider), fees & international transfer config, platform/revenue ledgers with movements + reconciliation.
@@ -88,6 +97,8 @@ Key variables (see `ENVIRONMENT_SETUP.md` for the full list):
 | `BREVO_API_KEY` | Transactional email |
 | `FCM_*` | Push notifications |
 | `SUPPORT_ALERT_EMAIL` | Optional email ping on new support requests |
+
+| `JOBS_SECRET` | Optional shared secret for `/internal/jobs/*` endpoints |
 
 ## Local Development
 
@@ -136,4 +147,9 @@ Migrations run automatically on boot (`runPostInitializeMigrations`): support-de
 
 ## API Documentation
 
-Swagger UI: `/api-docs`. The spec covers auth, team, tasks (+attachments), epics, comments, chat (+media/GIFs), calls, meetings, recordings, MetricAi (+public Ask), support desk, wallet, transfers, payroll, KYC, settings, notifications, subscriptions and the admin API.
+Swagger UI: `/api-docs`. The spec is generated from JSDoc annotations in `server/routes/*.ts` (`npm run generate-swagger`) and served from `server/swagger-output.json`.
+
+Coverage now includes **every endpoint of the five revenue features** — Storefront (`Storefront`), Recurring Billing (`Recurring Billing`), Payment Links (`Payment Links`), Smart Invoices (`Smart Invoices`) and MetricAi Credits (`MetricAi Credits`), plus their admin overviews (`/admin/store`, `/admin/subscriptions`, `/admin/invoices`) — alongside auth, team, tasks (+attachments), epics, comments, chat (+media/GIFs), calls, meetings, recordings, MetricAi (+public Ask), support desk, wallet, transfers, payroll, KYC, settings, notifications, subscriptions and the admin API. (Personal-app endpoints — Bills, Savings — are intentionally not documented here; they live dormant in `server/features/personal/`.)
+
+### Plan configuration (admin)
+All five revenue features are wired into `pricing_plans` and editable per plan through `PUT /admin/pricing` with: `store_enabled`, `max_store_products`, `store_fee_discount_percent`, `recurring_enabled`, `max_subscription_plans`, `subscription_fee_discount_percent`, `payment_links_enabled`, `max_payment_links`, `payment_link_fee_discount_percent`, `invoices_enabled`, `max_invoices_per_month`, `invoice_fee_discount_percent`, and `ai_credit_discount_percent`.

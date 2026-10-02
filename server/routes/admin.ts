@@ -772,7 +772,9 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
             name, price, currency, duration, discount, features, permissions,
             maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
-            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+            breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
+            paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
+            aiCreditDiscountPercent
         } = req.body;
         
         if (!name || !price || !currency || !duration) {
@@ -784,14 +786,18 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
             (name, price, currency, duration, discount, features, permissions, is_active,
             max_meeting_duration, max_participants, max_recording_duration, max_recording_storage,
             waiting_room_enabled, recording_enabled, screen_sharing_enabled,
-            breakout_rooms_enabled, virtual_backgrounds, live_captions)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            breakout_rooms_enabled, virtual_backgrounds, live_captions,
+            payment_links_enabled, max_payment_links, payment_link_fee_discount_percent,
+            ai_credit_discount_percent)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
              RETURNING *`,
             [
                 name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions),
                 maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
                 waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
-                breakoutRoomsEnabled, virtualBackgrounds, liveCaptions
+                breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
+                paymentLinksEnabled ?? true, maxPaymentLinks ?? 3, paymentLinkFeeDiscountPercent ?? 0,
+                aiCreditDiscountPercent ?? 0
             ]
         );
 
@@ -847,12 +853,17 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
             breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
-            metricAiEnabled
+            metricAiEnabled,
+            paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
+            aiCreditDiscountPercent,
+            invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent,
+            storeEnabled, maxStoreProducts, storeFeeDiscountPercent,
+            recurringEnabled, maxSubscriptionPlans, subscriptionFeeDiscountPercent
         } = req.body;
 
         // Dynamic update
         let queryStr = "UPDATE pricing_plans SET updated_at = NOW()";
-        const params = [id];
+        const params: any[] = [id];
         let paramCount = 2;
 
         if (name !== undefined) {
@@ -938,6 +949,71 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
         if (metricAiEnabled !== undefined) {
             queryStr += `, metric_ai_enabled = $${paramCount}`;
             params.push(String(metricAiEnabled === true));
+            paramCount++;
+        }
+        if (paymentLinksEnabled !== undefined) {
+            queryStr += `, payment_links_enabled = $${paramCount}`;
+            params.push(paymentLinksEnabled === true);
+            paramCount++;
+        }
+        if (maxPaymentLinks !== undefined) {
+            queryStr += `, max_payment_links = $${paramCount}`;
+            params.push(Number(maxPaymentLinks) || 0);
+            paramCount++;
+        }
+        if (paymentLinkFeeDiscountPercent !== undefined) {
+            queryStr += `, payment_link_fee_discount_percent = $${paramCount}`;
+            params.push(Number(paymentLinkFeeDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (aiCreditDiscountPercent !== undefined) {
+            queryStr += `, ai_credit_discount_percent = $${paramCount}`;
+            params.push(Number(aiCreditDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (invoicesEnabled !== undefined) {
+            queryStr += `, invoices_enabled = $${paramCount}`;
+            params.push(invoicesEnabled === true);
+            paramCount++;
+        }
+        if (maxInvoicesPerMonth !== undefined) {
+            queryStr += `, max_invoices_per_month = $${paramCount}`;
+            params.push(Number(maxInvoicesPerMonth) || 0);
+            paramCount++;
+        }
+        if (invoiceFeeDiscountPercent !== undefined) {
+            queryStr += `, invoice_fee_discount_percent = $${paramCount}`;
+            params.push(Number(invoiceFeeDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (storeEnabled !== undefined) {
+            queryStr += `, store_enabled = $${paramCount}`;
+            params.push(storeEnabled === true);
+            paramCount++;
+        }
+        if (maxStoreProducts !== undefined) {
+            queryStr += `, max_store_products = $${paramCount}`;
+            params.push(Number(maxStoreProducts) || 0);
+            paramCount++;
+        }
+        if (storeFeeDiscountPercent !== undefined) {
+            queryStr += `, store_fee_discount_percent = $${paramCount}`;
+            params.push(Number(storeFeeDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (recurringEnabled !== undefined) {
+            queryStr += `, recurring_enabled = $${paramCount}`;
+            params.push(recurringEnabled === true);
+            paramCount++;
+        }
+        if (maxSubscriptionPlans !== undefined) {
+            queryStr += `, max_subscription_plans = $${paramCount}`;
+            params.push(Number(maxSubscriptionPlans) || 0);
+            paramCount++;
+        }
+        if (subscriptionFeeDiscountPercent !== undefined) {
+            queryStr += `, subscription_fee_discount_percent = $${paramCount}`;
+            params.push(Number(subscriptionFeeDiscountPercent) || 0);
             paramCount++;
         }
 
@@ -4356,6 +4432,234 @@ protectedRouter.get("/growth/campaigns", requirePermission('manage_growth'), asy
         res.json({ success: true, data: { items: rowsRes.rows, total: totalRes.rows[0].total, page, limit } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load campaigns" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Revenue features — admin management
+// ---------------------------------------------------------------------------
+
+/**
+ * MetricAi Credit Packs CRUD. Pack prices are global; per-plan discounts are
+ * configured on the plan itself (ai_credit_discount_percent via /admin/pricing).
+ */
+protectedRouter.get("/ai-credit-packs", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const rows = await query(`SELECT * FROM ai_credit_packs ORDER BY sort_order ASC, price ASC`);
+        const stats = await query(
+            `SELECT COALESCE(SUM(amount), 0) AS revenue, COUNT(*)::int AS purchases
+             FROM ai_credit_purchases WHERE status = 'success'`
+        );
+        res.json({ success: true, packs: rows.rows, stats: stats.rows[0] });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load AI credit packs" });
+    }
+});
+
+protectedRouter.post("/ai-credit-packs", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { name, credits, price, currency, is_active, sort_order } = req.body || {};
+        if (!name || !credits || !price) return res.status(400).json({ success: false, error: "name, credits and price are required" });
+        const rows = await query(
+            `INSERT INTO ai_credit_packs (name, credits, price, currency, is_active, sort_order)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [name, Math.round(Number(credits)), Number(price), currency || 'NGN', is_active ?? true, sort_order ?? 0]
+        );
+        res.json({ success: true, pack: rows.rows[0] });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to create AI credit pack" });
+    }
+});
+
+protectedRouter.put("/ai-credit-packs/:id", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { id } = req.params;
+        const { name, credits, price, currency, is_active, sort_order } = req.body || {};
+        const rows = await query(
+            `UPDATE ai_credit_packs SET
+                name = COALESCE($2, name),
+                credits = COALESCE($3, credits),
+                price = COALESCE($4, price),
+                currency = COALESCE($5, currency),
+                is_active = COALESCE($6, is_active),
+                sort_order = COALESCE($7, sort_order),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 RETURNING *`,
+            [id, name || null, credits != null ? Math.round(Number(credits)) : null, price != null ? Number(price) : null,
+             currency || null, is_active ?? null, sort_order ?? null]
+        );
+        if (rows.rows.length === 0) return res.status(404).json({ success: false, error: "Pack not found" });
+        res.json({ success: true, pack: rows.rows[0] });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update AI credit pack" });
+    }
+});
+
+protectedRouter.delete("/ai-credit-packs/:id", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { id } = req.params;
+        const rows = await query(`DELETE FROM ai_credit_packs WHERE id = $1 RETURNING id`, [id]);
+        if (rows.rows.length === 0) return res.status(404).json({ success: false, error: "Pack not found" });
+        res.json({ success: true, message: "Pack deleted" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete AI credit pack" });
+    }
+});
+
+/** Platform-wide Payment Links overview (admin). */
+protectedRouter.get("/payment-links", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_links,
+                    COALESCE(SUM(CASE WHEN is_active THEN 1 ELSE 0 END), 0)::int AS active_links
+             FROM payment_links`
+        );
+        const payments = await query(
+            `SELECT COALESCE(SUM(amount), 0) AS gross, COALESCE(SUM(fee), 0) AS fees, COALESCE(SUM(net_amount), 0) AS net,
+                    COUNT(*)::int AS transactions
+             FROM payment_link_payments WHERE status = 'success'`
+        );
+        const recent = await query(
+            `SELECT q.transaction_reference, q.amount, q.fee, q.net_amount, q.currency, q.status,
+                    q.payer_name, q.payer_email, q.payment_provider, q.created_at,
+                    l.title AS link_title, b.name AS business_name
+             FROM payment_link_payments q
+             JOIN payment_links l ON l.id = q.link_id
+             LEFT JOIN businesses b ON b.id = q.business_id
+             ORDER BY q.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], payments: payments.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load payment links overview" });
+    }
+});
+
+/**
+ * @openapi
+ * /admin/invoices:
+ *   get:
+ *     summary: Platform-wide Smart Invoices overview (revenue, volumes, recent payments)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Invoice summary + payments + recent activity
+ */
+protectedRouter.get("/invoices", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_invoices,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)::int AS pending_invoices,
+                    COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_invoices
+             FROM invoices`
+        );
+        const payments = await query(
+            `SELECT COALESCE(SUM(amount), 0) AS gross, COALESCE(SUM(fee), 0) AS fees, COALESCE(SUM(net_amount), 0) AS net,
+                    COUNT(*)::int AS transactions
+             FROM invoice_payments WHERE status = 'success'`
+        );
+        const recent = await query(
+            `SELECT q.transaction_reference, q.amount, q.fee, q.net_amount, q.currency, q.status,
+                    q.payer_name, q.payer_email, q.payment_provider, q.created_at,
+                    i.invoice_number, i.client_name, b.name AS business_name
+             FROM invoice_payments q
+             JOIN invoices i ON i.id = q.invoice_id
+             LEFT JOIN businesses b ON b.id = q.business_id
+             ORDER BY q.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], payments: payments.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load invoices overview" });
+    }
+});
+
+/**
+ * @openapi
+ * /admin/store:
+ *   get:
+ *     summary: Platform-wide Storefront overview (products, orders, order-fee revenue, recent orders)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Store summary + money stats + recent activity
+ */
+protectedRouter.get("/store", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_products,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_products
+             FROM store_products`
+        );
+        const orders = await query(
+            `SELECT COUNT(*)::int AS total_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN 1 ELSE 0 END), 0)::int AS paid_orders,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)::int AS pending_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN total ELSE 0 END), 0) AS gross,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','fulfilled') THEN fee ELSE 0 END), 0) AS revenue
+             FROM store_orders`
+        );
+        const recent = await query(
+            `SELECT o.order_number, o.customer_name, o.total, o.fee, o.currency, o.status, o.payment_provider, o.created_at,
+                    b.name AS business_name
+             FROM store_orders o
+             LEFT JOIN businesses b ON b.id = o.business_id
+             ORDER BY o.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], orders: orders.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load store overview" });
+    }
+});
+
+/**
+ * @openapi
+ * /admin/subscriptions:
+ *   get:
+ *     summary: Platform-wide Recurring Billing overview (plans, subscribers, charge-fee revenue, recent charges)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Subscription summary + money stats + recent activity
+ */
+protectedRouter.get("/subscriptions", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_plans,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_plans
+             FROM customer_subscription_plans`
+        );
+        const subscribers = await query(
+            `SELECT COUNT(*)::int AS total_subscribers,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_subscribers,
+                    COALESCE(SUM(CASE WHEN status = 'past_due' THEN 1 ELSE 0 END), 0)::int AS past_due,
+                    COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0)::int AS cancelled
+             FROM customer_subscribers`
+        );
+        const money = await query(
+            `SELECT COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) AS gross,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN fee ELSE 0 END), 0) AS revenue,
+                    COALESCE(SUM(CASE WHEN status = 'success' THEN net_amount ELSE 0 END), 0) AS net,
+                    COUNT(*)::int AS successful_charges
+             FROM subscription_charges`
+        );
+        const recent = await query(
+            `SELECT c.reference, c.amount, c.fee, c.net_amount, c.currency, c.status, c.charge_path, c.created_at,
+                    s.customer_name, s.customer_email, p.name AS plan_name, p.interval,
+                    b.name AS business_name
+             FROM subscription_charges c
+             JOIN customer_subscribers s ON s.id = c.subscriber_id
+             JOIN customer_subscription_plans p ON p.id = c.plan_id
+             LEFT JOIN businesses b ON b.id = c.business_id
+             ORDER BY c.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], subscribers: subscribers.rows[0], money: money.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load subscriptions overview" });
     }
 });
 

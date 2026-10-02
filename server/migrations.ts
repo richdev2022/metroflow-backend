@@ -19,6 +19,134 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureMeetingSchedulingSchema();
   await ensureVapidKeys();
   await ensureSiteGrowthSchema();
+  await ensureRevenueFeaturesSchema();
+  await ensurePlanPricingLadder();
+  await ensureInvoicesSchema();
+  await ensureStoreSchema();
+  await ensureRecurringBillingSchema();
+  await ensureBusinessRevenueLadder();
+  await ensureBusinessRevenueLadderV2();
+}
+
+/**
+ * Revenue features:
+ *  1. Payment Links ("Get Paid") — shareable checkout links for businesses;
+ *     every successful customer payment credits the business wallet minus a
+ *     configurable collection fee that lands in the platform revenue wallet.
+ *  2. MetricAi Credit Packs — one-time credit top-ups for MetricAi usage,
+ *     purchasable from the wallet when a plan's AI allowance runs out.
+ * Both are plan-configurable (pricing_plans columns below, admin-editable).
+ */
+async function ensureRevenueFeaturesSchema(): Promise<void> {
+  // ---------- Payment Links ----------
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      slug VARCHAR(80) UNIQUE NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      description TEXT,
+      amount DECIMAL(12,2),
+      currency VARCHAR(3) DEFAULT 'NGN',
+      allow_custom_amount BOOLEAN DEFAULT FALSE,
+      is_active BOOLEAN DEFAULT TRUE,
+      views INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_payment_links_business ON payment_links(business_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_link_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE CASCADE,
+      business_id VARCHAR(255) NOT NULL,
+      transaction_reference VARCHAR(255) UNIQUE NOT NULL,
+      payer_name VARCHAR(255),
+      payer_email VARCHAR(255),
+      amount DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) DEFAULT 0,
+      net_amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending',
+      payment_provider VARCHAR(30),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_plp_link ON payment_link_payments(link_id)`);
+
+  // Plan configuration knobs for Payment Links
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS payment_links_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_payment_links INTEGER DEFAULT 3`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS payment_link_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Collection fee config (percentage with cap), mirroring funding_card.
+  // Idempotent: only inserted when the fee type does not exist yet.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Payment Link Collection Fee', 'payment_link', 'percentage_cap',
+           '{"percentage": 1.5, "cap": 2000}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'payment_link')
+  `);
+
+  // ---------- MetricAi Credit Packs ----------
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_packs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(100) NOT NULL,
+      credits INTEGER NOT NULL,
+      price DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      is_active BOOLEAN DEFAULT TRUE,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_balances (
+      user_id UUID PRIMARY KEY,
+      business_id VARCHAR(255),
+      balance INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_purchases (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      pack_id UUID,
+      pack_name VARCHAR(100),
+      credits INTEGER NOT NULL,
+      amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'success',
+      reference VARCHAR(255) UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_ai_credit_purchases_user ON ai_credit_purchases(user_id, created_at)`);
+
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS ai_credit_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Starter credit packs (skipped when the table already has rows)
+  await query(`
+    INSERT INTO ai_credit_packs (name, credits, price, currency, sort_order)
+    SELECT * FROM (VALUES
+      ('Starter Pack', 100, 2000, 'NGN', 1),
+      ('Business Pack', 500, 8000, 'NGN', 2),
+      ('Scale Pack', 1500, 20000, 'NGN', 3)
+    ) AS v(name, credits, price, currency, sort_order)
+    WHERE NOT EXISTS (SELECT 1 FROM ai_credit_packs)
+  `);
+
+  console.log("[migrations] Revenue features (payment links + AI credit packs) schema applied");
 }
 
 /**
@@ -820,4 +948,589 @@ async function ensureMeetingSchedulingSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_meeting_reminders_due ON meeting_reminders (remind_at) WHERE sent = FALSE`);
 
   console.log("[migrations] meeting scheduling schema applied");
+}
+
+/**
+ * Plan pricing / limits ladder (admin-adjustable afterwards).
+ *
+ * The legacy seeds priced plans in USD (Free 0 / Starter 29 / Pro 99) while the
+ * subscription charge flow defaults to NGN — meaning every NGN purchase went
+ * through a fragile external FX lookup that silently charged the raw USD number
+ * in kobo whenever it failed (a "₦29 Pro plan"). This migration moves the
+ * seeded tiers to explicit NGN pricing with a coherent limits ladder across
+ * every plan-gated surface (team, RTC, MetricAi, Payment Links, Invoices).
+ *
+ * Idempotent: each UPDATE only matches the legacy USD seed values, so rows an
+ * admin has already re-priced are never clobbered on reboot.
+ */
+async function ensurePlanPricingLadder(): Promise<void> {
+  // ---------- Free Trial ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      discount = 0,
+      description = 'Everything you need to try Metricorex — personal or business.',
+      max_team_members = 5,
+      max_meeting_duration = 40,
+      max_participants = 8,
+      max_recording_duration = 0,
+      max_recording_storage = 100,
+      recording_enabled = FALSE,
+      waiting_room_enabled = FALSE,
+      breakout_rooms_enabled = FALSE,
+      virtual_backgrounds = FALSE,
+      live_captions = FALSE,
+      metric_ai_chat_daily = 20,
+      metric_ai_chat_monthly = 200,
+      metric_ai_image_daily = 3,
+      metric_ai_image_monthly = 20,
+      metric_ai_video_daily = 0,
+      metric_ai_video_monthly = 0,
+      payment_links_enabled = TRUE,
+      max_payment_links = 1,
+      payment_link_fee_discount_percent = 0,
+      ai_credit_discount_percent = 0,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 3,
+      invoice_fee_discount_percent = 0,
+      features = '["Up to 5 team members", "Tasks, backlog & ideas", "40-min meetings, 8 participants", "MetricAi: 200 chats + 20 images / month", "1 payment link", "3 invoices per month", "Standard collection fees"]'::jsonb
+    WHERE name = 'Free Trial' AND price = 0 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  // ---------- Starter ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      price = 9900,
+      discount = 0,
+      description = 'For small teams getting paid and staying organised.',
+      max_team_members = 15,
+      max_meeting_duration = 120,
+      max_participants = 25,
+      max_recording_duration = 60,
+      max_recording_storage = 2048,
+      recording_enabled = TRUE,
+      waiting_room_enabled = TRUE,
+      breakout_rooms_enabled = FALSE,
+      virtual_backgrounds = FALSE,
+      live_captions = FALSE,
+      metric_ai_chat_daily = 60,
+      metric_ai_chat_monthly = 800,
+      metric_ai_image_daily = 10,
+      metric_ai_image_monthly = 80,
+      metric_ai_video_daily = 1,
+      metric_ai_video_monthly = 8,
+      payment_links_enabled = TRUE,
+      max_payment_links = 5,
+      payment_link_fee_discount_percent = 0,
+      ai_credit_discount_percent = 5,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 15,
+      invoice_fee_discount_percent = 10,
+      features = '["Up to 15 team members", "2-hour meetings, 25 participants, recording", "MetricAi: 800 chats + 80 images / month", "5 payment links", "15 invoices per month", "10% off invoice settlement fees", "5% off MetricAi credit packs", "Email support"]'::jsonb
+    WHERE name = 'Starter' AND price = 29 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  // ---------- Pro ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      price = 29900,
+      discount = 0,
+      description = 'Everything Metricorex offers — unlimited team, best fees.',
+      max_team_members = 999999,
+      max_meeting_duration = 999999,
+      max_participants = 200,
+      max_recording_duration = 240,
+      max_recording_storage = 10240,
+      recording_enabled = TRUE,
+      waiting_room_enabled = TRUE,
+      breakout_rooms_enabled = TRUE,
+      virtual_backgrounds = TRUE,
+      live_captions = TRUE,
+      metric_ai_chat_daily = 200,
+      metric_ai_chat_monthly = 3000,
+      metric_ai_image_daily = 15,
+      metric_ai_image_monthly = 150,
+      metric_ai_video_daily = 5,
+      metric_ai_video_monthly = 30,
+      payment_links_enabled = TRUE,
+      max_payment_links = 999999,
+      payment_link_fee_discount_percent = 25,
+      ai_credit_discount_percent = 10,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 999999,
+      invoice_fee_discount_percent = 25,
+      features = '["Unlimited team members", "Unlimited meeting duration, 200 participants", "Recording, breakout rooms, virtual backgrounds, live captions", "MetricAi: 3000 chats + 150 images + 30 videos / month", "Unlimited payment links", "Unlimited invoices", "25% off payment link & invoice settlement fees", "10% off MetricAi credit packs", "Priority support"]'::jsonb
+    WHERE name = 'Pro' AND price = 99 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  console.log("[migrations] plan pricing/limits ladder applied");
+}
+
+/**
+ * Smart Invoices — the third revenue feature.
+ *
+ * Businesses create itemised invoices (line items, tax, due date) and share a
+ * public checkout page with their clients. When a client pays through the
+ * active payment provider the webhook settles the invoice: the business wallet
+ * is credited net of an invoice settlement fee (fee_configurations 'invoice' —
+ * 1% capped ₦2,500 by default, reduced by the plan-level
+ * invoice_fee_discount_percent) which lands in the platform revenue wallet.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - invoices_enabled             (feature toggle)
+ *   - max_invoices_per_month       (NULL/999999+ = unlimited)
+ *   - invoice_fee_discount_percent
+ */
+async function ensureInvoicesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      invoice_number VARCHAR(40) UNIQUE NOT NULL,
+      client_name VARCHAR(255) NOT NULL,
+      client_email VARCHAR(255) NOT NULL,
+      client_phone VARCHAR(50),
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending', -- draft | pending | paid | cancelled (overdue computed on read)
+      due_date DATE,
+      notes TEXT,
+      tax_percent DECIMAL(5,2) DEFAULT 0,
+      subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
+      tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total DECIMAL(12,2) NOT NULL DEFAULT 0,
+      amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+      views INTEGER DEFAULT 0,
+      paid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoices_business ON invoices(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoice_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity DECIMAL(12,2) NOT NULL DEFAULT 1,
+      unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
+      amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      position INTEGER DEFAULT 0
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoice_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      business_id VARCHAR(255) NOT NULL,
+      transaction_reference VARCHAR(255) UNIQUE NOT NULL,
+      payer_name VARCHAR(255),
+      payer_email VARCHAR(255),
+      amount DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) DEFAULT 0,
+      net_amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending',
+      payment_provider VARCHAR(30),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoice_payments_invoice ON invoice_payments(invoice_id)`);
+
+  // Plan configuration knobs for Smart Invoices
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS invoices_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_invoices_per_month INTEGER DEFAULT 10`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS invoice_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Invoice settlement fee (percentage with cap), mirroring payment_link.
+  // Idempotent: only inserted when the fee type does not exist yet.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Invoice Settlement Fee', 'invoice', 'percentage_cap',
+           '{"percentage": 1.0, "cap": 2500}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'invoice')
+  `);
+
+  console.log("[migrations] Smart Invoices schema applied");
+}
+
+/**
+ * Storefront ("Metroflow Store") — a BUSINESS revenue feature.
+ *
+ * Businesses list products/services in a shareable storefront (public page
+ * /store/:publicId). Customers place orders and pay through the active
+ * payment provider's hosted checkout; the webhook credits the business
+ * wallet minus an order fee (fee_configurations 'store_order' — 2.5% capped
+ * ₦2,500 by default, reduced by the plan-level store_fee_discount_percent).
+ * The fee lands in the platform revenue wallet via creditRevenueWallet and
+ * every settlement is double-entered through the platform ledger.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - store_enabled              (feature toggle)
+ *   - max_store_products         (NULL/999999+ = unlimited)
+ *   - store_fee_discount_percent
+ */
+async function ensureStoreSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS store_products (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      name VARCHAR(160) NOT NULL,
+      description TEXT,
+      price DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      stock INTEGER,
+      image_url TEXT,
+      status VARCHAR(20) DEFAULT 'active', -- active | paused | draft
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_products_business ON store_products(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_products_status ON store_products(business_id, status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS store_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      order_number VARCHAR(40) UNIQUE NOT NULL,
+      checkout_reference VARCHAR(255) UNIQUE NOT NULL,
+      customer_name VARCHAR(160) NOT NULL,
+      customer_email VARCHAR(200),
+      customer_phone VARCHAR(50),
+      subtotal DECIMAL(15,2) NOT NULL DEFAULT 0,
+      fee DECIMAL(15,2) NOT NULL DEFAULT 0,
+      net_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      total DECIMAL(15,2) NOT NULL DEFAULT 0,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending', -- pending | paid | fulfilled | cancelled | failed
+      payment_provider VARCHAR(40),
+      note TEXT,
+      paid_at TIMESTAMP,
+      fulfilled_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_orders_business ON store_orders(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_orders_status ON store_orders(status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS store_order_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      order_id UUID NOT NULL REFERENCES store_orders(id) ON DELETE CASCADE,
+      product_id UUID,
+      product_name VARCHAR(160) NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      unit_price DECIMAL(15,2) NOT NULL,
+      amount DECIMAL(15,2) NOT NULL
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_store_order_items_order ON store_order_items(order_id)`);
+
+  // Plan configuration knobs for the Storefront
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS store_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_store_products INTEGER DEFAULT 5`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS store_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Storefront order fee: 2.5% capped ₦2,500 (idempotent seed).
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Storefront Order Fee', 'store_order', 'percentage_cap',
+           '{"percentage": 2.5, "cap": 2500}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'store_order')
+  `);
+
+  console.log("[Migrations] Storefront schema applied");
+}
+
+/**
+ * Recurring Billing (Customer Subscriptions) — a BUSINESS revenue feature.
+ *
+ * Businesses create subscription plans (daily / weekly / monthly) and share
+ * a public subscribe link. Subscribers either auto-pay from their Metroflow
+ * wallet (when the subscriber email maps to a platform user, mandate style —
+ * charged by the 5-minute cron engine) or pay each cycle through the hosted
+ * checkout link emailed to them. Every successful charge credits the
+ * merchant wallet minus a platform fee (fee_configurations 'subscription' —
+ * 2% capped ₦2,000 by default, reduced by the plan-level
+ * subscription_fee_discount_percent) which lands in the platform revenue
+ * wallet via creditRevenueWallet.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - recurring_enabled                   (feature toggle)
+ *   - max_subscription_plans              (NULL/999999+ = unlimited)
+ *   - subscription_fee_discount_percent
+ */
+async function ensureRecurringBillingSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS customer_subscription_plans (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      name VARCHAR(160) NOT NULL,
+      description TEXT,
+      amount DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      interval VARCHAR(20) NOT NULL DEFAULT 'monthly', -- daily | weekly | monthly
+      status VARCHAR(20) DEFAULT 'active',             -- active | paused
+      public_id UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_plans_business ON customer_subscription_plans(business_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS customer_subscribers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      plan_id UUID NOT NULL REFERENCES customer_subscription_plans(id) ON DELETE CASCADE,
+      customer_user_id UUID,
+      wallet_id UUID,
+      customer_name VARCHAR(160) NOT NULL,
+      customer_email VARCHAR(200) NOT NULL,
+      customer_phone VARCHAR(50),
+      status VARCHAR(20) DEFAULT 'active', -- active | past_due | cancelled
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      next_charge_date DATE,
+      last_charged_at TIMESTAMP,
+      last_charge_reference VARCHAR(255),
+      unsubscribe_token UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_business ON customer_subscribers(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_plan ON customer_subscribers(plan_id)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_csub_subscribers_plan_email ON customer_subscribers(plan_id, customer_email)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_csub_subscribers_due ON customer_subscribers(next_charge_date) WHERE status = 'active'`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS subscription_charges (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      subscriber_id UUID NOT NULL REFERENCES customer_subscribers(id) ON DELETE CASCADE,
+      plan_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      amount DECIMAL(15,2) NOT NULL,
+      fee DECIMAL(15,2) NOT NULL DEFAULT 0,
+      net_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      charge_path VARCHAR(20) NOT NULL DEFAULT 'checkout', -- wallet | checkout
+      status VARCHAR(20) DEFAULT 'pending',                -- pending | awaiting_payment | success | failed
+      period_start DATE,
+      period_end DATE,
+      failure_reason TEXT,
+      paid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sub_charges_subscriber ON subscription_charges(subscriber_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sub_charges_business ON subscription_charges(business_id)`);
+
+  // Plan configuration knobs for Recurring Billing
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS recurring_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_subscription_plans INTEGER DEFAULT 2`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS subscription_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Subscription charge fee: 2% capped ₦2,000 (idempotent seed).
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Subscription Charge Fee', 'subscription', 'percentage_cap',
+           '{"percentage": 2.0, "cap": 2000}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'subscription')
+  `);
+
+  console.log("[Migrations] Recurring Billing schema applied");
+}
+
+/**
+ * Business revenue knob ladder — seeds the Storefront / Recurring Billing
+ * knobs per plan and refreshes each plan's feature list:
+ *   1. strips the Personal-app bullets (bill payments / savings vaults) —
+ *      those features moved out of the business app into the dormant
+ *      personal feature folder (server/features/personal);
+ *   2. appends the Storefront + Recurring Billing bullets exactly once.
+ * Knob UPDATEs are gated on the columns still being at their freshly-added
+ * defaults so an admin's later re-pricing is never clobbered.
+ */
+async function ensureBusinessRevenueLadder(): Promise<void> {
+  // ---------- Knobs (gated on untouched defaults) ----------
+  await query(`
+    UPDATE pricing_plans SET
+      store_enabled = TRUE,
+      max_store_products = 3,
+      store_fee_discount_percent = 0,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 1,
+      subscription_fee_discount_percent = 0
+    WHERE name = 'Free Trial' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 2)
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      store_enabled = TRUE,
+      max_store_products = 15,
+      store_fee_discount_percent = 10,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 10,
+      subscription_fee_discount_percent = 10
+    WHERE name = 'Starter' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 10)
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      store_enabled = TRUE,
+      max_store_products = 999999,
+      store_fee_discount_percent = 25,
+      recurring_enabled = TRUE,
+      max_subscription_plans = 999999,
+      subscription_fee_discount_percent = 25
+    WHERE name = 'Pro' AND (max_store_products IS NULL OR max_store_products = 5)
+      AND (max_subscription_plans IS NULL OR max_subscription_plans = 999999)
+  `);
+
+  // ---------- Feature bullets (strip personal, append business once) ----------
+  try {
+    const plans = await query(`SELECT id, name, max_store_products, max_subscription_plans, features FROM pricing_plans`);
+    for (const plan of plans.rows) {
+      const features: string[] = Array.isArray(plan.features) ? plan.features : [];
+      const next = features.filter(
+        (f: string) => !/bill payment/i.test(f) && !/savings vault/i.test(f)
+      );
+      const hasStore = next.some((f: string) => /storefront/i.test(f));
+      const hasRecurring = next.some((f: string) => /recurring billing/i.test(f));
+      if (hasStore && hasRecurring) {
+        if (next.length !== features.length) {
+          await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+        }
+        continue;
+      }
+
+      const fmt = (n: any, noun: string) =>
+        n == null || Number(n) >= 999999 ? `Unlimited ${noun}` : `${Number(n)} ${noun}${Number(n) === 1 ? "" : "s"}`;
+      if (!hasStore) next.push(`${fmt(plan.max_store_products, "storefront product")} with hosted checkout`);
+      if (!hasRecurring) next.push(`${fmt(plan.max_subscription_plans, "recurring billing plan")} on any interval`);
+      await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+    }
+  } catch (err) {
+    console.error("[Migrations] business revenue feature-bullet refresh failed:", err);
+  }
+
+  console.log("[Migrations] business revenue knob ladder applied");
+}
+
+/**
+ * Business revenue knob ladder V2 — a rebalanced, revenue-driven ladder for
+ * the Storefront / Recurring Billing knobs plus softer fee caps.
+ *
+ * Why: the V1 ladder was written defensively small (Free Trial 3 products /
+ * 1 subscription plan, Starter 15/10 at 10% fee discounts). The approved
+ * monetisation ladder widens the funnel and makes the paid step-ups
+ * unmistakable:
+ *
+ *   Plan         max_store_products  max_subscription_plans  fee discounts
+ *   Free Trial    3  -> 5             1  -> 2                 0%
+ *   Starter      15  -> 25           10 -> 25                10% -> 15%
+ *   Pro          unlimited           unlimited               25% -> 35%
+ *
+ * Fee caps (fee_configurations, platform-wide):
+ *   store_order  2.5% cap ₦2,500 -> 2.5% cap ₦2,000  (competitive with the
+ *                ₦2,000 local cap tier used by NGN PSPs for large baskets)
+ *   subscription 2.0% cap ₦2,000 -> 2.0% cap ₦1,500  (recurring volume play —
+ *                keeps per-charge fees predictable for merchants)
+ *
+ * Every UPDATE is gated on the exact V1 value so an admin's later re-pricing
+ * (via /admin/pricing) is never clobbered on reboot. The plan feature
+ * bullets for both surfaces are regenerated to match the new numbers.
+ */
+async function ensureBusinessRevenueLadderV2(): Promise<void> {
+  // ---------- Fee caps (gated on the V1 configs) ----------
+  await query(`
+    UPDATE fee_configurations
+    SET config = '{"percentage": 2.5, "cap": 2000}'::jsonb, updated_at = CURRENT_TIMESTAMP
+    WHERE fee_type = 'store_order'
+      AND config_type = 'percentage_cap'
+      AND config->>'percentage' = '2.5'
+      AND config->>'cap' = '2500'
+  `);
+  await query(`
+    UPDATE fee_configurations
+    SET config = '{"percentage": 2.0, "cap": 1500}'::jsonb, updated_at = CURRENT_TIMESTAMP
+    WHERE fee_type = 'subscription'
+      AND config_type = 'percentage_cap'
+      AND (config->>'percentage' = '2' OR config->>'percentage' = '2.0')
+      AND config->>'cap' = '2000'
+  `);
+
+  // ---------- Knobs (gated on the V1 ladder) ----------
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 5,
+      store_fee_discount_percent = 0,
+      max_subscription_plans = 2,
+      subscription_fee_discount_percent = 0
+    WHERE name = 'Free Trial'
+      AND max_store_products = 3 AND max_subscription_plans = 1
+      AND store_fee_discount_percent = 0 AND subscription_fee_discount_percent = 0
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 25,
+      store_fee_discount_percent = 15,
+      max_subscription_plans = 25,
+      subscription_fee_discount_percent = 15
+    WHERE name = 'Starter'
+      AND max_store_products = 15 AND max_subscription_plans = 10
+      AND store_fee_discount_percent = 10 AND subscription_fee_discount_percent = 10
+  `);
+  await query(`
+    UPDATE pricing_plans SET
+      max_store_products = 999999,
+      store_fee_discount_percent = 35,
+      max_subscription_plans = 999999,
+      subscription_fee_discount_percent = 35
+    WHERE name = 'Pro'
+      AND max_store_products = 999999 AND max_subscription_plans = 999999
+      AND store_fee_discount_percent = 25 AND subscription_fee_discount_percent = 25
+  `);
+
+  // ---------- Feature bullets (regenerate store/recurring once) ----------
+  try {
+    const plans = await query(`SELECT id, name, max_store_products, max_subscription_plans, store_fee_discount_percent, subscription_fee_discount_percent, features FROM pricing_plans`);
+    for (const plan of plans.rows) {
+      const features: string[] = Array.isArray(plan.features) ? plan.features : [];
+      const others = features.filter(
+        (f: string) => !/storefront/i.test(f) && !/recurring billing/i.test(f)
+      );
+      const fmt = (n: any, noun: string) =>
+        n == null || Number(n) >= 999999 ? `Unlimited ${noun}` : `${Number(n)} ${noun}${Number(n) === 1 ? "" : "s"}`;
+      const storeDiscount = Number(plan.store_fee_discount_percent) || 0;
+      const subDiscount = Number(plan.subscription_fee_discount_percent) || 0;
+      const next = [
+        ...others,
+        `${fmt(plan.max_store_products, "storefront product")} with hosted checkout` +
+          (storeDiscount > 0 ? ` · ${storeDiscount}% off order fees` : ""),
+        `${fmt(plan.max_subscription_plans, "recurring billing plan")} on any interval` +
+          (subDiscount > 0 ? ` · ${subDiscount}% off subscription fees` : ""),
+      ];
+      if (JSON.stringify(next) !== JSON.stringify(features)) {
+        await query(`UPDATE pricing_plans SET features = $2::jsonb WHERE id = $1`, [plan.id, JSON.stringify(next)]);
+      }
+    }
+  } catch (err) {
+    console.error("[Migrations] business revenue V2 feature-bullet refresh failed:", err);
+  }
+
+  console.log("[Migrations] business revenue knob ladder V2 applied");
 }

@@ -20,6 +20,8 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureVapidKeys();
   await ensureSiteGrowthSchema();
   await ensureRevenueFeaturesSchema();
+  await ensurePlanPricingLadder();
+  await ensureInvoicesSchema();
 }
 
 /**
@@ -942,4 +944,215 @@ async function ensureMeetingSchedulingSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_meeting_reminders_due ON meeting_reminders (remind_at) WHERE sent = FALSE`);
 
   console.log("[migrations] meeting scheduling schema applied");
+}
+
+/**
+ * Plan pricing / limits ladder (admin-adjustable afterwards).
+ *
+ * The legacy seeds priced plans in USD (Free 0 / Starter 29 / Pro 99) while the
+ * subscription charge flow defaults to NGN — meaning every NGN purchase went
+ * through a fragile external FX lookup that silently charged the raw USD number
+ * in kobo whenever it failed (a "₦29 Pro plan"). This migration moves the
+ * seeded tiers to explicit NGN pricing with a coherent limits ladder across
+ * every plan-gated surface (team, RTC, MetricAi, Payment Links, Invoices).
+ *
+ * Idempotent: each UPDATE only matches the legacy USD seed values, so rows an
+ * admin has already re-priced are never clobbered on reboot.
+ */
+async function ensurePlanPricingLadder(): Promise<void> {
+  // ---------- Free Trial ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      discount = 0,
+      description = 'Everything you need to try Metricorex — personal or business.',
+      max_team_members = 5,
+      max_meeting_duration = 40,
+      max_participants = 8,
+      max_recording_duration = 0,
+      max_recording_storage = 100,
+      recording_enabled = FALSE,
+      waiting_room_enabled = FALSE,
+      breakout_rooms_enabled = FALSE,
+      virtual_backgrounds = FALSE,
+      live_captions = FALSE,
+      metric_ai_chat_daily = 20,
+      metric_ai_chat_monthly = 200,
+      metric_ai_image_daily = 3,
+      metric_ai_image_monthly = 20,
+      metric_ai_video_daily = 0,
+      metric_ai_video_monthly = 0,
+      payment_links_enabled = TRUE,
+      max_payment_links = 1,
+      payment_link_fee_discount_percent = 0,
+      ai_credit_discount_percent = 0,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 3,
+      invoice_fee_discount_percent = 0,
+      features = '["Up to 5 team members", "Tasks, backlog & ideas", "40-min meetings, 8 participants", "MetricAi: 200 chats + 20 images / month", "1 payment link", "3 invoices per month", "Standard collection fees"]'::jsonb
+    WHERE name = 'Free Trial' AND price = 0 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  // ---------- Starter ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      price = 9900,
+      discount = 0,
+      description = 'For small teams getting paid and staying organised.',
+      max_team_members = 15,
+      max_meeting_duration = 120,
+      max_participants = 25,
+      max_recording_duration = 60,
+      max_recording_storage = 2048,
+      recording_enabled = TRUE,
+      waiting_room_enabled = TRUE,
+      breakout_rooms_enabled = FALSE,
+      virtual_backgrounds = FALSE,
+      live_captions = FALSE,
+      metric_ai_chat_daily = 60,
+      metric_ai_chat_monthly = 800,
+      metric_ai_image_daily = 10,
+      metric_ai_image_monthly = 80,
+      metric_ai_video_daily = 1,
+      metric_ai_video_monthly = 8,
+      payment_links_enabled = TRUE,
+      max_payment_links = 5,
+      payment_link_fee_discount_percent = 0,
+      ai_credit_discount_percent = 5,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 15,
+      invoice_fee_discount_percent = 10,
+      features = '["Up to 15 team members", "2-hour meetings, 25 participants, recording", "MetricAi: 800 chats + 80 images / month", "5 payment links", "15 invoices per month", "10% off invoice settlement fees", "5% off MetricAi credit packs", "Email support"]'::jsonb
+    WHERE name = 'Starter' AND price = 29 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  // ---------- Pro ----------
+  await query(`
+    UPDATE pricing_plans SET
+      currency = 'NGN',
+      price = 29900,
+      discount = 0,
+      description = 'Everything Metricorex offers — unlimited team, best fees.',
+      max_team_members = 999999,
+      max_meeting_duration = 999999,
+      max_participants = 200,
+      max_recording_duration = 240,
+      max_recording_storage = 10240,
+      recording_enabled = TRUE,
+      waiting_room_enabled = TRUE,
+      breakout_rooms_enabled = TRUE,
+      virtual_backgrounds = TRUE,
+      live_captions = TRUE,
+      metric_ai_chat_daily = 200,
+      metric_ai_chat_monthly = 3000,
+      metric_ai_image_daily = 15,
+      metric_ai_image_monthly = 150,
+      metric_ai_video_daily = 5,
+      metric_ai_video_monthly = 30,
+      payment_links_enabled = TRUE,
+      max_payment_links = 999999,
+      payment_link_fee_discount_percent = 25,
+      ai_credit_discount_percent = 10,
+      invoices_enabled = TRUE,
+      max_invoices_per_month = 999999,
+      invoice_fee_discount_percent = 25,
+      features = '["Unlimited team members", "Unlimited meeting duration, 200 participants", "Recording, breakout rooms, virtual backgrounds, live captions", "MetricAi: 3000 chats + 150 images + 30 videos / month", "Unlimited payment links", "Unlimited invoices", "25% off payment link & invoice settlement fees", "10% off MetricAi credit packs", "Priority support"]'::jsonb
+    WHERE name = 'Pro' AND price = 99 AND (currency = 'USD' OR currency IS NULL)
+  `);
+
+  console.log("[migrations] plan pricing/limits ladder applied");
+}
+
+/**
+ * Smart Invoices — the third revenue feature.
+ *
+ * Businesses create itemised invoices (line items, tax, due date) and share a
+ * public checkout page with their clients. When a client pays through the
+ * active payment provider the webhook settles the invoice: the business wallet
+ * is credited net of an invoice settlement fee (fee_configurations 'invoice' —
+ * 1% capped ₦2,500 by default, reduced by the plan-level
+ * invoice_fee_discount_percent) which lands in the platform revenue wallet.
+ *
+ * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
+ *   - invoices_enabled             (feature toggle)
+ *   - max_invoices_per_month       (NULL/999999+ = unlimited)
+ *   - invoice_fee_discount_percent
+ */
+async function ensureInvoicesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      invoice_number VARCHAR(40) UNIQUE NOT NULL,
+      client_name VARCHAR(255) NOT NULL,
+      client_email VARCHAR(255) NOT NULL,
+      client_phone VARCHAR(50),
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending', -- draft | pending | paid | cancelled (overdue computed on read)
+      due_date DATE,
+      notes TEXT,
+      tax_percent DECIMAL(5,2) DEFAULT 0,
+      subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
+      tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total DECIMAL(12,2) NOT NULL DEFAULT 0,
+      amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+      views INTEGER DEFAULT 0,
+      paid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoices_business ON invoices(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoice_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity DECIMAL(12,2) NOT NULL DEFAULT 1,
+      unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
+      amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      position INTEGER DEFAULT 0
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoice_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      business_id VARCHAR(255) NOT NULL,
+      transaction_reference VARCHAR(255) UNIQUE NOT NULL,
+      payer_name VARCHAR(255),
+      payer_email VARCHAR(255),
+      amount DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) DEFAULT 0,
+      net_amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending',
+      payment_provider VARCHAR(30),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoice_payments_invoice ON invoice_payments(invoice_id)`);
+
+  // Plan configuration knobs for Smart Invoices
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS invoices_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_invoices_per_month INTEGER DEFAULT 10`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS invoice_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Invoice settlement fee (percentage with cap), mirroring payment_link.
+  // Idempotent: only inserted when the fee type does not exist yet.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Invoice Settlement Fee', 'invoice', 'percentage_cap',
+           '{"percentage": 1.0, "cap": 2500}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'invoice')
+  `);
+
+  console.log("[migrations] Smart Invoices schema applied");
 }

@@ -3,6 +3,7 @@ import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
 import { settlePaymentLinkPayment } from "./payment_links";
+import { settleInvoicePayment } from "./invoices";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
@@ -128,6 +129,12 @@ const handleSquadWebhook = async (event: any) => {
                     // wallet net of collection fee; fee → revenue wallet.
                     if (transaction.transaction_type === 'payment_link') {
                         await settlePaymentLinkPayment(reference, 'squad');
+                    }
+
+                    // Handle Smart Invoices (revenue feature) — settles merchant
+                    // wallet net of settlement fee; fee → revenue wallet.
+                    if (transaction.transaction_type === 'invoice') {
+                        await settleInvoicePayment(reference, 'squad');
                     }
 
                     // Handle Wallet Funding
@@ -329,6 +336,11 @@ const handleMonnifyWebhook = async (event: any) => {
                     // Handle Payment Links (revenue feature)
                     if (transaction.transaction_type === 'payment_link') {
                         await settlePaymentLinkPayment(reference, 'monnify');
+                    }
+
+                    // Handle Smart Invoices (revenue feature)
+                    if (transaction.transaction_type === 'invoice') {
+                        await settleInvoicePayment(reference, 'monnify');
                     }
 
                     // Handle Wallet Funding
@@ -746,6 +758,11 @@ const handleFlutterwaveWebhook = async (event: any) => {
             // of collection fee; gross must NOT be credited generically).
             if (transaction.transaction_type === 'payment_link') {
                 await settlePaymentLinkPayment(reference, 'flutterwave');
+                return;
+            }
+            // Smart Invoices settle through their own path too.
+            if (transaction.transaction_type === 'invoice') {
+                await settleInvoicePayment(reference, 'flutterwave');
                 return;
             }
             const credited = await creditWalletFundingTransaction(transaction, 'flutterwave');

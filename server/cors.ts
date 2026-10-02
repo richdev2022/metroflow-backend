@@ -7,6 +7,7 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "https://api.metricorex.com",
   "https://metricorex.com",
+  "https://www.metricorex.com",
   "https://files.metricorex.com",
   "https://app.metricorex.com",
   "https://admin.metricorex.com",

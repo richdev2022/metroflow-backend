@@ -19,6 +19,128 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureMeetingSchedulingSchema();
   await ensureVapidKeys();
   await ensureSiteGrowthSchema();
+  await ensureRevenueFeaturesSchema();
+}
+
+/**
+ * Revenue features:
+ *  1. Payment Links ("Get Paid") — shareable checkout links for businesses;
+ *     every successful customer payment credits the business wallet minus a
+ *     configurable collection fee that lands in the platform revenue wallet.
+ *  2. MetricAi Credit Packs — one-time credit top-ups for MetricAi usage,
+ *     purchasable from the wallet when a plan's AI allowance runs out.
+ * Both are plan-configurable (pricing_plans columns below, admin-editable).
+ */
+async function ensureRevenueFeaturesSchema(): Promise<void> {
+  // ---------- Payment Links ----------
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL,
+      created_by UUID,
+      slug VARCHAR(80) UNIQUE NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      description TEXT,
+      amount DECIMAL(12,2),
+      currency VARCHAR(3) DEFAULT 'NGN',
+      allow_custom_amount BOOLEAN DEFAULT FALSE,
+      is_active BOOLEAN DEFAULT TRUE,
+      views INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_payment_links_business ON payment_links(business_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_link_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE CASCADE,
+      business_id VARCHAR(255) NOT NULL,
+      transaction_reference VARCHAR(255) UNIQUE NOT NULL,
+      payer_name VARCHAR(255),
+      payer_email VARCHAR(255),
+      amount DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) DEFAULT 0,
+      net_amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending',
+      payment_provider VARCHAR(30),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_plp_link ON payment_link_payments(link_id)`);
+
+  // Plan configuration knobs for Payment Links
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS payment_links_enabled BOOLEAN DEFAULT TRUE`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS max_payment_links INTEGER DEFAULT 3`);
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS payment_link_fee_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Collection fee config (percentage with cap), mirroring funding_card.
+  // Idempotent: only inserted when the fee type does not exist yet.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Payment Link Collection Fee', 'payment_link', 'percentage_cap',
+           '{"percentage": 1.5, "cap": 2000}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'payment_link')
+  `);
+
+  // ---------- MetricAi Credit Packs ----------
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_packs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(100) NOT NULL,
+      credits INTEGER NOT NULL,
+      price DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      is_active BOOLEAN DEFAULT TRUE,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_balances (
+      user_id UUID PRIMARY KEY,
+      business_id VARCHAR(255),
+      balance INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ai_credit_purchases (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      pack_id UUID,
+      pack_name VARCHAR(100),
+      credits INTEGER NOT NULL,
+      amount DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'success',
+      reference VARCHAR(255) UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_ai_credit_purchases_user ON ai_credit_purchases(user_id, created_at)`);
+
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS ai_credit_discount_percent DECIMAL(5,2) DEFAULT 0`);
+
+  // Starter credit packs (skipped when the table already has rows)
+  await query(`
+    INSERT INTO ai_credit_packs (name, credits, price, currency, sort_order)
+    SELECT * FROM (VALUES
+      ('Starter Pack', 100, 2000, 'NGN', 1),
+      ('Business Pack', 500, 8000, 'NGN', 2),
+      ('Scale Pack', 1500, 20000, 'NGN', 3)
+    ) AS v(name, credits, price, currency, sort_order)
+    WHERE NOT EXISTS (SELECT 1 FROM ai_credit_packs)
+  `);
+
+  console.log("[migrations] Revenue features (payment links + AI credit packs) schema applied");
 }
 
 /**

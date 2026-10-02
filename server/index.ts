@@ -98,7 +98,12 @@ import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, g
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
-import { initializeDatabase, query, resolvedDatabaseName } from "./db";
+import {
+  initializeDatabase,
+  query,
+  resolvedDatabaseName,
+  verifySchema,
+} from "./db";
 import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
 import { isTenorConfigured } from "./lib/config-flags";
@@ -183,6 +188,10 @@ export async function createServer() {
         await initializeDatabase();
         // Post-init migrations + one-off ledger backfills (idempotent)
         await runPostInitializeMigrations();
+        // Authoritative schema check — AFTER every table-creating migration
+        // has run (checking inside initializeDatabase always reported the
+        // revenue/RBAC tables missing because their migrations run later).
+        await verifySchema();
         logger.info("✅ Database initialized successfully");
         isDbReady = true;
         return;
@@ -205,19 +214,40 @@ export async function createServer() {
     }
   })();
 
-  // In serverless environments, we must wait for the database to initialize
-  // because background tasks may be frozen immediately after the response is sent.
-  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) {
+  // Post-init tasks that need the database. On a persistent server (PM2/VPS)
+  // the HTTP listener must NOT wait for this: the deploy health check probes
+  // /api/ping within 60s of the pm2 restart, and a cold Neon connection plus
+  // first-run migrations must never delay the bind (this previously made every
+  // deploy report "server did not answer .../api/ping within 60s" and put pm2
+  // into a restart loop). Serverless still awaits — frozen background tasks
+  // would never finish there.
+  const dbReadyPromise = (async () => {
+    await dbInitPromise;
+    if (isDbReady) {
+      try {
+        await updateOverdueTasks();
+      } catch (error) {
+        logger.error("Post-init updateOverdueTasks failed:", error);
+      }
+    } else {
+      // Stay up: /api/ping keeps answering (deploys stay green), the DB check
+      // middleware returns 503 for data routes, and the next restart re-runs
+      // the fully idempotent initialization.
+      logger.error("Server is up, but the database is unavailable — data routes return 503 until initialization succeeds.");
+    }
+  })();
+
+  if (isServerlessEnv) {
     console.log("Serverless environment detected, awaiting database initialization...");
-    try {
-      await dbInitPromise;
-    } catch (e) {
-      // Error is already captured in dbInitError
+    await dbReadyPromise;
+    if (!isDbReady) {
+      throw dbInitError ?? new Error("Database initialization failed");
     }
   }
 
   // Middleware
   cron.schedule("0 * * * *", async () => {
+    if (!isDbReady) return; // DB still initializing — skip this tick
     try {
       logger.info("Running activity log cleanup...");
       const threeDaysAgo = new Date();
@@ -267,26 +297,23 @@ export async function createServer() {
     }
   });
   
-  // Update overdue tasks on server startup
-  await dbInitPromise;
-  if (!isDbReady) {
-    throw dbInitError ?? new Error("Database initialization failed");
-  }
-  await updateOverdueTasks();
-  
   // Start transfer reconciliation poller (non-serverless only).
   // Webhook-first design: Flutterwave `transfer.completed` webhooks drive
   // status changes; the poller is a cheap safety net (probe-first query,
   // bounded batch, self-scheduling loop, exponential backoff on DB errors).
-  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
-    startTransferMonitor();
+  // Started only after the DB is ready so its first probe never fails.
+  if (!isServerlessEnv) {
+    void dbReadyPromise.then(() => {
+      if (isDbReady) startTransferMonitor();
+    });
   }
 
   // Meeting reminders (push + email at 60/15 minutes before start).
   // VPS/PM2 only — serverless cannot run per-minute crons. Each tick atomically
   // claims due meeting_reminders rows (sent=FALSE) so ticks never double-send.
-  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+  if (!isServerlessEnv) {
     cron.schedule("* * * * *", async () => {
+      if (!isDbReady) return; // DB still initializing — skip this tick
       try {
         const { processDueMeetingReminders } = await import("./services/meetingReminders");
         const result = await processDueMeetingReminders();
@@ -304,6 +331,7 @@ export async function createServer() {
     // pay link). Idempotent via the next_charge_date claim inside
     // processDueSubscriptionCharges.
     cron.schedule("*/5 * * * *", async () => {
+      if (!isDbReady) return; // DB still initializing — skip this tick
       try {
         const { processDueSubscriptionCharges } = await import("./routes/recurring");
         const result = await processDueSubscriptionCharges();
@@ -469,8 +497,9 @@ export async function createServer() {
   });
 
   // Single local cron for product documentation jobs (non-serverless only).
-  if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
+  if (!isServerlessEnv) {
     cron.schedule("* * * * *", async () => {
+      if (!isDbReady) return; // DB still initializing — skip this tick
       try {
         await processPendingProductDocJobs(5);
       } catch (error) {

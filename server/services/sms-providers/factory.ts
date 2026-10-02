@@ -13,7 +13,9 @@ const whatsappProviders: Record<string, WhatsAppProvider> = {
   termii: termiiProvider,
 };
 
-const DEFAULT_SMS_PROVIDER = process.env.DEFAULT_SMS_PROVIDER || "termii";
+// KudiSMS is the production SMS channel for OTPs/notifications (kudisms.net).
+// Termii remains available as an SMS fallback — switch via DEFAULT_SMS_PROVIDER.
+const DEFAULT_SMS_PROVIDER = process.env.DEFAULT_SMS_PROVIDER || "kudi";
 const DEFAULT_WHATSAPP_PROVIDER = process.env.DEFAULT_WHATSAPP_PROVIDER || "meta";
 
 export function getSMSProvider(providerName?: string): SMSProvider {

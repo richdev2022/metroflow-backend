@@ -528,12 +528,12 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
     );
 
     const businessRes = await query(
-      `SELECT phone FROM businesses WHERE id = $1`,
+      `SELECT phone_number FROM businesses WHERE id = $1`,
       [businessId]
     );
 
     const email = userRes.rows[0]?.email;
-    const phone = businessRes.rows[0]?.phone;
+    const phone = businessRes.rows[0]?.phone_number;
 
     if (!email && !phone) {
       return res.status(400).json({
@@ -551,7 +551,12 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
       [otpCode, otpExpiresAt, userId]
     );
 
-    // Send via email
+    // Deliver the OTP over every available channel; only fail when NO
+    // channel succeeded (sendEmail resolves to false instead of throwing,
+    // sendSMS throws on provider failure).
+    let emailSent = false;
+    let smsSent = false;
+
     if (email) {
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
@@ -569,21 +574,24 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
           </div>
         </div>
       `;
-
-      await sendEmail(email, "OTP to Update Transaction PIN - MetricFlow", "Use this OTP to update your PIN", html);
+      emailSent = await sendEmail(email, "OTP to Update Transaction PIN - MetricFlow", "Use this OTP to update your PIN", html);
+      if (!emailSent) console.error("PIN OTP email delivery failed");
     }
 
-    // Send via SMS
     if (phone) {
       try {
         await sendSMS(phone, `Your MetricFlow OTP to update transaction PIN is: ${otpCode}`);
+        smsSent = true;
       } catch (smsErr) {
-        console.error("SMS send error:", smsErr);
-        // Continue even if SMS fails (email might have worked)
+        console.error("PIN OTP SMS send error:", smsErr);
       }
     }
 
-    res.json({ success: true, message: "OTP sent successfully" });
+    if (!emailSent && !smsSent) {
+      return res.status(500).json({ success: false, error: "Failed to send OTP via email and SMS" });
+    }
+
+    res.json({ success: true, message: "OTP sent successfully", channels: [...(emailSent ? ['email'] : []), ...(smsSent ? ['sms'] : [])] });
   } catch (error) {
     console.error("Send PIN OTP error:", error);
     res.status(500).json({ success: false, error: "Failed to send OTP" });
@@ -681,9 +689,91 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
 
 /**
  * @swagger
+ * /settings/otp-enabled/send-otp:
+ *   post:
+ *     summary: Send an OTP that authorizes toggling OTP-for-transactions
+ *     tags: [Settings]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: OTP sent successfully
+ *       400:
+ *         description: No contact information available
+ *       500:
+ *         description: Failed to send OTP
+ */
+router.post("/otp-enabled/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const businessId = req.user!.businessId;
+
+    const userRes = await query(
+      `SELECT email FROM users WHERE id = $1`,
+      [userId]
+    );
+    const businessRes = await query(
+      `SELECT phone_number FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+
+    const email = userRes.rows[0]?.email;
+    const phone = businessRes.rows[0]?.phone_number;
+
+    if (!email && !phone) {
+      return res.status(400).json({
+        success: false,
+        error: "No contact information available to send OTP"
+      });
+    }
+
+    const otpCode = generateOTP();
+    const otpExpiresAt = getOTPExpiry();
+
+    await query(
+      `UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_type = 'otp_toggle' WHERE id = $3`,
+      [otpCode, otpExpiresAt, userId]
+    );
+
+    let emailSent = false;
+    let smsSent = false;
+
+    if (email) {
+      const html = generateOtpEmailHtml(otpCode, "Confirm Transaction OTP Setting");
+      emailSent = await sendEmail(
+        email,
+        "Confirm Transaction OTP Setting - MetricFlow",
+        "Use this OTP to confirm your security setting change",
+        html
+      );
+      if (!emailSent) console.error("OTP-toggle OTP email delivery failed");
+    }
+
+    if (phone) {
+      try {
+        await sendSMS(phone, `Your MetricFlow OTP to confirm your transaction OTP setting change is: ${otpCode}`);
+        smsSent = true;
+      } catch (smsErr) {
+        console.error("OTP-toggle OTP SMS send error:", smsErr);
+      }
+    }
+
+    if (!emailSent && !smsSent) {
+      return res.status(500).json({ success: false, error: "Failed to send OTP via email and SMS" });
+    }
+
+    res.json({ success: true, message: "OTP sent successfully", channels: [...(emailSent ? ['email'] : []), ...(smsSent ? ['sms'] : [])] });
+  } catch (error) {
+    console.error("Send OTP-toggle OTP error:", error);
+    res.status(500).json({ success: false, error: "Failed to send OTP" });
+  }
+});
+
+/**
+ * @swagger
  * /settings/otp-enabled:
  *   put:
- *     summary: Toggle OTP requirement for transfers
+ *     summary: Toggle OTP requirement for transfers (requires OTP confirmation)
  *     tags: [Settings]
  *     security:
  *       - bearerAuth: []
@@ -696,22 +786,57 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
  *     responses:
  *       200:
  *         description: OTP setting updated successfully
+ *       400:
+ *         description: Missing/invalid/expired OTP
  */
 router.put("/otp-enabled", authenticateToken, checkSubscriptionStatus, validateBody(ToggleOtpSchema), async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.userId;
     const businessId = req.user!.businessId;
-    const { enabled } = req.body;
-        
-        await query(
-            `UPDATE businesses SET otp_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-            [enabled, businessId]
-        );
-        
-        res.json({ success: true, message: `OTP ${enabled ? 'enabled' : 'disabled'} successfully` });
-    } catch (error) {
-        console.error("Toggle OTP error:", error);
-        res.status(500).json({ success: false, error: "Failed to update OTP setting" });
+    const { enabled, otp } = req.body;
+
+    // Changing this setting is security-sensitive: an attacker (or a stolen
+    // session) must not be able to silently strip the OTP layer off
+    // transfers. Require a fresh OTP confirmation (otp_type 'otp_toggle')
+    // before the flip is applied — mirrors the transaction PIN update flow.
+    const userRes = await query(
+      `SELECT otp_code, otp_expires_at, otp_type FROM users WHERE id = $1`,
+      [userId]
+    );
+    const user = userRes.rows[0];
+
+    if (!user?.otp_code || user.otp_type !== "otp_toggle") {
+      return res.status(400).json({
+        success: false,
+        error: "OTP verification required. Please request an OTP first."
+      });
     }
+    if (user.otp_code !== otp) {
+      return res.status(400).json({ success: false, error: "Invalid OTP" });
+    }
+    if (!user.otp_expires_at || new Date(user.otp_expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        error: "OTP expired. Please request a new one."
+      });
+    }
+
+    await query(
+      `UPDATE businesses SET otp_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [enabled, businessId]
+    );
+
+    // Consume the OTP so it cannot be replayed.
+    await query(
+      `UPDATE users SET otp_code = NULL, otp_expires_at = NULL, otp_type = NULL WHERE id = $1`,
+      [userId]
+    );
+
+    res.json({ success: true, message: `OTP ${enabled ? 'enabled' : 'disabled'} successfully` });
+  } catch (error) {
+    console.error("Toggle OTP error:", error);
+    res.status(500).json({ success: false, error: "Failed to update OTP setting" });
+  }
 });
 
 /**

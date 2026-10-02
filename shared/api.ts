@@ -41,12 +41,19 @@ export interface TeamMember {
   role: "admin" | "manager" | "member";
   status: "active" | "invited" | "inactive";
   joinedAt?: string;
+  /** custom role assignment (Role & Permission management) */
+  roleId?: string | null;
+  roleName?: string | null;
+  /** resolved permission slugs for this member; owner/admin get the full catalog */
+  permissions?: string[];
 }
 
 export interface InviteTeamMemberInput {
   name: string;
   email: string;
   role: "admin" | "manager" | "member";
+  /** optional custom role (team_roles.id) — takes precedence for permissions */
+  roleId?: string | null;
 }
 
 // Task Status Types

@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
 import { accountLookup, processAllPending } from "../services/transfer";
@@ -27,7 +28,7 @@ const genRef = () => `TRF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
  *        destination_currency (default USD)
  * Response: live_rate, marked_up_rate, receiving_amount, fee, total_debit (source currency)
  */
-router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
   try {
     const amount = Number(req.query.amount);
     const sourceCurrency = (String(req.query.source_currency || 'NGN')).toUpperCase();
@@ -180,7 +181,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
  *                   type: string
  *                   example: "Failed to request OTP"
  */
-router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/otp/request", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;
@@ -424,7 +425,7 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, async (r
  *                   type: string
  *                   example: "Failed to initiate transfer"
  */
-router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
+router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
     const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId, recipientAddress, recipientCity, recipientState, recipientPostalCode, recipientCountry, bankName, swiftCode, routingNumber } = req.body;
     const businessId = req.user?.businessId;
@@ -813,7 +814,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *                   type: string
  *                   example: "Failed to initiate bulk transfer"
  */
-router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
+router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
     const { type, data, otp, pin } = req.body;
     // Accept both snake_case and camelCase source wallet id (validation schema
@@ -1530,7 +1531,7 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
  *                 message:
  *                   type: string
  */
-router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/retry", authenticateToken, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -1583,7 +1584,7 @@ router.post("/:id/retry", authenticateToken, async (req: AuthenticatedRequest, r
   }
 });
 
-router.post("/:id/verify", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/verify", authenticateToken, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;
@@ -1683,7 +1684,7 @@ router.get("/banks", authenticateToken, async (req: AuthenticatedRequest, res) =
  *       200:
  *         description: Account details
  */
-router.post("/lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
   try {
     const { bankCode, accountNumber } = req.body;
     if (!bankCode || !accountNumber) {
@@ -1724,7 +1725,7 @@ router.post("/lookup", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *       200:
  *         description: Account details
  */
-router.post("/account-lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+router.post("/account-lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
   try {
     const { bank_code, account_number } = req.body;
     if (!bank_code || !account_number) {

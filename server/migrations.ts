@@ -26,6 +26,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureRecurringBillingSchema();
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
+  await ensureTeamRolesSchema();
 }
 
 /**
@@ -1533,4 +1534,31 @@ async function ensureBusinessRevenueLadderV2(): Promise<void> {
   }
 
   console.log("[Migrations] business revenue knob ladder V2 applied");
+}
+
+/**
+ * Business-team Roles & Permissions ("Role Management"):
+ *   - team_roles: per-business roles carrying a permissions array (slugs from
+ *     config/permissions.ts). Mirrors the platform-admin RBAC.
+ *   - users.role_id: the member's assigned custom role (NULL = legacy role
+ *     string semantics — owner/admin/manager/member defaults still apply).
+ * Idempotent; safe on every boot.
+ */
+async function ensureTeamRolesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS team_roles (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id VARCHAR(255) NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      is_system BOOLEAN NOT NULL DEFAULT FALSE,
+      permissions TEXT[] NOT NULL DEFAULT '{}',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(business_id, name)
+    )
+  `);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_team_roles_business ON team_roles(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id)`);
 }

@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 import { getProvider } from "../services/providers/factory";
@@ -131,7 +132,7 @@ router.get("/products", authenticateToken, checkSubscriptionStatus, async (req: 
  *       403:
  *         description: Storefront disabled or product cap reached (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/products", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/products", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_store"), async (req: AuthenticatedRequest, res) => {
     try {
         const { userId, businessId } = req.user!;
         const { name, description, price, stock, image_url, status } = req.body || {};
@@ -194,7 +195,7 @@ router.post("/products", authenticateToken, checkSubscriptionStatus, async (req:
  *       200:
  *         description: Updated product
  */
-router.put("/products/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/products/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_store"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -245,7 +246,7 @@ router.put("/products/:id", authenticateToken, checkSubscriptionStatus, async (r
  *       200:
  *         description: Deleted
  */
-router.delete("/products/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/products/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_store"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -334,7 +335,7 @@ router.get("/orders", authenticateToken, checkSubscriptionStatus, async (req: Au
  *       400:
  *         description: Only paid orders can be fulfilled
  */
-router.post("/orders/:id/fulfil", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/orders/:id/fulfil", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_store"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -372,7 +373,7 @@ router.post("/orders/:id/fulfil", authenticateToken, checkSubscriptionStatus, as
  *       400:
  *         description: Only unpaid orders can be cancelled
  */
-router.post("/orders/:id/cancel", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/orders/:id/cancel", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_store"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;

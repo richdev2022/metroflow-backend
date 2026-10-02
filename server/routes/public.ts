@@ -63,6 +63,141 @@ router.get("/app-config", async (req, res) => {
 router.post("/metric-ai/ask", postPublicMetricAiAsk as any);
 
 // ---------------------------------------------------------------------------
+// Mobile app update check (public — called by the Flutter app on login and
+// app start, with or without a session). Compares the caller's version code
+// (build number) against the newest ACTIVE release row for the platform.
+// NEVER returns 5xx to the client on data problems: the mobile side treats
+// any failure as "no update" and stays silent, so a soft success response
+// keeps old app builds fully functional even before the table exists.
+// ---------------------------------------------------------------------------
+
+/** Semver-ish compare of "1.2.3" strings; returns >0 if a > b, 0 if equal. */
+function compareVersionNames(a: string, b: string): number {
+  const pa = String(a || "").trim().split(/[.\-+_]/).map((s) => parseInt(s, 10) || 0);
+  const pb = String(b || "").trim().split(/[.\-+_]/).map((s) => parseInt(s, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (pa[i] || 0) - (pb[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+/**
+ * @swagger
+ * /public/app-updates/check:
+ *   get:
+ *     summary: Check whether a newer mobile app release is available
+ *     tags: [Public]
+ *     security: []
+ *     parameters:
+ *       - in: query
+ *         name: platform
+ *         schema: { type: string, enum: [ios, android] }
+ *       - in: query
+ *         name: current_version_code
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: current_version_name
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Update availability + release metadata (always 200)
+ */
+router.get("/app-updates/check", async (req, res) => {
+  const platform = String(req.query.platform || "android").toLowerCase().trim();
+  const currentVersionName = String(req.query.current_version_name || "").trim();
+  const currentVersionCodeRaw = parseInt(String(req.query.current_version_code || ""), 10);
+  const hasCode = Number.isFinite(currentVersionCodeRaw) && currentVersionCodeRaw > 0;
+
+  const noUpdate = {
+    update_available: false,
+    update_required: false,
+    force_update: false,
+    platform,
+    current: { version_name: currentVersionName || null, version_code: hasCode ? currentVersionCodeRaw : null },
+    latest: null as Record<string, unknown> | null,
+    min_supported_version_code: null as number | null,
+  };
+
+  try {
+    if (platform !== "ios" && platform !== "android") {
+      return res.status(400).json({ success: false, error: "platform must be 'ios' or 'android'" });
+    }
+
+    let latest: Record<string, any> | null = null;
+    let minSupported: number | null = null;
+    try {
+      const latestRes = await query(
+        `SELECT id, platform, version_name, version_code, force_update,
+                min_supported_version_code, release_notes, store_url, created_at, updated_at
+         FROM app_versions
+         WHERE platform = $1 AND is_active = TRUE
+         ORDER BY version_code DESC
+         LIMIT 1`,
+        [platform],
+      );
+      latest = latestRes.rows[0] || null;
+      const minRes = await query(
+        `SELECT MAX(min_supported_version_code) AS min_code
+         FROM app_versions
+         WHERE platform = $1 AND is_active = TRUE AND min_supported_version_code IS NOT NULL`,
+        [platform],
+      );
+      minSupported = minRes.rows[0]?.min_code != null ? Number(minRes.rows[0].min_code) : null;
+    } catch (tableErr: any) {
+      // app_versions not migrated yet — behave as "no update" (never block clients).
+      console.error("Public app-updates/check schema error:", tableErr.message);
+      return res.json({ success: true, data: noUpdate });
+    }
+
+    if (!latest) {
+      return res.json({ success: true, data: noUpdate });
+    }
+
+    // Primary comparison: monotonic integer version code (build number).
+    // Fallback: semver-ish compare of the names when the caller has no code.
+    let updateAvailable = false;
+    if (hasCode) {
+      updateAvailable = Number(latest.version_code) > currentVersionCodeRaw;
+    } else if (currentVersionName) {
+      updateAvailable = compareVersionNames(latest.version_name, currentVersionName) > 0;
+    }
+
+    const belowFloor = hasCode && minSupported != null && currentVersionCodeRaw < minSupported;
+    const updateRequired = updateAvailable && (latest.force_update === true || belowFloor === true);
+
+    return res.json({
+      success: true,
+      data: {
+        update_available: updateAvailable,
+        update_required: updateRequired,
+        force_update: updateRequired,
+        platform,
+        current: {
+          version_name: currentVersionName || null,
+          version_code: hasCode ? currentVersionCodeRaw : null,
+        },
+        latest: {
+          id: latest.id,
+          version_name: latest.version_name,
+          version_code: Number(latest.version_code),
+          force_update: latest.force_update === true,
+          release_notes: latest.release_notes || null,
+          store_url: latest.store_url || null,
+          updated_at: latest.updated_at,
+        },
+        min_supported_version_code: minSupported,
+      },
+    });
+  } catch (error: any) {
+    console.error("Public app-updates/check error:", error.message);
+    // Soft-success keeps every client silent instead of erroring.
+    res.json({ success: true, data: noUpdate });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Site growth (marketing site): wishlist + email subscriptions.
 // Public (no auth) — consumed by metricorex.com forms. Email sending happens
 // inline; failures never break the signup (the record is already persisted).

@@ -3626,6 +3626,194 @@ protectedRouter.delete("/announcements/:id", requirePermission('manage_settings'
 });
 
 // ============================================================================
+// Mobile app releases (drives the in-app update prompt)
+// ============================================================================
+
+const APP_VERSION_PLATFORMS = ["ios", "android"];
+
+const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }) => {
+  const errors: string[] = [];
+  const out: Record<string, any> = {};
+
+  if (body.platform !== undefined || forCreate) {
+    const platform = String(body.platform || "").toLowerCase().trim();
+    if (!APP_VERSION_PLATFORMS.includes(platform)) {
+      errors.push("platform must be 'ios' or 'android'");
+    } else {
+      out.platform = platform;
+    }
+  }
+
+  if (body.version_name !== undefined || forCreate) {
+    const versionName = String(body.version_name ?? "").trim();
+    if (!versionName) errors.push("version_name is required");
+    else if (versionName.length > 32) errors.push("version_name must be 32 characters or fewer");
+    else out.version_name = versionName;
+  }
+
+  if (body.version_code !== undefined || forCreate) {
+    const code = parseInt(String(body.version_code), 10);
+    if (!Number.isFinite(code) || code <= 0) errors.push("version_code must be a positive integer (the build number)");
+    else out.version_code = code;
+  }
+
+  if (body.min_supported_version_code !== undefined) {
+    if (body.min_supported_version_code === null || body.min_supported_version_code === "") {
+      out.min_supported_version_code = null;
+    } else {
+      const minCode = parseInt(String(body.min_supported_version_code), 10);
+      if (!Number.isFinite(minCode) || minCode <= 0) errors.push("min_supported_version_code must be a positive integer or null");
+      else out.min_supported_version_code = minCode;
+    }
+  }
+
+  if (body.force_update !== undefined) out.force_update = body.force_update === true || body.force_update === "true";
+  if (body.is_active !== undefined) out.is_active = body.is_active === true || body.is_active === "true";
+
+  if (body.release_notes !== undefined) {
+    // Empty string means "clear" (COALESCE on the server keeps '' as the new value).
+    const notes = body.release_notes === null ? null : String(body.release_notes).trim();
+    out.release_notes = notes === null ? null : notes.slice(0, 5000);
+  }
+
+  if (body.store_url !== undefined) {
+    const url = body.store_url === null ? null : String(body.store_url).trim();
+    if (url && !/^https?:\/\//i.test(url) && !/^market:\/\//i.test(url)) {
+      errors.push("store_url must start with https://, http:// or market://");
+    } else {
+      out.store_url = url === null ? null : url;
+    }
+  }
+
+  return { out, errors };
+};
+
+/**
+ * GET /admin/app-versions
+ * List every tracked mobile release (both platforms), newest first.
+ */
+protectedRouter.get("/app-versions", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(
+            `SELECT * FROM app_versions ORDER BY platform ASC, version_code DESC, created_at DESC`,
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to fetch app releases" });
+    }
+});
+
+/**
+ * POST /admin/app-versions
+ * Publish a new mobile release. Once active, app builds with a lower
+ * version_code are prompted to update (forced when force_update is set or
+ * they are below min_supported_version_code).
+ */
+protectedRouter.post("/app-versions", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { out, errors } = parseAppVersionPayload(req.body || {}, { forCreate: true });
+        if (errors.length > 0) {
+            return res.status(400).json({ success: false, error: errors.join("; ") });
+        }
+
+        const result = await query(
+            `INSERT INTO app_versions
+                (platform, version_name, version_code, force_update, min_supported_version_code,
+                 release_notes, store_url, is_active, created_by)
+             VALUES ($1, $2, $3, COALESCE($4, FALSE), $5, $6, $7, COALESCE($8, TRUE), $9)
+             RETURNING *`,
+            [
+                out.platform,
+                out.version_name,
+                out.version_code,
+                out.force_update ?? false,
+                out.min_supported_version_code ?? null,
+                out.release_notes ?? null,
+                out.store_url ?? null,
+                out.is_active ?? true,
+                req.admin?.adminId || null,
+            ],
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error: any) {
+        if (error?.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                error: "A release with this version code already exists for this platform",
+            });
+        }
+        res.status(500).json({ success: false, error: error.message || "Failed to create app release" });
+    }
+});
+
+/**
+ * PUT /admin/app-versions/:id
+ * Partial update — toggle force_update / is_active, raise the support floor,
+ * edit notes or the store link.
+ */
+protectedRouter.put("/app-versions/:id", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { out, errors } = parseAppVersionPayload(req.body || {}, { forCreate: false });
+        if (errors.length > 0) {
+            return res.status(400).json({ success: false, error: errors.join("; ") });
+        }
+
+        const result = await query(
+            `UPDATE app_versions SET
+                platform = COALESCE($1, platform),
+                version_name = COALESCE($2, version_name),
+                version_code = COALESCE($3, version_code),
+                force_update = COALESCE($4, force_update),
+                min_supported_version_code = COALESCE($5, min_supported_version_code),
+                release_notes = COALESCE($6, release_notes),
+                store_url = COALESCE($7, store_url),
+                is_active = COALESCE($8, is_active),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $9
+             RETURNING *`,
+            [
+                out.platform ?? null,
+                out.version_name ?? null,
+                out.version_code ?? null,
+                out.force_update ?? null,
+                out.min_supported_version_code ?? null,
+                out.release_notes ?? null,
+                out.store_url ?? null,
+                out.is_active ?? null,
+                req.params.id,
+            ],
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "App release not found" });
+        }
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error: any) {
+        if (error?.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                error: "A release with this version code already exists for this platform",
+            });
+        }
+        res.status(500).json({ success: false, error: error.message || "Failed to update app release" });
+    }
+});
+
+/**
+ * DELETE /admin/app-versions/:id
+ */
+protectedRouter.delete("/app-versions/:id", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const result = await query(`DELETE FROM app_versions WHERE id = $1 RETURNING id`, [req.params.id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "App release not found" });
+        }
+        res.json({ success: true, message: "App release deleted" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete app release" });
+    }
+});
+
+// ============================================================================
 // Broadcast push / email notifications
 // ============================================================================
 

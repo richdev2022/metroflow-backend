@@ -103,6 +103,53 @@ export const getMyRole: RequestHandler = async (req, res) => {
 };
 
 /**
+ * Make the workspace's two "default" roles real, editable team_roles rows.
+ *
+ * Historically Manager/Member were virtual (legacy users.role string +
+ * hardcoded permission arrays), which meant admins could NOT tune them. We now
+ * seed them once per workspace as is_system rows carrying the same default
+ * permission sets, and link legacy manager/member members to them (only where
+ * no custom role is assigned). From then on admins can add/remove their
+ * permissions via PUT /roles/:id like any other role; owner/admin stay super.
+ *
+ * Idempotent + cheap: INSERT .. WHERE NOT EXISTS, link only touches rows with
+ * role_id IS NULL. Runs on GET /roles so both apps converge on first load.
+ */
+const ensureDefaultRoles = async (businessId: string): Promise<void> => {
+  try {
+    await query(
+      `INSERT INTO team_roles (business_id, name, description, is_system, permissions)
+       SELECT $1, 'Manager', 'Default manager role — everything except team management.', TRUE, $2::text[]
+       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Manager')
+       ON CONFLICT (business_id, name) DO NOTHING`,
+      [businessId, DEFAULT_MANAGER_PERMISSIONS]
+    );
+    await query(
+      `INSERT INTO team_roles (business_id, name, description, is_system, permissions)
+       SELECT $1, 'Member', 'Default member role — day-to-day work and communication.', TRUE, $2::text[]
+       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Member')
+       ON CONFLICT (business_id, name) DO NOTHING`,
+      [businessId, DEFAULT_MEMBER_PERMISSIONS]
+    );
+    await query(
+      `UPDATE users u
+          SET role_id = r.id
+         FROM team_roles r
+        WHERE r.business_id = $1
+          AND r.is_system = TRUE
+          AND u.business_id = $1
+          AND u.role_id IS NULL
+          AND ((r.name = 'Manager' AND u.role = 'manager')
+            OR (r.name = 'Member' AND u.role = 'member'))`,
+      [businessId]
+    );
+  } catch (error) {
+    // Seeding is a convenience — never fail the listing because of it.
+    console.error("ensureDefaultRoles error:", error);
+  }
+};
+
+/**
  * @swagger
  * /roles:
  *   get:
@@ -118,6 +165,8 @@ export const getRoles: RequestHandler = async (req, res) => {
   try {
     const businessId = (req as AuthenticatedRequest).user?.businessId;
     if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    await ensureDefaultRoles(businessId);
 
     const result = await query(
       `SELECT r.id, r.name, r.description, r.is_system, r.permissions,
@@ -236,6 +285,16 @@ export const updateRole: RequestHandler = async (req, res) => {
       return res.status(400).json({ success: false, error: "Role name is too long (max 100 characters)" });
     }
 
+    // Default (system) roles keep their stable names — the seeded Manager/
+    // Member rows are linked to legacy members by name. Permissions and
+    // description remain freely editable.
+    if (name !== undefined && existing.rows[0].is_system && name !== existing.rows[0].name) {
+      return res.status(400).json({
+        success: false,
+        error: "Default roles cannot be renamed — their permission sets are editable",
+      });
+    }
+
     const updated = await query(
       `UPDATE team_roles SET
          name = COALESCE($3, name),
@@ -276,6 +335,20 @@ export const deleteRole: RequestHandler = async (req, res) => {
     const businessId = (req as AuthenticatedRequest).user?.businessId;
     const roleId = String(req.params.id || "");
     if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const existing = await query(
+      `SELECT id, name, is_system FROM team_roles WHERE id = $1 AND business_id = $2 LIMIT 1`,
+      [roleId, businessId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Role not found" });
+    }
+    if (existing.rows[0].is_system) {
+      return res.status(400).json({
+        success: false,
+        error: `"${existing.rows[0].name}" is a default role and cannot be deleted — edit its permissions instead`,
+      });
+    }
 
     const deleted = await query(
       `DELETE FROM team_roles WHERE id = $1 AND business_id = $2 RETURNING name`,

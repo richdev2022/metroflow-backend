@@ -29,6 +29,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureStoreSchema(); // + store_enabled etc.
   await ensureRecurringBillingSchema(); // + recurring_enabled etc.
   await ensureTeamRolesSchema(); // + users.role_id
+  await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -1591,4 +1592,54 @@ async function ensureTeamRolesSchema(): Promise<void> {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL`);
   await query(`CREATE INDEX IF NOT EXISTS idx_team_roles_business ON team_roles(business_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id)`);
+}
+
+/**
+ * Mobile app releases (drives the in-app "update available" prompt).
+ *
+ * The mobile app calls GET /api/public/app-updates/check on login / app start
+ * with its current version code (build number). The endpoint compares it with
+ * the newest ACTIVE row for the platform:
+ *   - update_available: latest.version_code > current
+ *   - update_required:  latest.force_update OR current < min_supported_version_code
+ *     (min_supported is the MAX floor across ALL active rows, so any active
+ *     release can raise the floor for older installs)
+ *
+ * `version_code` is the monotonic build number (flutter --build-number=N →
+ * Android versionCode / iOS CFBundleVersion), which is the robust comparison
+ * key; version_name (semver string) is display-only.
+ *
+ * Seeded with the current production baseline (build 13) so the admin panel
+ * has a starting row; inserts are ON CONFLICT idempotent.
+ */
+async function ensureAppVersionsSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS app_versions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      platform VARCHAR(10) NOT NULL CHECK (platform IN ('ios', 'android')),
+      version_name VARCHAR(32) NOT NULL,
+      version_code INTEGER NOT NULL,
+      force_update BOOLEAN NOT NULL DEFAULT FALSE,
+      min_supported_version_code INTEGER,
+      release_notes TEXT,
+      store_url TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by UUID,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT app_versions_platform_code_unique UNIQUE (platform, version_code)
+    )
+  `);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_app_versions_platform_active
+     ON app_versions (platform, is_active, version_code DESC)`,
+  );
+  // Baseline rows for the currently shipping build (idempotent).
+  await query(`
+    INSERT INTO app_versions (platform, version_name, version_code, release_notes, is_active)
+    VALUES
+      ('android', '1.0.0', 13, 'Initial tracked release.', TRUE),
+      ('ios', '1.0.0', 13, 'Initial tracked release.', TRUE)
+    ON CONFLICT (platform, version_code) DO NOTHING
+  `);
 }

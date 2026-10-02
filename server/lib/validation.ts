@@ -11,6 +11,9 @@ export const UpdateTransactionPinSchema = z.object({
 
 export const ToggleOtpSchema = z.object({
   enabled: z.boolean(),
+  // Flipping the OTP-for-transactions switch is security-sensitive: an OTP
+  // confirmation is required to effect the change (mirrors the PIN update).
+  otp: z.string().length(6).regex(/^\d+$/, "OTP must be 6 digits"),
 });
 
 export const InitiateSingleTransferSchema = z.object({

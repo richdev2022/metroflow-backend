@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 import { getProvider } from "../services/providers/factory";
@@ -209,7 +210,7 @@ router.get("/plans", authenticateToken, checkSubscriptionStatus, async (req: Aut
  *       403:
  *         description: Recurring billing disabled or plan cap reached (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/plans", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/plans", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { userId, businessId } = req.user!;
         const { name, description, amount, interval } = req.body || {};
@@ -275,7 +276,7 @@ router.post("/plans", authenticateToken, checkSubscriptionStatus, async (req: Au
  *       200:
  *         description: Updated plan
  */
-router.put("/plans/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/plans/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -326,7 +327,7 @@ router.put("/plans/:id", authenticateToken, checkSubscriptionStatus, async (req:
  *       400:
  *         description: Plan still has subscribers
  */
-router.delete("/plans/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/plans/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -436,7 +437,7 @@ router.get("/subscribers", authenticateToken, checkSubscriptionStatus, async (re
  *       400:
  *         description: Invalid plan / already subscribed
  */
-router.post("/subscribers", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/subscribers", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { plan_id, customer_name, customer_email, customer_phone } = req.body || {};
@@ -496,7 +497,7 @@ router.post("/subscribers", authenticateToken, checkSubscriptionStatus, async (r
  *       200:
  *         description: Cancelled
  */
-router.delete("/subscribers/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/subscribers/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;
@@ -530,7 +531,7 @@ router.delete("/subscribers/:id", authenticateToken, checkSubscriptionStatus, as
  *       200:
  *         description: Reactivated
  */
-router.post("/subscribers/:id/reactivate", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/subscribers/:id/reactivate", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_subscriptions"), async (req: AuthenticatedRequest, res) => {
     try {
         const { businessId } = req.user!;
         const { id } = req.params;

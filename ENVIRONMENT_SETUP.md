@@ -97,28 +97,32 @@ DEFAULT_WHATSAPP_PROVIDER=meta
   5. Get your Phone Number ID from App Dashboard > WhatsApp > Phone Numbers.
   6. For production, you will need to verify your business and a phone number with Meta.
 
+### KudiSMS (Default for SMS — OTPs & notifications)
+```env
+KUDI_API_KEY=
+KUDI_SENDER_ID=
+DEFAULT_SMS_PROVIDER=kudi
+```
+- **How to get**:
+  1. Sign up at [my.kudisms.net](https://my.kudisms.net/) (KudiSMS — kudisms.net; NOT kudi.ai, which is a different company).
+  2. Copy your API Key from the dashboard → this is `KUDI_API_KEY`.
+  3. Submit your Sender ID (e.g. `METRICOREX`) for approval as a **Corporate** Sender ID from the dashboard — corporate approval is required for the transactional route this backend uses (`POST /api/corporate`). Set the approved ID as `KUDI_SENDER_ID`.
+  4. Optional: `KUDI_API_BASE` overrides the API base URL (default `https://my.kudisms.net/api`).
+- **Behavior**: all OTP/notification SMS (transfer OTP, PIN-update OTP, OTP-toggle OTP, KYC OTP, contact-change OTP) go through KudiSMS and are checked against the provider response — a rejected delivery now fails the request with the provider's reason (e.g. invalid token, unapproved sender ID, insufficient balance) instead of silently pretending success.
+- **Docs**: [API overview](https://www.kudisms.net/docs) · [SMS endpoints](https://www.kudisms.net/docs/sms/) · [Error codes](https://www.kudisms.net/docs/errors/)
+
 ### Termii (Backup for SMS & WhatsApp)
 ```env
 TERMII_API_KEY=
 TERMII_SENDER_ID=N-Alert
 TERMII_WHATSAPP_NUMBER=
-DEFAULT_SMS_PROVIDER=termii
 ```
 - **How to get**:
   1. Sign up at [termii.com](https://termii.com/)
   2. Go to Settings > API Keys to get your API Key.
   3. Sender ID can be your business name (must be approved for production).
   4. For WhatsApp, you need to set up a WhatsApp number in your Termii dashboard.
-  5. To use Termii for WhatsApp instead of Meta, set `DEFAULT_WHATSAPP_PROVIDER=termii`.
-
-### Kudi (SMS Only)
-```env
-KUDI_API_KEY=
-KUDI_SENDER_ID=
-```
-- **How to get**:
-  1. Sign up at [kudi.ai](https://kudi.ai/)
-  2. Navigate to your dashboard to get API Key and set Sender ID.
+  5. Termii is NOT the default SMS provider anymore — only used if you set `DEFAULT_SMS_PROVIDER=termii`, or as a WhatsApp channel via `DEFAULT_WHATSAPP_PROVIDER=termii`.
 
 ---
 

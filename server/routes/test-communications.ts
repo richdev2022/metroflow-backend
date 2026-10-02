@@ -137,7 +137,23 @@ router.post("/send", async (req, res) => {
       if (provider) {
         const smsProvider = getSMSProvider(provider);
         smsResult = await smsProvider.sendSMS(recipient, message);
+        // Direct provider calls return a normalized envelope instead of
+        // throwing — check it so a rejected delivery is reported honestly.
+        if (!smsResult || smsResult.success === false) {
+          const reason = smsResult?.error || 'unknown provider error';
+          console.error(`Test SMS delivery failed via ${provider}: ${reason}`);
+          return res.status(502).json({
+            success: false,
+            error: `SMS delivery failed via ${provider}: ${reason}`,
+            otp,
+            category,
+            recipient,
+            provider,
+            providerResponse: smsResult
+          });
+        }
       } else {
+        // sendSMS throws on provider failure; the outer catch reports it.
         smsResult = await sendSMS(recipient, message);
       }
       

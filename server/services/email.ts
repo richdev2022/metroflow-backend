@@ -1,5 +1,12 @@
 import { sendEmail as sendEmailFromSender } from "./email-sender";
 
+// Official brand logo used across every email template. Always points at
+// the official Metricorex artwork hosted on the marketing site — app-host
+// copies can go stale (and older templates referenced dead builder.io /
+// placeholder URLs). Override with APP_LOGO_URL if the brand asset moves.
+const EMAIL_LOGO_URL =
+  process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
+
 export interface EmailPayload {
   to: Array<{
     email: string;
@@ -93,7 +100,7 @@ export function generateLoginAttemptEmailHtml(
  * Welcome email sent whenever a new account is created.
  */
 export function generateAccountCreationEmailHtml(name: string, loginLink: string): string {
-  const logoUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/Assets/logo.png` : 'https://metricorex.com/Assets/logo.png';
+  const logoUrl = EMAIL_LOGO_URL;
   return `
     <html>
       <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
@@ -195,7 +202,7 @@ export function generateInviteEmailHtml(
   inviteLink: string,
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -241,7 +248,7 @@ export function generateAdminInviteEmailHtml(
   loginLink: string
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -307,7 +314,7 @@ export function generateBusinessRegistrationEmailHtml(
   businessName: string,
   loginLink: string,
 ): string {
-  const logoUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/Assets/logo.png` : 'https://via.placeholder.com/150x50/2563eb/ffffff?text=KPI+Tracker';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -423,7 +430,7 @@ export async function sendCommentNotification(
 
     const subject = `Comment ${action} on ${targetType}: ${targetTitle}`;
     const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-    const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://via.placeholder.com/150x50/2563eb/ffffff?text=KPI+Tracker';
+    const logoUrl = EMAIL_LOGO_URL;
 
     for (const user of recipients) {
       const emailHtml = `
@@ -492,7 +499,7 @@ export async function sendMentionNotification(
         ? `${baseUrl}/${targetType === 'task' ? 'tasks' : 'backlog'}?${targetType}Id=${targetId}` 
         : `http://localhost:8080/${targetType === 'task' ? 'tasks' : 'backlog'}`;
 
-    const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://via.placeholder.com/150x50/2563eb/ffffff?text=KPI+Tracker';
+    const logoUrl = EMAIL_LOGO_URL;
 
     for (const user of usersResult.rows) {
       const subject = `You were mentioned in a comment on ${targetType}: ${targetTitle}`;
@@ -547,7 +554,7 @@ export async function sendTransferFailureNotification(
 ) {
   const subject = `Transfer Failed - ${reference}`;
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const htmlContent = `
     <html>
@@ -664,7 +671,7 @@ export function generateMeetingInvitationEmailHtml(
   waitingRoomEnabled: boolean
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const formatDateTime = (date: Date) => {
     return date.toLocaleString('en-NG', {
@@ -759,7 +766,7 @@ interface MeetingReminderEmailInput {
 
 export function generateMeetingReminderEmailHtml(input: MeetingReminderEmailInput): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const formatDateTime = (date: Date) => {
     return date.toLocaleString('en-NG', {
@@ -856,7 +863,7 @@ export function generateCallInvitationEmailHtml(
   waitingRoomEnabled: boolean
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const formatDateTime = (date: Date) => {
     return date.toLocaleString('en-NG', {
@@ -942,7 +949,7 @@ export function generateOtpEmailHtml(
   purpose: string = "Transaction Verification"
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -988,7 +995,7 @@ export function generateTaskActivityEmailHtml(
   actorName: string,
   taskLink: string,
 ): string {
-  const logoUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/Assets/logo.png` : 'https://via.placeholder.com/150x50/2563eb/ffffff?text=KPI+Tracker';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const actionLabels: Record<string, string> = {
     created: "created a new task",
@@ -1042,7 +1049,7 @@ export function generateKYCOtpEmailHtml(
   expiresInMinutes: number = 10
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -1094,7 +1101,7 @@ export function generateSubscriptionCancelledEmail(
   planName: string
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -1147,7 +1154,7 @@ export function generateSubscriptionDowngradedEmail(
   newPlanName: string
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -1202,7 +1209,7 @@ export function generateSubscriptionActivatedEmail(
   nextBillingDate: Date
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
   const formattedAmount = `${currency} ${amount.toLocaleString()}`;
   const formattedDate = nextBillingDate.toLocaleDateString('en-NG', {
     year: 'numeric',
@@ -1266,7 +1273,7 @@ export function generateRenewalFailedEmail(
   reason: string
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   return `
     <html>
@@ -1324,7 +1331,7 @@ export function generateTransactionAlertEmailHtml(
   description: string
 ): string {
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
-  const logoUrl = baseUrl ? `${baseUrl}/Assets/logo.png` : 'https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899';
+  const logoUrl = EMAIL_LOGO_URL;
 
   const isCredit = transactionType === 'credit';
   const primaryColor = isCredit ? '#10b981' : '#ef4444';

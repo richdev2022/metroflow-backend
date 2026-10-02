@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "crypto";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
@@ -18,8 +19,10 @@ import { transferQueue } from "../lib/queues";
 
 const router = express.Router();
 
-// Helper to generate reference if util doesn't exist
-const genRef = () => `TRF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+// Helper to generate reference if util doesn't exist.
+// Random hex suffix (not a bounded int) so rapid retries/bulk inserts can
+// never collide on the UNIQUE reference within the same millisecond.
+const genRef = () => `TRF-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
 
 /**
  * GET /transfers/quote

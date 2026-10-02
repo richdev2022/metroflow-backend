@@ -510,6 +510,9 @@ export async function checkProcessingTransfers(): Promise<void> {
       `SELECT 1 FROM transfer_queue
        WHERE (status = 'processing' AND updated_at < NOW() - INTERVAL '${PROCESSING_STALE_SECONDS} seconds')
           OR (status = 'pending' AND created_at < NOW() - INTERVAL '${PENDING_STUCK_MINUTES} minutes')
+          OR (status = 'failed' AND wallet_id IS NOT NULL AND updated_at > NOW() - INTERVAL '7 days'
+              AND EXISTS (SELECT 1 FROM transactions t WHERE t.reference = transfer_queue.reference AND t.type = 'debit')
+              AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.reference = transfer_queue.reference || '-REFUND'))
        LIMIT 1`
     );
 
@@ -560,6 +563,34 @@ export async function checkProcessingTransfers(): Promise<void> {
           logRateLimited(`Error verifying transfer ${transfer.reference}`, verifyError);
         }
       }
+    }
+
+    // 3. Safety net: auto-reverse FAILED transfers whose wallet debit was
+    // never refunded. Covers rows flipped to failed by a provider webhook
+    // (Squad/Monnify/Flutterwave) before reversal existed, or any path that
+    // marked failed without crediting the user back.
+    try {
+      const unrefunded = await query(
+        `SELECT * FROM transfer_queue
+         WHERE status = 'failed' AND wallet_id IS NOT NULL
+           AND updated_at > NOW() - INTERVAL '7 days'
+           AND EXISTS (SELECT 1 FROM transactions t WHERE t.reference = transfer_queue.reference AND t.type = 'debit')
+           AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.reference = transfer_queue.reference || '-REFUND')
+         ORDER BY updated_at ASC
+         LIMIT 25`
+      );
+      for (const transfer of unrefunded.rows) {
+        try {
+          const reversed = await reverseFailedTransfer(transfer, 'Reconciliation sweep: failed transfer without reversal');
+          if (reversed) {
+            console.log(`[TransferMonitor] Auto-reversed failed transfer ${transfer.reference}`);
+          }
+        } catch (revError: any) {
+          logRateLimited(`Error auto-reversing failed transfer ${transfer.reference}`, revError);
+        }
+      }
+    } catch (sweepError: any) {
+      logRateLimited("Failed-transfer reversal sweep skipped", sweepError);
     }
 
     consecutiveFailures = 0;
@@ -615,6 +646,100 @@ export function normalizeTransferForProcessing(transfer: any): any {
   return { ...transfer, _providerAmount: transfer.amount, _providerCurrency: transfer.currency || 'NGN' };
 }
 
+/**
+ * Auto-reversal: credit back a FAILED transfer's debit (amount + fee) to the
+ * source wallet and unwind the platform/revenue holds, recording the
+ * corresponding `refund` transaction rows.
+ *
+ * Idempotent by construction:
+ *  - only runs when the debit transaction exists (money actually left),
+ *  - only runs when no `${reference}-REFUND` transaction exists yet,
+ *  - INSERTs use ON CONFLICT DO NOTHING as a final guard.
+ *
+ * Used by: immediate provider rejection, processing exceptions, provider
+ * webhooks (Squad/Monnify/Flutterwave FAILED/REVERSED) and the monitor sweep
+ * for failed-but-never-reversed rows.
+ *
+ * @returns true when a reversal was performed, false when skipped.
+ */
+export async function reverseFailedTransfer(transfer: any, reason: string): Promise<boolean> {
+  if (!transfer || !transfer.wallet_id) return false;
+
+  const amount = parseFloat(transfer.amount);
+  const fee = parseFloat(transfer.fee || '0');
+  const totalRefund = amount + fee;
+
+  // Only reverse when money actually left the wallet (debit txn exists)
+  const txnCheck = await query(
+    `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+    [transfer.reference]
+  );
+  if (txnCheck.rows.length === 0) return false;
+
+  // Idempotency: never reverse twice
+  const refundCheck = await query(
+    `SELECT id FROM transactions WHERE reference = $1`,
+    [transfer.reference + '-REFUND']
+  );
+  if (refundCheck.rows.length > 0) return false;
+
+  await query(
+    `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+    [totalRefund, transfer.wallet_id]
+  );
+
+  await debitPlatformWallet(
+    amount,
+    transfer.currency || 'NGN',
+    transfer.reference + '-REFUND',
+    `Reversal of platform hold for failed transfer ${transfer.reference}`,
+  );
+
+  if (fee > 0) {
+    await debitRevenueWallet(
+      fee,
+      transfer.currency || 'NGN',
+      transfer.reference + '-REFUND',
+      `Reversal of fee revenue for failed transfer ${transfer.reference}`,
+    );
+  }
+
+  await query(
+    `INSERT INTO transactions
+     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+     VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
+     ON CONFLICT (reference) DO NOTHING`,
+    [
+      transfer.business_id,
+      amount,
+      transfer.currency || 'NGN',
+      transfer.reference + '-REFUND',
+      `Auto-reversal for failed transfer: ${transfer.reference}`,
+      transfer.wallet_id
+    ]
+  );
+
+  if (fee > 0) {
+    await query(
+      `INSERT INTO transactions
+       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
+       ON CONFLICT (reference) DO NOTHING`,
+      [
+        transfer.business_id,
+        fee,
+        transfer.currency || 'NGN',
+        transfer.reference + '-FEE-REFUND',
+        `Auto-reversal of fee for failed transfer: ${transfer.reference}`,
+        transfer.wallet_id
+      ]
+    );
+  }
+
+  console.log(`[TransferService] AUTO-REVERSAL applied for ${transfer.reference} | amount+fee=${totalRefund} | reason: ${reason}`);
+  return true;
+}
+
 export async function processAllPending(businessId: string) {
   // 1. Fetch pending transfers
   const pendingTransfers = await query(
@@ -632,8 +757,19 @@ export async function processAllPending(businessId: string) {
   console.log(`Processing ${pendingTransfers.rows.length} pending transfers for business ${businessId}`);
 
   for (const transfer of pendingTransfers.rows) {
-    // Update status to processing to prevent double pick-up
-    await query(`UPDATE transfer_queue SET status = 'processing' WHERE id = $1`, [transfer.id]);
+    // Atomically claim the row: only the pass that flips it pending ->
+    // processing may proceed. Prevents the concurrent route-pass + BullMQ
+    // worker-pass race where both drove the pipeline and the loser crashed
+    // on transactions_reference_key (23505) mid-insert.
+    const claim = await query(
+      `UPDATE transfer_queue SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND status = 'pending' RETURNING id`,
+      [transfer.id]
+    );
+    if (claim.rows.length === 0) {
+      // Already claimed/processed by a concurrent pass (route vs worker vs monitor)
+      continue;
+    }
 
     try {
       // 2. Check Wallet & Debit
@@ -693,7 +829,8 @@ export async function processAllPending(businessId: string) {
             await query(
               `INSERT INTO transactions 
                (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
+               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')
+               ON CONFLICT (reference) DO NOTHING`,
               [
                   transfer.business_id, 
                   amount, 
@@ -723,7 +860,8 @@ export async function processAllPending(businessId: string) {
               await query(
                 `INSERT INTO transactions 
                  (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)
+                 ON CONFLICT (reference) DO NOTHING`,
                 [
                     transfer.business_id, 
                     fee, 
@@ -863,82 +1001,12 @@ export async function processAllPending(businessId: string) {
           },
         });
       } else if (isFailed && transfer.wallet_id) {
-        // If provider rejected immediately, refund the wallet
-        const amount = parseFloat(transfer.amount);
-        const fee = parseFloat(transfer.fee || '0');
-        const totalRefund = amount + fee;
+        // If provider rejected immediately, auto-reverse the wallet debit
+        // (amount + fee) and unwind the platform/revenue holds.
+        const reversed = await reverseFailedTransfer(transfer, failureReason || 'Provider rejected the transfer');
 
-        const txnCheck = await query(
-          `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
-          [transfer.reference]
-        );
-        if (txnCheck.rows.length > 0) {
-          console.log(`[TransferService] Immediate refund for transfer ${transfer.reference} - Amount: ${totalRefund}, Reason: ${failureReason}`);
-          
-          await query(
-            `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
-            [totalRefund, transfer.wallet_id]
-          );
-          
-          await debitPlatformWallet(
-            amount,
-            transfer.currency || 'NGN',
-            transfer.reference + '-REFUND',
-            `Reversal of platform hold for failed transfer ${transfer.reference}`,
-          );
-
-          if (fee > 0) {
-            await debitRevenueWallet(
-              fee,
-              transfer.currency || 'NGN',
-              transfer.reference + '-REFUND',
-              `Reversal of fee revenue for failed transfer ${transfer.reference}`,
-            );
-          }
-
-          const refundTxnCheck = await query(
-            `SELECT id FROM transactions WHERE reference = $1`,
-            [transfer.reference + '-REFUND']
-          );
-          
-          if (refundTxnCheck.rows.length === 0) {
-            await query(
-              `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-              [
-                transfer.business_id, 
-                amount, 
-                transfer.currency || 'NGN', 
-                transfer.reference + '-REFUND', 
-                `Refund for failed transfer: ${transfer.reference}`,
-                transfer.wallet_id
-              ]
-            );
-          }
-
-          if (fee > 0) {
-            const feeRefundTxnCheck = await query(
-              `SELECT id FROM transactions WHERE reference = $1`,
-              [transfer.reference + '-FEE-REFUND']
-            );
-            
-            if (feeRefundTxnCheck.rows.length === 0) {
-              await query(
-                `INSERT INTO transactions 
-                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                 VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                [
-                  transfer.business_id, 
-                  fee, 
-                  transfer.currency || 'NGN', 
-                  transfer.reference + '-FEE-REFUND', 
-                  `Refund fee for failed transfer: ${transfer.reference}`,
-                  transfer.wallet_id
-                ]
-              );
-            }
-          }
+        if (reversed) {
+          console.log(`[TransferService] Immediate refund for transfer ${transfer.reference}, Reason: ${failureReason}`);
 
           // Send email notification on failure
           const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
@@ -989,72 +1057,11 @@ export async function processAllPending(businessId: string) {
       const noRefundErrors = ["Insufficient wallet balance", "Source wallet not found"];
       if (
         !noRefundErrors.includes(reason) &&
-        !reason.startsWith("Wallet currency mismatch") &&
-        transfer.wallet_id
+        !reason.startsWith("Wallet currency mismatch")
       ) {
-          // Check if we actually debited? 
-           const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`, [transfer.reference]);
-           if (txnCheck.rows.length > 0) {
-               // We debited, so refund
-               const amount = parseFloat(transfer.amount);
-               const fee = parseFloat(transfer.fee || '0');
-               const totalRefund = amount + fee;
-
-                await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [totalRefund, transfer.wallet_id]);
-                
-                // Reversal: Debit Platform Wallet (Amount)
-                await debitPlatformWallet(amount, transfer.currency || 'NGN');
-
-                // Reversal: Debit Revenue Wallet (Fee)
-                if (fee > 0) {
-                    await debitRevenueWallet(fee, transfer.currency || 'NGN');
-                }
-
-                // Check if refund transaction already exists
-                const refundTxnCheck = await query(
-                    `SELECT id FROM transactions WHERE reference = $1`,
-                    [transfer.reference + '-REFUND']
-                );
-                
-                if (refundTxnCheck.rows.length === 0) {
-                    await query(
-                        `INSERT INTO transactions 
-                         (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                         VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                        [
-                            transfer.business_id, 
-                            amount, 
-                            transfer.currency || 'NGN', 
-                            transfer.reference + '-REFUND', 
-                            `Refund for failed transfer: ${transfer.reference}`,
-                            transfer.wallet_id
-                        ]
-                    );
-                }
-
-                if (fee > 0) {
-                    const feeRefundTxnCheck = await query(
-                        `SELECT id FROM transactions WHERE reference = $1`,
-                        [transfer.reference + '-FEE-REFUND']
-                    );
-                    
-                    if (feeRefundTxnCheck.rows.length === 0) {
-                        await query(
-                            `INSERT INTO transactions 
-                             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                             VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')`,
-                            [
-                                transfer.business_id, 
-                                fee, 
-                                transfer.currency || 'NGN', 
-                                transfer.reference + '-FEE-REFUND', 
-                                `Refund fee for failed transfer: ${transfer.reference}`,
-                                transfer.wallet_id
-                            ]
-                        );
-                    }
-                }
-           }
+          // Auto-reverse the debit when money actually left the wallet.
+          // The helper is idempotent (checks debit txn + existing -REFUND row).
+          await reverseFailedTransfer(transfer, reason);
       }
 
       await query(

@@ -9,6 +9,7 @@ import { settleSubscriptionCharge } from "./recurring";
 import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
+import { reverseFailedTransfer } from "../services/transfer";
 
 const router = express.Router();
 
@@ -315,6 +316,16 @@ const handleSquadWebhook = async (event: any) => {
                  WHERE id = $5`,
                 [newStatus, failureReason, JSON.stringify(body), JSON.stringify(body), transfer.id]
             );
+
+            // AUTO-REVERSAL: the provider rejected the payout — return the
+            // user's money (amount + fee) immediately and unwind holds.
+            if (newStatus === 'failed' && transfer.wallet_id) {
+                try {
+                    await reverseFailedTransfer(transfer, failureReason || 'Squad reported transfer failed');
+                } catch (reversalError) {
+                    console.error(`Auto-reversal failed for Squad transfer ${reference}:`, reversalError);
+                }
+            }
         }
     }
 };
@@ -590,6 +601,16 @@ const handleMonnifyWebhook = async (event: any) => {
                          WHERE id = $5`,
                         [newStatus, failureReason, JSON.stringify(tx), JSON.stringify(disbursementData), transfer.id]
                     );
+
+                    // AUTO-REVERSAL: Monnify FAILED/REVERSED disbursement —
+                    // return the user's money (amount + fee) immediately.
+                    if (newStatus === 'failed' && transfer.wallet_id) {
+                        try {
+                            await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed');
+                        } catch (reversalError) {
+                            console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
+                        }
+                    }
                 }
             }
         } else {
@@ -621,6 +642,15 @@ const handleMonnifyWebhook = async (event: any) => {
                      WHERE id = $5`,
                     [newStatus, failureReason, JSON.stringify(disbursementData), JSON.stringify(disbursementData), transfer.id]
                 );
+
+                // AUTO-REVERSAL: Monnify FAILED/REVERSED disbursement (single)
+                if (newStatus === 'failed' && transfer.wallet_id) {
+                    try {
+                        await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed');
+                    } catch (reversalError) {
+                        console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
+                    }
+                }
             }
         }
     }
@@ -1064,6 +1094,16 @@ const handleFlutterwaveWebhook = async (event: any) => {
              WHERE id = $5`,
             [newStatus, failureReason, JSON.stringify(event), JSON.stringify(transferData), transfer.id]
         );
+
+        // AUTO-REVERSAL: Flutterwave FAILED/REVERTED/CANCELED transfer —
+        // return the user's money (amount + fee) immediately.
+        if (newStatus === 'failed' && transfer.wallet_id) {
+            try {
+                await reverseFailedTransfer(transfer, failureReason || 'Flutterwave reported transfer failed/reverted');
+            } catch (reversalError) {
+                console.error(`Auto-reversal failed for Flutterwave transfer ${reference}:`, reversalError);
+            }
+        }
     }
 };
 

@@ -635,6 +635,20 @@ export function initSocketServer(server: http.Server): void {
       broadcastPresence(socket.data.userId, "online").catch(() => undefined);
     }
 
+    // 0-prec-b. Auto-join the user's personal room on authenticated connect.
+    // Mobile clients never emit "user-online" (web-only behavior), so call
+    // broadcasts to `user:{id}` — call:accepted / call:rejected / call:ended —
+    // never reached a mobile CALLER: the callee answered but the caller kept
+    // ringing until timeout. Mobile-to-mobile calls were effectively broken.
+    // Joining here (and keeping user-online for legacy clients) guarantees
+    // every authenticated socket receives its personal events.
+    if (socket.data.authenticated && socket.data.userId) {
+      socket.join(`user:${socket.data.userId}`);
+      if (socket.data.businessId) {
+        socket.join(`business:${socket.data.businessId}`);
+      }
+    }
+
     // 0a. Optional authentication middleware support: clients may pass
     // { auth: { token } } in io() options. Guests connect without tokens.
     // (The handshake auth was already read in io.use() below; nothing to do here.)

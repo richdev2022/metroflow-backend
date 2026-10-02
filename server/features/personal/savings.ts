@@ -1,8 +1,8 @@
 import express from "express";
-import { query } from "../db";
-import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
-import { createNotification } from "../services/notifications";
+import { query } from "../../db";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
+import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
+import { createNotification } from "../../services/notifications";
 
 const router = express.Router();
 

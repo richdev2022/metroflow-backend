@@ -9,10 +9,10 @@ const options = {
       title: "Metricorex API",
       version: "2.0.0",
       description:
-        "Metricorex (Metroflow) backend — personal + business work OS with fintech rails. " +
-        "Revenue features: Bills Hub (airtime/data/TV/electricity/betting), Savings Vaults " +
-        "(auto-save + early-break fee), Payment Links, Smart Invoices and MetricAi Credit " +
-        "Packs — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens.",
+        "Metricorex (Metroflow) backend — business work OS with fintech rails. " +
+        "Revenue features: Payment Links, Smart Invoices, MetricAi Credit Packs, " +
+        "Storefront (hosted product checkout) and Recurring Billing (customer " +
+        "subscriptions) — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens.",
     },
     servers: [
       {

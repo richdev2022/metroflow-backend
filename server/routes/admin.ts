@@ -855,7 +855,8 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
             metricAiEnabled,
             paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
-            aiCreditDiscountPercent
+            aiCreditDiscountPercent,
+            invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent
         } = req.body;
 
         // Dynamic update
@@ -966,6 +967,21 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
         if (aiCreditDiscountPercent !== undefined) {
             queryStr += `, ai_credit_discount_percent = $${paramCount}`;
             params.push(Number(aiCreditDiscountPercent) || 0);
+            paramCount++;
+        }
+        if (invoicesEnabled !== undefined) {
+            queryStr += `, invoices_enabled = $${paramCount}`;
+            params.push(invoicesEnabled === true);
+            paramCount++;
+        }
+        if (maxInvoicesPerMonth !== undefined) {
+            queryStr += `, max_invoices_per_month = $${paramCount}`;
+            params.push(Number(maxInvoicesPerMonth) || 0);
+            paramCount++;
+        }
+        if (invoiceFeeDiscountPercent !== undefined) {
+            queryStr += `, invoice_fee_discount_percent = $${paramCount}`;
+            params.push(Number(invoiceFeeDiscountPercent) || 0);
             paramCount++;
         }
 
@@ -4483,6 +4499,35 @@ protectedRouter.get("/payment-links", requirePermission('manage_plans', 'manage_
         res.json({ success: true, summary: summary.rows[0], payments: payments.rows[0], recent: recent.rows });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load payment links overview" });
+    }
+});
+
+/** Platform-wide Smart Invoices overview (admin). */
+protectedRouter.get("/invoices", requirePermission('manage_plans', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const summary = await query(
+            `SELECT COUNT(*)::int AS total_invoices,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)::int AS pending_invoices,
+                    COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_invoices
+             FROM invoices`
+        );
+        const payments = await query(
+            `SELECT COALESCE(SUM(amount), 0) AS gross, COALESCE(SUM(fee), 0) AS fees, COALESCE(SUM(net_amount), 0) AS net,
+                    COUNT(*)::int AS transactions
+             FROM invoice_payments WHERE status = 'success'`
+        );
+        const recent = await query(
+            `SELECT q.transaction_reference, q.amount, q.fee, q.net_amount, q.currency, q.status,
+                    q.payer_name, q.payer_email, q.payment_provider, q.created_at,
+                    i.invoice_number, i.client_name, b.name AS business_name
+             FROM invoice_payments q
+             JOIN invoices i ON i.id = q.invoice_id
+             LEFT JOIN businesses b ON b.id = q.business_id
+             ORDER BY q.created_at DESC LIMIT 50`
+        );
+        res.json({ success: true, summary: summary.rows[0], payments: payments.rows[0], recent: recent.rows });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load invoices overview" });
     }
 });
 

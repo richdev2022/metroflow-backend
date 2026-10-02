@@ -797,26 +797,23 @@ router.post("/initiate-payment", authenticateToken, async (req, res) => {
         finalAmount = Math.max(0, finalAmount - discount);
     }
     
-    // Handle currency conversion
-    if (currency === 'NGN') {
+    // Handle currency conversion.
+    // Plans seeded with an explicit NGN price (plan.currency === 'NGN') are
+    // charged as-is; the legacy external FX lookup is only used when the plan
+    // is actually denominated in a different currency than the charge.
+    if (currency === 'NGN' && (plan.currency || 'USD').toUpperCase() !== 'NGN') {
        try {
          const rateRes = await axios.get('https://api.exchangerate-api.com/v4/latest/USD');
          if (rateRes.data && rateRes.data.rates && rateRes.data.rates.NGN) {
             const rate = rateRes.data.rates.NGN;
             finalAmount = Math.round(finalAmount * rate);
          } else {
-            // Fallback rate if API fails? Or error out?
-            // For now, let's error out to be safe or use a fallback.
-            // Using a safe fallback is risky for money. Better to error.
             console.error("Failed to fetch exchange rate");
-            // Use a hardcoded fallback just in case or throw
-            // throw new Error("Exchange rate unavailable");
-            // Assuming 1500 for now as fallback if API fails completely? No, bad idea.
+            return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
          }
        } catch (err) {
          console.error("Exchange rate API error:", err);
-         // If we can't get the rate, we can't process NGN accurately if base is USD.
-         // However, if we must proceed, we could fallback.
+         return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
        }
     }
 

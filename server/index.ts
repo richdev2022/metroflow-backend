@@ -80,6 +80,11 @@ import kycRouter from "./routes/kyc";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
+import paymentLinksRouter from "./routes/payment_links";
+import aiCreditsRouter from "./routes/ai_credits";
+import invoicesRouter from "./routes/invoices";
+import storeRouter from "./routes/store";
+import recurringRouter from "./routes/recurring";
 import providersRouter from "./routes/providers";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
@@ -288,6 +293,23 @@ export async function createServer() {
         }
       } catch (error) {
         logger.error("Meeting reminders cron error:", error);
+      }
+    });
+
+    // Recurring Billing charge engine — runs every 5 minutes, charges each
+    // due customer subscription (wallet path debits the subscriber's wallet
+    // instantly; checkout path queues a hosted-checkout charge and emails the
+    // pay link). Idempotent via the next_charge_date claim inside
+    // processDueSubscriptionCharges.
+    cron.schedule("*/5 * * * *", async () => {
+      try {
+        const { processDueSubscriptionCharges } = await import("./routes/recurring");
+        const result = await processDueSubscriptionCharges();
+        if (result.processed > 0) {
+          logger.info(`[Recurring] charges processed ${result.processed}: ${result.succeeded} ok, ${result.failed} failed`);
+        }
+      } catch (error) {
+        logger.error("Recurring billing cron error:", error);
       }
     });
   }
@@ -664,6 +686,16 @@ export async function createServer() {
   // Fee Management Routes
   mainRouter.use("/fees", feesRouter);
   mainRouter.use("/admin/fees", adminFeesRouter);
+
+  // Revenue features: Payment Links ("Get Paid") + MetricAi Credit Packs + Smart Invoices
+  mainRouter.use("/payment-links", paymentLinksRouter);
+  mainRouter.use("/ai-credits", aiCreditsRouter);
+  mainRouter.use("/invoices", invoicesRouter);
+  // Business revenue features: Storefront + Recurring Billing (Customer Subscriptions).
+  // (Bills Hub & Savings Vaults live in server/features/personal — dormant until
+  // the Personal app ships; see server/features/personal/README.md.)
+  mainRouter.use("/store", storeRouter);
+  mainRouter.use("/recurring", recurringRouter);
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);

@@ -234,3 +234,146 @@ function dailyMessage(feature: AiFeature, limit: number): string {
 function monthlyMessage(feature: AiFeature, limit: number): string {
   return `You've used all ${limit} ${FEATURE_LABEL[feature]} included in your plan this month. Your allowance resets next month — or upgrade for a higher limit.`;
 }
+
+// ---------------------------------------------------------------------------
+// MetricAi Credit Packs (paid top-ups)
+//
+// When a plan's daily/monthly allowance is exhausted, usage falls back to the
+// user's purchased credit balance (1 usage = 1 credit). Credits never expire
+// and are consumed only when the plan bucket is full, so paying for a pack
+// strictly extends the plan.
+// ---------------------------------------------------------------------------
+
+export interface AiCreditBalanceInfo {
+  balance: number;
+  totalPurchased: number;
+}
+
+export async function getAiCreditBalance(userId: string): Promise<AiCreditBalanceInfo> {
+  try {
+    const bal = await query(`SELECT balance FROM ai_credit_balances WHERE user_id = $1`, [userId]);
+    const purchased = await query(
+      `SELECT COALESCE(SUM(credits), 0) AS total FROM ai_credit_purchases WHERE user_id = $1 AND status = 'success'`,
+      [userId],
+    );
+    return {
+      balance: Number(bal.rows[0]?.balance) || 0,
+      totalPurchased: Number(purchased.rows[0]?.total) || 0,
+    };
+  } catch (e) {
+    console.error("[ai-usage] failed to load credit balance:", e);
+    return { balance: 0, totalPurchased: 0 };
+  }
+}
+
+/**
+ * Atomically consume one paid credit. Returns true when a credit was
+ * available and debited (the WHERE balance > 0 guard makes concurrent
+ * requests safe — no negative balances).
+ */
+export async function consumeAiCredit(userId: string, businessId: string | null): Promise<boolean> {
+  try {
+    const res = await query(
+      `UPDATE ai_credit_balances
+       SET balance = balance - 1, updated_at = NOW()
+       WHERE user_id = $1 AND balance > 0
+       RETURNING balance`,
+      [userId],
+    );
+    if (res.rows.length === 0) return false;
+    // Ledger entry for support/audit (best-effort).
+    await query(
+      `INSERT INTO ai_credit_purchases
+         (user_id, business_id, pack_name, credits, amount, currency, status, reference)
+       VALUES ($1, $2, 'USAGE', -1, 0, 'NGN', 'consumed', $3)
+       ON CONFLICT (reference) DO NOTHING`,
+      [
+        userId,
+        businessId,
+        `AI-CREDIT-USE-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+      ],
+    ).catch(() => {});
+    return true;
+  } catch (e) {
+    console.error("[ai-usage] credit consumption failed:", e);
+    return false;
+  }
+}
+
+/**
+ * Plan gate WITH credit-pack fallback: over the cap but owns credits → burn a
+ * credit and pass. Shared by the daily/monthly over-limit branches.
+ */
+async function overLimitWithCredits(
+  userId: string,
+  businessId: string | null,
+  feature: AiFeature,
+  period: "daily" | "monthly",
+  limit: number,
+  used: number,
+  resetsAt: string,
+): Promise<{ ok: true } | { ok: false; feature: AiFeature; period: "daily" | "monthly"; limit: number; used: number; resetsAt: string; friendlyError: string }> {
+  const consumed = await consumeAiCredit(userId, businessId);
+  if (consumed) return { ok: true };
+  const { balance } = await getAiCreditBalance(userId);
+  const creditHint = balance > 0
+    ? ""
+    : " You can buy a MetricAi credit pack from your wallet to keep going, or upgrade your plan.";
+  return {
+    ok: false,
+    feature,
+    period,
+    limit,
+    used,
+    resetsAt,
+    friendlyError: `${period === "daily" ? dailyMessage(feature, limit) : monthlyMessage(feature, limit)}${creditHint}`,
+  };
+}
+
+export type AiUsageGate =
+  | { ok: true }
+  | { ok: false; feature: AiFeature; period: "daily" | "monthly"; limit: number; used: number; resetsAt: string; friendlyError: string };
+
+export function isAiUsageGateFailure(g: AiUsageGate): g is Extract<AiUsageGate, { ok: false }> {
+  return g.ok === false;
+}
+
+/** Check-only variant of the plan gate that also considers credit packs.
+ *  Used for image/video generation: one paid credit is burned at the gate
+ *  when the plan bucket is full (a failed upstream generation may lose one
+ *  credit — bounded and rare; the plan bucket itself is only consumed on
+ *  success via recordAiUsage). */
+export async function assertWithinAiUsageWithCredits(
+  userId: string,
+  businessId: string | null,
+  feature: AiFeature,
+  limits: AiPlanLimits,
+): Promise<AiUsageGate> {
+  const gate: AiUsageGate = await assertWithinAiUsage(userId, feature, limits);
+  if (isAiUsageGateFailure(gate)) {
+    return overLimitWithCredits(userId, businessId, feature, gate.period, gate.limit, gate.used, gate.resetsAt);
+  }
+  return { ok: true };
+}
+
+/**
+ * Atomic "check + consume one slot" WITH credit-pack fallback — used for chat
+ * messages: the plan bucket is recorded on success, and a paid credit is only
+ * burned when the message actually goes through over the cap.
+ */
+export async function tryConsumeAiUsageWithCredits(
+  userId: string,
+  businessId: string | null,
+  feature: AiFeature,
+  limits: AiPlanLimits,
+): Promise<AiUsageGate> {
+  const gate: AiUsageGate = await assertWithinAiUsage(userId, feature, limits);
+  if (isAiUsageGateFailure(gate)) {
+    const overLimit = await overLimitWithCredits(userId, businessId, feature, gate.period, gate.limit, gate.used, gate.resetsAt);
+    if (isAiUsageGateFailure(overLimit)) return overLimit;
+    await recordAiUsage(userId, businessId, feature);
+    return { ok: true };
+  }
+  await recordAiUsage(userId, businessId, feature);
+  return { ok: true };
+}

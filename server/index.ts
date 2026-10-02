@@ -71,6 +71,8 @@ import adminRouter from "./routes/admin";
 import subscriptionRouter from "./routes/subscription";
 import webhookRouter from "./routes/webhook";
 import dashboardRouter from "./routes/dashboard";
+import rolesRouter from "./routes/roles";
+import { requireTeamPermission } from "./middleware/teamAuth";
 import transferRouter from "./routes/transfers";
 import payrollRouter from "./routes/payroll";
 import settingsRouter from "./routes/settings";
@@ -613,43 +615,43 @@ export async function createServer() {
   // Tasks API routes
   mainRouter.get("/board", authenticateToken, checkSubscriptionStatus, getBoard);
   mainRouter.get("/tasks", authenticateToken, checkSubscriptionStatus, getTasks);
-  mainRouter.post("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), createTask);
-  mainRouter.post("/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkCreateTasks);
-  mainRouter.put("/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkUpdateTasks);
-  mainRouter.put("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), updateTask);
-  mainRouter.delete("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTask);
-  mainRouter.delete("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), bulkDeleteTasks);
+  mainRouter.post("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), createTask);
+  mainRouter.post("/tasks/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), bulkCreateTasks);
+  mainRouter.put("/tasks/bulk-update", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), bulkUpdateTasks);
+  mainRouter.put("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), updateTask);
+  mainRouter.delete("/tasks/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), deleteTask);
+  mainRouter.delete("/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), bulkDeleteTasks);
 
   // Task file attachments (WhatsApp-style uploads)
-  mainRouter.post("/tasks/:id/attachments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), uploadTaskAttachments);
+  mainRouter.post("/tasks/:id/attachments", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), uploadTaskAttachments);
   mainRouter.get("/tasks/:id/attachments", authenticateToken, checkSubscriptionStatus, getTaskAttachments);
-  mainRouter.delete("/tasks/attachments/:attachmentId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), deleteTaskAttachment);
+  mainRouter.delete("/tasks/attachments/:attachmentId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_tasks'), requireTeamPermission('manage_tasks'), deleteTaskAttachment);
 
   // Team API routes
-  mainRouter.get("/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTeamRanking);
-  mainRouter.get("/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), getTopTeamRanking);
+  mainRouter.get("/team/ranking", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), requireTeamPermission('view_ranking'), getTeamRanking);
+  mainRouter.get("/team/ranking/top", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_ranking'), requireTeamPermission('view_ranking'), getTopTeamRanking);
   mainRouter.get("/team", authenticateToken, checkSubscriptionStatus, getTeamMembers);
   mainRouter.get("/team/:id", authenticateToken, checkSubscriptionStatus, getTeamMemberById);
-  mainRouter.post("/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), checkTeamLimit, inviteTeamMember);
+  mainRouter.post("/team/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'), checkTeamLimit, inviteTeamMember);
   mainRouter.get("/team/verify-invite-token/:token", verifyInviteToken);
   mainRouter.post("/team/accept-invite/:token", acceptInvite);
   mainRouter.patch(
     "/team/:id/status",
     authenticateToken,
     checkSubscriptionStatus,
-    checkFeaturePermission('manage_team'),
+    checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'),
     updateTeamMemberStatus,
   );
   mainRouter.put(
     "/team/:id/status",
     authenticateToken,
     checkSubscriptionStatus,
-    checkFeaturePermission('manage_team'),
+    checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'),
     updateTeamMemberStatus,
   );
-  mainRouter.patch("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
-  mainRouter.put("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), updateTeamMemberRole);
-  mainRouter.delete("/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), deleteTeamMember);
+  mainRouter.patch("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'), updateTeamMemberRole);
+  mainRouter.put("/team/:id/role", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'), updateTeamMemberRole);
+  mainRouter.delete("/team/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_team'), requireTeamPermission('manage_team'), deleteTeamMember);
 
   // Comments API routes
   mainRouter.get("/comments/epic/:epicName", authenticateToken, checkSubscriptionStatus, getComments);
@@ -660,9 +662,9 @@ export async function createServer() {
 
   // Epics API routes
   mainRouter.get("/epics", authenticateToken, checkSubscriptionStatus, getEpics);
-  mainRouter.post("/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), createEpic);
-  mainRouter.post("/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), backfillEpics);
-  mainRouter.post("/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), linkTasksToEpic);
+  mainRouter.post("/epics", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), requireTeamPermission('manage_epics'), createEpic);
+  mainRouter.post("/epics/backfill", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), requireTeamPermission('manage_epics'), backfillEpics);
+  mainRouter.post("/epics/:epicId/tasks", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_epics'), requireTeamPermission('manage_epics'), linkTasksToEpic);
 
   // Task assignments API routes
   mainRouter.post("/assignments", authenticateToken, checkSubscriptionStatus, assignTasks);
@@ -670,14 +672,14 @@ export async function createServer() {
   mainRouter.delete("/assignments/:assignmentId", authenticateToken, checkSubscriptionStatus, removeAssignment);
 
   // Activity logs API routes
-  mainRouter.get("/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), getActivityLogs);
+  mainRouter.get("/activity-logs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('view_activity'), requireTeamPermission('view_activity'), getActivityLogs);
 
   // Ideas API routes
-  mainRouter.get("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), getIdeas);
-  mainRouter.post("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), createIdea);
-  mainRouter.put("/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdeaStatus);
-  mainRouter.put("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), updateIdea);
-  mainRouter.delete("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), deleteIdea);
+  mainRouter.get("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), requireTeamPermission('manage_ideas'), getIdeas);
+  mainRouter.post("/ideas", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), requireTeamPermission('manage_ideas'), createIdea);
+  mainRouter.put("/ideas/:id/status", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), requireTeamPermission('manage_ideas'), updateIdeaStatus);
+  mainRouter.put("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), requireTeamPermission('manage_ideas'), updateIdea);
+  mainRouter.delete("/ideas/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_ideas'), requireTeamPermission('manage_ideas'), deleteIdea);
 
   // Product Documentation API routes
   mainRouter.use("/product-docs", productDocsRouter);
@@ -702,6 +704,8 @@ export async function createServer() {
 
   // Dashboard API routes
   mainRouter.use("/dashboard", dashboardRouter);
+  // Business-team Role & Permission management (mirror of the admin RBAC)
+  mainRouter.use("/roles", rolesRouter);
 
   // Subscription API routes
   mainRouter.use("/subscription", subscriptionRouter);
@@ -740,56 +744,56 @@ export async function createServer() {
   mainRouter.use("/test-communications", testCommunicationsRouter);
 
   // Meetings API routes
-  mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetings);
-  mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingByCode);
-  mainRouter.get("/meetings/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), validateMeetingAccess);
+  mainRouter.get("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetings);
+  mainRouter.get("/meetings/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetingByCode);
+  mainRouter.get("/meetings/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), validateMeetingAccess);
   // Get meeting by UUID or code (must be registered after the more specific GET routes above)
-  mainRouter.get("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingById);
-  mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), createMeeting);
-  mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), updateMeeting);
-  mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), deleteMeeting);
-  mainRouter.post("/meetings/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), joinMeeting);
-  mainRouter.post("/meetings/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), leaveMeeting);
-  mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), addMeetingParticipants);
-  mainRouter.post("/meetings/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingInvite);
+  mainRouter.get("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetingById);
+  mainRouter.post("/meetings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), createMeeting);
+  mainRouter.put("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), updateMeeting);
+  mainRouter.delete("/meetings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), deleteMeeting);
+  mainRouter.post("/meetings/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), joinMeeting);
+  mainRouter.post("/meetings/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), leaveMeeting);
+  mainRouter.post("/meetings/:meetingId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), addMeetingParticipants);
+  mainRouter.post("/meetings/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), generateMeetingInvite);
   // Transcript + AI meeting notes (provider-agnostic — fed by caption segments)
-  mainRouter.get("/meetings/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingTranscript);
-  mainRouter.get("/meetings/:id/notes", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingNotes);
-  mainRouter.post("/meetings/:id/notes/generate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), generateMeetingNotesEndpoint);
+  mainRouter.get("/meetings/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetingTranscript);
+  mainRouter.get("/meetings/:id/notes", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetingNotes);
+  mainRouter.post("/meetings/:id/notes/generate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), generateMeetingNotesEndpoint);
   // Post-meeting report (attendees, AI notes, transcript, recordings)
-  mainRouter.get("/meetings/:id/report", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), getMeetingReport);
+  mainRouter.get("/meetings/:id/report", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_meetings"), requireTeamPermission("use_meetings"), getMeetingReport);
   // Public guest access (must be before any conflicting authenticated routes)
   mainRouter.get("/meetings/guest/validate/:code", guestValidateMeeting);
   // Guest join (public, no auth): guests join via meeting link + name (+password if set)
   mainRouter.post("/meetings/guest/:code/join", guestJoinMeeting);
 
   // Chat API routes
-  mainRouter.get("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversations);
-  mainRouter.post("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), createConversation);
-  mainRouter.get("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getConversationMessages);
-  mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), sendMessage);
-  mainRouter.put("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
-  mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), markConversationAsRead);
+  mainRouter.get("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getConversations);
+  mainRouter.post("/chat/conversations", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), createConversation);
+  mainRouter.get("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getConversationMessages);
+  mainRouter.post("/chat/conversations/:conversationId/messages", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), sendMessage);
+  mainRouter.put("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), markConversationAsRead);
+  mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), markConversationAsRead);
   // Voice-note / media upload for chat (WhatsApp-style audio messages)
-  mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), uploadChatMedia);
+  mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), uploadChatMedia);
   // GIF picker (Tenor proxy — key stays server-side)
-  mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), searchChatGifs);
+  mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), searchChatGifs);
 
   // MetricAi chat intelligence: translate a message / smart reply chips /
   // whole-conversation summary (all GLM-backed, graceful 503 when unset)
-  mainRouter.post("/chat/ai/translate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiTranslateMessage);
-  mainRouter.post("/chat/ai/smart-replies", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiSmartReplies);
-  mainRouter.post("/chat/conversations/:conversationId/ai/summarize", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), aiSummarizeConversation);
+  mainRouter.post("/chat/ai/translate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), aiTranslateMessage);
+  mainRouter.post("/chat/ai/smart-replies", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), aiSmartReplies);
+  mainRouter.post("/chat/conversations/:conversationId/ai/summarize", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), aiSummarizeConversation);
 
   // Chat message edit / delete (WhatsApp-style)
-  mainRouter.patch("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), editMessage);
-  mainRouter.delete("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), deleteMessage);
+  mainRouter.patch("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), editMessage);
+  mainRouter.delete("/chat/conversations/:conversationId/messages/:messageId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), deleteMessage);
 
   // Chat participants: roster / leave / roles / remove (WhatsApp-style)
-  mainRouter.get("/chat/conversations/:conversationId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), getParticipants);
-  mainRouter.post("/chat/conversations/:conversationId/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), leaveConversation);
-  mainRouter.patch("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), updateParticipantRole);
-  mainRouter.delete("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), removeParticipant);
+  mainRouter.get("/chat/conversations/:conversationId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getParticipants);
+  mainRouter.post("/chat/conversations/:conversationId/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), leaveConversation);
+  mainRouter.patch("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), updateParticipantRole);
+  mainRouter.delete("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), removeParticipant);
 
   // Contact blocking (direct chats; enforced in sendMessage/createConversation)
   mainRouter.get("/users/blocked", authenticateToken, checkSubscriptionStatus, listBlocked);
@@ -819,23 +823,23 @@ export async function createServer() {
   }, postAiAttachment);
 
   // Calls API routes
-  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCalls);
-  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallByCode);
-  mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), validateCallAccess);
+  mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCalls);
+  mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCallByCode);
+  mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), validateCallAccess);
   // Rich call detail (GET /calls/:id returns a superset of the legacy payload:
   // legacy top-level call fields + { call, participants, hasTranscript,
   // transcriptsCount, recording, conversationId }). Transcript endpoint kept
   // separate so /calls/:id keeps matching codes and UUIDs alike.
-  mainRouter.get("/calls/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallTranscript);
+  mainRouter.get("/calls/:id/transcript", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCallTranscript);
   // Get call by UUID or code (must be registered after the more specific GET routes above)
-  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), getCallDetail);
-  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), createCall);
-  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), updateCall);
-  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), joinCall);
-  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), leaveCall);
-  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), deleteCall);
-  mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), addCallParticipants);
-  mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), generateCallInvite);
+  mainRouter.get("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCallDetail);
+  mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), createCall);
+  mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), updateCall);
+  mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), joinCall);
+  mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), leaveCall);
+  mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), deleteCall);
+  mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), addCallParticipants);
+  mainRouter.post("/calls/generate-invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), generateCallInvite);
   // Guest access (public, no auth): guests join via call link + name (+password if set)
   mainRouter.get("/calls/guest/validate/:code", guestValidateCall);
   mainRouter.post("/calls/guest/:code/join", guestJoinCall);

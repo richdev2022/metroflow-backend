@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
+import { requireTeamPermission } from "../middleware/teamAuth";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
@@ -119,7 +120,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *       403:
  *         description: Plan limit reached or feature disabled (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_payment_links"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;
@@ -195,7 +196,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
  *       404:
  *         description: Link not found
  */
-router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.put("/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_payment_links"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;
@@ -244,7 +245,7 @@ router.put("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
  *       404:
  *         description: Link not found
  */
-router.delete("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.delete("/:id", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_payment_links"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const { id } = req.params;

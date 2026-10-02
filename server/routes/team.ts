@@ -1,6 +1,7 @@
 import { RequestHandler } from "express";
 import { query } from "../db";
 import { InviteTeamMemberInput, TeamMember, ApiResponse } from "@shared/api";
+import { DEFAULT_MANAGER_PERMISSIONS, DEFAULT_MEMBER_PERMISSIONS, ALL_PERMISSION_IDS } from "../middleware/teamAuth";
 import { sendEmail, generateInviteEmailHtml } from "../services/email";
 import { hashPassword } from "../services/auth";
 import crypto from "crypto";
@@ -259,15 +260,21 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
 
     const result = await query(
       `SELECT
-        id, name, email, role, status, kyc_status, salary_currency, bank_code, account_number, account_name
-       FROM users
-       WHERE business_id = $1 AND status IN ('active', 'invited', 'inactive')
-       ORDER BY created_at DESC`,
+        u.id, u.name, u.email, u.role, u.status, u.kyc_status, u.salary_currency, u.bank_code, u.account_number, u.account_name,
+        u.role_id AS "roleId",
+        tr.name AS "roleName",
+        tr.permissions AS "rolePermissions"
+       FROM users u
+       LEFT JOIN team_roles tr ON tr.id = u.role_id
+       WHERE u.business_id = $1 AND u.status IN ('active', 'invited', 'inactive')
+       ORDER BY u.created_at DESC`,
       [businessId],
     );
 
     const redisClient = getRedisClient();
-    // Add is_owner flag and presence status to each user
+    // Add is_owner flag, presence status and the member's RESOLVED permissions
+    // (owner/admin -> every permission; custom role -> its permission set;
+    // legacy manager/member -> the documented default sets).
     const teamMembers = await Promise.all(result.rows.map(async (user) => {
       const isOwner = user.id === ownerId;
       let presenceStatus = "offline";
@@ -277,11 +284,21 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
           presenceStatus = "online";
         }
       }
+      const isSuper = isOwner || user.role === "admin";
+      const permissions = isSuper
+        ? ALL_PERMISSION_IDS
+        : Array.isArray(user.rolePermissions) && user.rolePermissions.length > 0
+          ? user.rolePermissions
+          : user.role === "manager"
+            ? DEFAULT_MANAGER_PERMISSIONS
+            : DEFAULT_MEMBER_PERMISSIONS;
+      const { rolePermissions: _dropped, ...memberFields } = user;
       return {
-        ...user,
+        ...memberFields,
         role: isOwner ? "Owner" : user.role,
         is_owner: isOwner,
-        presence_status: presenceStatus
+        presence_status: presenceStatus,
+        permissions,
       };
     }));
 
@@ -353,6 +370,25 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
       });
     }
 
+    // Custom role assignment (Role & Permission management). When a roleId is
+    // supplied it must belong to this business; the legacy role string falls
+    // back to 'member' (the custom role's permissions drive enforcement).
+    let roleId: string | null = null;
+    if ((input as any).roleId) {
+      const roleCheck = await query(
+        `SELECT id FROM team_roles WHERE id = $1 AND business_id = $2 LIMIT 1`,
+        [String((input as any).roleId), businessId]
+      );
+      if (roleCheck.rows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Selected role not found for this workspace",
+        });
+      }
+      roleId = roleCheck.rows[0].id;
+    }
+    const legacyRole = input.role || "member";
+
     // Generate invite token
     const inviteToken = crypto.randomBytes(32).toString("hex");
     const inviteExpiresAt = new Date();
@@ -360,16 +396,17 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
 
     const result = await query(
       `INSERT INTO users
-       (business_id, name, email, role, status, invite_token, invite_expires_at)
-        VALUES ($1, $2, $3, $4, 'invited', $5, $6)
+       (business_id, name, email, role, status, invite_token, invite_expires_at, role_id)
+        VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7)
         ON CONFLICT (business_id, email) DO UPDATE SET
           name = $2,
           role = $4,
           invite_token = $5,
           invite_expires_at = $6,
+          role_id = $7,
           updated_at = CURRENT_TIMESTAMP
         RETURNING id, name, email, role, status`,
-      [businessId, input.name, input.email, input.role, inviteToken, inviteExpiresAt],
+      [businessId, input.name, input.email, legacyRole, inviteToken, inviteExpiresAt, roleId],
     );
 
     const member = result.rows[0];
@@ -804,7 +841,7 @@ export const updateTeamMemberRole: RequestHandler = async (req: AuthenticatedReq
    */
   try {
     const { id } = req.params;
-    const { role } = req.body;
+    const { role, roleId } = req.body;
     const businessId = req.user?.businessId;
 
     if (!businessId) {
@@ -814,11 +851,29 @@ export const updateTeamMemberRole: RequestHandler = async (req: AuthenticatedReq
       });
     }
 
-    if (!["admin", "manager", "member"].includes(role)) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid role",
-      });
+    // Two assignment modes:
+    //  - roleId  -> assign a custom role from the workspace's role manager
+    //  - role    -> legacy fixed role ('admin'|'manager'|'member'); clears any
+    //               custom role so the fixed role's defaults apply
+    let legacyRole: string | null = null;
+    let customRoleId: string | null = null;
+    if (roleId) {
+      const roleCheck = await query(
+        `SELECT id FROM team_roles WHERE id = $1 AND business_id = $2 LIMIT 1`,
+        [String(roleId), businessId]
+      );
+      if (roleCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, error: "Selected role not found for this workspace" });
+      }
+      customRoleId = roleCheck.rows[0].id;
+    } else {
+      if (!role || !["admin", "manager", "member"].includes(role)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid role",
+        });
+      }
+      legacyRole = role;
     }
 
     // Get business details
@@ -839,10 +894,12 @@ export const updateTeamMemberRole: RequestHandler = async (req: AuthenticatedReq
 
     const result = await query(
       `UPDATE users
-        SET role = $1, updated_at = CURRENT_TIMESTAMP
+        SET role = COALESCE($1, role),
+            role_id = $4,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = $2 AND business_id = $3
         RETURNING id, name, email, role, status`,
-      [role, id, businessId],
+      [legacyRole, id, businessId, customRoleId],
     );
 
     if (result.rows.length === 0) {

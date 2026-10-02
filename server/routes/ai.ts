@@ -516,6 +516,10 @@ export const getAiStatus: RequestHandler = async (req: MetricAiRequest, res) => 
         enabled,                       // plan includes MetricAi
         serverConfigured,              // GLM key present on the server
         available: enabled && serverConfigured,
+        // Every team member chats with MetricAi privately: history is stored
+        // per USER (ai_messages.user_id = the caller), never shared across
+        // the workspace — even though the BUSINESS pays for the plan.
+        privateChat: true,
         planName: aiAccess.planName || null,
         chatModel: getGlmChatModel(),
         imageModel: getGlmImageModel(),

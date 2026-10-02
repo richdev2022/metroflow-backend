@@ -551,7 +551,12 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
       [otpCode, otpExpiresAt, userId]
     );
 
-    // Send via email
+    // Deliver the OTP over every available channel; only fail when NO
+    // channel succeeded (sendEmail resolves to false instead of throwing,
+    // sendSMS throws on provider failure).
+    let emailSent = false;
+    let smsSent = false;
+
     if (email) {
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
@@ -569,21 +574,24 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
           </div>
         </div>
       `;
-
-      await sendEmail(email, "OTP to Update Transaction PIN - MetricFlow", "Use this OTP to update your PIN", html);
+      emailSent = await sendEmail(email, "OTP to Update Transaction PIN - MetricFlow", "Use this OTP to update your PIN", html);
+      if (!emailSent) console.error("PIN OTP email delivery failed");
     }
 
-    // Send via SMS
     if (phone) {
       try {
         await sendSMS(phone, `Your MetricFlow OTP to update transaction PIN is: ${otpCode}`);
+        smsSent = true;
       } catch (smsErr) {
-        console.error("SMS send error:", smsErr);
-        // Continue even if SMS fails (email might have worked)
+        console.error("PIN OTP SMS send error:", smsErr);
       }
     }
 
-    res.json({ success: true, message: "OTP sent successfully" });
+    if (!emailSent && !smsSent) {
+      return res.status(500).json({ success: false, error: "Failed to send OTP via email and SMS" });
+    }
+
+    res.json({ success: true, message: "OTP sent successfully", channels: [...(emailSent ? ['email'] : []), ...(smsSent ? ['sms'] : [])] });
   } catch (error) {
     console.error("Send PIN OTP error:", error);
     res.status(500).json({ success: false, error: "Failed to send OTP" });
@@ -727,26 +735,34 @@ router.post("/otp-enabled/send-otp", authenticateToken, checkSubscriptionStatus,
       [otpCode, otpExpiresAt, userId]
     );
 
+    let emailSent = false;
+    let smsSent = false;
+
     if (email) {
       const html = generateOtpEmailHtml(otpCode, "Confirm Transaction OTP Setting");
-      await sendEmail(
+      emailSent = await sendEmail(
         email,
         "Confirm Transaction OTP Setting - MetricFlow",
         "Use this OTP to confirm your security setting change",
         html
       );
+      if (!emailSent) console.error("OTP-toggle OTP email delivery failed");
     }
 
     if (phone) {
       try {
         await sendSMS(phone, `Your MetricFlow OTP to confirm your transaction OTP setting change is: ${otpCode}`);
+        smsSent = true;
       } catch (smsErr) {
-        console.error("SMS send error:", smsErr);
-        // Continue even if SMS fails (email might have worked)
+        console.error("OTP-toggle OTP SMS send error:", smsErr);
       }
     }
 
-    res.json({ success: true, message: "OTP sent successfully" });
+    if (!emailSent && !smsSent) {
+      return res.status(500).json({ success: false, error: "Failed to send OTP via email and SMS" });
+    }
+
+    res.json({ success: true, message: "OTP sent successfully", channels: [...(emailSent ? ['email'] : []), ...(smsSent ? ['sms'] : [])] });
   } catch (error) {
     console.error("Send OTP-toggle OTP error:", error);
     res.status(500).json({ success: false, error: "Failed to send OTP" });

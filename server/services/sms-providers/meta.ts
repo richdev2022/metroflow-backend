@@ -8,9 +8,19 @@ const META_WHATSAPP_PHONE_NUMBER_ID = process.env.META_WHATSAPP_PHONE_NUMBER_ID;
 
 export const metaProvider: WhatsAppProvider = {
     async sendWhatsApp(to: string, message: string) {
-        if (process.env.NODE_ENV === 'test' || !META_WHATSAPP_ACCESS_TOKEN || !META_WHATSAPP_PHONE_NUMBER_ID) {
-            console.log(`[MOCK Meta WhatsApp] To: ${to}, Message: ${message}`);
-            return { success: true, message: "Mock WhatsApp sent" };
+        if (!META_WHATSAPP_ACCESS_TOKEN || !META_WHATSAPP_PHONE_NUMBER_ID) {
+            if (process.env.NODE_ENV === 'production') {
+                console.error(
+                    '[Meta WhatsApp] NOT CONFIGURED: META_WHATSAPP_ACCESS_TOKEN and/or META_WHATSAPP_PHONE_NUMBER_ID are unset in production. Delivery cannot succeed.'
+                );
+                return {
+                    success: false,
+                    provider: 'meta',
+                    error: 'Meta WhatsApp is not configured on the server (META_WHATSAPP_ACCESS_TOKEN / META_WHATSAPP_PHONE_NUMBER_ID missing)',
+                };
+            }
+            console.warn(`[MOCK Meta WhatsApp] To: ${to}, Message: ${message} — set META_WHATSAPP_ACCESS_TOKEN + META_WHATSAPP_PHONE_NUMBER_ID for real delivery`);
+            return { success: true, provider: 'meta', mock: true, message: "Mock WhatsApp sent (Meta not configured)" };
         }
 
         try {

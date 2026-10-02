@@ -180,4 +180,24 @@ export const AVAILABLE_PERMISSIONS = [
     description:
       "View the site wishlist, manage email subscribers per category and send email notification campaigns",
   },
+  {
+    id: "manage_payment_links",
+    name: "Manage Payment Links",
+    description: "Create, edit, share and deactivate payment links",
+  },
+  {
+    id: "manage_invoices",
+    name: "Manage Invoices",
+    description: "Create, send, edit and cancel smart invoices",
+  },
+  {
+    id: "manage_store",
+    name: "Manage Storefront",
+    description: "List products, fulfil orders and manage the public storefront",
+  },
+  {
+    id: "manage_subscriptions",
+    name: "Manage Recurring Billing",
+    description: "Create subscription plans and manage customer subscribers",
+  },
 ];

@@ -908,6 +908,14 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
        return res.json({ success: true, message: "Payment already verified" });
     }
 
+    // A checkout the customer abandoned before paying was already marked
+    // cancelled by the browser-facing verify flow — report it explicitly so
+    // clients show a friendly "nothing was deducted" state instead of a
+    // generic verification failure.
+    if (transaction.status === 'cancelled') {
+       return res.json({ success: false, cancelled: true, message: "Payment cancelled — no money was deducted." });
+    }
+
     const providerName = transaction.payment_provider || process.env.DEFAULT_PAYMENT_PROVIDER || 'flutterwave';
     const provider = getProvider(providerName);
 
@@ -938,8 +946,20 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
             } else if (providerName === 'monnify') {
                 walletVerified = verifyResponse && verifyResponse.success && verifyResponse.data?.paymentStatus === 'PAID';
             }
-        } catch (verifyErr) {
+        } catch (verifyErr: any) {
             console.error("Wallet funding verification failed:", verifyErr);
+            // A checkout that was never completed has no provider transaction
+            // (404 / "not found"). Mark it cancelled locally (idempotent) and
+            // tell the client so it can show the right message.
+            const notFound = /no transaction|not found|could not be found|does not exist/i.test(verifyErr?.message || '')
+                || verifyErr?.response?.status === 404;
+            if (notFound) {
+                await query(
+                    `UPDATE transactions SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND status NOT IN ('success','cancelled')`,
+                    [transaction.id],
+                ).catch(() => {});
+                return res.json({ success: false, cancelled: true, message: "Payment cancelled — no money was deducted." });
+            }
         }
 
         if (!walletVerified) {
@@ -995,7 +1015,12 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
             }
 
             await client.query('COMMIT');
-            return res.json({ success: true, message: "Wallet funded successfully" });
+            return res.json({
+                success: true,
+                message: "Wallet funded successfully",
+                status: 'success',
+                amount: transaction.amount,
+            });
         } catch (creditErr) {
             await client.query('ROLLBACK');
             console.error("Wallet funding credit failed:", creditErr);

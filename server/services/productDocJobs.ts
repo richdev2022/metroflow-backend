@@ -4,6 +4,13 @@ import { sendEmail } from "./email";
 
 type JobType = "generate" | "regenerate";
 
+// Official brand logo used across every email template. Always points at
+// the official Metricorex artwork hosted on the marketing site — app-host
+// copies can go stale (and older templates referenced dead builder.io /
+// placeholder URLs). Override with APP_LOGO_URL if the brand asset moves.
+const EMAIL_LOGO_URL =
+  process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
+
 export async function processPendingProductDocJobs(limit: number = 5) {
   const pendingJobsResult = await query(
     `
@@ -170,9 +177,7 @@ async function sendProductDocReadyEmail(
 
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
   const dashboardUrl = baseUrl ? `${baseUrl}/ideas` : "http://localhost:8080/ideas";
-  const logoUrl = baseUrl
-    ? `${baseUrl}/Assets/logo.png`
-    : "https://cdn.builder.io/api/v1/image/assets%2F46d24169bc6640e4a28cf8a42de16442%2F5d8ef2d7f38346fbb44eb85f01d7d899";
+  const logoUrl = EMAIL_LOGO_URL;
 
   const actionText =
     jobType === "generate"

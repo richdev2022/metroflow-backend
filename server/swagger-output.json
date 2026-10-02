@@ -1,9 +1,9 @@
 {
   "openapi": "3.0.0",
   "info": {
-    "title": "MetricFlow API",
-    "version": "1.0.0",
-    "description": "API documentation for MetricFlow Backend"
+    "title": "Metricorex API",
+    "version": "2.0.0",
+    "description": "Metricorex (Metroflow) backend — business work OS with fintech rails. Revenue features: Payment Links, Smart Invoices, MetricAi Credit Packs, Storefront (hosted product checkout) and Recurring Billing (customer subscriptions) — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens."
   },
   "servers": [
     {
@@ -3823,6 +3823,374 @@
         }
       }
     },
+    "/api/store/products": {
+      "get": {
+        "summary": "List the business's storefront products",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Products + storefront plan state"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a storefront product (plan-gated)",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "price"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "price": {
+                    "type": "number"
+                  },
+                  "stock": {
+                    "type": "integer",
+                    "nullable": true,
+                    "description": "NULL = unlimited"
+                  },
+                  "image_url": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "paused",
+                      "draft"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Product created"
+          },
+          "403": {
+            "description": "Storefront disabled or product cap reached (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/store/products/{id}": {
+      "put": {
+        "summary": "Update a storefront product",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated product"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a storefront product",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/store/orders": {
+      "get": {
+        "summary": "List storefront orders + sales stats",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "paid",
+                "fulfilled",
+                "cancelled",
+                "all"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Orders (with items) + stats"
+          }
+        }
+      }
+    },
+    "/api/store/orders/{id}/fulfil": {
+      "post": {
+        "summary": "Mark a paid order as fulfilled",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Fulfilled order"
+          },
+          "400": {
+            "description": "Only paid orders can be fulfilled"
+          }
+        }
+      }
+    },
+    "/api/store/orders/{id}/cancel": {
+      "post": {
+        "summary": "Cancel an unpaid order",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled order"
+          },
+          "400": {
+            "description": "Only unpaid orders can be cancelled"
+          }
+        }
+      }
+    },
+    "/api/store/public/{businessId}": {
+      "get": {
+        "summary": "Public storefront view (business profile + active products)",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "businessId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Storefront payload"
+          },
+          "404": {
+            "description": "Storefront not found"
+          }
+        }
+      }
+    },
+    "/api/store/public/{businessId}/checkout": {
+      "post": {
+        "summary": "Place an order and start payment (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "businessId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "customer_name",
+                  "items"
+                ],
+                "properties": {
+                  "customer_name": {
+                    "type": "string"
+                  },
+                  "customer_email": {
+                    "type": "string"
+                  },
+                  "customer_phone": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional provider override"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "product_id",
+                        "quantity"
+                      ],
+                      "properties": {
+                        "product_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "quantity": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 999
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url + order reference"
+          },
+          "400": {
+            "description": "Invalid items / sold out / checkout failed"
+          }
+        }
+      }
+    },
+    "/api/store/public/order/{reference}": {
+      "get": {
+        "summary": "Public order status (checkout landing page polls this)",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reference",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order summary + status"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        }
+      }
+    },
     "/api/settings": {
       "get": {
         "summary": "Get business settings",
@@ -4207,6 +4575,481 @@
         }
       }
     },
+    "/api/recurring/plans": {
+      "get": {
+        "summary": "List the business's subscription plans + stats",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plans with subscriber counts + MRR estimate"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a customer subscription plan (plan-gated)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "amount",
+                  "interval"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "amount": {
+                    "type": "number"
+                  },
+                  "interval": {
+                    "type": "string",
+                    "enum": [
+                      "daily",
+                      "weekly",
+                      "monthly"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Plan created"
+          },
+          "403": {
+            "description": "Recurring billing disabled or plan cap reached (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/recurring/plans/{id}": {
+      "put": {
+        "summary": "Update a subscription plan (pause/resume, reprice)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated plan"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a subscription plan (only when it has no subscribers)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "Plan still has subscribers"
+          }
+        }
+      }
+    },
+    "/api/recurring/subscribers": {
+      "get": {
+        "summary": "List subscribers (+ charges stats)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "plan_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "past_due",
+                "cancelled",
+                "all"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscribers with plan info + stats"
+          }
+        }
+      },
+      "post": {
+        "summary": "Add a subscriber (merchant-added customer, first charge starts today)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "plan_id",
+                  "customer_name",
+                  "customer_email"
+                ],
+                "properties": {
+                  "plan_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "customer_name": {
+                    "type": "string"
+                  },
+                  "customer_email": {
+                    "type": "string"
+                  },
+                  "customer_phone": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscriber added (wallet-charged now, or checkout_url for the first cycle)"
+          },
+          "400": {
+            "description": "Invalid plan / already subscribed"
+          }
+        }
+      }
+    },
+    "/api/recurring/subscribers/{id}": {
+      "delete": {
+        "summary": "Cancel a subscriber (stops future charges)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled"
+          }
+        }
+      }
+    },
+    "/api/recurring/subscribers/{id}/reactivate": {
+      "post": {
+        "summary": "Reactivate a past-due or cancelled subscriber (next charge runs today)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Reactivated"
+          }
+        }
+      }
+    },
+    "/api/recurring/charges": {
+      "get": {
+        "summary": "List subscription charges (revenue history)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "awaiting_payment",
+                "success",
+                "failed",
+                "all"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Charges newest first"
+          }
+        }
+      }
+    },
+    "/api/recurring/public/plans/{publicId}": {
+      "get": {
+        "summary": "Public subscription plan view (subscribe page)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publicId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plan + merchant payload"
+          },
+          "404": {
+            "description": "Plan not found or paused"
+          }
+        }
+      }
+    },
+    "/api/recurring/public/plans/{publicId}/subscribe": {
+      "post": {
+        "summary": "Subscribe to a plan (wallet-charged when the email maps to a Metroflow user, else returns a checkout URL)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publicId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "customer_name",
+                  "customer_email"
+                ],
+                "properties": {
+                  "customer_name": {
+                    "type": "string"
+                  },
+                  "customer_email": {
+                    "type": "string"
+                  },
+                  "customer_phone": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscribed (charge succeeded, or checkout_url for the first cycle)"
+          },
+          "400": {
+            "description": "Already subscribed / checkout failed"
+          }
+        }
+      }
+    },
+    "/api/recurring/public/charges/{reference}": {
+      "get": {
+        "summary": "Public charge status (email pay-link landing)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reference",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Charge summary"
+          },
+          "404": {
+            "description": "Charge not found"
+          }
+        }
+      }
+    },
+    "/api/recurring/public/charges/{reference}/pay": {
+      "post": {
+        "summary": "Pay a due subscription charge (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reference",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "checkout_url + reference"
+          },
+          "400": {
+            "description": "Charge not payable"
+          }
+        }
+      }
+    },
+    "/api/recurring/public/unsubscribe/{token}": {
+      "post": {
+        "summary": "Unsubscribe via the emailed token (no auth)",
+        "tags": [
+          "Recurring Billing"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled"
+          },
+          "404": {
+            "description": "Subscription not found"
+          }
+        }
+      }
+    },
     "/api/recordings": {
       "get": {
         "summary": "Get recordings",
@@ -4413,6 +5256,105 @@
         }
       }
     },
+    "/api/push/subscribe": {
+      "post": {
+        "summary": "Register a Web Push (VAPID) subscription for the authenticated user",
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "endpoint",
+                  "keys"
+                ],
+                "properties": {
+                  "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "keys": {
+                    "type": "object",
+                    "properties": {
+                      "p256dh": {
+                        "type": "string"
+                      },
+                      "auth": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "userAgent": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription saved (upsert by endpoint)"
+          }
+        }
+      }
+    },
+    "/api/push/unsubscribe": {
+      "post": {
+        "summary": "Remove a Web Push subscription (by endpoint) for the authenticated user",
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription removed (or nothing to remove)"
+          }
+        }
+      }
+    },
+    "/api/push/vapid-public-key": {
+      "get": {
+        "summary": "Web Push VAPID public key (for PushManager.subscribe)",
+        "tags": [
+          "Push"
+        ],
+        "responses": {
+          "200": {
+            "description": "VAPID public key (or publicKey null when Web Push is unavailable)"
+          }
+        }
+      }
+    },
     "/api/public/app-config": {
       "get": {
         "summary": "Public app configuration (maintenance mode + active announcement)",
@@ -4423,6 +5365,88 @@
         "responses": {
           "200": {
             "description": "Maintenance flag + latest active announcement"
+          }
+        }
+      }
+    },
+    "/api/public/wishlist": {
+      "post": {
+        "summary": "Join the MetriCorex Personal wishlist",
+        "tags": [
+          "Public"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "features": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "productUpdates": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Wishlist entry stored; confirmation email queued"
+          }
+        }
+      }
+    },
+    "/api/public/subscribe": {
+      "post": {
+        "summary": "Subscribe to email categories (e.g. monthly product updates)",
+        "tags": [
+          "Public"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "categories": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscriber stored; welcome email queued"
           }
         }
       }
@@ -5086,6 +6110,255 @@
         "responses": {
           "200": {
             "description": "Configuration updated"
+          }
+        }
+      }
+    },
+    "/api/payment-links": {
+      "get": {
+        "summary": "List the business's payment links with payment stats",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment links (newest first)"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a payment link (fixed or custom amount, plan-gated)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "amount": {
+                    "type": "number",
+                    "description": "Required unless allow_custom_amount is true"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "default": "NGN"
+                  },
+                  "allow_custom_amount": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created link (shareable slug returned)"
+          },
+          "403": {
+            "description": "Plan limit reached or feature disabled (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/payment-links/{id}": {
+      "put": {
+        "summary": "Update a payment link (title, description, amount, custom-amount, active state)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated link"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a payment link",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      }
+    },
+    "/api/payment-links/{id}/payments": {
+      "get": {
+        "summary": "List payments received through a link",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Link payments (newest first)"
+          },
+          "404": {
+            "description": "Link not found"
+          }
+        }
+      }
+    },
+    "/api/payment-links/public/{slug}": {
+      "get": {
+        "summary": "Public payment link view (no auth — customer checkout)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Link details + business name"
+          },
+          "404": {
+            "description": "Link not found or inactive"
+          }
+        }
+      }
+    },
+    "/api/payment-links/public/{slug}/initiate": {
+      "post": {
+        "summary": "Initiate a customer payment (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Payment Links"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "payer_email"
+                ],
+                "properties": {
+                  "amount": {
+                    "type": "number",
+                    "description": "Required for custom-amount links"
+                  },
+                  "payer_name": {
+                    "type": "string"
+                  },
+                  "payer_email": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional provider override"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url + reference"
+          },
+          "404": {
+            "description": "Link not found or inactive"
+          },
+          "502": {
+            "description": "Provider initiation failed"
           }
         }
       }
@@ -5863,6 +7136,324 @@
         "responses": {
           "200": {
             "description": "Business KYC submitted"
+          }
+        }
+      }
+    },
+    "/api/invoices": {
+      "get": {
+        "summary": "List the business's invoices with payment stats",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "pending",
+                "paid",
+                "cancelled",
+                "overdue",
+                "all"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoices (newest first)"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an invoice (line items + tax + due date, plan-gated)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "client_name",
+                  "client_email",
+                  "items"
+                ],
+                "properties": {
+                  "client_name": {
+                    "type": "string"
+                  },
+                  "client_email": {
+                    "type": "string"
+                  },
+                  "client_phone": {
+                    "type": "string"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "description": {
+                          "type": "string"
+                        },
+                        "quantity": {
+                          "type": "number"
+                        },
+                        "unit_price": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  },
+                  "tax_percent": {
+                    "type": "number"
+                  },
+                  "due_date": {
+                    "type": "string",
+                    "format": "date"
+                  },
+                  "notes": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "draft"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created invoice (invoice_number returned)"
+          },
+          "403": {
+            "description": "Monthly quota reached or feature disabled (PLAN_UPGRADE_REQUIRED)"
+          }
+        }
+      }
+    },
+    "/api/invoices/{id}": {
+      "get": {
+        "summary": "Invoice detail (owner) — line items + payment history",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice, items and payments"
+          },
+          "404": {
+            "description": "Invoice not found"
+          }
+        }
+      },
+      "put": {
+        "summary": "Edit a draft/pending invoice that has not received any payment",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated invoice"
+          },
+          "400": {
+            "description": "Paid invoices cannot be edited"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an invoice (only when nothing has been paid against it)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "Paid invoices cannot be deleted"
+          }
+        }
+      }
+    },
+    "/api/invoices/{id}/cancel": {
+      "post": {
+        "summary": "Cancel an unpaid invoice",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled invoice"
+          },
+          "400": {
+            "description": "Only unpaid invoices can be cancelled"
+          }
+        }
+      }
+    },
+    "/api/invoices/public/{id}": {
+      "get": {
+        "summary": "Public invoice view (no auth — the client sees items, totals, due date)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public invoice payload"
+          },
+          "404": {
+            "description": "Invoice not found"
+          }
+        }
+      }
+    },
+    "/api/invoices/public/{id}/initiate": {
+      "post": {
+        "summary": "Initiate a client payment (returns hosted checkout URL, settled by webhook)",
+        "tags": [
+          "Smart Invoices"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "payer_name": {
+                    "type": "string"
+                  },
+                  "payer_email": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "description": "Optional provider override"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url + reference"
+          },
+          "400": {
+            "description": "Invoice already paid / no amount due"
+          },
+          "404": {
+            "description": "Invoice not found"
           }
         }
       }
@@ -7322,6 +8913,93 @@
         }
       }
     },
+    "/api/users/{userId}/block": {
+      "post": {
+        "summary": "Block a contact",
+        "description": "Blocks a user in the same business. Direct conversations between the two users stop accepting messages in both directions. 409 when the block already exists.",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contact blocked"
+          },
+          "400": {
+            "description": "Invalid target / cannot block yourself"
+          },
+          "404": {
+            "description": "Target user not found in this business"
+          },
+          "409": {
+            "description": "Contact already blocked"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Unblock a contact",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contact unblocked"
+          },
+          "404": {
+            "description": "No such block"
+          }
+        }
+      }
+    },
+    "/api/users/blocked": {
+      "get": {
+        "summary": "List blocked contacts",
+        "tags": [
+          "Chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Blocked contacts fetched successfully"
+          }
+        }
+      }
+    },
     "/api/auth/register": {
       "post": {
         "summary": "Register a new business and admin user",
@@ -7939,6 +9617,108 @@
           },
           "500": {
             "description": "Server error"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/packs": {
+      "get": {
+        "summary": "Credit pack catalogue with plan discount + buyer's credit balance",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Packs (price, discount_percent, discounted_price) + balance"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/balance": {
+      "get": {
+        "summary": "Current MetricAi credit balance for the caller",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Credit balance"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/purchases": {
+      "get": {
+        "summary": "Purchase history for the caller",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent credit purchases (newest first)"
+          }
+        }
+      }
+    },
+    "/api/ai-credits/purchase": {
+      "post": {
+        "summary": "Purchase a MetricAi credit pack from a wallet",
+        "tags": [
+          "MetricAi Credits"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pack_id"
+                ],
+                "properties": {
+                  "pack_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "wallet_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Optional — auto-resolved when omitted"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Purchase succeeded, credits granted"
+          },
+          "400": {
+            "description": "Insufficient balance / no wallet"
+          },
+          "404": {
+            "description": "Pack not found"
           }
         }
       }
@@ -10128,6 +11908,84 @@
         }
       }
     },
+    "/api/admin/growth/wishlist": {
+      "get": {
+        "summary": "List all Personal wishlist entries (searchable, paginated)",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/growth/subscribers": {
+      "get": {
+        "summary": "List email subscribers (filter by category, searchable)",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/growth/campaigns/send": {
+      "post": {
+        "summary": "Send an email notification to every subscriber of a category",
+        "tags": [
+          "Admin"
+        ]
+      }
+    },
+    "/api/admin/invoices": {
+      "get": {
+        "summary": "Platform-wide Smart Invoices overview (revenue, volumes, recent payments)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice summary + payments + recent activity"
+          }
+        }
+      }
+    },
+    "/api/admin/store": {
+      "get": {
+        "summary": "Platform-wide Storefront overview (products, orders, order-fee revenue, recent orders)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Store summary + money stats + recent activity"
+          }
+        }
+      }
+    },
+    "/api/admin/subscriptions": {
+      "get": {
+        "summary": "Platform-wide Recurring Billing overview (plans, subscribers, charge-fee revenue, recent charges)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscription summary + money stats + recent activity"
+          }
+        }
+      }
+    },
     "/api/activity-logs": {
       "get": {
         "summary": "Get activity logs",
@@ -10227,8 +12085,16 @@
       "description": "Subscription management endpoints"
     },
     {
+      "name": "Storefront",
+      "description": "Metroflow Store — hosted product checkout for businesses — a revenue feature (order fee lands in the platform revenue wallet, plan-configurable via store_fee_discount_percent)"
+    },
+    {
       "name": "Settings",
       "description": "Business settings management"
+    },
+    {
+      "name": "Recurring Billing",
+      "description": "Customer subscriptions — auto-charging recurring plans for businesses — a revenue feature (charge fee lands in the platform revenue wallet, plan-configurable via subscription_fee_discount_percent)"
     },
     {
       "name": "Providers",
@@ -10239,8 +12105,16 @@
       "description": "Payroll management and adjustments"
     },
     {
+      "name": "Payment Links",
+      "description": "Shareable checkout links for businesses — a revenue feature (collection fee lands in the platform revenue wallet, plan-configurable)"
+    },
+    {
       "name": "KYC",
       "description": "Know Your Customer verification endpoints"
+    },
+    {
+      "name": "Smart Invoices",
+      "description": "Itemised invoices with public checkout pages — a revenue feature (settlement fee lands in the platform revenue wallet, plan-configurable)"
     },
     {
       "name": "Fees",
@@ -10261,6 +12135,10 @@
     {
       "name": "Auth",
       "description": "Authentication endpoints"
+    },
+    {
+      "name": "MetricAi Credits",
+      "description": "One-time MetricAi credit pack top-ups purchasable from wallets — a revenue feature (plan-level ai_credit_discount_percent applies)"
     },
     {
       "name": "Admin Fees",

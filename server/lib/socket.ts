@@ -1261,13 +1261,30 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    // User presence
-    socket.on("user-online", async (userId: string, businessId: string) => {
+    // User presence — accepts BOTH payload shapes:
+    //   - web-style (JS client): two positional args (userId, businessId)
+    //   - mobile (Dart client): ONE data argument — socket_io_client's emit()
+    //     only takes a single data param, so Dart sends {userId, businessId}
+    //     as a map (three positional args do not compile there).
+    // The server-verified handshake identity always wins when present, and
+    // anything unresolvable is discarded instead of being stringified into
+    // garbage rooms like "user:[object Object]" or "user:abc,def".
+    socket.on("user-online", async (...args: any[]) => {
+      const first = args[0];
+      const payload =
+        first && typeof first === "object" && !Array.isArray(first)
+          ? (first as { userId?: string; businessId?: string })
+          : null;
+      let userId: string =
+        payload?.userId ?? (typeof first === "string" ? first : "");
+      let businessId: string =
+        payload?.businessId ?? (typeof args[1] === "string" ? args[1] : "");
       // Prefer the server-verified identity from handshake auth when present
       if (socket.data.authenticated) {
         userId = socket.data.userId;
         businessId = socket.data.businessId;
       }
+      if (!userId || !businessId) return;
       socket.data.userId = userId;
       socket.data.businessId = businessId;
 
@@ -1300,7 +1317,24 @@ export function initSocketServer(server: http.Server): void {
       }
     });
 
-    socket.on("user-keep-alive", async (userId: string, businessId: string) => {
+    // Same dual-shape contract as "user-online" above; the handshake identity
+    // wins so unauthenticated or malformed payloads can never poison the
+    // presence keys with "online:undefined:undefined".
+    socket.on("user-keep-alive", async (...args: any[]) => {
+      const first = args[0];
+      const payload =
+        first && typeof first === "object" && !Array.isArray(first)
+          ? (first as { userId?: string; businessId?: string })
+          : null;
+      let userId: string =
+        payload?.userId ?? (typeof first === "string" ? first : "");
+      let businessId: string =
+        payload?.businessId ?? (typeof args[1] === "string" ? args[1] : "");
+      if (socket.data.authenticated) {
+        userId = socket.data.userId;
+        businessId = socket.data.businessId;
+      }
+      if (!userId || !businessId) return;
       if (isRedisReady()) {
         await redisClient.setex(
           `online:${businessId}:${userId}`,

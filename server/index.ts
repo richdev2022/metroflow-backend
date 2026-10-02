@@ -31,7 +31,7 @@ import {
   changePassword,
   getMe,
 } from "./routes/auth";
-import { biometricEnroll, biometricLogin, biometricRevoke } from "./routes/auth";
+import { biometricEnroll, biometricLogin, biometricRevoke, biometricStatus } from "./routes/auth";
 import {
   getTasks,
   createTask,
@@ -639,6 +639,7 @@ export async function createServer() {
   // Biometric unlock endpoints
   mainRouter.post("/auth/biometric/enroll", authenticateToken, biometricEnroll);
   mainRouter.post("/auth/biometric/login", biometricLogin);
+  mainRouter.post("/auth/biometric/status", biometricStatus);
   mainRouter.delete("/auth/biometric/enroll", authenticateToken, biometricRevoke);
 
   // Tasks API routes

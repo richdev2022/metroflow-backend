@@ -1460,3 +1460,126 @@ export async function sendTransactionAlert(
   
   await sendEmail(userEmail, userName, `${transactionType.toUpperCase()} Alert - ${reference}`, htmlContent);
 }
+
+/* ==========================================================================
+ * TRANSACTION DISPUTE LIFECYCLE EMAILS
+ * Customer files a dispute -> admin alerted -> status changes notify the
+ * customer. One flexible card builder + three thin senders.
+ * ========================================================================== */
+
+interface DisputeEmailData {
+  customerName: string;
+  reference: string;
+  amount?: string | number;
+  currency?: string;
+  category?: string;
+  status?: string;
+  message?: string;
+  note?: string;
+  actionLabel?: string; // e.g. "Reversal triggered", "Provider recheck", "Closed"
+  receiptUrl?: string;
+}
+
+function disputeStatusPill(status?: string): { bg: string; fg: string; label: string } {
+  const s = (status || "").toLowerCase();
+  if (s === "resolved") return { bg: "#ecfdf5", fg: "#065f46", label: "Resolved" };
+  if (s === "closed") return { bg: "#f3f4f6", fg: "#374151", label: "Closed" };
+  if (s === "rejected") return { bg: "#fef2f2", fg: "#991b1b", label: "Rejected" };
+  if (s === "under_review") return { bg: "#fffbeb", fg: "#92400e", label: "Under review" };
+  return { bg: "#eff6ff", fg: "#1d4ed8", label: "Open" };
+}
+
+function disputeRow(label: string, value?: string | number | null): string {
+  if (value === undefined || value === null || value === "") return "";
+  return `
+    <tr>
+      <td style="padding: 6px 0; color: #6b7280; font-size: 13px; width: 40%;">${label}</td>
+      <td style="padding: 6px 0; color: #111827; font-size: 13px; font-weight: 600; text-align: right; word-break: break-all;">${value}</td>
+    </tr>`;
+}
+
+export function generateDisputeEmailHtml(
+  heading: string,
+  intro: string,
+  data: DisputeEmailData,
+  opts: { forAdmin?: boolean } = {},
+): string {
+  const logoUrl = EMAIL_LOGO_URL;
+  const pill = disputeStatusPill(data.status);
+  const accent = opts.forAdmin ? "#7c3aed" : "#2563eb";
+  const cta = opts.forAdmin
+    ? `
+          <p style="text-align: center; margin: 28px 0 8px;">
+            <a href="${data.receiptUrl || "https://app.metricorex.com"}" style="background-color: ${accent}; color: #ffffff; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; display: inline-block;">Open Admin Dashboard</a>
+          </p>`
+    : "";
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border-top: 4px solid ${accent};">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+
+          <h1 style="color: #111827; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 8px;">${heading}</h1>
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-bottom: 24px;">${intro}</p>
+
+          <div style="text-align: center; margin-bottom: 20px;">
+            <span style="background-color: ${pill.bg}; color: ${pill.fg}; font-size: 12px; font-weight: 700; padding: 6px 14px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.05em;">${pill.label}</span>
+          </div>
+
+          <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px 24px; margin-bottom: 24px;">
+            ${disputeRow("Reference", data.reference)}
+            ${disputeRow("Amount", data.amount ? `${data.currency || "NGN"} ${data.amount}` : null)}
+            ${disputeRow("Category", data.category ? String(data.category).replace(/_/g, " ") : null)}
+            ${disputeRow("Customer message", data.message)}
+            ${disputeRow("Admin note", data.note)}
+            ${disputeRow("Action taken", data.actionLabel)}
+          </div>
+
+          ${cta}
+
+          <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-top: 28px;">
+            Need help? Contact us at support@metricorex.com.<br/>
+            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+          </p>
+        </div>
+      </body>
+    </html>`;
+}
+
+/** Admin inbox: a customer filed a new dispute. */
+export async function sendDisputeAdminAlert(
+  adminEmail: string,
+  businessName: string,
+  data: DisputeEmailData,
+): Promise<void> {
+  const html = generateDisputeEmailHtml(
+    "New Transaction Dispute",
+    `${businessName} disputed a transaction and is awaiting review.`,
+    { ...data, status: data.status || "open" },
+    { forAdmin: true },
+  );
+  await sendEmail(adminEmail, "Dispute Desk", `Dispute filed - ${data.reference}`, html);
+}
+
+/** Customer: their dispute state changed (filed / under review / resolved / closed). */
+export async function sendDisputeCustomerUpdate(
+  userEmail: string,
+  data: DisputeEmailData,
+): Promise<void> {
+  const heading =
+    data.status === "open" ? "Dispute Received" : "Dispute Update";
+  const intro =
+    data.status === "open"
+      ? `Hi ${data.customerName}, we received your dispute and our team is on it.`
+      : `Hi ${data.customerName}, here is the latest update on your dispute.`;
+  const html = generateDisputeEmailHtml(heading, intro, data);
+  await sendEmail(
+    userEmail,
+    data.customerName,
+    `${heading} - ${data.reference}`,
+    html,
+  );
+}

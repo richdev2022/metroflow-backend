@@ -263,7 +263,11 @@ export const getTeamMembers: RequestHandler = async (req: AuthenticatedRequest, 
         u.id, u.name, u.email, u.role, u.status, u.kyc_status, u.salary_currency, u.bank_code, u.account_number, u.account_name,
         u.role_id AS "roleId",
         tr.name AS "roleName",
-        tr.permissions AS "rolePermissions"
+        tr.permissions AS "rolePermissions",
+        u.phone_number AS "phoneNumber",
+        u.job_title AS "jobTitle",
+        u.department AS "department",
+        u.employment_type AS "employmentType"
        FROM users u
        LEFT JOIN team_roles tr ON tr.id = u.role_id
        WHERE u.business_id = $1 AND u.status IN ('active', 'invited', 'inactive')
@@ -389,6 +393,16 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
     }
     const legacyRole = input.role || "member";
 
+    // Complete employee information (optional — invite still works with just
+    // name + email). Accept both camelCase and snake_case spellings.
+    const phoneNumber =
+      (input as any).phoneNumber ?? (input as any).phone_number ?? null;
+    const jobTitle =
+      (input as any).jobTitle ?? (input as any).job_title ?? null;
+    const department = (input as any).department ?? null;
+    const employmentType =
+      (input as any).employmentType ?? (input as any).employment_type ?? null;
+
     // Generate invite token
     const inviteToken = crypto.randomBytes(32).toString("hex");
     const inviteExpiresAt = new Date();
@@ -396,17 +410,23 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
 
     const result = await query(
       `INSERT INTO users
-       (business_id, name, email, role, status, invite_token, invite_expires_at, role_id)
-        VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7)
+       (business_id, name, email, role, status, invite_token, invite_expires_at, role_id,
+        phone_number, job_title, department, employment_type)
+        VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (business_id, email) DO UPDATE SET
           name = $2,
           role = $4,
           invite_token = $5,
           invite_expires_at = $6,
           role_id = $7,
+          phone_number = $8,
+          job_title = $9,
+          department = $10,
+          employment_type = $11,
           updated_at = CURRENT_TIMESTAMP
         RETURNING id, name, email, role, status`,
-      [businessId, input.name, input.email, legacyRole, inviteToken, inviteExpiresAt, roleId],
+      [businessId, input.name, input.email, legacyRole, inviteToken, inviteExpiresAt, roleId,
+       phoneNumber, jobTitle, department, employmentType],
     );
 
     const member = result.rows[0];

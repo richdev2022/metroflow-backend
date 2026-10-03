@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Metricorex — Admin Console</title>
+<link rel="icon" href="/Assets/logo.png" />
+<style>
+  :root {
+    --bg: #f2f4fa;
+    --surface: #ffffff;
+    --ink: #101828;
+    --ink-2: #475467;
+    --ink-3: #98a2b3;
+    --line: #e4e7ec;
+    --accent: #4f46e5;
+    --accent-2: #6366f1;
+    --accent-soft: #eef2ff;
+    --navy: #0c1226;
+    --navy-2: #131b38;
+    --ok: #067647;
+    --ok-soft: #ecfdf3;
+    --warn: #b54708;
+    --warn-soft: #fffaeb;
+    --bad: #b42318;
+    --bad-soft: #fef3f2;
+    --info: #175cd3;
+    --info-soft: #eff8ff;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
+    --shadow-lg: 0 12px 32px rgba(16,24,40,.16);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; line-height: 1.45;
+  }
+  button { font: inherit; cursor: pointer; }
+  input, select, textarea { font: inherit; color: var(--ink); }
+  a { color: var(--accent); text-decoration: none; }
+  ::placeholder { color: var(--ink-3); }
+
+  /* ---------- Login ---------- */
+  .login-wrap {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+    background: radial-gradient(1200px 600px at 20% -10%, #1e2a5a 0%, var(--navy) 55%), var(--navy);
+  }
+  .login-card {
+    width: 100%; max-width: 400px; background: var(--surface); border-radius: 18px;
+    padding: 34px 30px; box-shadow: var(--shadow-lg);
+  }
+  .login-card .logo { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 6px; }
+  .login-card .logo img { height: 40px; width: auto; }
+  .login-card .logo span { font-size: 19px; font-weight: 700; letter-spacing: -.2px; }
+  .login-sub { text-align: center; color: var(--ink-2); margin-bottom: 24px; font-size: 13px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
+  .field input, .field select, .field textarea {
+    width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    background: #fff; outline: none; transition: border .15s, box-shadow .15s;
+  }
+  .field textarea { min-height: 84px; resize: vertical; }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(99,102,241,.15);
+  }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    border: 1px solid transparent; border-radius: 10px; padding: 10px 16px; font-weight: 600;
+    transition: filter .15s, background .15s, opacity .15s; white-space: nowrap;
+  }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-ghost { background: #fff; border-color: var(--line); color: var(--ink-2); }
+  .btn-ghost:hover { background: #f9fafb; color: var(--ink); }
+  .btn-danger { background: var(--bad); color: #fff; }
+  .btn-danger:hover { filter: brightness(1.08); }
+  .btn-warn { background: #d97706; color: #fff; }
+  .btn-ok { background: var(--ok); color: #fff; }
+  .btn-sm { padding: 6px 11px; font-size: 12.5px; border-radius: 8px; }
+  .btn-block { width: 100%; }
+  .login-err {
+    display: none; background: var(--bad-soft); color: var(--bad); border: 1px solid #fecdca;
+    border-radius: 10px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px;
+  }
+
+  /* ---------- Shell ---------- */
+  .shell { display: none; min-height: 100vh; }
+  .shell.on { display: flex; }
+  .sidebar {
+    width: 232px; flex-shrink: 0; background: var(--navy); color: #cbd5e1;
+    display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+  }
+  .side-brand { display: flex; align-items: center; gap: 10px; padding: 20px 18px 16px; }
+  .side-brand img { height: 30px; width: auto; }
+  .side-brand span { color: #fff; font-weight: 700; font-size: 15.5px; letter-spacing: -.2px; }
+  .side-tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.2px; color: #64748b; padding: 0 18px 12px; }
+  .side-nav { flex: 1; overflow-y: auto; padding: 4px 10px 16px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px;
+    color: #aab4c8; cursor: pointer; margin-bottom: 2px; font-weight: 500; border: none; background: none; width: 100%; text-align: left;
+  }
+  .nav-item svg { width: 17px; height: 17px; flex-shrink: 0; }
+  .nav-item:hover { background: rgba(255,255,255,.06); color: #e2e8f0; }
+  .nav-item.active { background: var(--accent); color: #fff; }
+  .nav-badge {
+    margin-left: auto; background: #ef4444; color: #fff; border-radius: 999px;
+    font-size: 10.5px; font-weight: 700; padding: 1px 7px; min-width: 18px; text-align: center;
+  }
+  .nav-item.active .nav-badge { background: rgba(255,255,255,.25); }
+  .side-foot { padding: 14px 16px; border-top: 1px solid rgba(255,255,255,.08); font-size: 12.5px; }
+  .side-foot .who { color: #e2e8f0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .side-foot button { margin-top: 8px; width: 100%; background: rgba(255,255,255,.07); border: none; color: #aab4c8; padding: 8px; border-radius: 8px; font-weight: 600; }
+  .side-foot button:hover { background: rgba(255,255,255,.12); color: #fff; }
+
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    background: var(--surface); border-bottom: 1px solid var(--line); padding: 14px 26px;
+    display: flex; align-items: center; gap: 14px; position: sticky; top: 0; z-index: 40;
+  }
+  .topbar h1 { font-size: 17px; font-weight: 700; letter-spacing: -.2px; }
+  .topbar .sub { color: var(--ink-3); font-size: 12.5px; margin-top: 1px; }
+  .topbar .spacer { flex: 1; }
+  .icon-btn {
+    width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--line);
+    background: #fff; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-2);
+  }
+  .icon-btn:hover { background: #f9fafb; color: var(--ink); }
+  .content { padding: 24px 26px 60px; max-width: 1280px; width: 100%; margin: 0 auto; }
+
+  /* ---------- Cards / stats ---------- */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow); }
+  .stat-card .lbl { color: var(--ink-2); font-size: 12.5px; font-weight: 600; }
+  .stat-card .val { font-size: 24px; font-weight: 800; letter-spacing: -.5px; margin-top: 5px; }
+  .stat-card .hint { color: var(--ink-3); font-size: 12px; margin-top: 3px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 18px; }
+  .card-head { padding: 15px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .card-head h3 { font-size: 14.5px; font-weight: 700; }
+  .card-head .muted { color: var(--ink-3); font-size: 12.5px; }
+  .card-head .spacer { flex: 1; }
+  .card-body { padding: 18px; }
+
+  /* ---------- Toolbar / filters ---------- */
+  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .search {
+    display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 12px; min-width: 240px; flex: 0 1 320px;
+  }
+  .search input { border: none; outline: none; width: 100%; background: transparent; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); background: #fff; color: var(--ink-2); border-radius: 999px;
+    padding: 6px 13px; font-size: 12.5px; font-weight: 600;
+  }
+  .chip:hover { background: #f9fafb; }
+  .chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* ---------- Tables ---------- */
+  .table-wrap { overflow-x: auto; }
+  table.data { width: 100%; border-collapse: collapse; min-width: 640px; }
+  table.data th {
+    text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--ink-3); font-weight: 700; padding: 10px 14px; border-bottom: 1px solid var(--line);
+    background: #fafbfc; white-space: nowrap;
+  }
+  table.data td { padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  table.data tbody tr:hover { background: #fafbff; }
+  table.data tbody tr.clickable { cursor: pointer; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .cell-sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
+  .empty { text-align: center; color: var(--ink-3); padding: 44px 20px; }
+  .empty .big { font-size: 34px; margin-bottom: 8px; }
+
+  /* ---------- Badges ---------- */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 3px 10px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: .2px; white-space: nowrap;
+  }
+  .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .b-success { background: var(--ok-soft); color: var(--ok); }
+  .b-failed { background: var(--bad-soft); color: var(--bad); }
+  .b-pending, .b-processing { background: var(--warn-soft); color: var(--warn); }
+  .b-open { background: var(--bad-soft); color: var(--bad); }
+  .b-under_review { background: var(--info-soft); color: var(--info); }
+  .b-resolved { background: var(--ok-soft); color: var(--ok); }
+  .b-closed { background: #f2f4f7; color: var(--ink-2); }
+  .b-rejected { background: var(--bad-soft); color: var(--bad); }
+  .b-neutral { background: #f2f4f7; color: var(--ink-2); }
+  .b-credit { background: var(--ok-soft); color: var(--ok); }
+  .b-debit { background: var(--bad-soft); color: var(--bad); }
+
+  /* ---------- Drawer ---------- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(12,18,38,.5); z-index: 90;
+    opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  .overlay.on { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed; top: 0; right: -560px; width: 560px; max-width: 96vw; height: 100vh; z-index: 100;
+    background: var(--surface); box-shadow: var(--shadow-lg); transition: right .25s ease;
+    display: flex; flex-direction: column;
+  }
+  .drawer.on { right: 0; }
+  .drawer-head { padding: 16px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+  .drawer-head h3 { font-size: 15.5px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px 30px; }
+  .kv { display: grid; grid-template-columns: 128px 1fr; gap: 7px 12px; font-size: 13px; margin-bottom: 6px; }
+  .kv .k { color: var(--ink-3); font-weight: 600; }
+  .kv .v { word-break: break-word; }
+  .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--ink-3); font-weight: 700; margin: 20px 0 10px; }
+  .section-title:first-child { margin-top: 0; }
+  .note-box { background: #fafbfc; border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; font-size: 13px; color: var(--ink-2); }
+  .actions-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+
+  /* ---------- Modal ---------- */
+  .modal-wrap {
+    position: fixed; inset: 0; z-index: 120; display: none; align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-wrap.on { display: flex; }
+  .modal-back { position: absolute; inset: 0; background: rgba(12,18,38,.55); }
+  .modal {
+    position: relative; background: var(--surface); border-radius: 16px; width: 100%; max-width: 460px;
+    padding: 22px; box-shadow: var(--shadow-lg); max-height: 90vh; overflow-y: auto;
+  }
+  .modal h3 { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+  .modal .m-sub { color: var(--ink-2); font-size: 13px; margin-bottom: 16px; }
+  .modal .m-actions { display: flex; gap: 9px; justify-content: flex-end; margin-top: 18px; }
+
+  /* ---------- Toasts ---------- */
+  .toasts { position: fixed; bottom: 20px; right: 20px; z-index: 200; display: flex; flex-direction: column; gap: 9px; }
+  .toast {
+    background: var(--navy); color: #e2e8f0; border-radius: 12px; padding: 12px 16px; font-size: 13px;
+    box-shadow: var(--shadow-lg); max-width: 380px; animation: slideIn .25s ease; display: flex; gap: 9px; align-items: flex-start;
+  }
+  .toast.ok { border-left: 3px solid #34d399; }
+  .toast.err { border-left: 3px solid #f87171; }
+  .toast.info { border-left: 3px solid #818cf8; }
+  @keyframes slideIn { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  /* ---------- Charts ---------- */
+  .chart { display: flex; align-items: flex-end; gap: 10px; height: 170px; padding-top: 10px; }
+  .chart .col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 7px; height: 100%; justify-content: flex-end; }
+  .chart .bar { width: 100%; max-width: 46px; background: linear-gradient(180deg, var(--accent-2), var(--accent)); border-radius: 7px 7px 3px 3px; min-height: 3px; transition: height .4s ease; }
+  .chart .bar.alt { background: linear-gradient(180deg, #38bdf8, #0284c7); }
+  .chart .num { font-size: 10.5px; color: var(--ink-3); font-weight: 600; }
+  .chart .lab { font-size: 11.5px; color: var(--ink-2); font-weight: 600; }
+
+  /* ---------- Email chips (settings) ---------- */
+  .email-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+  .email-row { display: flex; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: #fafbfc; }
+  .email-row .em { flex: 1; font-size: 13.5px; word-break: break-all; }
+  .email-row .x { border: none; background: none; color: var(--ink-3); font-size: 16px; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  .email-row .x:hover { color: var(--bad); background: var(--bad-soft); }
+  .add-row { display: flex; gap: 9px; }
+  .add-row input { flex: 1; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; outline: none; }
+  .add-row input:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
+  .test-results { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .test-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .switch { position: relative; width: 44px; height: 25px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track { position: absolute; inset: 0; background: #d0d5dd; border-radius: 999px; transition: background .2s; cursor: pointer; }
+  .switch .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 19px; height: 19px; background: #fff;
+    border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 2px rgba(0,0,0,.2);
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(19px); }
+
+  /* ---------- Pagination ---------- */
+  .pager { display: flex; align-items: center; gap: 10px; justify-content: flex-end; padding: 13px 4px 2px; }
+  .pager .pg-info { color: var(--ink-3); font-size: 12.5px; margin-right: auto; }
+  .pg-btn { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 6px 12px; font-weight: 600; color: var(--ink-2); }
+  .pg-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .pg-btn:not(:disabled):hover { background: #f9fafb; }
+
+  .skel { background: linear-gradient(90deg, #eef0f4 25%, #f7f8fa 50%, #eef0f4 75%); background-size: 200% 100%; animation: sk 1.2s infinite; border-radius: 8px; }
+  @keyframes sk { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+  /* ---------- Notification feed ---------- */
+  .feed-item { display: flex; gap: 12px; padding: 13px 4px; border-bottom: 1px solid var(--line); }
+  .feed-item:last-child { border-bottom: none; }
+  .feed-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); margin-top: 5px; flex-shrink: 0; }
+  .feed-dot.read { background: var(--line); }
+  .feed-item .t { font-weight: 600; font-size: 13.5px; }
+  .feed-item .b { color: var(--ink-2); font-size: 13px; margin-top: 2px; }
+  .feed-item .d { color: var(--ink-3); font-size: 11.5px; margin-top: 3px; }
+
+  @media (max-width: 900px) {
+    .sidebar { width: 64px; }
+    .side-brand span, .side-tag, .nav-item .txt, .side-foot .who { display: none; }
+    .side-brand { justify-content: center; padding: 16px 0 8px; }
+    .nav-item { justify-content: center; padding: 11px 0; }
+    .nav-badge { position: absolute; transform: translate(10px, -10px); margin: 0; }
+    .content { padding: 18px 14px 50px; }
+    .topbar { padding: 12px 14px; }
+    .drawer { width: 100vw; max-width: 100vw; }
+    .kv { grid-template-columns: 104px 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div class="login-wrap" id="loginView">
+  <div class="login-card">
+    <div class="logo"><img src="/Assets/logo.png" alt="Metricorex" onerror="this.style.display='none'" /><span>Admin Console</span></div>
+    <div class="login-sub">Sign in with your platform admin account</div>
+    <div class="login-err" id="loginErr"></div>
+    <form id="loginForm">
+      <div class="field">
+        <label for="liEmail">Email</label>
+        <input id="liEmail" type="email" autocomplete="username" placeholder="admin@metricorex.com" required />
+      </div>
+      <div class="field">
+        <label for="liPass">Password</label>
+        <input id="liPass" type="password" autocomplete="current-password" placeholder="••••••••" required />
+      </div>
+      <button class="btn btn-primary btn-block" id="liBtn" type="submit">Sign in</button>
+    </form>
+  </div>
+</div>
+
+<!-- ============ APP SHELL ============ -->
+<div class="shell" id="shell">
+  <aside class="sidebar">
+    <div class="side-brand"><img src="/Assets/logo.png" alt="" onerror="this.style.display='none'" /><span>Metricorex</span></div>
+    <div class="side-tag">Admin Console</div>
+    <nav class="side-nav" id="sideNav">
+      <button class="nav-item" data-page="dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+        <span class="txt">Dashboard</span>
+      </button>
+      <button class="nav-item" data-page="disputes" style="position:relative">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="txt">Disputes</span>
+        <span class="nav-badge" id="disputesBadge" style="display:none">0</span>
+      </button>
+      <button class="nav-item" data-page="transactions">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/></svg>
+        <span class="txt">Transactions</span>
+      </button>
+      <button class="nav-item" data-page="transfers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <span class="txt">Transfers</span>
+      </button>
+      <button class="nav-item" data-page="kyc">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <span class="txt">KYC</span>
+      </button>
+      <button class="nav-item" data-page="notifications" style="position:relative">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        <span class="txt">Notifications</span>
+        <span class="nav-badge" id="notifBadge" style="display:none">0</span>
+      </button>
+      <button class="nav-item" data-page="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="txt">Settings</span>
+      </button>
+    </nav>
+    <div class="side-foot">
+      <div class="who" id="whoAmI">—</div>
+      <button id="logoutBtn">Sign out</button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div>
+        <h1 id="pageTitle">Dashboard</h1>
+        <div class="sub" id="pageSub"></div>
+      </div>
+      <div class="spacer"></div>
+      <button class="icon-btn" id="refreshBtn" title="Refresh">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/></svg>
+      </button>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<!-- Drawer + overlay + modal + toasts -->
+<div class="overlay" id="overlay"></div>
+<aside class="drawer" id="drawer"><div class="drawer-head"><h3 id="drawerTitle"></h3><button class="icon-btn" id="drawerClose" title="Close">✕</button></div><div class="drawer-body" id="drawerBody"></div></aside>
+<div class="modal-wrap" id="modalWrap"><div class="modal-back" id="modalBack"></div><div class="modal" id="modalBox"></div></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+/* ===================== core helpers ===================== */
+var TOKEN_KEY = "mf_admin_token", NAME_KEY = "mf_admin_name";
+var $ = function (id) { return document.getElementById(id); };
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+function money(v, cur) {
+  var n = Number(v);
+  if (!isFinite(n)) n = 0;
+  var c = cur || "NGN";
+  try { return new Intl.NumberFormat("en-NG", { style: "currency", currency: c }).format(n); }
+  catch (e) { return c + " " + n.toLocaleString(); }
+}
+function num(v) { var n = Number(v); return isFinite(n) ? n.toLocaleString() : String(v == null ? "0" : v); }
+function dt(v) {
+  if (!v) return "—";
+  var d = new Date(v);
+  return isNaN(d.getTime()) ? String(v) : d.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+function Badge(status) {
+  var s = String(status || "neutral").toLowerCase().replace(/\s+/g, "_");
+  var known = ["success", "failed", "pending", "processing", "open", "under_review", "resolved", "closed", "rejected", "credit", "debit"];
+  var cls = known.indexOf(s) >= 0 ? "b-" + s : "b-neutral";
+  return '<span class="badge ' + cls + '">' + esc(String(status || "—").replace(/_/g, " ")) + "</span>";
+}
+function toast(msg, kind, ms) {
+  var t = document.createElement("div");
+  t.className = "toast " + (kind || "info");
+  t.innerHTML = esc(msg);
+  $("toasts").appendChild(t);
+  setTimeout(function () { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, (ms || 4200));
+  setTimeout(function () { t.remove(); }, (ms || 4200) + 350);
+}
+function api(path, opts) {
+  opts = opts || {};
+  var headers = { "Content-Type": "application/json" };
+  var tk = localStorage.getItem(TOKEN_KEY);
+  if (tk) headers["Authorization"] = "Bearer " + tk;
+  return fetch("/api/admin" + path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  }).then(function (r) {
+    return r.json().catch(function () { return { success: false, error: "Bad response" }; }).then(function (j) {
+      if (r.status === 401) { logout(true); throw new Error((j && j.error) || "Session expired — sign in again"); }
+      if (r.status === 403) throw new Error((j && j.error) || "Insufficient permissions for this action");
+      if (!r.ok || j.success === false) throw new Error((j && j.error) || ("Request failed (" + r.status + ")"));
+      return j;
+    });
+  });
+}
+/* Modal helpers */
+function openModal(html) { $("modalBox").innerHTML = html; $("modalWrap").classList.add("on"); }
+function closeModal() { $("modalWrap").classList.remove("on"); }
+$("modalBack").onclick = closeModal;
+function confirmModal(cfg) {
+  openModal(
+    '<h3>' + esc(cfg.title) + '</h3>' +
+    '<div class="m-sub">' + esc(cfg.sub || "") + '</div>' +
+    (cfg.note ?
+      '<div class="field"><label>' + esc(cfg.note.label || "Note (optional)") + '</label><textarea id="mNote" placeholder="' + esc(cfg.note.placeholder || "") + '">' + esc(cfg.note.value || "") + '</textarea></div>' :
+      '') +
+    '<div class="m-actions"><button class="btn btn-ghost" id="mCancel">Cancel</button>' +
+    '<button class="btn ' + (cfg.danger ? "btn-danger" : "btn-primary") + '" id="mOk">' + esc(cfg.okText || "Confirm") + '</button></div>'
+  );
+  $("mCancel").onclick = closeModal;
+  $("mOk").onclick = function () {
+    var note = $("mNote") ? $("mNote").value.trim() : "";
+    cfg.onOk(note);
+  };
+}
+/* Drawer helpers */
+function openDrawer(title, bodyHtml) {
+  $("drawerTitle").textContent = title;
+  $("drawerBody").innerHTML = bodyHtml;
+  $("drawer").classList.add("on");
+  $("overlay").classList.add("on");
+}
+function closeDrawer() { $("drawer").classList.remove("on"); $("overlay").classList.remove("on"); }
+$("drawerClose").onclick = closeDrawer;
+$("overlay").onclick = closeDrawer;
+function pagerHtml(page, totalPages, total) {
+  return '<div class="pager">' +
+    '<span class="pg-info">' + num(total) + " record(s) — page " + page + " of " + Math.max(totalPages, 1) + "</span>" +
+    '<button class="pg-btn" id="pgPrev"' + (page <= 1 ? " disabled" : "") + ">Prev</button>" +
+    '<button class="pg-btn" id="pgNext"' + (page >= totalPages ? " disabled" : "") + ">Next</button>" +
+    "</div>";
+}
+
+/* ===================== auth ===================== */
+function showLogin() {
+  $("shell").classList.remove("on");
+  $("loginView").style.display = "flex";
+}
+function showApp() {
+  $("loginView").style.display = "none";
+  $("shell").classList.add("on");
+  $("whoAmI").textContent = localStorage.getItem(NAME_KEY) || "Admin";
+  route();
+  refreshBadges();
+}
+function logout(expired) {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(NAME_KEY);
+  closeDrawer(); closeModal();
+  showLogin();
+  if (expired) toast("Session expired — please sign in again", "err");
+}
+$("logoutBtn").onclick = function () { logout(false); };
+$("loginForm").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var btn = $("liBtn");
+  $("loginErr").style.display = "none";
+  btn.disabled = true; btn.textContent = "Signing in…";
+  fetch("/api/admin/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: $("liEmail").value.trim(), password: $("liPass").value }),
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j.success) throw new Error(j.error || "Login failed");
+    localStorage.setItem(TOKEN_KEY, j.token);
+    localStorage.setItem(NAME_KEY, (j.admin && (j.admin.name || j.admin.email)) || "Admin");
+    btn.disabled = false; btn.textContent = "Sign in";
+    $("liPass").value = "";
+    showApp();
+  }).catch(function (err) {
+    btn.disabled = false; btn.textContent = "Sign in";
+    $("loginErr").textContent = err.message || "Login failed";
+    $("loginErr").style.display = "block";
+  });
+});
+
+/* ===================== router ===================== */
+var PAGES = {
+  dashboard:    { title: "Dashboard",    sub: "Platform overview",                render: renderDashboard },
+  disputes:     { title: "Disputes",     sub: "Transaction dispute desk",         render: renderDisputes },
+  transactions: { title: "Transactions", sub: "All wallet transactions",          render: renderTransactions },
+  transfers:    { title: "Transfers",    sub: "Outbound transfer queue",          render: renderTransfers },
+  kyc:          { title: "KYC",          sub: "Identity verifications",           render: renderKyc },
+  notifications:{ title: "Notifications",sub: "Internal admin alert feed",        render: renderNotifications },
+  settings:     { title: "Settings",     sub: "Platform configuration",           render: renderSettings },
+};
+var currentPage = "dashboard";
+function route() {
+  var page = (location.hash || "#/dashboard").replace(/^#\/?/, "") || "dashboard";
+  if (!PAGES[page]) page = "dashboard";
+  currentPage = page;
+  var meta = PAGES[page];
+  $("pageTitle").textContent = meta.title;
+  $("pageSub").textContent = meta.sub;
+  var items = document.querySelectorAll(".nav-item");
+  for (var i = 0; i < items.length; i++) {
+    items[i].classList.toggle("active", items[i].getAttribute("data-page") === page);
+  }
+  $("content").innerHTML = '<div class="skel" style="height:120px;margin-bottom:14px"></div><div class="skel" style="height:260px"></div>';
+  meta.render();
+}
+window.addEventListener("hashchange", route);
+document.getElementById("sideNav").addEventListener("click", function (e) {
+  var btn = e.target.closest(".nav-item");
+  if (btn) location.hash = "#/" + btn.getAttribute("data-page");
+});
+$("refreshBtn").onclick = function () { route(); refreshBadges(); };
+
+/* Open dispute count + unread feed count badges */
+function refreshBadges() {
+  api("/disputes?status=open&limit=1").then(function (j) {
+    var open = (j.pagination && j.pagination.total) || 0;
+    var b = $("disputesBadge");
+    b.style.display = open > 0 ? "inline" : "none";
+    b.textContent = open > 99 ? "99+" : open;
+  }).catch(function () {});
+  api("/notifications?limit=1").then(function (j) {
+    var u = j.unread || 0;
+    var b = $("notifBadge");
+    b.style.display = u > 0 ? "inline" : "none";
+    b.textContent = u > 99 ? "99+" : u;
+  }).catch(function () {});
+}
+setInterval(refreshBadges, 60000);
+
+/* ===================== dashboard ===================== */
+function renderDashboard() {
+  $("content").innerHTML = "<p style='color:var(--ink-3)'>Loading dashboard…</p>";
+  Promise.all([
+    api("/dashboard/stats").catch(function () { return null; }),
+    api("/dashboard/charts").catch(function () { return null; }),
+    api("/wallet").catch(function () { return null; }),
+  ]).then(function (rs) {
+    var stats = rs[0] && rs[0].stats, charts = rs[1] && rs[1].charts, wallet = rs[2] && rs[2].wallet;
+    var cards = "";
+    if (stats) {
+      cards +=
+        statCard("Total businesses", num(stats.totalBusinesses)) +
+        statCard("Total users", num(stats.totalUsers)) +
+        statCard("Active subscriptions", num(stats.activeBusinesses)) +
+        statCard("Total revenue", money(stats.totalRevenue));
+    }
+    $("content").innerHTML =
+      '<div class="stat-grid">' + (cards || '<div class="card"><div class="card-body" style="color:var(--ink-3)">Stats unavailable (view_dashboard permission required).</div></div>') + "</div>" +
+      '<div class="stat-grid">' +
+        '<div class="stat-card"><div class="lbl">Platform wallet</div><div class="val">' + (wallet ? money(wallet.balance, wallet.currency) : "—") + "</div>" +
+        '<div class="hint">' + (wallet ? esc(wallet.currency || "NGN") + " · " + esc(wallet.status || "active") : "view_dashboard required") + "</div></div>" +
+        '<div class="stat-card"><div class="lbl">Quick links</div><div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">' +
+          '<a href="#/disputes">→ Dispute desk</a><a href="#/transfers">→ Transfer queue</a><a href="#/settings">→ Dispute email settings</a></div></div>' +
+      "</div>" +
+      '<div class="card"><div class="card-head"><h3>Revenue — last 6 months</h3></div><div class="card-body" id="revChart"></div></div>' +
+      '<div class="card"><div class="card-head"><h3>Business growth — last 6 months</h3></div><div class="card-body" id="growthChart"></div></div>';
+    if (charts && charts.revenueData) drawBars($("revChart"), charts.revenueData, "revenue", function (d) { return money(d); });
+    if (charts && charts.businessGrowthData) drawBars($("growthChart"), charts.businessGrowthData, "businesses", function (d) { return num(d); });
+  });
+}
+function statCard(lbl, val) {
+  return '<div class="stat-card"><div class="lbl">' + esc(lbl) + '</div><div class="val">' + esc(val) + "</div></div>";
+}
+function drawBars(el, rows, key, fmt) {
+  var max = 1;
+  for (var i = 0; i < rows.length; i++) { var v = Number(rows[i][key]) || 0; if (v > max) max = v; }
+  var html = '<div class="chart">';
+  for (var j = 0; j < rows.length; j++) {
+    var val = Number(rows[j][key]) || 0;
+    var h = Math.max((val / max) * 100, 2);
+    html += '<div class="col"><div class="num">' + fmt(val) + '</div><div class="bar" style="height:' + h + '%"></div><div class="lab">' + esc(rows[j].name) + "</div></div>";
+  }
+  el.innerHTML = html + "</div>";
+}
+
+/* ===================== transactions ===================== */
+var txnState = { page: 1, search: "", status: "" };
+function renderTransactions() {
+  $("content").innerHTML =
+    '<div class="toolbar">' +
+      '<div class="search">🔍<input id="txnSearch" placeholder="Search reference, business…" value="' + esc(txnState.search) + '" /></div>' +
+      '<select id="txnStatus" class="chip" style="border-radius:10px;padding:8px 12px">' +
+        ["", "success", "failed", "pending", "processing", "abandoned", "reversed"].map(function (s) {
+          return '<option value="' + s + '"' + (txnState.status === s ? " selected" : "") + ">" + (s ? s.toUpperCase() : "All statuses") + "</option>";
+        }).join("") +
+      "</select>" +
+    '</div><div id="txnTable"></div>';
+  $("txnSearch").addEventListener("input", debounce(function () { txnState.search = $("txnSearch").value.trim(); txnState.page = 1; loadTxns(); }, 400));
+  $("txnStatus").addEventListener("change", function () { txnState.status = $("txnStatus").value; txnState.page = 1; loadTxns(); });
+  loadTxns();
+}
+function loadTxns() {
+  var box = $("txnTable");
+  if (!box) return;
+  box.innerHTML = '<div class="skel" style="height:220px"></div>';
+  var q = "?page=" + txnState.page + "&perPage=15" +
+    (txnState.search ? "&search=" + encodeURIComponent(txnState.search) : "") +
+    (txnState.status ? "&status=" + encodeURIComponent(txnState.status) : "");
+  api("/transactions" + q).then(function (j) {
+    var rows = j.transactions || [];
+    var p = j.pagination || {};
+    if (!rows.length) { box.innerHTML = emptyBox("No transactions found"); return; }
+    box.innerHTML =
+      '<div class="card"><div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Reference</th><th>Business</th><th>Type</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead><tbody>" +
+      rows.map(function (t) {
+        var type = t.transaction_type || t.type || "—";
+        return "<tr>" +
+          '<td class="mono">' + esc(t.reference) + "</td>" +
+          "<td>" + esc(t.business_name || "—") + "</td>" +
+          "<td>" + Badge(String(type).match(/credit|refund/i) ? "credit" : String(type).match(/debit|transfer|withdraw/i) ? "debit" : "neutral") + " <span class='cell-sub'>" + esc(String(type).replace(/_/g, " ")) + "</span></td>" +
+          "<td><b>" + money(t.amount, t.currency) + "</b></td>" +
+          "<td>" + Badge(t.status) + "</td>" +
+          '<td class="cell-sub">' + dt(t.created_at) + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>" + pagerHtml(p.page || 1, p.totalPages || 1, p.total || rows.length) + "</div>";
+    $("pgPrev").onclick = function () { txnState.page--; loadTxns(); };
+    $("pgNext").onclick = function () { txnState.page++; loadTxns(); };
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+
+/* ===================== transfers ===================== */
+var xfrState = { page: 1, search: "", status: "" };
+function renderTransfers() {
+  $("content").innerHTML =
+    '<div class="toolbar">' +
+      '<div class="search">🔍<input id="xfrSearch" placeholder="Search reference, recipient…" value="' + esc(xfrState.search) + '" /></div>' +
+      '<select id="xfrStatus" class="chip" style="border-radius:10px;padding:8px 12px">' +
+        ["", "success", "failed", "pending", "processing"].map(function (s) {
+          return '<option value="' + s + '"' + (xfrState.status === s ? " selected" : "") + ">" + (s ? s.toUpperCase() : "All statuses") + "</option>";
+        }).join("") +
+      "</select>" +
+    '</div><div id="xfrTable"></div>';
+  $("xfrSearch").addEventListener("input", debounce(function () { xfrState.search = $("xfrSearch").value.trim(); xfrState.page = 1; loadXfrs(); }, 400));
+  $("xfrStatus").addEventListener("change", function () { xfrState.status = $("xfrStatus").value; xfrState.page = 1; loadXfrs(); });
+  loadXfrs();
+}
+function loadXfrs() {
+  var box = $("xfrTable");
+  if (!box) return;
+  box.innerHTML = '<div class="skel" style="height:220px"></div>';
+  var q = "?page=" + xfrState.page + "&limit=15" +
+    (xfrState.search ? "&search=" + encodeURIComponent(xfrState.search) : "") +
+    (xfrState.status ? "&status=" + encodeURIComponent(xfrState.status) : "");
+  api("/transfers" + q).then(function (j) {
+    var rows = j.transfers || [];
+    var p = j.pagination || {};
+    if (!rows.length) { box.innerHTML = emptyBox("No transfers found"); return; }
+    box.innerHTML =
+      '<div class="card"><div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Reference</th><th>Business</th><th>Recipient</th><th>Amount</th><th>Provider</th><th>Status</th><th>Date</th></tr></thead><tbody>" +
+      rows.map(function (t) {
+        return "<tr>" +
+          '<td class="mono">' + esc(t.reference) + "</td>" +
+          "<td>" + esc(t.business_name || "—") + "</td>" +
+          "<td>" + esc(t.recipient_name || t.recipient_account || "—") + '<div class="cell-sub">' + esc(t.recipient_bank_name || t.recipient_bank || "") + "</div></td>" +
+          "<td><b>" + money(t.amount, t.currency) + "</b></td>" +
+          '<td class="cell-sub">' + esc(t.payment_provider || t.provider || "—") + "</td>" +
+          "<td>" + Badge(t.status) + "</td>" +
+          '<td class="cell-sub">' + dt(t.created_at) + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>" + pagerHtml(p.page || 1, p.totalPages || 1, p.total || rows.length) + "</div>";
+    $("pgPrev").onclick = function () { xfrState.page--; loadXfrs(); };
+    $("pgNext").onclick = function () { xfrState.page++; loadXfrs(); };
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+
+/* shared bits */
+function emptyBox(msg) {
+  return '<div class="card"><div class="empty"><div class="big">📭</div>' + esc(msg) + "</div></div>";
+}
+function debounce(fn, ms) {
+  var t;
+  return function () { var a = arguments, s = this; clearTimeout(t); t = setTimeout(function () { fn.apply(s, a); }, ms); };
+}
+/* ===================== disputes (core) ===================== */
+var dispState = { page: 1, status: "", search: "" };
+var DISP_CATEGORIES = {
+  failed_transfer: "Failed transfer", unauthorized: "Unauthorized", double_debit: "Double debit",
+  not_received: "Not received", amount_mismatch: "Amount mismatch", other: "Other",
+};
+function renderDisputes() {
+  $("content").innerHTML =
+    '<div class="toolbar">' +
+      '<div class="search">🔍<input id="dSearch" placeholder="Search reference or business…" value="' + esc(dispState.search) + '" /></div>' +
+      '<div class="chips" id="dChips">' +
+        ["", "open", "under_review", "resolved", "closed", "rejected"].map(function (s) {
+          return '<button class="chip' + (dispState.status === s ? " active" : "") + '" data-s="' + s + '">' + (s ? s.replace("_", " ") : "All") + "</button>";
+        }).join("") +
+      "</div>" +
+    '</div><div id="dTable"></div>';
+  $("dSearch").addEventListener("input", debounce(function () { dispState.search = $("dSearch").value.trim(); dispState.page = 1; loadDisputes(); }, 400));
+  $("dChips").addEventListener("click", function (e) {
+    var c = e.target.closest(".chip");
+    if (!c) return;
+    dispState.status = c.getAttribute("data-s");
+    dispState.page = 1;
+    renderDisputes();
+  });
+  loadDisputes();
+}
+function loadDisputes() {
+  var box = $("dTable");
+  if (!box) return;
+  box.innerHTML = '<div class="skel" style="height:200px"></div>';
+  var q = "?page=" + dispState.page + "&limit=15" +
+    (dispState.status ? "&status=" + encodeURIComponent(dispState.status) : "") +
+    (dispState.search ? "&search=" + encodeURIComponent(dispState.search) : "");
+  api("/disputes" + q).then(function (j) {
+    var rows = j.data || [];
+    var p = j.pagination || {};
+    if (!rows.length) { box.innerHTML = emptyBox("No disputes" + (dispState.status ? " with status " + dispState.status.replace("_", " ") : " yet")); return; }
+    box.innerHTML =
+      '<div class="card"><div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Reference</th><th>Business</th><th>Category</th><th>Status</th><th>Action taken</th><th>Filed</th></tr></thead><tbody>" +
+      rows.map(function (d) {
+        return '<tr class="clickable" data-id="' + esc(d.id) + '">' +
+          '<td class="mono"><b>' + esc(d.transaction_reference) + "</b></td>" +
+          "<td>" + esc(d.business_name || "—") + '<div class="cell-sub">' + esc(d.filed_by_name || d.filed_by_email || "") + "</div></td>" +
+          "<td>" + esc(DISP_CATEGORIES[d.category] || d.category || "—") + "</td>" +
+          "<td>" + Badge(d.status) + "</td>" +
+          '<td class="cell-sub">' + esc(d.resolution_action ? d.resolution_action.replace(/_/g, " ") : "—") + "</td>" +
+          '<td class="cell-sub">' + dt(d.created_at) + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>" + pagerHtml(p.page || 1, p.totalPages || 1, p.total || rows.length) + "</div>";
+    $("pgPrev").onclick = function () { dispState.page--; loadDisputes(); };
+    $("pgNext").onclick = function () { dispState.page++; loadDisputes(); };
+    var trs = box.querySelectorAll("tr.clickable");
+    for (var i = 0; i < trs.length; i++) {
+      trs[i].onclick = function () { openDispute(this.getAttribute("data-id")); };
+    }
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+function openDispute(id) {
+  openDrawer("Dispute " + id.slice(0, 8) + "…", '<div class="skel" style="height:300px"></div>');
+  api("/disputes/" + encodeURIComponent(id)).then(function (j) {
+    var d = j.data || {};
+    var t = d.transaction || null;
+    var html =
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px">' +
+        Badge(d.status) + "<span class='cell-sub'>Category: <b>" + esc(DISP_CATEGORIES[d.category] || d.category || "—") + "</b></span>" +
+      "</div>" +
+      '<div class="section-title">Customer message</div>' +
+      '<div class="note-box">' + esc(d.message || "—") + "</div>" +
+      (d.attachment_url ?
+        '<div style="margin-top:10px"><a href="' + esc(d.attachment_url) + '" target="_blank" rel="noopener">📎 Evidence attachment' + (d.attachment_name ? " — " + esc(d.attachment_name) : "") + "</a></div>" : "") +
+      '<div class="section-title">Filed by</div>' +
+      '<div class="kv">' +
+        '<div class="k">Business</div><div class="v">' + esc((d.business && d.business.name) || d.business_name || "—") + "</div>" +
+        '<div class="k">Contact email</div><div class="v">' + esc((d.business && d.business.email) || "—") + "</div>" +
+        '<div class="k">Filed by</div><div class="v">' + esc((d.filedBy && (d.filedBy.name + " · " + d.filedBy.email)) || "—") + "</div>" +
+        '<div class="k">Filed at</div><div class="v">' + dt(d.created_at) + "</div>" +
+      "</div>";
+    if (t) {
+      html +=
+        '<div class="section-title">Transaction snapshot</div>' +
+        '<div class="kv">' +
+          '<div class="k">Source</div><div class="v">' + esc(t.source === "transfer_queue" ? "Transfer" : "Wallet transaction") + "</div>" +
+          '<div class="k">Amount</div><div class="v"><b>' + money(t.amount, t.currency) + "</b></div>" +
+          '<div class="k">Provider status</div><div class="v">' + Badge(t.status) + "</div>" +
+          '<div class="k">Provider</div><div class="v">' + esc(t.provider || "—") + "</div>" +
+          '<div class="k">Description</div><div class="v">' + esc(t.description || "—") + "</div>" +
+          (t.recipient ?
+            '<div class="k">Recipient</div><div class="v">' + esc(t.recipient.name || "—") + '<div class="cell-sub">' +
+              esc(t.recipient.accountNumber || "") + (t.recipient.bankName ? " · " + t.recipient.bankName : t.recipient.bankCode ? " · " + t.recipient.bankCode : "") + "</div></div>" : "") +
+          (t.failureReason ? '<div class="k">Failure reason</div><div class="v" style="color:var(--bad)">' + esc(t.failureReason) + "</div>" : "") +
+          '<div class="k">Created</div><div class="v">' + dt(t.createdAt) + "</div>" +
+        "</div>";
+    } else {
+      html += '<div class="section-title">Transaction snapshot</div><div class="note-box">The disputed transaction could not be resolved in either ledger.</div>';
+    }
+    if (d.resolution_note || d.resolution_action) {
+      html +=
+        '<div class="section-title">Resolution</div>' +
+        '<div class="kv">' +
+          (d.resolution_action ? '<div class="k">Action</div><div class="v">' + esc(d.resolution_action.replace(/_/g, " ")) + "</div>" : "") +
+          (d.resolution_note ? '<div class="k">Note</div><div class="v">' + esc(d.resolution_note) + "</div>" : "") +
+          (d.resolved_at ? '<div class="k">Resolved at</div><div class="v">' + dt(d.resolved_at) + "</div>" : "") +
+        "</div>";
+    }
+    var actionable = ["open", "under_review"].indexOf(String(d.status)) >= 0;
+    html +=
+      '<div class="section-title">Actions</div>' +
+      (actionable ?
+        '<div class="actions-row">' +
+          '<button class="btn btn-ghost btn-sm" id="dRecheck">🔄 Recheck with provider</button>' +
+          '<button class="btn btn-warn btn-sm" id="dReverse">↩️ Reverse funds</button>' +
+          '<button class="btn btn-ghost btn-sm" id="dStatus">⚑ Change status</button>' +
+          '<button class="btn btn-ok btn-sm" id="dClose">✓ Close / reject</button>' +
+        "</div>" :
+        '<div class="note-box">This dispute is <b>' + esc(d.status) + "</b> — reopen it (change status to open) to take action.</div>") +
+      '<p class="cell-sub" style="margin-top:12px">Every action emails + pushes the customer. Recheck re-queries the payment provider (a confirmed failure auto-refunds the customer). Reverse only works for failed, not-yet-credited transfers.</p>';
+    openDrawer("Dispute " + (d.transaction_reference || id), html);
+
+    if (actionable) {
+      $("dRecheck").onclick = function () {
+        confirmModal({
+          title: "Recheck with provider?",
+          sub: "The provider is re-queried for the final state of " + (d.transaction_reference || "") + ". A confirmed failure automatically returns the funds; a confirmed success closes the case.",
+          okText: "Run recheck",
+          onOk: function (note) {
+            closeModal();
+            api("/disputes/" + d.id + "/recheck", { method: "POST", body: { note: note || undefined } })
+              .then(function (r) { toast("Recheck complete — outcome: " + (r.data && r.data.transactionStatus), "ok"); openDispute(d.id); loadDisputes(); refreshBadges(); })
+              .catch(function (e) { toast(e.message, "err"); });
+          },
+        });
+      };
+      $("dReverse").onclick = function () {
+        confirmModal({
+          title: "Reverse the funds?",
+          danger: true,
+          sub: "Credits the customer's wallet for " + (t ? money(t.amount, t.currency) : "the disputed amount") + ". Only possible while the transfer is FAILED and not yet credited — the server re-verifies this before reversing.",
+          okText: "Trigger reversal",
+          note: { label: "Note (recorded on the dispute)", placeholder: "e.g. confirmed non-delivery with provider" },
+          onOk: function (note) {
+            closeModal();
+            api("/disputes/" + d.id + "/reverse", { method: "POST", body: { note: note || undefined } })
+              .then(function () { toast("Reversal complete — customer credited", "ok"); openDispute(d.id); loadDisputes(); refreshBadges(); })
+              .catch(function (e) { toast(e.message, "err"); });
+          },
+        });
+      };
+      $("dStatus").onclick = function () {
+        openModal(
+          '<h3>Change dispute status</h3><div class="m-sub">The customer is notified on every change.</div>' +
+          '<div class="field"><label>Status</label><select id="mStatus">' +
+            ["open", "under_review", "resolved", "closed", "rejected"].map(function (s) { return '<option value="' + s + '"' + (d.status === s ? " selected" : "") + ">" + s.replace("_", " ") + "</option>"; }).join("") +
+          "</select></div>" +
+          '<div class="field"><label>Note (optional)</label><textarea id="mNote" placeholder="Shown to the customer in the email"></textarea></div>' +
+          '<div class="m-actions"><button class="btn btn-ghost" id="mCancel">Cancel</button><button class="btn btn-primary" id="mOk">Update</button></div>'
+        );
+        $("mCancel").onclick = closeModal;
+        $("mOk").onclick = function () {
+          var status = $("mStatus").value, note = $("mNote").value.trim();
+          closeModal();
+          api("/disputes/" + d.id + "/status", { method: "POST", body: { status: status, note: note || undefined } })
+            .then(function () { toast("Dispute updated", "ok"); openDispute(d.id); loadDisputes(); refreshBadges(); })
+            .catch(function (e) { toast(e.message, "err"); });
+        };
+      };
+      $("dClose").onclick = function () {
+        openModal(
+          '<h3>Close dispute</h3><div class="m-sub">Closing ends the lifecycle. Choose whether the dispute was upheld (closed) or not upheld (rejected).</div>' +
+          '<div class="field"><label>Resolution</label><select id="mRes"><option value="closed">Closed — issue addressed</option><option value="rejected">Rejected — not upheld</option></select></div>' +
+          '<div class="field"><label>Resolution note</label><textarea id="mNote" placeholder="Explains the outcome to the customer"></textarea></div>' +
+          '<div class="m-actions"><button class="btn btn-ghost" id="mCancel">Cancel</button><button class="btn btn-ok" id="mOk">Close dispute</button></div>'
+        );
+        $("mCancel").onclick = closeModal;
+        $("mOk").onclick = function () {
+          var resolution = $("mRes").value, note = $("mNote").value.trim();
+          if (!note) { toast("Please add a short resolution note", "err"); return; }
+          closeModal();
+          api("/disputes/" + d.id + "/close", { method: "POST", body: { resolution: resolution, note: note } })
+            .then(function () { toast("Dispute closed", "ok"); openDispute(d.id); loadDisputes(); refreshBadges(); })
+            .catch(function (e) { toast(e.message, "err"); });
+        };
+      };
+    }
+  }).catch(function (e) {
+    openDrawer("Dispute", '<div class="empty">' + esc(e.message) + "</div>");
+  });
+}
+
+/* ===================== kyc ===================== */
+function renderKyc() {
+  $("content").innerHTML = '<div id="kycBox"><div class="skel" style="height:240px"></div></div>';
+  api("/kyc").then(function (j) {
+    var rows = j.kyc_records || [];
+    if (!rows.length) { $("kycBox").innerHTML = emptyBox("No KYC records"); return; }
+    $("kycBox").innerHTML =
+      '<div class="card"><div class="card-head"><h3>All KYC records</h3><span class="muted">' + rows.length + "</span></div>" +
+      '<div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Name</th><th>Email</th><th>Type</th><th>Status</th><th>Submitted</th><th style=\"width:170px\">Actions</th></tr></thead><tbody>" +
+      rows.map(function (k) {
+        var isBiz = k.type === "business";
+        var act = "";
+        if (isBiz && k.kyc_status === "pending") {
+          act = '<button class="btn btn-ok btn-sm" data-act="approve" data-id="' + esc(k.id) + '">Approve</button> ' +
+                '<button class="btn btn-danger btn-sm" data-act="reject" data-id="' + esc(k.id) + '">Reject</button>';
+        }
+        return "<tr>" +
+          "<td>" + esc(k.name || "—") + "</td>" +
+          "<td>" + esc(k.email || "—") + "</td>" +
+          '<td><span class="badge ' + (isBiz ? "b-under_review" : "b-neutral") + '" style="background:#f2f4f7;color:var(--ink-2)">' + (isBiz ? "Business" : "User") + "</span></td>" +
+          "<td>" + Badge(k.kyc_status) + "</td>" +
+          '<td class="cell-sub">' + dt(k.created_at) + "</td>" +
+          "<td>" + (act || '<span class="cell-sub">' + esc(k.kyc_rejection_reason || "—") + "</span>") + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div></div>";
+    $("kycBox").addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-act]");
+      if (!b) return;
+      var id = b.getAttribute("data-id"), act = b.getAttribute("data-act");
+      if (act === "approve") {
+        confirmModal({
+          title: "Approve business KYC?",
+          sub: "The business will be marked verified and emailed immediately.",
+          okText: "Approve",
+          onOk: function () {
+            closeModal();
+            api("/kyc/business/" + id + "/approve", { method: "POST" })
+              .then(function () { toast("Business approved", "ok"); renderKyc(); })
+              .catch(function (err) { toast(err.message, "err"); });
+          },
+        });
+      } else {
+        openModal(
+          '<h3>Reject business KYC</h3><div class="m-sub">A rejection reason is required and is emailed to the business.</div>' +
+          '<div class="field"><label>Reason</label><textarea id="mNote" placeholder="e.g. Proof of address is unreadable"></textarea></div>' +
+          '<div class="m-actions"><button class="btn btn-ghost" id="mCancel">Cancel</button><button class="btn btn-danger" id="mOk">Reject</button></div>'
+        );
+        $("mCancel").onclick = closeModal;
+        $("mOk").onclick = function () {
+          var reason = $("mNote").value.trim();
+          if (!reason) { toast("Reason is required", "err"); return; }
+          closeModal();
+          api("/kyc/business/" + id + "/reject", { method: "POST", body: { reason: reason } })
+            .then(function () { toast("Business rejected", "ok"); renderKyc(); })
+            .catch(function (err) { toast(err.message, "err"); });
+        };
+      }
+    });
+  }).catch(function (e) { $("kycBox").innerHTML = emptyBox(e.message); });
+}
+
+/* ===================== notifications feed ===================== */
+function renderNotifications() {
+  $("content").innerHTML =
+    '<div class="toolbar"><button class="btn btn-ghost btn-sm" id="markRead">Mark all as read</button></div><div id="feedBox"><div class="skel" style="height:200px"></div></div>';
+  $("markRead").onclick = function () {
+    api("/notifications/read-all", { method: "POST" }).then(function () { toast("Feed marked as read", "ok"); renderNotifications(); refreshBadges(); }).catch(function (e) { toast(e.message, "err"); });
+  };
+  api("/notifications").then(function (j) {
+    var rows = j.data || [];
+    if (!rows.length) { $("feedBox").innerHTML = emptyBox("No notifications yet"); return; }
+    $("feedBox").innerHTML =
+      '<div class="card"><div class="card-body" style="padding:6px 18px">' +
+      rows.map(function (n) {
+        return '<div class="feed-item"><div class="feed-dot' + (n.is_read ? " read" : "") + '"></div><div style="min-width:0">' +
+          '<div class="t">' + esc(n.title) + "</div>" +
+          (n.body ? '<div class="b">' + esc(n.body) + "</div>" : "") +
+          '<div class="d">' + dt(n.created_at) + " · " + esc(String(n.type || "").replace(/_/g, " ")) + "</div>" +
+          "</div></div>";
+      }).join("") + "</div></div>";
+  }).catch(function (e) { $("feedBox").innerHTML = emptyBox(e.message); });
+}
+
+/* ===================== settings ===================== */
+var disputeEmails = [];
+function renderSettings() {
+  $("content").innerHTML =
+    /* Dispute emails (admin-managed, DB-backed) */
+    '<div class="card">' +
+      '<div class="card-head"><h3>Dispute notification emails</h3><span class="badge b-resolved" id="deSource">—</span></div>' +
+      '<div class="card-body">' +
+        '<p class="cell-sub" style="margin-bottom:14px">These inboxes receive an alert whenever a customer files a transaction dispute (and on reversal / recheck events). Stored in the platform database — <b>no redeploy needed</b>; the .env value is only a fallback and is overridden once you save here.</p>' +
+        '<div class="email-list" id="deList"></div>' +
+        '<div class="add-row">' +
+          '<input id="deInput" type="email" placeholder="Add an email and press Enter (e.g. disputes@metricorex.com)" />' +
+          '<button class="btn btn-primary" id="deAdd">Add</button>' +
+        "</div>" +
+        '<div class="actions-row">' +
+          '<button class="btn btn-primary" id="deSave">Save changes</button>' +
+          '<button class="btn btn-ghost" id="deTest">Send test email</button>' +
+        "</div>" +
+        '<div class="test-results" id="deTestRes"></div>' +
+      "</div>" +
+    "</div>" +
+    /* Maintenance mode */
+    '<div class="card">' +
+      '<div class="card-head"><h3>Maintenance mode</h3><span class="muted">Emails + pushes every active user when toggled</span></div>' +
+      '<div class="card-body" style="display:flex;align-items:center;gap:14px">' +
+        '<label class="switch"><input type="checkbox" id="mmToggle" /><span class="track"></span></label>' +
+        '<div><b id="mmState">—</b><div class="cell-sub">When ON, user apps show a maintenance screen.</div></div>' +
+      "</div>" +
+    "</div>";
+
+  /* --- dispute emails --- */
+  loadDisputeEmails();
+  $("deAdd").onclick = addDisputeEmail;
+  $("deInput").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); addDisputeEmail(); } });
+  $("deSave").onclick = function () {
+    if (!disputeEmails.length) { toast("Add at least one email first", "err"); return; }
+    api("/settings/dispute-emails", { method: "PUT", body: { emails: disputeEmails } })
+      .then(function () { toast("Dispute emails saved — live immediately", "ok"); loadDisputeEmails(); })
+      .catch(function (e) { toast(e.message, "err"); });
+  };
+  $("deTest").onclick = function () {
+    var btn = $("deTest");
+    btn.disabled = true; btn.textContent = "Sending…";
+    $("deTestRes").innerHTML = "";
+    api("/settings/dispute-emails/test", { method: "POST" }).then(function (j) {
+      renderTestResults((j.data && j.data.results) || []);
+      btn.disabled = false; btn.textContent = "Send test email";
+    }).catch(function (e) {
+      toast(e.message, "err");
+      btn.disabled = false; btn.textContent = "Send test email";
+    });
+  };
+  /* --- maintenance mode --- */
+  api("/maintenance-mode").then(function (j) {
+    var on = !!(j.data && j.data.maintenance_mode);
+    $("mmToggle").checked = on;
+    $("mmState").textContent = on ? "Maintenance mode is ON" : "Maintenance mode is OFF";
+  }).catch(function () { $("mmState").textContent = "manage_settings permission required"; });
+  $("mmToggle").addEventListener("change", function () {
+    var enable = $("mmToggle").checked;
+    confirmModal({
+      title: enable ? "Enable maintenance mode?" : "Disable maintenance mode?",
+      danger: enable,
+      sub: enable
+        ? "Every active, verified user will be emailed and pushed that the app is under maintenance."
+        : "Every user will be emailed and pushed that the app is back up.",
+      okText: enable ? "Enable" : "Disable",
+      onOk: function () {
+        closeModal();
+        api("/maintenance-mode", { method: "PUT", body: { enabled: enable } })
+          .then(function () { $("mmState").textContent = enable ? "Maintenance mode is ON" : "Maintenance mode is OFF"; toast("Maintenance mode " + (enable ? "enabled" : "disabled"), "ok"); })
+          .catch(function (e) { $("mmToggle").checked = !enable; toast(e.message, "err"); });
+      },
+    });
+  });
+}
+function loadDisputeEmails() {
+  api("/settings/dispute-emails").then(function (j) {
+    var d = j.data || {};
+    disputeEmails = d.emails || [];
+    var src = $("deSource");
+    if (d.source === "database") { src.className = "badge b-resolved"; src.textContent = "Managed in Admin Console"; }
+    else { src.className = "badge b-pending"; src.textContent = "Using .env fallback"; }
+    renderDisputeEmailRows(d.envFallback || []);
+  }).catch(function (e) {
+    $("deList").innerHTML = '<div class="note-box">' + esc(e.message) + "</div>";
+  });
+}
+function renderDisputeEmailRows(envFallback) {
+  var list = $("deList");
+  if (!list) return;
+  if (!disputeEmails.length) {
+    list.innerHTML =
+      '<div class="note-box">No emails set yet. ' +
+      (envFallback && envFallback.length
+        ? "Current .env fallback in effect: <b>" + envFallback.map(esc).join(", ") + "</b>"
+        : "No .env fallback configured either — disputes are only visible in the Notifications feed until you add an email.") +
+      "</div>";
+    return;
+  }
+  list.innerHTML = disputeEmails.map(function (em, i) {
+    return '<div class="email-row"><span>✉️</span><span class="em">' + esc(em) + '</span><button class="x" data-i="' + i + '" title="Remove">✕</button></div>';
+  }).join("");
+  var xs = list.querySelectorAll(".x");
+  for (var i = 0; i < xs.length; i++) {
+    xs[i].onclick = function () {
+      disputeEmails.splice(parseInt(this.getAttribute("data-i"), 10), 1);
+      renderDisputeEmailRows([]);
+    };
+  }
+}
+function addDisputeEmail() {
+  var input = $("deInput");
+  var v = (input.value || "").trim().toLowerCase();
+  if (!v) return;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) { toast("That doesn't look like a valid email address", "err"); return; }
+  if (disputeEmails.indexOf(v) >= 0) { toast("Already in the list", "info"); input.value = ""; return; }
+  if (disputeEmails.length >= 20) { toast("Maximum of 20 emails", "err"); return; }
+  disputeEmails.push(v);
+  input.value = "";
+  renderDisputeEmailRows([]);
+}
+function renderTestResults(results) {
+  var box = $("deTestRes");
+  if (!box) return;
+  box.innerHTML = results.map(function (r) {
+    return '<div class="test-row">' + (r.sent ? "✅" : "❌") + " <span>" + esc(r.email) + "</span>" +
+      (r.sent ? '<span class="cell-sub">sent</span>' : '<span class="cell-sub" style="color:var(--bad)">' + esc(r.error || "failed") + "</span>") + "</div>";
+  }).join("");
+}
+
+/* ===================== boot ===================== */
+if (localStorage.getItem(TOKEN_KEY)) { showApp(); } else { showLogin(); }
+</script>
+</body>
+</html>

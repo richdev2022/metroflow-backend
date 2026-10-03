@@ -5,7 +5,7 @@ import { reverseFailedTransfer } from "../services/transfer";
 import { verifySingleTransfer } from "../services/transfer";
 import { sendDisputeCustomerUpdate, sendDisputeAdminAlert } from "../services/email";
 import { sendPushToUsers } from "../services/push";
-import { resolveDisputeTransaction, disputeAdminEmails, notifyDisputeCustomer } from "./disputes";
+import { resolveDisputeTransaction, getDisputeAdminEmails, notifyDisputeCustomer } from "./disputes";
 
 /**
  * Transaction dispute lifecycle — platform admin side.
@@ -51,7 +51,8 @@ async function markResolved(
 }
 
 async function alertAdminDesk(subject: string, body: string): Promise<void> {
-  for (const adminEmail of disputeAdminEmails()) {
+  const { emails } = await getDisputeAdminEmails();
+  for (const adminEmail of emails) {
     await sendDisputeAdminAlert(adminEmail, "Dispute Desk", {
       customerName: "",
       reference: "",

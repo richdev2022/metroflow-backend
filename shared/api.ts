@@ -46,6 +46,11 @@ export interface TeamMember {
   roleName?: string | null;
   /** resolved permission slugs for this member; owner/admin get the full catalog */
   permissions?: string[];
+  /** complete employee information (invite form) */
+  phoneNumber?: string | null;
+  jobTitle?: string | null;
+  department?: string | null;
+  employmentType?: string | null;
 }
 
 export interface InviteTeamMemberInput {
@@ -54,6 +59,14 @@ export interface InviteTeamMemberInput {
   role: "admin" | "manager" | "member";
   /** optional custom role (team_roles.id) — takes precedence for permissions */
   roleId?: string | null;
+  /** complete employee information */
+  phone_number?: string | null;
+  phoneNumber?: string | null;
+  job_title?: string | null;
+  jobTitle?: string | null;
+  department?: string | null;
+  employment_type?: string | null;
+  employmentType?: string | null;
 }
 
 // Task Status Types

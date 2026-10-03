@@ -4,6 +4,34 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 
 /**
+ * Map a raw notifications table row (snake_case columns) to camelCase — the
+ * shape the Prisma-backed endpoints emit and every client (web/mobile)
+ * expects. The mobile app previously crashed on this endpoint with
+ * "type 'Null' is not a subtype of type 'String' in type cast" because it
+ * read camelCase keys off the raw snake_case rows.
+ */
+function mapNotificationRow(row: any): any {
+  if (!row || typeof row !== "object") return row;
+  return {
+    id: row.id,
+    businessId: row.business_id,
+    userId: row.user_id,
+    type: row.type,
+    title: row.title,
+    message: row.message,
+    actionUrl: row.action_url ?? null,
+    actionType: row.action_type ?? null,
+    metadata: row.metadata ?? null,
+    isRead: row.is_read ?? false,
+    isActionable: row.is_actionable ?? false,
+    actionTaken: row.action_taken ?? null,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at ?? null,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
  * @swagger
  * /notifications:
  *   get:
@@ -75,7 +103,7 @@ export const getNotifications: RequestHandler = async (
 
     const response: ApiResponse<{ notifications: any[]; total: number }> = {
       success: true,
-      data: { notifications: result.rows, total },
+      data: { notifications: result.rows.map(mapNotificationRow), total },
     };
     res.json(response);
   } catch (error) {
@@ -140,7 +168,7 @@ export const markNotificationAsRead: RequestHandler = async (
 
     const response: ApiResponse<any> = {
       success: true,
-      data: result.rows[0],
+      data: mapNotificationRow(result.rows[0]),
     };
     res.json(response);
   } catch (error) {
@@ -266,7 +294,7 @@ export const takeNotificationAction: RequestHandler = async (
 
     const response: ApiResponse<any> = {
       success: true,
-      data: result.rows[0],
+      data: mapNotificationRow(result.rows[0]),
     };
     res.json(response);
   } catch (error) {

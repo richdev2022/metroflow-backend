@@ -3,7 +3,13 @@ import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
-import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml } from "../services/email";
+import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert } from "../services/email";
+import {
+  getDisputeAdminEmails,
+  setDisputeAdminEmails,
+  parseEmailList,
+  disputeAdminEmails,
+} from "./disputes";
 import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
@@ -3547,6 +3553,139 @@ protectedRouter.put("/maintenance-mode", requirePermission('manage_settings'), a
         res.json({ success: true, data: { maintenance_mode: enabled } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to update maintenance mode" });
+    }
+});
+
+// ============================================================================
+// Dispute email recipients (ADMIN-MANAGED — stored in system_settings, NOT .env)
+// ============================================================================
+
+/**
+ * GET /admin/settings/dispute-emails
+ * Returns the inboxes that receive transaction dispute alerts.
+ * `source` tells the console whether the list comes from the database
+ * (admin-managed) or from the .env fallback chain (not yet overridden).
+ */
+protectedRouter.get("/settings/dispute-emails", requirePermission('manage_settings', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { emails, source, envFallback } = await getDisputeAdminEmails();
+        res.json({ success: true, data: { emails, source, envFallback } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load dispute emails" });
+    }
+});
+
+/**
+ * PUT /admin/settings/dispute-emails
+ * Body: { emails: string[] | string } — list of inboxes (or a comma/newline
+ * separated string). Validated, deduped, lowercased and persisted to
+ * system_settings so it survives deploys and needs no redeploy to change.
+ */
+protectedRouter.put("/settings/dispute-emails", requirePermission('manage_settings', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const raw = req.body?.emails;
+        if (raw === undefined || raw === null) {
+            res.status(400).json({ success: false, error: "emails is required" });
+            return;
+        }
+        const rawList = Array.isArray(raw) ? raw.join(",") : String(raw);
+        const emails = parseEmailList(rawList);
+        if (emails.length === 0) {
+            res.status(400).json({
+                success: false,
+                error: "Provide at least one valid email address",
+            });
+            return;
+        }
+        if (emails.length > 20) {
+            res.status(400).json({ success: false, error: "A maximum of 20 email addresses is allowed" });
+            return;
+        }
+        await setDisputeAdminEmails(emails);
+
+        console.log(`[admin] dispute emails updated by admin ${req.admin?.adminId}: ${emails.join(", ")}`);
+        res.json({ success: true, data: { emails, source: "database" } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save dispute emails" });
+    }
+});
+
+/**
+ * POST /admin/settings/dispute-emails/test
+ * Sends a test dispute alert to every configured inbox and reports the
+ * per-address delivery result, so admins can verify the wiring instantly.
+ */
+protectedRouter.post("/settings/dispute-emails/test", requirePermission('manage_settings', 'manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { emails } = await getDisputeAdminEmails();
+        if (emails.length === 0) {
+            res.status(400).json({
+                success: false,
+                error: "No dispute emails configured yet — add at least one address first",
+            });
+            return;
+        }
+        const results: Array<{ email: string; sent: boolean; error?: string }> = [];
+        for (const email of emails) {
+            try {
+                await sendDisputeAdminAlert(email, "Dispute Desk", {
+                    customerName: "Test customer",
+                    reference: "TEST-" + Date.now().toString().slice(-8),
+                    amount: "1,000.00",
+                    currency: "NGN",
+                    category: "failed_transfer",
+                    status: "open",
+                    message: "This is a TEST dispute alert triggered from the Admin Console to verify dispute email delivery.",
+                });
+                results.push({ email, sent: true });
+            } catch (err: any) {
+                results.push({ email, sent: false, error: err?.message || "send failed" });
+            }
+        }
+        const allSent = results.every((r) => r.sent);
+        res.status(allSent ? 200 : 502).json({ success: allSent, data: { results } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to send test emails" });
+    }
+});
+
+// Legacy alias kept for older console builds: which inboxes WOULD the env use?
+protectedRouter.get("/settings/dispute-emails/env", requirePermission('manage_settings', 'manage_finance'), async (_req: AuthenticatedAdminRequest, res) => {
+    res.json({ success: true, data: { emails: disputeAdminEmails() } });
+});
+
+// ============================================================================
+// Admin notification feed (dispute alerts, support, etc.)
+// ============================================================================
+
+/** GET /admin/notifications — latest 50 feed rows + unread count. */
+protectedRouter.get("/notifications", async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const limit = Math.min(parseInt(String(req.query.limit || "50"), 10) || 50, 100);
+        const rows = await query(
+            `SELECT id, type, title, body, is_read, created_at
+             FROM admin_notifications
+             WHERE admin_id IS NULL
+             ORDER BY created_at DESC
+             LIMIT $1`,
+            [limit],
+        );
+        const unread = await query(
+            `SELECT COUNT(*)::int AS count FROM admin_notifications WHERE admin_id IS NULL AND is_read = FALSE`,
+        );
+        res.json({ success: true, data: rows.rows, unread: unread.rows[0]?.count || 0 });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load notifications" });
+    }
+});
+
+/** POST /admin/notifications/read-all — mark the whole feed as read. */
+protectedRouter.post("/notifications/read-all", async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        await query(`UPDATE admin_notifications SET is_read = TRUE WHERE admin_id IS NULL AND is_read = FALSE`);
+        res.json({ success: true });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to mark notifications read" });
     }
 });
 

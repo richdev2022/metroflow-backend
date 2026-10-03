@@ -31,6 +31,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureTeamRolesSchema(); // + users.role_id
   await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
   await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
+  await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -41,6 +42,35 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
   await ensurePlanPricingLadder();
+}
+
+/**
+ * Transfer beneficiaries — a per-user directory of recent transfer recipients.
+ * Populated automatically whenever a user initiates a single transfer and
+ * surfaced as one-tap chips inside the transfer form. Auto-save is upsert
+ * keyed on (user, bank, account) so repeat transfers refresh last_used_at
+ * instead of duplicating rows.
+ */
+async function ensureBeneficiariesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS transfer_beneficiaries (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      business_id UUID,
+      bank_code VARCHAR(20) NOT NULL,
+      bank_name VARCHAR(120),
+      account_number VARCHAR(20) NOT NULL,
+      account_name VARCHAR(160),
+      currency VARCHAR(10) DEFAULT 'NGN',
+      use_count INTEGER DEFAULT 1,
+      last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id, bank_code, account_number)
+    )
+  `);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_beneficiaries_user ON transfer_beneficiaries(user_id, last_used_at DESC)`,
+  );
 }
 
 /**

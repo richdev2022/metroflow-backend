@@ -298,6 +298,7 @@ export const checkKycStatus = async (req: AuthenticatedRequest, res: Response, n
     if (!isUserVerified) {
       return res.status(403).json({
         success: false,
+        code: "KYC_REQUIRED",
         error: "KYC verification is required to access this feature. Please complete your KYC verification."
       });
     }

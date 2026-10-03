@@ -1,11 +1,11 @@
 import express from "express";
 import crypto from "crypto";
 import { query } from "../db";
-import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission } from "../middleware/auth";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
-import { accountLookup, processAllPending } from "../services/transfer";
+import { accountLookup, processAllPending, reverseFailedTransfer } from "../services/transfer";
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
@@ -428,7 +428,10 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, requireT
  *                   type: string
  *                   example: "Failed to initiate transfer"
  */
-router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
+// KYC REQUIRED: moving money out of the wallet is a regulated financial
+// action — the customer must have completed Tier-1 KYC (BVN or NIN) first.
+// The 403 carries code "KYC_REQUIRED" so clients can open the KYC flow.
+router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
     const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId, recipientAddress, recipientCity, recipientState, recipientPostalCode, recipientCountry, bankName, swiftCode, routingNumber } = req.body;
     const businessId = req.user?.businessId;
@@ -648,6 +651,37 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       responseMessage = "Transfer is being processed";
     }
 
+    // BENEFICIARY AUTO-SAVE: every transfer attempt adds/refreshes the
+    // recipient in the user's recent-beneficiaries directory (upsert keyed
+    // on user + bank + account so repeats bump last_used_at instead of
+    // duplicating). Best-effort — never blocks the transfer response.
+    try {
+      const bBank = finalTransfer.recipient_bank;
+      const bAcct = finalTransfer.recipient_account;
+      if (bBank && bAcct) {
+        await query(
+          `INSERT INTO transfer_beneficiaries
+             (user_id, business_id, bank_code, account_number, account_name, currency)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (user_id, bank_code, account_number)
+           DO UPDATE SET
+             account_name = COALESCE(EXCLUDED.account_name, transfer_beneficiaries.account_name),
+             use_count = transfer_beneficiaries.use_count + 1,
+             last_used_at = CURRENT_TIMESTAMP`,
+          [
+            userId,
+            businessId || null,
+            String(bBank),
+            String(bAcct),
+            finalTransfer.recipient_name || null,
+            finalTransfer.currency || 'NGN',
+          ],
+        );
+      }
+    } catch (bErr) {
+      console.error("Beneficiary auto-save failed (non-fatal):", bErr);
+    }
+
     const statusCode = finalTransfer.status === 'failed' ? 200 : 200;
 
     res.status(statusCode).json({ 
@@ -840,7 +874,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  *                   type: string
  *                   example: "Failed to initiate bulk transfer"
  */
-router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
+router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
     const { type, data, otp, pin } = req.body;
     // Accept both snake_case and camelCase source wallet id (validation schema
@@ -1557,7 +1591,141 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
  *                 message:
  *                   type: string
  */
-router.post("/:id/retry", authenticateToken, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
+/**
+ * GET /transfers/beneficiaries — the user's recent transfer recipients
+ * (newest first). Powers the one-tap beneficiary chips in the transfer form.
+ */
+router.get("/beneficiaries", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const result = await query(
+      `SELECT id, bank_code, bank_name, account_number, account_name, currency, use_count, last_used_at
+       FROM transfer_beneficiaries
+       WHERE user_id = $1
+       ORDER BY last_used_at DESC
+       LIMIT 30`,
+      [userId],
+    );
+
+    res.json({
+      success: true,
+      data: result.rows.map((r: any) => ({
+        id: r.id,
+        bankCode: r.bank_code,
+        bankName: r.bank_name || null,
+        accountNumber: r.account_number,
+        accountName: r.account_name || '',
+        currency: r.currency || 'NGN',
+        useCount: Number(r.use_count || 0),
+        lastUsedAt: r.last_used_at,
+      })),
+    });
+  } catch (error) {
+    console.error("List beneficiaries error:", error);
+    res.status(500).json({ success: false, error: "Failed to load beneficiaries" });
+  }
+});
+
+/**
+ * DELETE /transfers/beneficiaries/:id — remove a saved beneficiary.
+ */
+router.delete("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const { id } = req.params;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const result = await query(
+      `DELETE FROM transfer_beneficiaries WHERE id = $1 AND user_id = $2`,
+      [id, userId],
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
+    res.json({ success: true, message: "Beneficiary removed" });
+  } catch (error) {
+    console.error("Delete beneficiary error:", error);
+    res.status(500).json({ success: false, error: "Failed to remove beneficiary" });
+  }
+});
+
+/**
+ * POST /transfers/:id/force-reversal — customer-triggered self-heal.
+ *
+ * A failed transfer whose money has NOT come back yet (e.g. the reversal
+ * webhook arrived while the backend ran an older build). Idempotent: the
+ * shared reverseFailedTransfer helper refuses double refunds, so tapping
+ * repeatedly is safe. Accepts the transfer UUID or its reference.
+ */
+router.post("/:id/force-reversal", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const businessId = req.user?.businessId;
+    const { id } = req.params;
+    if (!userId || !businessId) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+
+    const isUuid = /^[0-9a-fA-F-]{36}$/.test(id);
+    const transferRes = await query(
+      isUuid
+        ? `SELECT * FROM transfer_queue WHERE id = $1 AND business_id = $2`
+        : `SELECT * FROM transfer_queue WHERE reference = $1 AND business_id = $2`,
+      [id, businessId],
+    );
+    if (transferRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Transfer not found" });
+    }
+    const transfer = transferRes.rows[0];
+
+    if (transfer.status !== 'failed') {
+      return res.status(400).json({
+        success: false,
+        error: `Only failed transfers can be reversed (this one is "${transfer.status}")`,
+      });
+    }
+    if (!transfer.wallet_id) {
+      return res.status(400).json({
+        success: false,
+        error: "This transfer is not linked to a wallet — contact support",
+      });
+    }
+
+    // Already refunded? Report the existing refund instead of erroring.
+    const refundRes = await query(
+      `SELECT id, reference FROM transactions WHERE reference = $1 LIMIT 1`,
+      [`${transfer.reference}-REFUND`],
+    );
+    if (refundRes.rows.length > 0) {
+      return res.json({
+        success: true,
+        message: 'This transfer was already reversed — the amount is back in your wallet.',
+        data: { alreadyReversed: true, refundReference: refundRes.rows[0].reference },
+      });
+    }
+
+    const reversed = await reverseFailedTransfer(transfer, 'Customer-requested reversal from receipt');
+    if (!reversed) {
+      return res.status(500).json({
+        success: false,
+        error: "Reversal could not be completed right now — it will retry automatically, or contact support",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Reversal completed — the full amount (including the fee) is back in your wallet.",
+      data: { alreadyReversed: false },
+    });
+  } catch (error) {
+    console.error("Force reversal error:", error);
+    res.status(500).json({ success: false, error: "Failed to reverse transfer" });
+  }
+});
+
+router.post("/:id/retry", authenticateToken, requireTeamPermission("manage_finance"), checkKycStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
     const businessId = req.user?.businessId;

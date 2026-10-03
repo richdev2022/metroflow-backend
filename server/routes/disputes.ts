@@ -5,6 +5,7 @@ import { upload } from "../middleware/upload";
 import { uploadMediaBuffer } from "../services/media-upload";
 import { sendDisputeAdminAlert, sendDisputeCustomerUpdate } from "../services/email";
 import { sendPushToUsers } from "../services/push";
+import { getSetting, setSetting } from "../services/app-config";
 
 /**
  * Transaction disputes (customer side).
@@ -74,18 +75,65 @@ export async function resolveDisputeTransaction(
   return null;
 }
 
-/** Email inboxes that receive new-dispute alerts (first config wins). */
+/** system_settings key that stores the admin-managed dispute inbox list. */
+export const DISPUTE_EMAILS_SETTING_KEY = "dispute_admin_emails";
+
+/** Parse a comma/newline/semicolon-separated email string into a clean list. */
+export function parseEmailList(raw: string): string[] {
+  return Array.from(
+    new Set(
+      (raw || "")
+        .split(/[,;\n]/)
+        .map((e) => e.trim().toLowerCase())
+        .filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)),
+    ),
+  );
+}
+
+/** Env-only fallback chain (legacy behavior — used when no DB value exists). */
 export function disputeAdminEmails(): string[] {
-  const raw =
+  return parseEmailList(
     process.env.DISPUTE_ADMIN_EMAILS ||
-    process.env.KYC_ADMIN_EMAILS ||
-    process.env.SUPPORT_ALERT_EMAIL ||
-    process.env.ADMIN_ALERT_EMAIL ||
-    "";
-  return raw
-    .split(",")
-    .map((e) => e.trim())
-    .filter(Boolean);
+      process.env.KYC_ADMIN_EMAILS ||
+      process.env.SUPPORT_ALERT_EMAIL ||
+      process.env.ADMIN_ALERT_EMAIL ||
+      "",
+  );
+}
+
+/**
+ * Email inboxes that receive dispute alerts.
+ * ADMIN-MANAGED FIRST: the value saved from the Admin Console
+ * (system_settings.dispute_admin_emails) always wins; the .env chain is only
+ * a bootstrap fallback so a fresh deploy still alerts someone.
+ */
+export async function getDisputeAdminEmails(): Promise<{
+  emails: string[];
+  source: "database" | "env";
+  envFallback: string[];
+}> {
+  const envFallback = disputeAdminEmails();
+  try {
+    const stored = await getSetting(DISPUTE_EMAILS_SETTING_KEY, "");
+    if (stored && stored.trim()) {
+      const emails = parseEmailList(stored);
+      if (emails.length > 0) {
+        return { emails, source: "database", envFallback };
+      }
+    }
+  } catch (err) {
+    console.error("[disputes] failed to read dispute email setting (falling back to env):", err);
+  }
+  return { emails: envFallback, source: "env", envFallback };
+}
+
+/** Persist the admin-managed dispute inbox list. */
+export async function setDisputeAdminEmails(emails: string[]): Promise<void> {
+  await setSetting(
+    DISPUTE_EMAILS_SETTING_KEY,
+    emails.join(","),
+    "Admin Console: inboxes that receive transaction dispute alerts",
+  );
 }
 
 /** Notify the customer on every dispute lifecycle event (push + in-app). */
@@ -250,7 +298,7 @@ const fileDispute: RequestHandler = async (req, res) => {
     try {
       const businessRes = await query(`SELECT name FROM businesses WHERE id = $1`, [businessId]);
       const businessName = businessRes.rows[0]?.name || "A customer";
-      const admins = disputeAdminEmails();
+      const { emails: admins } = await getDisputeAdminEmails();
       for (const adminEmail of admins) {
         await sendDisputeAdminAlert(adminEmail, businessName, {
           customerName: businessName,

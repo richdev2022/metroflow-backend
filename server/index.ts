@@ -74,6 +74,7 @@ import dashboardRouter from "./routes/dashboard";
 import rolesRouter from "./routes/roles";
 import { requireTeamPermission } from "./middleware/teamAuth";
 import transferRouter from "./routes/transfers";
+import disputesRouter from "./routes/disputes";
 import payrollRouter from "./routes/payroll";
 import settingsRouter from "./routes/settings";
 import { rtcRouter } from "./lib/calling/routes";
@@ -748,6 +749,8 @@ export async function createServer() {
 
   // Transfer API routes
   mainRouter.use("/transfers", transferRouter);
+  // Transaction dispute lifecycle (customer side; admin side lives under /admin/disputes)
+  mainRouter.use("/disputes", disputesRouter);
 
   // Payroll API routes
   mainRouter.use("/payroll", payrollRouter);

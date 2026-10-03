@@ -80,6 +80,9 @@ const monnifyClient = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
+  // Hard ceiling so a hanging provider call can never block the transfer
+  // route (which awaits the provider synchronously for an instant status).
+  timeout: 30_000,
 });
 
 // Add interceptor to add access token to all requests

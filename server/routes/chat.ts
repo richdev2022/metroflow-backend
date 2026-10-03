@@ -880,7 +880,11 @@ export const sendMessage: RequestHandler = async (
                 },
                 androidChannelId: "general",
               },
-              { inApp: false, type: "chat_message" },
+              // inApp: true — every received message must also land in the
+              // in-app notifications panel (createNotification mirrors it into
+              // the notifications table + sockets), not just the OS tray.
+              // businessId is required for that mirror to insert.
+              { inApp: true, type: "chat_message", businessId },
             ).catch(() => {});
           }
         } catch (chatPushError) {

@@ -1155,7 +1155,9 @@ router.get("/verify", async (req, res) => {
                     const netAmount = Number(transaction.amount) || 0;
                     const feeAmount = Number(transaction.fee) || 0;
 
-                    // Gross inflow the gateway received (net + fee charged on top)
+                    // Gross inflow the gateway received (net + fee charged on top).
+                    // ONE row: the internal wallet allocation never touches the
+                    // pool account, so no "-USER" debit row is written.
                     await creditPlatformWallet(
                         netAmount + feeAmount,
                         'NGN',
@@ -1163,16 +1165,8 @@ router.get("/verify", async (req, res) => {
                         'Customer Wallet Funding Received (Card)',
                         ledgerProvider,
                     );
-                    // The user's payout leaving the platform pool
-                    await debitPlatformWallet(
-                        netAmount,
-                        'NGN',
-                        `${reference}-USER`,
-                        'Platform Wallet Debit for User Funding',
-                        ledgerProvider,
-                    );
-                    // The fee moves from the pool into the revenue wallet —
-                    // this ALSO writes the wallet_id-NULL revenue row that the
+                    // The fee lands in the revenue wallet —
+                    // this writes the wallet_id-NULL revenue row that the
                     // admin Revenue Ledger history aggregates on.
                     if (feeAmount > 0) {
                         await creditRevenueWallet(

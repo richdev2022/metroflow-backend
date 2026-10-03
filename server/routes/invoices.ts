@@ -3,7 +3,7 @@ import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { getProvider } from "../services/providers/factory";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
+import { calculateFee, creditPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 
 const router = express.Router();
@@ -755,9 +755,9 @@ export async function settleInvoicePayment(reference: string, providerName: stri
         [payment.invoice_id, gross]
     );
 
-    // Double-entry platform ledger: gross in, net out, fee to revenue
+    // Pool ledger: the client's gateway payment IS a real pool inflow.
+    // The merchant settlement is an internal wallet credit (no pool movement).
     await creditPlatformWallet(gross, currency, reference, 'Invoice Client Payment Received', providerName);
-    await debitPlatformWallet(net, currency, `${reference}-MERCHANT`, 'Platform Wallet Debit for Invoice Settlement', providerName);
     if (fee > 0) {
         await creditRevenueWallet(fee, currency, reference, 'Invoice Settlement Fee', providerName);
     }

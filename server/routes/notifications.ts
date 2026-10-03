@@ -78,11 +78,10 @@ export const getNotifications: RequestHandler = async (
     const offset = (page - 1) * limit;
     const unreadOnly = req.query.unreadOnly === "true";
 
-    // Delete expired notifications first
-    await query(
-      `DELETE FROM notifications WHERE expires_at < NOW()`,
-      []
-    );
+    // NOTE: expired-notification cleanup used to run INSIDE this handler
+    // (a full-table `DELETE FROM notifications WHERE expires_at < NOW()` on
+    // every GET — a table-wide write per request per user). It now runs on a
+    // boot-time interval; see startNotificationCleanup() in index.ts.
 
     const countResult = await query(
       `SELECT COUNT(*) as total FROM notifications 

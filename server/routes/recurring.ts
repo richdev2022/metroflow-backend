@@ -2,7 +2,7 @@ import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
+import { calculateFee, creditPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 import { getProvider } from "../services/providers/factory";
 import { sendEmail } from "../services/email";
@@ -1102,9 +1102,9 @@ async function runWalletCharge(opts: { subscriber: any; plan: any; periodStart: 
          `Subscription payment received — ${plan.name} (${subscriber.customer_name})`, merchantWallet.id, fee]
     );
 
-    // Double-entry platform ledger: gross in, net out, fee to revenue
-    await creditPlatformWallet(amount, currency, reference, "Subscription Charge Collected", "wallet");
-    await debitPlatformWallet(net, currency, `${reference}-MERCHANT`, "Platform Wallet Debit for Subscription Settlement", "wallet");
+    // Wallet-charged subscription: fully INTERNAL (subscriber wallet ->
+    // merchant wallet). No pool movement occurs, so NO platform-ledger rows.
+    // Only the fee revenue (virtual allocation) is recorded.
     if (fee > 0) {
         await creditRevenueWallet(fee, currency, reference, "Subscription Charge Fee", "wallet");
     }
@@ -1310,9 +1310,9 @@ export async function settleSubscriptionCharge(reference: string, providerName: 
          `Subscription payment received (net of ${fee} ${currency} fee)`, merchantWallet.id, fee, providerName]
     );
 
-    // Double-entry platform ledger: gross in, net out, fee to revenue
+    // Pool ledger: the customer's gateway payment IS a real pool inflow.
+    // The merchant settlement is an internal wallet credit (no pool movement).
     await creditPlatformWallet(gross, currency, reference, "Subscription Charge Received", providerName);
-    await debitPlatformWallet(net, currency, `${reference}-MERCHANT`, "Platform Wallet Debit for Subscription Settlement", providerName);
     if (fee > 0) {
         await creditRevenueWallet(fee, currency, reference, "Subscription Charge Fee", providerName);
     }

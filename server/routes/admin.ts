@@ -398,8 +398,19 @@ protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), asy
     const usersCount = await query(`SELECT COUNT(*) FROM users`);
     const activeBusinesses = await query(`SELECT COUNT(*) FROM businesses WHERE subscription_status = 'active'`);
     
-    // Real revenue aggregation
-    const revenue = await query(`SELECT SUM(amount) as sum FROM transactions WHERE status = 'success'`);
+    // Real revenue: ONLY platform earnings — the wallet_id-NULL fee/subscription
+    // credit rows written by creditRevenueWallet()/subscription settlement (the
+    // same aggregation the /revenue endpoint uses). Previously this summed
+    // EVERY successful transaction (fundings, transfers, refunds, ledger
+    // mirrors), massively overstating revenue.
+    const revenue = await query(`
+      SELECT COALESCE(SUM(amount), 0) as sum
+      FROM transactions
+      WHERE status = 'success'
+        AND transaction_type IN ('fee', 'subscription')
+        AND wallet_id IS NULL
+        AND type = 'credit'
+    `);
 
     res.json({
       success: true,
@@ -430,7 +441,8 @@ protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), asy
  */
 protectedRouter.get("/dashboard/charts", requirePermission('view_dashboard'), async (req, res) => {
   try {
-    // 1. Revenue Over Time (Last 6 months)
+    // 1. Revenue Over Time (Last 6 months) — platform earnings ONLY
+    //    (fee/subscription credit rows), not every successful transaction.
     const revenueRes = await query(`
       SELECT 
         to_char(d, 'Mon') as name, 
@@ -440,7 +452,12 @@ protectedRouter.get("/dashboard/charts", requirePermission('view_dashboard'), as
         date_trunc('month', NOW()), 
         '1 month'::interval
       ) d
-      LEFT JOIN transactions t ON date_trunc('month', t.created_at) = d AND t.status = 'success'
+      LEFT JOIN transactions t 
+        ON date_trunc('month', t.created_at) = d 
+        AND t.status = 'success'
+        AND t.transaction_type IN ('fee', 'subscription')
+        AND t.wallet_id IS NULL
+        AND t.type = 'credit'
       GROUP BY d
       ORDER BY d ASC
     `);
@@ -561,10 +578,24 @@ protectedRouter.get("/wallet/history", requirePermission('view_dashboard'), asyn
     }
     const walletId = walletRes.rows[0].id;
 
+    // PLATFORM LEDGER = mirror of the provider pool account. Show ONLY rows
+    // that correspond to real pool movements (fundings in, payouts out, vendor
+    // settlements, provider reversals). Internal allocation pairs ("-USER",
+    // "-MERCHANT", revenue mirrors, transfer holds) never touched the pool —
+    // filter them defensively so legacy/un-migrated rows can't pollute the
+    // history either.
     const transactions = await query(
         `SELECT * FROM transactions 
          WHERE wallet_id = $1 
          AND transaction_type NOT IN ('fee', 'subscription')
+         AND reference NOT LIKE '%-USER'
+         AND reference NOT LIKE '%-MERCHANT'
+         AND reference NOT LIKE '%-PLATFORM'
+         AND description NOT LIKE 'Platform Wallet Debit for Revenue%'
+         AND description NOT LIKE 'Platform Wallet Credit (Revenue Reversal)%'
+         AND description NOT LIKE 'Platform Wallet Credit for Transfer%'
+         AND description NOT LIKE 'Reversal of platform hold%'
+         AND description NOT IN ('Bill Payment Received', 'Savings Withdrawal Received', 'Subscription Charge Collected')
          ORDER BY created_at DESC`,
         [walletId]
     );
@@ -1318,7 +1349,24 @@ protectedRouter.get("/transactions", requirePermission('view_dashboard'), async 
             addSharedFilter("t.status = ?", "tq.status = ?", status);
         }
 
-        const transactionWhere = transactionFilters.length ? `WHERE ${transactionFilters.join(" AND ")}` : "";
+        const transactionWhere = transactionFilters.length
+            ? `WHERE ${transactionFilters.join(" AND ")}`
+            : "";
+
+        // Base exclusions for the transactions side of the UNION:
+        //  - transaction_type='platform' rows are the internal pool ledger —
+        //    never user-facing transactions.
+        //  - transaction_type='transfer' rows duplicate the transfer_queue
+        //    side of this UNION (every transfer is queued; the txn row only
+        //    mirrors its wallet debit), which made every transfer appear TWICE
+        //    in the admin history.
+        // Platform ledger rows can still be inspected on the Platform Wallet
+        // page (/admin/wallet/history).
+        const transactionBase =
+            "t.transaction_type IS DISTINCT FROM 'platform' AND t.transaction_type IS DISTINCT FROM 'transfer'";
+        const transactionsWhereFinal = transactionWhere
+            ? `${transactionWhere} AND ${transactionBase}`
+            : `WHERE ${transactionBase}`;
         const transferWhere = transferFilters.length ? `WHERE ${transferFilters.join(" AND ")}` : "";
 
         const transactionsQuery = `
@@ -1350,7 +1398,7 @@ protectedRouter.get("/transactions", requirePermission('view_dashboard'), async 
             FROM transactions t
             LEFT JOIN businesses b ON t.business_id = b.id
             LEFT JOIN pricing_plans p ON t.plan_id = p.id
-            ${transactionWhere}
+            ${transactionsWhereFinal}
         `;
 
         const transfersQuery = `

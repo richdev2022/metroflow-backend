@@ -2,7 +2,7 @@ import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
+import { calculateFee, creditPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 import { getProvider } from "../services/providers/factory";
 
@@ -720,9 +720,9 @@ export async function settleStoreOrderPayment(reference: string, providerName: s
         [order.id]
     );
 
-    // Double-entry platform ledger: gross in, net out, fee to revenue
+    // Pool ledger: the customer's gateway payment IS a real pool inflow.
+    // The merchant settlement is an internal wallet credit (no pool movement).
     await creditPlatformWallet(gross, currency, reference, 'Storefront Order Payment Received', providerName);
-    await debitPlatformWallet(net, currency, `${reference}-MERCHANT`, 'Platform Wallet Debit for Store Order Settlement', providerName);
     if (fee > 0) {
         await creditRevenueWallet(fee, currency, reference, 'Storefront Order Fee', providerName);
     }

@@ -3,9 +3,66 @@ import { sendSMS } from "../services/sms";
 import { sendEmail, generateOtpEmailHtml, generateKYCOtpEmailHtml } from "../services/email";
 import { sendWhatsApp } from "../services/whatsapp";
 import { getAvailableSMSProviders, getSMSProvider } from "../services/sms-providers/factory";
+import { isPushConfigured } from "../services/push";
+import { query } from "../db";
+import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import crypto from "crypto";
 
 const router = express.Router();
+
+/**
+ * @swagger
+ * /test-communications/push-status:
+ *   get:
+ *     summary: Push (FCM) diagnostics for the signed-in user
+ *     description: Shows whether FCM credentials are configured server-side, which Firebase project sends are targeting, and how many devices are registered for the caller. Use this to verify the push pipeline end to end.
+ *     tags: [Test Communications]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Diagnostics
+ */
+router.get("/push-status", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    const devicesRes = await query(
+      `SELECT platform, COUNT(*)::int AS count FROM user_devices WHERE user_id = $1 GROUP BY platform`,
+      [userId],
+    );
+    const account = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+      ? (() => {
+          try {
+            const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+            const json = JSON.parse(raw.trim().startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
+            return { project_id: json.project_id || null, client_email: json.client_email || null };
+          } catch {
+            return { project_id: null, client_email: null, parse_error: true };
+          }
+        })()
+      : null;
+
+    res.json({
+      success: true,
+      data: {
+        fcmConfigured: isPushConfigured(),
+        mode: process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+          ? "http-v1 (service account)"
+          : process.env.FCM_SERVER_KEY
+            ? "legacy server key"
+            : "NOT CONFIGURED — pushes are dropped silently; set FIREBASE_SERVICE_ACCOUNT_JSON + FIREBASE_PROJECT_ID",
+        firebaseProjectId: process.env.FIREBASE_PROJECT_ID || account?.project_id || null,
+        serviceAccountEmail: account?.client_email || null,
+        serviceAccountParseError: !!(account as any)?.parse_error,
+        myDevices: devicesRes.rows,
+        hint:
+          "If fcmConfigured is false, no push will ever reach any device. If firebaseProjectId does not match the apps' Firebase project, every send 404s and tokens get pruned.",
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error?.message || "Failed to read push status" });
+  }
+});
 
 /**
  * @swagger

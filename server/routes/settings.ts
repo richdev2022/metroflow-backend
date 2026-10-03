@@ -214,6 +214,122 @@ router.put("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
     }
 });
 
+// Multipart storage for the SSO profile-completion logo upload (R2 when
+// configured, local /uploads fallback — mirrors POST /settings/profile/avatar).
+const completeLogoUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+});
+
+/**
+ * POST /settings/business/complete (multipart: logo optional, field 'logo')
+ * One-call SSO onboarding completion: business name, industry, phone number
+ * and logo. Owner/admin only. Returns the recomputed profileCompleted flag so
+ * the client knows whether the gate is cleared.
+ */
+router.post("/business/complete", authenticateToken, checkSubscriptionStatus, completeLogoUpload.single('logo'), async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId;
+        const userId = req.user!.userId;
+
+        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+        const role = roleRes.rows[0]?.role;
+        if (!['owner', 'admin'].includes(role)) {
+            return res.status(403).json({
+                success: false,
+                error: "Only business owners and admins can complete the business profile.",
+            });
+        }
+
+        const { name, industry, phone_number } = req.body || {};
+        const updates: string[] = [];
+        const values: any[] = [];
+        let idx = 1;
+
+        const trimmedName = String(name || '').trim();
+        if (!trimmedName) {
+            return res.status(400).json({ success: false, error: "Business name is required" });
+        }
+        if (/'s workspace$/i.test(trimmedName)) {
+            return res.status(400).json({
+                success: false,
+                error: "Please enter your real business name (not the auto-generated placeholder)",
+            });
+        }
+        updates.push(`name = $${idx}`); values.push(trimmedName); idx++;
+
+        const trimmedIndustry = String(industry || '').trim();
+        if (!trimmedIndustry) {
+            return res.status(400).json({ success: false, error: "Industry is required" });
+        }
+        updates.push(`industry = $${idx}`); values.push(trimmedIndustry); idx++;
+
+        const trimmedPhone = String(phone_number || '').trim();
+        if (!trimmedPhone) {
+            return res.status(400).json({ success: false, error: "Phone number is required" });
+        }
+        updates.push(`phone_number = $${idx}`); values.push(trimmedPhone); idx++;
+
+        // Logo (optional but REQUIRED to clear the gate — it is part of the
+        // completion checklist) — accept the multipart upload, or a
+        // logo_url string the client already uploaded elsewhere.
+        const file = (req as any).file as Express.Multer.File | undefined;
+        let logoUrl: string | null = null;
+        if (file?.buffer) {
+            const { r2Storage } = await import("../lib/storage");
+            if (r2Storage.isAvailable()) {
+                try {
+                    const ext = file.originalname.includes(".")
+                        ? file.originalname.split(".").pop()!.toLowerCase()
+                        : (file.mimetype.includes('png') ? 'png' : 'jpg');
+                    const key = `logos/${businessId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+                    logoUrl = await r2Storage.uploadFile(key, file.buffer, file.mimetype);
+                } catch (uploadError) {
+                    console.error("Business logo R2 upload failed, falling back to local:", uploadError);
+                }
+            }
+            if (!logoUrl) {
+                const fs = await import("fs");
+                const uploadDir = path.join(process.cwd(), "uploads");
+                if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+                const ext = file.originalname.includes(".")
+                    ? file.originalname.split(".").pop()!.toLowerCase()
+                    : (file.mimetype.includes('png') ? 'png' : 'jpg');
+                const filename = `logo-${businessId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+                fs.writeFileSync(path.join(uploadDir, filename), file.buffer);
+                const apiOrigin = process.env.API_PUBLIC_BASE_URL
+                    || process.env.APP_BASE_URL
+                    || 'https://api.metricorex.com';
+                logoUrl = `${apiOrigin.replace(/\/$/, '')}/uploads/${filename}`;
+            }
+        } else if (String((req.body as any).logo_url || '').trim()) {
+            logoUrl = String((req.body as any).logo_url).trim();
+        }
+        if (!logoUrl) {
+            return res.status(400).json({ success: false, error: "Business logo is required" });
+        }
+        updates.push(`logo_url = $${idx}`); values.push(logoUrl); idx++;
+
+        values.push(businessId);
+        await query(
+            `UPDATE businesses SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${idx}`,
+            values
+        );
+
+        const { computeBusinessProfileCompleted } = await import("./auth");
+        const profileCompleted = await computeBusinessProfileCompleted(businessId);
+
+        res.json({
+            success: true,
+            data: { profileCompleted, logoUrl },
+            message: "Business profile completed",
+        });
+    } catch (error: any) {
+        console.error("Business complete error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to complete business profile" });
+    }
+});
+
 /**
  * @swagger
  * /settings/update-contact/request-otp:

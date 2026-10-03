@@ -98,18 +98,41 @@ export interface PushPayload {
 }
 
 /**
- * DATA-ONLY FCM delivery.
+ * PLATFORM-AWARE FCM delivery.
  *
- * Messages that carry an FCM `notification` block are displayed by the OS
- * tray on Android/iOS and the app's background handler (FirebaseMessaging
- * onBackgroundMessage) is NEVER invoked for them. Our clients render their
- * own rich notifications (full-screen incoming-call ring, chat style,
- * launcher badge count), so every push must arrive as a pure data message:
- *  - Android: high-priority data message wakes the background isolate.
- *  - iOS:     `content-available: 1` wakes the background handler.
- * `title`/`body` are still folded INTO the data payload so any client-side
- * generic handler can display them.
+ * A single delivery strategy cannot serve both OSes:
+ *
+ *  - ANDROID: data-only + high priority is correct — the message wakes the
+ *    Flutter background isolate, which renders rich local notifications
+ *    (full-screen incoming-call ring with custom ringtone, chat style,
+ *    launcher badge). A system-tray notification block would SUPPRESS the
+ *    background handler and kill that UX.
+ *
+ *  - IOS: data-only (`content-available`) background pushes are throttled by
+ *    APNs and are NEVER delivered to force-quit apps — this is why calls did
+ *    not ring and badges did not update when the app was not open. iOS
+ *    therefore gets a HYBRID message: a real `aps.alert` (apns-push-type:
+ *    alert, apns-priority: 10) that APNs displays system-side no matter what
+ *    state the app is in, PLUS the full data payload so a tap still deep-links
+ *    and the background handler still runs its state logic. The mobile app
+ *    skips its local notification when the system already showed one, so
+ *    nothing duplicates.
  */
+
+let pushProjectLogged = false;
+
+function resolveProjectId(account: ServiceAccount | null): string | null {
+  const projectId = process.env.FIREBASE_PROJECT_ID || account?.project_id || null;
+  if (projectId && !pushProjectLogged) {
+    pushProjectLogged = true;
+    console.log(
+      `[push] FCM HTTP v1 active for project "${projectId}". Mobile devices register tokens ` +
+        `from THEIR Firebase project — if this is not the same project (currently expected: ` +
+        `project-65e11808-f15a-47a5-b68), every send will 404 and tokens get pruned.`,
+    );
+  }
+  return projectId;
+}
 
 async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ sent: number; failed: number }> {
   if (tokens.length === 0) return { sent: 0, failed: 0 };
@@ -117,7 +140,7 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
   // Mode 1: FCM HTTP v1
   const account = loadServiceAccount();
   if (account) {
-    const projectId = process.env.FIREBASE_PROJECT_ID || account.project_id;
+    const projectId = resolveProjectId(account);
     if (!projectId) {
       console.error("[push] FIREBASE_PROJECT_ID missing - cannot send via HTTP v1");
       return { sent: 0, failed: tokens.length };
@@ -125,39 +148,67 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
     const accessToken = await getAccessToken();
     if (!accessToken) return { sent: 0, failed: tokens.length };
 
-    // title/body folded into data — clients render notifications themselves.
+    // title/body folded into data — clients render/handle them either way.
     const dataPayload: Record<string, string> = {
       ...(payload.data || {}),
       title: payload.title,
       body: payload.body,
     };
+    const badgeRaw = dataPayload.badge ? parseInt(String(dataPayload.badge), 10) : NaN;
+
+    // Split tokens by platform so each OS gets the strategy it needs.
+    let iosTokens = new Set<string>();
+    try {
+      const platRes = await query(
+        `SELECT fcm_token, platform FROM user_devices WHERE fcm_token = ANY($1)`,
+        [tokens],
+      );
+      iosTokens = new Set(
+        platRes.rows
+          .filter((r: any) => String(r.platform || "").toLowerCase().startsWith("ios"))
+          .map((r: any) => r.fcm_token),
+      );
+    } catch {
+      // Table missing / DB hiccup — default everything to Android strategy.
+    }
 
     let sent = 0;
     let failed = 0;
     for (const token of tokens) {
+      const isIos = iosTokens.has(token);
       try {
-        await axios.post(
-          `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
-          {
-            message: {
+        const message: any = isIos
+          ? {
               token,
-              // NO `notification` block — see the doc comment above. A
-              // notification+data message is shown by the OS tray and the
-              // app's background handler never runs (no ring, no badge).
               data: dataPayload,
-              android: {
-                priority: "high",
-              },
+              android: { priority: "high" },
               apns: {
-                headers: { "apns-priority": "5" },
+                headers: { "apns-priority": "10", "apns-push-type": "alert" },
                 payload: {
                   aps: {
-                    "content-available": 1,
+                    alert: { title: payload.title, body: payload.body },
+                    sound: "default",
+                    ...(Number.isFinite(badgeRaw) && badgeRaw > 0 ? { badge: badgeRaw } : {}),
+                    "thread-id": String(dataPayload.type || "general"),
                   },
                 },
               },
-            },
-          },
+            }
+          : {
+              token,
+              // Data-only on Android: wakes the background isolate which
+              // renders the rich local notification (full-screen call ring).
+              data: dataPayload,
+              android: { priority: "high" },
+              apns: {
+                headers: { "apns-priority": "5", "apns-push-type": "background" },
+                payload: { aps: { "content-available": 1 } },
+              },
+            };
+
+        await axios.post(
+          `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
+          { message },
           {
             headers: { Authorization: `Bearer ${accessToken}` },
             timeout: 15000,
@@ -170,6 +221,11 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
         if (status === 404 || status === 410) {
           // Token no longer valid - remove it
           await query(`DELETE FROM user_devices WHERE fcm_token = $1`, [token]).catch(() => {});
+        } else {
+          console.error(
+            `[push] send failed (${isIos ? "ios" : "android"}) status=${status || "?"}:`,
+            JSON.stringify(err.response?.data?.error || err.message).slice(0, 300),
+          );
         }
       }
     }

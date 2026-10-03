@@ -613,6 +613,29 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       console.error("Error re-querying transfer status:", qErr);
     }
 
+    // INSTANT STATUS: users must see the real outcome, not "Processing" by
+    // default. If the provider call only gave us an indeterminate status
+    // (pending/processing), actively poll the provider a few times RIGHT NOW
+    // (bounded ~12s) before answering. Only after this window do we leave it
+    // as processing — from where the monitor/webhooks take over.
+    if (['pending', 'processing', 'queued'].includes(finalTransfer.status)) {
+      const { verifySingleTransfer } = await import("../services/transfer");
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise((r) => setTimeout(r, 4000));
+        try {
+          const reRes = await query(`SELECT * FROM transfer_queue WHERE id = $1`, [queuedTransfer.id]);
+          if (reRes.rows.length > 0) finalTransfer = reRes.rows[0];
+          if (['success', 'failed'].includes(finalTransfer.status)) break; // final
+          const verified = await verifySingleTransfer(finalTransfer, 1);
+          if (verified) finalTransfer = verified;
+          if (['success', 'failed'].includes(finalTransfer.status)) break; // final
+        } catch (vErr) {
+          console.error("[Sync] Inline verify poll failed:", vErr);
+        }
+      }
+    }
+
     // If sync processing failed and status is still pending, surface the error
     let responseMessage = "Transfer initiated successfully";
     if (syncProcessingError && finalTransfer.status === 'pending') {

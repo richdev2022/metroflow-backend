@@ -1,5 +1,5 @@
 import { query } from "../db";
-import { hashPassword, verifyPassword } from "./auth";
+import { hashPassword, verifyPassword, SESSION_IDLE_TIMEOUT_MINUTES } from "./auth";
 import crypto from "crypto";
 
 // Admin Token Generation
@@ -18,8 +18,8 @@ export async function generateAdminToken(adminId: string): Promise<string> {
 
 export async function verifyAdminToken(token: string): Promise<{ adminId: string } | null> {
   try {
-    // Get idle timeout from env (default to 30 minutes)
-    const idleTimeoutMinutes = parseInt(process.env.TOKEN_IDLE_TIMEOUT_MINUTES || "30", 10);
+    // Same sliding idle window as user sessions (shared default).
+    const idleTimeoutMinutes = SESSION_IDLE_TIMEOUT_MINUTES;
     
     // First, try to update the session and get the session info in one query
     const updateResult = await query(

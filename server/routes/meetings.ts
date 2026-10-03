@@ -955,6 +955,7 @@ export const updateMeeting: RequestHandler = async (
       timezone,
       status,
       attendeeIds,
+      guestEmails,
       password,
       maxParticipants,
       waitingRoomEnabled,
@@ -962,6 +963,17 @@ export const updateMeeting: RequestHandler = async (
       screenSharingEnabled,
       coHostId,
     } = req.body;
+
+    // Guest emails on update: sanitized like create. Only NEW guests get
+    // invitation emails — existing ones are never re-emailed on every save.
+    let guestEmailList: string[] = [];
+    if (guestEmails !== undefined) {
+      const guestCheck = sanitizeGuestEmails(guestEmails);
+      if (guestCheck.error) {
+        return res.status(400).json({ success: false, error: guestCheck.error });
+      }
+      guestEmailList = guestCheck.emails;
+    }
 
     if (attendeeIds !== undefined) {
       const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
@@ -985,24 +997,33 @@ export const updateMeeting: RequestHandler = async (
     }
 
     // First get the meeting's actual id (try UUID first if valid, then code)
+    // — plus the previous schedule + code so we can (a) re-schedule reminder
+    // jobs after a time change and (b) build invitation links for attendees
+    // added through this edit.
     let actualId: string | undefined;
+    let previousStartTime: Date | null = null;
+    let meetingCode: string | null = null;
     if (isValidUUID(id)) {
       const idResult = await query(
-        `SELECT id FROM meetings WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, start_time, meeting_code FROM meetings WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (idResult.rows.length > 0) {
         actualId = idResult.rows[0].id;
+        previousStartTime = idResult.rows[0].start_time;
+        meetingCode = idResult.rows[0].meeting_code;
       }
     }
 
     if (!actualId) {
       const codeResult = await query(
-        `SELECT id FROM meetings WHERE meeting_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, start_time, meeting_code FROM meetings WHERE meeting_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (codeResult.rows.length > 0) {
         actualId = codeResult.rows[0].id;
+        previousStartTime = codeResult.rows[0].start_time;
+        meetingCode = codeResult.rows[0].meeting_code;
       }
     }
 
@@ -1064,22 +1085,112 @@ export const updateMeeting: RequestHandler = async (
 
     const meeting = result.rows[0];
 
-    // Update attendees if provided
+    // ------------------------------------------------------------------
+    // Attendee DIFF (never delete-then-reinsert): only removed attendees
+    // are deleted and only newly-added ones are inserted + invited. This
+    // keeps participants added from another client (call room "Add people",
+    // web) intact when a stale list is saved elsewhere.
+    // ------------------------------------------------------------------
     if (attendeeIds !== undefined) {
-      await query(`DELETE FROM meeting_attendees WHERE meeting_id = $1`, [actualId]);
-      const attendees = [];
-      if (attendeeIds.length > 0) {
-        const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds));
-        for (const attendeeId of uniqueAttendeeIds) {
-          const attendeeResult = await query(
+      const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
+
+      const existingRes = await query(
+        `SELECT user_id FROM meeting_attendees WHERE meeting_id = $1`,
+        [actualId],
+      );
+      const existingIds = new Set<string>(existingRes.rows.map((r: any) => String(r.user_id)));
+      const newIds = new Set<string>(uniqueAttendeeIds);
+
+      const toRemove = [...existingIds].filter((uid) => !newIds.has(uid));
+      const toAdd = uniqueAttendeeIds.filter((uid) => !existingIds.has(uid));
+
+      if (toRemove.length > 0) {
+        await query(
+          `DELETE FROM meeting_attendees WHERE meeting_id = $1 AND user_id = ANY($2::uuid[])`,
+          [actualId, toRemove],
+        );
+      }
+
+      const attendees: any[] = [];
+      // Current roster (whatever survived the diff) for the response.
+      const rosterRes = await query(
+        `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1 ORDER BY created_at ASC`,
+        [actualId],
+      );
+      attendees.push(...rosterRes.rows);
+
+      if (toAdd.length > 0) {
+        const placeholders = toAdd.map((_, i) => `$${i + 1}`).join(',');
+        const usersResult = await query(
+          `SELECT id, name, email FROM users WHERE id IN (${placeholders})`,
+          toAdd,
+        );
+        const usersMap = new Map<string, { id: string; name: string | null; email: string | null }>(
+          usersResult.rows.map((u: any) => [u.id, u]),
+        );
+        const inviterRes = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const inviterName = inviterRes.rows[0]?.name || 'Someone';
+        const inviteLink = buildMeetingLink(meeting.meetingCode || meetingCode || '');
+        const startForEmail = startTime ? new Date(startTime) : previousStartTime;
+        const endForEmail = endTime
+          ? new Date(endTime)
+          : new Date((startForEmail || new Date()).getTime() + 60 * 60000);
+
+        for (const attendeeId of toAdd) {
+          await query(
             `INSERT INTO meeting_attendees (meeting_id, user_id)
              VALUES ($1, $2)
-             RETURNING id, user_id as "userId", status`,
+             ON CONFLICT DO NOTHING`,
             [actualId, attendeeId],
           );
-          attendees.push(attendeeResult.rows[0]);
+
+          // In-app invitation notification
+          await createNotification({
+            businessId: businessId!,
+            userId: attendeeId,
+            type: "meeting",
+            title: "Meeting Invitation",
+            message: `${inviterName} invited you to a meeting: ${meeting.title}`,
+            actionUrl: `/meetings/${meeting.meetingCode}`,
+            actionType: "view_meeting",
+            metadata: { meetingId: actualId, meetingCode: meeting.meetingCode },
+            isActionable: false,
+            expiresInHours: 24,
+          }).catch(() => {});
+
+          // Email invitation for the newly-added attendee only
+          const user = usersMap.get(attendeeId);
+          if (user?.email) {
+            const emailHtml = generateMeetingInvitationEmailHtml(
+              user.name || 'User',
+              meeting.title,
+              meeting.description || null,
+              startForEmail || new Date(),
+              endForEmail,
+              meeting.meetingCode,
+              inviterName,
+              inviteLink,
+              meeting.password || null,
+              !!meeting.waitingRoomEnabled,
+            );
+            await sendEmail(
+              user.email,
+              user.name || 'User',
+              `Meeting Invitation: ${meeting.title}`,
+              emailHtml,
+            ).catch((err: any) => console.error('Meeting update invite email error:', err?.message || err));
+          }
         }
+
+        // Refresh the roster for the response
+        const refreshedRoster = await query(
+          `SELECT id, user_id as "userId", status FROM meeting_attendees WHERE meeting_id = $1 ORDER BY created_at ASC`,
+          [actualId],
+        );
+        attendees.length = 0;
+        attendees.push(...refreshedRoster.rows);
       }
+
       meeting.attendees = attendees;
     } else {
       // Get existing attendees
@@ -1089,6 +1200,74 @@ export const updateMeeting: RequestHandler = async (
       );
       meeting.attendees = attendeeResult.rows;
     }
+
+    // ------------------------------------------------------------------
+    // Guest (external email) participants: insert any NEW emails and send
+    // them an invitation. Existing guests are left untouched (no re-email).
+    // ------------------------------------------------------------------
+    if (guestEmails !== undefined && guestEmailList.length > 0) {
+      const existingGuestsRes = await query(
+        `SELECT email FROM meeting_guests WHERE meeting_id = $1`,
+        [actualId],
+      );
+      const existingGuestEmails = new Set(
+        existingGuestsRes.rows.map((r: any) => String(r.email || '').toLowerCase()),
+      );
+      const newGuests = guestEmailList.filter((e) => !existingGuestEmails.has(e.toLowerCase()));
+
+      for (const guestEmail of guestEmailList) {
+        await query(
+          `INSERT INTO meeting_guests (meeting_id, email) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [actualId, guestEmail],
+        );
+      }
+
+      if (newGuests.length > 0) {
+        const inviterRes = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const inviterName = inviterRes.rows[0]?.name || 'Someone';
+        const guestLink = buildMeetingLink(meeting.meetingCode || meetingCode || '');
+        const startForEmail = startTime ? new Date(startTime) : previousStartTime;
+        const endForEmail = endTime
+          ? new Date(endTime)
+          : new Date((startForEmail || new Date()).getTime() + 60 * 60000);
+        for (const guestEmail of newGuests) {
+          const emailHtml = generateMeetingInvitationEmailHtml(
+            guestEmail,
+            meeting.title,
+            meeting.description || null,
+            startForEmail || new Date(),
+            endForEmail,
+            meeting.meetingCode,
+            inviterName,
+            guestLink,
+            meeting.password || null,
+            !!meeting.waitingRoomEnabled,
+          );
+          await sendEmail(
+            guestEmail,
+            guestEmail,
+            `Meeting Invitation: ${meeting.title}`,
+            emailHtml,
+          ).catch((err: any) => console.error('Guest invite email error:', err?.message || err));
+        }
+      }
+    }
+
+    // Re-schedule reminder jobs after a schedule change (the old reminders
+    // fire at the previous time otherwise) and email attendees when the
+    // time moved.
+    const newStartTime = startTime ? new Date(startTime) : null;
+    const scheduleChanged =
+      newStartTime &&
+      previousStartTime &&
+      Math.abs(newStartTime.getTime() - new Date(previousStartTime).getTime()) > 60_000;
+    if (newStartTime && (scheduleChanged || !previousStartTime)) {
+      await scheduleMeetingReminders(actualId, newStartTime).catch((err: any) =>
+        console.error('Reschedule reminders error:', err?.message || err),
+      );
+    }
+
+    await attachGuests(meeting);
     enrichMeeting(meeting);
 
     // Log activity

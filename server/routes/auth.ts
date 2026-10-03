@@ -248,6 +248,12 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       // rejected with "A business with this email already exists", permanently
       // locking the email out of signup.
       try {
+        // Delete CHILD rows first — task_statuses/users carry FKs to the
+        // business, so deleting the business last is the only order that
+        // actually succeeds (the previous order left the business + user
+        // rows behind and permanently locked the email out of signup).
+        await query(`DELETE FROM task_statuses WHERE business_id = $1`, [business.id]);
+        await query(`DELETE FROM users WHERE business_id = $1`, [business.id]);
         await query(`DELETE FROM activity_logs WHERE business_id = $1`, [business.id]);
         await query(`DELETE FROM audit_logs WHERE business_id = $1`, [business.id]);
         await query(`DELETE FROM businesses WHERE id = $1`, [business.id]);
@@ -381,24 +387,30 @@ export const verifyOTP: RequestHandler = async (req, res) => {
 
     const business = businessResult.rows[0];
 
-    // Send welcome email
-    const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL;
-    if (!baseUrl) {
-      throw new Error('CLIENT_URL environment variable is not set');
-    }
+    // Send welcome email. NOTE: this must NEVER be able to fail the
+    // verification itself — a missing CLIENT_URL used to throw here and turn
+    // every correct-OTP submission into a 500 "Failed to verify OTP", which
+    // is exactly the "signup OTP screen is not working" report. Email is
+    // best-effort; the account is verified either way.
+    const baseUrl = process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || "https://app.metricorex.com";
     const loginLink = `${baseUrl}/login`;
-    const welcomeEmailHtml = generateBusinessRegistrationEmailHtml(
-      user.name,
-      business.name,
-      loginLink,
-    );
+    let emailSent = false;
+    try {
+      const welcomeEmailHtml = generateBusinessRegistrationEmailHtml(
+        user.name,
+        business?.name || "your business",
+        loginLink,
+      );
 
-    const emailSent = await sendEmail(
-      input.email,
-      user.name,
-      "Welcome to MetricFlow!",
-      welcomeEmailHtml,
-    );
+      emailSent = await sendEmail(
+        input.email,
+        user.name,
+        "Welcome to MetricFlow!",
+        welcomeEmailHtml,
+      );
+    } catch (emailErr: any) {
+      console.error("Welcome email error (non-fatal):", emailErr?.message || emailErr);
+    }
 
     if (!emailSent) {
       console.error("Failed to send welcome email to", input.email);

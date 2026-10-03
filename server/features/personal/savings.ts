@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
+import { calculateFee, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 
 const router = express.Router();
@@ -657,9 +657,9 @@ router.post("/vaults/:id/withdraw", authenticateToken, checkSubscriptionStatus, 
             fee,
         });
 
-        // Double-entry platform ledger + revenue for the break fee
-        await creditPlatformWallet(withdrawAmount, wallet.currency || "NGN", reference, "Savings Withdrawal Received", "savings");
-        await debitPlatformWallet(payout, wallet.currency || "NGN", `${reference}-PAYOUT`, "Platform Wallet Debit for Savings Payout", "savings");
+        // Savings withdrawal is fully INTERNAL (savings vault -> user wallet);
+        // no pool movement occurs, so NO platform-ledger rows are written.
+        // Only the early-break fee revenue (virtual allocation) is recorded.
         if (fee > 0) {
             await creditRevenueWallet(fee, wallet.currency || "NGN", reference, "Savings Early Withdrawal Fee", "savings");
         }

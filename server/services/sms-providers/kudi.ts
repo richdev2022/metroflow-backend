@@ -76,19 +76,23 @@ export const kudiProvider: SMSProvider = {
         try {
             const phone = normalizePhone(to);
 
-            // KudiSMS accepts form-data, x-www-form-urlencoded or JSON.
-            // urlencoded is used here: it is the most universally accepted
-            // encoding for their PHP backend and needs no extra dependency.
-            const params = new URLSearchParams();
-            params.append('token', API_KEY);
-            params.append('senderID', SENDER_ID);
-            params.append('recipients', phone);
-            params.append('message', message);
-
-            const response = await axios.post(KUDI_CORPORATE_URL, params, {
-                timeout: 15000,
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            });
+            // ⚠️ ENCODING (verified live against the real endpoint, Oct 2026):
+            // KudiSMS /corporate DOES NOT parse application/x-www-form-urlencoded
+            // bodies — a urlencoded POST arrives with an EMPTY $_POST and the API
+            // answers 200 {"error_code":"300","msg":"Missing parameters: token,
+            // senderID, recipients, message."} even though every field was sent.
+            // JSON (and multipart) ARE parsed correctly. JSON is used here.
+            const response = await axios.post(
+                KUDI_CORPORATE_URL,
+                { token: API_KEY, senderID: SENDER_ID, recipients: phone, message },
+                {
+                    timeout: 15000,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'application/json',
+                    },
+                },
+            );
 
             const data = response.data || {};
             const ok = data.error_code === '000' || data.status === 'success';

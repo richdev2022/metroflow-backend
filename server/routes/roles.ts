@@ -116,21 +116,34 @@ export const getMyRole: RequestHandler = async (req, res) => {
  * role_id IS NULL. Runs on GET /roles so both apps converge on first load.
  */
 const ensureDefaultRoles = async (businessId: string): Promise<void> => {
+  // Manager + Member as REAL, editable team_roles rows (is_system). Owner and
+  // admin stay wildcard-super by design — they are not rows.
+  // NOTE: we deliberately rely ONLY on `WHERE NOT EXISTS` (NOT on
+  // `ON CONFLICT (business_id, name)`): production tables created by older
+  // migrations may lack the UNIQUE constraint, which made ON CONFLICT throw
+  // and — because this whole helper swallows errors — silently seed NOTHING,
+  // leaving the Role & Permissions screen empty.
   try {
     await query(
       `INSERT INTO team_roles (business_id, name, description, is_system, permissions)
        SELECT $1, 'Manager', 'Default manager role — everything except team management.', TRUE, $2::text[]
-       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Manager')
-       ON CONFLICT (business_id, name) DO NOTHING`,
+       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Manager')`,
       [businessId, DEFAULT_MANAGER_PERMISSIONS]
     );
+  } catch (error) {
+    console.error("ensureDefaultRoles(Manager) error:", error);
+  }
+  try {
     await query(
       `INSERT INTO team_roles (business_id, name, description, is_system, permissions)
        SELECT $1, 'Member', 'Default member role — day-to-day work and communication.', TRUE, $2::text[]
-       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Member')
-       ON CONFLICT (business_id, name) DO NOTHING`,
+       WHERE NOT EXISTS (SELECT 1 FROM team_roles WHERE business_id = $1 AND name = 'Member')`,
       [businessId, DEFAULT_MEMBER_PERMISSIONS]
     );
+  } catch (error) {
+    console.error("ensureDefaultRoles(Member) error:", error);
+  }
+  try {
     await query(
       `UPDATE users u
           SET role_id = r.id
@@ -144,8 +157,7 @@ const ensureDefaultRoles = async (businessId: string): Promise<void> => {
       [businessId]
     );
   } catch (error) {
-    // Seeding is a convenience — never fail the listing because of it.
-    console.error("ensureDefaultRoles error:", error);
+    console.error("ensureDefaultRoles(link legacy) error:", error);
   }
 };
 

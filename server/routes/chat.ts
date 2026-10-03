@@ -274,7 +274,18 @@ export const getConversations: RequestHandler = async (
 
     // Derive display helpers: direct chats show the OTHER participant's name
     // and avatar; group chats show the conversation name.
-    const data = result.rows.map((conv: any) => {
+    // LEGACY CLEANUP: conversations created by the old mobile client carried a
+    // snake_case key the server ignored, so they were created with a SINGLE
+    // participant (the creator) and can never receive messages from anyone
+    // else. Hide those junk rows from the list (and self-heal the annoyance)
+    // instead of surfacing permanent "No messages yet" ghosts.
+    const data = result.rows
+      .filter((conv: any) => {
+        if ((conv.type || 'direct') !== 'direct') return true; // groups always shown
+        const participants = Array.isArray(conv.participants) ? conv.participants : [];
+        return participants.length >= 2;
+      })
+      .map((conv: any) => {
       const participants = Array.isArray(conv.participants) ? conv.participants : [];
       const other = participants.find((p: any) => p && p.userId && String(p.userId) !== String(userId));
       const mine = participants.find((p: any) => p && p.userId && String(p.userId) === String(userId));

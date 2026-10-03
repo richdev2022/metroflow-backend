@@ -146,9 +146,14 @@ export async function uploadMediaBuffer(opts: {
         buffer.byteOffset + buffer.byteLength,
       ) as any);
     } catch (blobErr) {
-      console.error("Netlify Blobs upload failed, using data URI:", blobErr);
-      url = `data:${mimeType};base64,${buffer.toString("base64")}`;
+      // NEVER fall back to a data: URI — a base64 video inlined into
+      // chat_messages.attachment_url makes every message-list response carry
+      // megabytes of JSON and video players cannot stream data: URIs. Fail
+      // the upload loudly instead so callers return a proper error.
       try { fs.unlinkSync(path.join(uploadDir, filename)); } catch {}
+      throw new Error(
+        `Media upload failed: serverless blob storage unavailable (${blobErr?.message || blobErr})`,
+      );
     }
   }
 

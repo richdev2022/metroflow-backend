@@ -1,5 +1,5 @@
 import express from "express";
-import { authenticateToken, AuthenticatedRequest, checkFeaturePermission } from "../middleware/auth";
+import { authenticateToken, AuthenticatedRequest, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
 import { query, pool } from "../db";
 import { getProvider } from "../services/providers/factory";
 import { processSubscriptionRenewals } from "../services/subscription";
@@ -716,8 +716,10 @@ router.put("/cards/:id/active", authenticateToken, async (req, res) => {
     }
 });
 
-// Initiate Payment
-router.post("/initiate-payment", authenticateToken, async (req, res) => {
+// Initiate Payment — KYC REQUIRED: paying for a subscription is a financial
+// action; the platform requires Tier-1 KYC (BVN or NIN) first. 403 carries
+// code "KYC_REQUIRED" so clients can route the user into the KYC flow.
+router.post("/initiate-payment", authenticateToken, checkKycStatus, async (req, res) => {
 /**
  * @swagger
  * /subscription/initiate-payment:

@@ -133,6 +133,26 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
         const userEmail = userCheck.rows[0]?.email;
         const userName = userCheck.rows[0]?.name;
 
+        // UNIQUENESS GUARD — one BVN/NIN can only ever belong to ONE account.
+        // Checked BEFORE the (billable) Prembly lookup so a duplicate is
+        // rejected instantly with a clear "already exists" message, and again
+        // at verify-otp time as the final gate. Abandoned attempts (failed)
+        // don't block anyone, but a pending or verified record does.
+        const duplicate = await query(
+            `SELECT id, name, email FROM users
+             WHERE ${type} = $1
+               AND id <> $2
+               AND COALESCE(${type}_status, 'pending') <> 'failed'
+             LIMIT 1`,
+            [number, userId]
+        );
+        if (duplicate.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: `This ${type.toUpperCase()} is already linked to another account. Each ${type.toUpperCase()} can only be used on one ${process.env.APP_NAME || 'Metricorex'} account.`
+            });
+        }
+
         let verificationData;
         
         // Call Prembly API
@@ -253,7 +273,7 @@ router.post("/verify-otp", authenticateToken, async (req: AuthenticatedRequest, 
         }
 
         const userResult = await query(
-            `SELECT id, bvn_status, nin_status, kyc_status, otp_hash, otp_expires_at, kyc_data, otp_type, name, email
+            `SELECT id, bvn, nin, bvn_status, nin_status, kyc_status, otp_hash, otp_expires_at, kyc_data, otp_type, name, email
              FROM users WHERE id = $1`, 
             [userId]
         );
@@ -276,6 +296,27 @@ router.post("/verify-otp", authenticateToken, async (req: AuthenticatedRequest, 
         const inputHash = crypto.createHash('sha256').update(otp).digest('hex');
         if (inputHash !== user.otp_hash) {
             return res.status(400).json({ success: false, error: "Invalid OTP" });
+        }
+
+        // FINAL uniqueness gate: another account may have initiated/verified
+        // the same BVN/NIN between this user's initiate and OTP entry.
+        if (verifiedType === 'bvn' || verifiedType === 'nin') {
+            const number = user[verifiedType];
+            if (number) {
+                const dup = await query(
+                    `SELECT id FROM users
+                     WHERE ${verifiedType} = $1 AND id <> $2
+                       AND COALESCE(${verifiedType}_status, 'pending') <> 'failed'
+                     LIMIT 1`,
+                    [number, userId]
+                );
+                if (dup.rows.length > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: `This ${verifiedType.toUpperCase()} is already linked to another account.`
+                    });
+                }
+            }
         }
 
         // Mark as verified

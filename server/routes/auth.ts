@@ -1272,6 +1272,9 @@ export const googleAuth: RequestHandler = async (req, res) => {
         businessId: business.id,
         isNewUser,
         requiresPasswordSetup: true,
+        // Fresh SSO sign-up: derived workspace name, no phone/industry/logo
+        // yet — clients MUST route to the profile-completion screen first.
+        profileCompleted: false,
         message: "Google sign-up successful",
         user: {
           id: newUser.id,
@@ -1285,6 +1288,9 @@ export const googleAuth: RequestHandler = async (req, res) => {
           id: business.id,
           name: business.name,
           email: business.email,
+          industry: businessIndustry || null,
+          phoneNumber: null,
+          logoUrl: null,
         },
       });
     }
@@ -1312,6 +1318,9 @@ export const googleAuth: RequestHandler = async (req, res) => {
       businessId: user.businessId,
       isNewUser,
       requiresPasswordSetup: !user.passwordHash,
+      // Existing SSO accounts still owe a complete business profile (phone,
+      // industry, real name, logo) before reaching the dashboard.
+      profileCompleted: await computeBusinessProfileCompleted(user.businessId),
       message: isNewUser ? "Google sign-up successful" : "Google login successful",
       user: {
         id: user.id,
@@ -1497,6 +1506,39 @@ export const changePassword: RequestHandler = async (req: AuthenticatedRequest, 
  *     security:
  *       - bearerAuth: []
  */
+/**
+ * SSO onboarding gate — is the business profile fully filled in?
+ *
+ * Google sign-ups create the business with a DERIVED name ("Ada's Workspace"),
+ * no phone number, no industry (when not supplied) and no logo. The mobile/web
+ * clients route those users to the profile-completion screen until every
+ * required field is present. Fails CLOSED (false) on DB errors so the user is
+ * always given the chance to complete — never silently skipped.
+ */
+export async function computeBusinessProfileCompleted(businessId: string | null | undefined): Promise<boolean> {
+  if (!businessId) return false;
+  try {
+    const res = await query(
+      `SELECT name, industry, phone_number, logo_url FROM businesses WHERE id = $1 LIMIT 1`,
+      [businessId],
+    );
+    const b = res.rows[0];
+    if (!b) return false;
+    const name = String(b.name || '').trim();
+    const derivedPattern = /'s workspace$/i; // auto-generated SSO placeholder
+    return Boolean(
+      name &&
+        !derivedPattern.test(name) &&
+        String(b.industry || '').trim() &&
+        String(b.phone_number || '').trim() &&
+        String(b.logo_url || '').trim(),
+    );
+  } catch (e) {
+    console.error('computeBusinessProfileCompleted failed:', e);
+    return false;
+  }
+}
+
 export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
@@ -1518,7 +1560,12 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    return res.json({ success: true, data: result.rows[0] });
+    const data: Record<string, unknown> = result.rows[0];
+    // SSO onboarding gate — clients route to the profile-completion screen
+    // until the business profile is fully filled in.
+    data.profileCompleted = await computeBusinessProfileCompleted(data.businessId as string);
+
+    return res.json({ success: true, data });
   } catch (error) {
     console.error("Get me error:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch profile" });

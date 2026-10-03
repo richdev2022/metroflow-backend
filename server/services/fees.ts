@@ -313,27 +313,16 @@ export async function creditRevenueWallet(
     // This is the Revenue Wallet (platform_wallet table)
     if (amount === 0) return;
 
-    const sign = amount >= 0 ? 1 : -1;
     const absAmount = Math.abs(amount);
     const resolvedProvider = provider || inferProviderFromReference(reference);
 
-    // 1. Move the fee in/out of the operational platform wallet - WITH a
-    //    ledger row so the Platform Ledger shows the fee movement too.
-    const platformWalletId = await getOrCreateInternalWallet(currency);
-    await query(
-        `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [amount, platformWalletId]
-    );
-    await recordPlatformTransaction(
-        platformWalletId,
-        -amount,
-        currency,
-        reference,
-        mirrorDescription || (sign > 0 ? 'Platform Wallet Debit for Revenue' : 'Platform Wallet Credit (Revenue Reversal)'),
-        resolvedProvider,
-    );
+    // NOTE: the revenue wallet is a VIRTUAL allocation — fees physically stay
+    // in the provider pool account. It must NOT write platform-ledger rows,
+    // otherwise every fee pollutes the Platform Ledger with internal
+    // "Debit for Revenue" noise and the ledger stops mirroring the real pool
+    // account (fundings in, payouts out).
 
-    // 2. Mirror the movement into the revenue wallet balance.
+    // 1. Mirror the movement into the revenue wallet balance.
     let walletRes = await query(`SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
 
     if (walletRes.rows.length === 0) {

@@ -1,6 +1,6 @@
 import express from "express";
 import { query } from "../db";
-import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
+import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkKycStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { getProvider } from "../services/providers/factory";
 import { calculateFee, creditPlatformWallet, creditRevenueWallet } from "../services/fees";
@@ -120,7 +120,9 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *       403:
  *         description: Plan limit reached or feature disabled (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/", authenticateToken, checkSubscriptionStatus, requireTeamPermission("manage_payment_links"), async (req: AuthenticatedRequest, res) => {
+// KYC REQUIRED: payment links collect real money for the business — creating
+// one requires Tier-1 KYC (BVN or NIN). 403 carries code "KYC_REQUIRED".
+router.post("/", authenticateToken, checkSubscriptionStatus, checkKycStatus, requireTeamPermission("manage_payment_links"), async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;

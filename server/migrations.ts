@@ -30,6 +30,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureRecurringBillingSchema(); // + recurring_enabled etc.
   await ensureTeamRolesSchema(); // + users.role_id
   await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
+  await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -1641,5 +1642,42 @@ async function ensureAppVersionsSchema(): Promise<void> {
       ('android', '1.0.0', 13, 'Initial tracked release.', TRUE),
       ('ios', '1.0.0', 13, 'Initial tracked release.', TRUE)
     ON CONFLICT (platform, version_code) DO NOTHING
+  `);
+}
+
+/**
+ * Transaction disputes: a customer opens a dispute against a debit
+ * (transfer / payment), attaches evidence, and a platform admin investigates
+ * and resolves it (reversal with credit-guard, provider recheck, or close).
+ * One OPEN dispute per transaction reference is enforced by a partial unique
+ * index; resolved/closed disputes free the reference for a new dispute.
+ */
+async function ensureDisputesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS transaction_disputes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID NOT NULL,
+      user_id UUID,
+      transaction_reference VARCHAR(255) NOT NULL,
+      transaction_source VARCHAR(20),            -- 'transfer_queue' | 'transactions'
+      category VARCHAR(50) DEFAULT 'other',      -- failed_transfer|unauthorized|double_debit|not_received|amount_mismatch|other
+      message TEXT NOT NULL,
+      attachment_url TEXT,
+      attachment_name VARCHAR(255),
+      status VARCHAR(30) DEFAULT 'open',         -- open|under_review|resolved|closed|rejected
+      resolution_action VARCHAR(40),             -- reversal|recheck|closed|none
+      resolution_note TEXT,
+      resolved_by UUID,                          -- platform admin id
+      resolved_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_disputes_business ON transaction_disputes(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_disputes_status ON transaction_disputes(status)`);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_disputes_open_txn
+    ON transaction_disputes (transaction_reference)
+    WHERE status IN ('open', 'under_review')
   `);
 }

@@ -912,6 +912,20 @@ export async function createServer() {
   app.use("/", mainRouter);
   app.use("/api", mainRouter);
 
+  // Expired-notification cleanup: HOURLY background pass. This used to live
+  // inside GET /notifications (a full-table DELETE on every request) which
+  // added a pointless write per user poll — the interval does the same job
+  // once an hour and is safe to run in every PM2 worker (idempotent DELETE).
+  setInterval(() => {
+    query(`DELETE FROM notifications WHERE expires_at IS NOT NULL AND expires_at < NOW()`, [])
+      .then((r) => {
+        if (r.rowCount && r.rowCount > 0) {
+          console.log(`[cleanup] removed ${r.rowCount} expired notification(s)`);
+        }
+      })
+      .catch((err) => console.error("[cleanup] expired notifications:", err?.message || err));
+  }, 60 * 60 * 1000).unref();
+
   // Redirect /wallet/verify to /api/wallet/verify (for backward compatibility with old callback URLs)
   app.get("/wallet/verify", (req, res) => {
     const queryString = req.url.split('?')[1] || '';

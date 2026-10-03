@@ -1593,6 +1593,32 @@ async function ensureTeamRolesSchema(): Promise<void> {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL`);
   await query(`CREATE INDEX IF NOT EXISTS idx_team_roles_business ON team_roles(business_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id)`);
+  // Complete employee information on team members (invite form).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title VARCHAR(120)`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(120)`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employment_type VARCHAR(40)`);
+  // Pre-existing tables (created before is_system existed) must still get the
+  // column — the default-role seeding relies on it.
+  await query(`ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE`);
+  await query(`ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS permissions TEXT[] NOT NULL DEFAULT '{}'`);
+  await query(`ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS description TEXT`);
+  // The UNIQUE(business_id, name) is only guaranteed on tables created by the
+  // CREATE above; add it defensively for legacy tables (no-op when present).
+  await query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname LIKE 'team_roles_business_id_name_key'
+          AND conrelid = 'team_roles'::regclass
+      ) THEN
+        BEGIN
+          ALTER TABLE team_roles ADD CONSTRAINT team_roles_business_id_name_key UNIQUE (business_id, name);
+        EXCEPTION WHEN others THEN NULL; -- duplicate rows already present
+        END;
+      END IF;
+    END $$;
+  `);
 }
 
 /**

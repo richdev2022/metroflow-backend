@@ -108,3 +108,51 @@ export async function pushMissedCall(
     console.error("[call-push] pushMissedCall failed (non-fatal):", err?.message || err);
   }
 }
+
+/**
+ * "Call cancelled" — SILENT push that tells devices still RINGING that the
+ * caller hung up, so the full-screen ring notification and the in-app
+ * incoming-call overlay are dismissed immediately (the ring device was never
+ * in the socket room, so `call:ended` alone could not reach it).
+ * No banner is rendered on purpose: the call simply goes away.
+ */
+export async function pushCallCancelled(
+  calleeUserIds: string[],
+  info: { callId: string; callerName?: string | null; callerId?: string | null; reason?: string },
+): Promise<void> {
+  try {
+    const targets = (calleeUserIds || []).filter(
+      (id) => id && id !== info.callerId,
+    );
+    if (targets.length === 0) return;
+
+    await sendPushToUsers(
+      targets.map((userId) => ({ userId })),
+      {
+        title: "Call cancelled",
+        body: "The call was cancelled",
+        data: {
+          type: "call-cancelled",
+          callId: info.callId,
+          callerName: info.callerName || "",
+          reason: info.reason || "caller_hung_up",
+        },
+        androidChannelId: "calls",
+      },
+      // inApp:false + no type mirror => silent data push, nothing rendered.
+      { inApp: false },
+    ).catch(() => {});
+
+    await sendWebPushToUsers(
+      targets,
+      {
+        type: "call-cancelled",
+        callId: info.callId,
+        reason: info.reason || "caller_hung_up",
+      },
+      { TTL: 60, urgency: "high" },
+    );
+  } catch (err: any) {
+    console.error("[call-push] pushCallCancelled failed (non-fatal):", err?.message || err);
+  }
+}

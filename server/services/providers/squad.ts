@@ -27,6 +27,9 @@ const squadClient = axios.create({
     Authorization: `Bearer ${SQUAD_SECRET_KEY}`,
     "Content-Type": "application/json",
   },
+  // Hard ceiling so a hanging provider call can never block the transfer
+  // route (which awaits the provider synchronously for an instant status).
+  timeout: 30_000,
 });
 
 // Helper to convert major unit (e.g. 100.50) to minor unit (10050)

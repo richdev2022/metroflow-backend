@@ -6,6 +6,7 @@ import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
 import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml } from "../services/email";
 import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
+import adminDisputesRouter from "./admin_disputes";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
 import { verifyPayment } from "../services/squad";
@@ -380,6 +381,8 @@ authRouter.post("/forgot-password", async (req, res) => {
 });
 
 router.use('/auth', authRouter);
+// Dispute lifecycle — own router (brings authenticateAdmin + manage_finance per route)
+router.use('/disputes', adminDisputesRouter);
 router.use('/', protectedRouter);
 
 // Dashboard Stats

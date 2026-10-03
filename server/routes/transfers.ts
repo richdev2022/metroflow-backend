@@ -1706,7 +1706,16 @@ router.post("/:id/force-reversal", authenticateToken, async (req: AuthenticatedR
       });
     }
 
-    const reversed = await reverseFailedTransfer(transfer, 'Customer-requested reversal from receipt');
+    // Reverse with a HARD 20s cap. The wallet UPDATE can momentarily wait on
+    // a row lock (e.g. the reconciliation monitor reversing the same failed
+    // transfer concurrently) — without a cap the HTTP request hangs past the
+    // mobile client's 30s timeout and the user just sees "Something went
+    // wrong". On timeout we answer honestly: the reversal continues in the
+    // background (idempotent) and the monitor sweep is the safety net.
+    const reversed = await Promise.race([
+      reverseFailedTransfer(transfer, 'Customer-requested reversal from receipt'),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20000)),
+    ]);
     if (!reversed) {
       return res.status(500).json({
         success: false,

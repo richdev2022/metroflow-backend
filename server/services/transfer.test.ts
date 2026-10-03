@@ -23,6 +23,13 @@ vi.mock('./email', () => ({
   sendTransactionAlert: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mock push service (FCM + in-app notification for reversals)
+vi.mock('./push', () => ({
+  sendPushToUsers: vi.fn().mockResolvedValue({ sent: 0, failed: 0, users: 0 }),
+  sendPushToAll: vi.fn().mockResolvedValue({ sent: 0, failed: 0, users: 0 }),
+  isPushConfigured: vi.fn().mockReturnValue(false),
+}));
+
 // Mock fees module functions
 vi.mock('./fees', () => ({
   creditPlatformWallet: vi.fn().mockResolvedValue(undefined),
@@ -102,8 +109,8 @@ describe('processAllPending', () => {
         // 1. Fetch Pending Transfers
         mockQuery.mockResolvedValueOnce({ rows: [transfer] });
 
-        // 2. Update Status to processing
-        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 2. Atomic claim (UPDATE ... WHERE status='pending' RETURNING id)
+        mockQuery.mockResolvedValueOnce({ rows: [{ id: transfer.id }] });
 
         // 3. Check Wallet & Debit (Balance Check)
         mockQuery.mockResolvedValueOnce({ rows: [{ balance: '1000' }] });
@@ -136,8 +143,10 @@ describe('processAllPending', () => {
 
         await processAllPending(businessId);
 
-        // Verifications via mocked modules
-        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        // Verifications via mocked modules.
+        // NOTE: no platform "hold" credit at initiation — the pool only moves
+        // when the payout actually succeeds (debitPlatformWallet below).
+        expect(fees.creditPlatformWallet).not.toHaveBeenCalled();
         expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
         expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
@@ -186,7 +195,7 @@ describe('processAllPending', () => {
         
         // Setup similar to success until Squad call
         mockQuery.mockResolvedValueOnce({ rows: [transfer] }); // 1. Fetch
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // 2. Processing
+        mockQuery.mockResolvedValueOnce({ rows: [{ id: transfer.id }] }); // 2. Atomic claim (RETURNING id)
         mockQuery.mockResolvedValueOnce({ rows: [{ balance: '1000' }] }); // 3. Check Balance
         mockQuery.mockResolvedValueOnce({ rows: [] }); // 4. Debit User
         mockQuery.mockResolvedValueOnce({ rows: [] }); // 5. Idempotency SELECT amount txn
@@ -207,14 +216,17 @@ describe('processAllPending', () => {
 
         await processAllPending(businessId);
 
-        // Verifications: Debit side should have been called
-        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        // Verifications: fee revenue earned then reversed on failure. The pool
+        // ledger is untouched by the failure (no hold was ever written, and
+        // the payout never happened).
+        expect(fees.creditPlatformWallet).not.toHaveBeenCalled();
         expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
 
-        // Refund side should reverse everything
-        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        // Refund side reverses the fee revenue only (wallet credit + refund
+        // rows happen via direct SQL inside reverseFailedTransfer)
         expect(fees.debitRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
+        expect(fees.debitPlatformWallet).not.toHaveBeenCalled();
 
         // verifySingleTransfer should NOT have been called since we determined immediate status = failed
         expect(mockVerifyTransfer).not.toHaveBeenCalled();

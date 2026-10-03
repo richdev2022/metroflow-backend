@@ -1,7 +1,7 @@
 import express from "express";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
-import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet, creditPlatformWallet } from "../services/fees";
 import { settlePaymentLinkPayment } from "./payment_links";
 import { settleInvoicePayment } from "./invoices";
 import { settleStoreOrderPayment } from "./store";
@@ -239,13 +239,12 @@ const handleSquadWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Platform ledger (double-entry): the customer's gross inflow lands
-              // in the platform pool, the user payout leaves it and the fee moves
-              // to revenue - net platform balance change is zero.
+              // Platform ledger: ONE row — the gross inflow the provider
+              // actually sent to the pool account. Internal wallet allocation
+              // never touches the pool, so no "-USER" debit row exists.
               await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'squad');
-              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'Platform Wallet Debit for User Funding', 'squad');
 
-              // Credit revenue wallet (this will also debit platform wallet for fee)
+              // Credit revenue wallet (virtual allocation; no pool movement)
               if (fee > 0) {
                 await creditRevenueWallet(fee, 'NGN', reference, undefined, 'squad');
               }
@@ -385,7 +384,10 @@ const handleMonnifyWebhook = async (event: any) => {
                         
                         if (walletId) {
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
-                            await debitPlatformWallet(amount, 'NGN', `${reference}-PLATFORM`, 'Platform Wallet Debit for User Funding', 'monnify');
+                            // Pool ledger: ONE gross inflow row (matches the Squad/
+                            // Flutterwave funding paths — the Monnify path previously
+                            // wrote NO pool credit, breaking the pool mirror).
+                            await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'monnify');
                         }
                     }
                     
@@ -488,12 +490,11 @@ const handleMonnifyWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Platform ledger (double-entry): gross inflow lands in the pool,
-              // the user payout leaves it, the fee moves to revenue - net zero.
+              // Platform ledger: ONE row — the gross inflow into the pool
+              // (internal wallet allocation never touches the pool).
               await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'monnify');
-              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'Platform Wallet Debit for User Funding', 'monnify');
 
-              // Credit revenue wallet (this will also debit platform wallet for fee)
+              // Credit revenue wallet (virtual allocation; no pool movement)
               if (fee > 0) {
                 await creditRevenueWallet(fee, 'NGN', reference, undefined, 'monnify');
               }
@@ -604,9 +605,11 @@ const handleMonnifyWebhook = async (event: any) => {
 
                     // AUTO-REVERSAL: Monnify FAILED/REVERSED disbursement —
                     // return the user's money (amount + fee) immediately.
+                    // REVERSED = provider paid out THEN pulled funds back to the
+                    // pool, so the pool ledger must record the inflow.
                     if (newStatus === 'failed' && transfer.wallet_id) {
                         try {
-                            await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed');
+                            await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed', { providerReturnedFunds: isReversed });
                         } catch (reversalError) {
                             console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
                         }
@@ -643,10 +646,11 @@ const handleMonnifyWebhook = async (event: any) => {
                     [newStatus, failureReason, JSON.stringify(disbursementData), JSON.stringify(disbursementData), transfer.id]
                 );
 
-                // AUTO-REVERSAL: Monnify FAILED/REVERSED disbursement (single)
+                // AUTO-REVERSAL: Monnify FAILED/REVERSED disbursement (single).
+                // REVERSED = provider returned funds to the pool.
                 if (newStatus === 'failed' && transfer.wallet_id) {
                     try {
-                        await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed');
+                        await reverseFailedTransfer(transfer, failureReason || 'Monnify reported transfer failed/reversed', { providerReturnedFunds: isReversed });
                     } catch (reversalError) {
                         console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
                     }
@@ -991,13 +995,10 @@ const handleFlutterwaveWebhook = async (event: any) => {
             client.release();
         }
 
-        // Platform ledger (double-entry): the customer's gross inflow lands in
-        // the platform pool, the user payout leaves it and the fee moves to
-        // revenue - net platform balance change is zero. Flutterwave fundings
-        // previously wrote NO platform rows at all, which made the admin
-        // Platform Ledger show fee movements only.
+        // Platform ledger: ONE row — the gross inflow into the pool account.
+        // (Flutterwave fundings previously wrote NO platform rows at all, then
+        // an internal "-USER" pair was added — both broke the pool mirror.)
         await creditPlatformWallet(amount, 'NGN', creditReference, 'Customer Wallet Funding Received (Flutterwave Virtual Account)', 'flutterwave').catch(() => {});
-        await debitPlatformWallet(creditAmount, 'NGN', `${creditReference}-USER`, 'Platform Wallet Debit for User Funding', 'flutterwave').catch(() => {});
 
         if (fee > 0) {
             await creditRevenueWallet(fee, 'NGN', creditReference, undefined, 'flutterwave').catch(() => {});

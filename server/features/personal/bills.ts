@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
+import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 import { verifyPassword } from "../../services/auth";
 import { fulfilBill, isBillsProviderConfigured } from "./bills-provider";
@@ -443,8 +443,9 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             ]
         );
 
-        // Double-entry platform ledger: value in, payout out, fee to revenue.
-        await creditPlatformWallet(total, wallet.currency || "NGN", reference, "Bill Payment Received", "bills");
+        // Pool ledger: the ONLY real pool movement for a wallet-funded bill is
+        // the vendor settlement (platform pays the bill provider). The wallet
+        // debit itself is internal — no "Bill Payment Received" inflow row.
         await debitPlatformWallet(billAmount, wallet.currency || "NGN", `${reference}-VENDOR`, "Platform Wallet Debit for Bill Settlement", "bills");
         if (fee > 0) {
             await creditRevenueWallet(fee, wallet.currency || "NGN", reference, "Bill Payment Convenience Fee", "bills");

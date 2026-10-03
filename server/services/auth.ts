@@ -2,6 +2,24 @@ import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { query } from "../db";
 
+/**
+ * Session idle timeout (minutes). Each successful verifyToken slides the
+ * window forward (last_activity_at = NOW()), so this is INACTIVITY-only:
+ * an app in active use never expires.
+ *
+ * HISTORY: the default was 30 minutes, which silently killed mobile sessions
+ * between screens — the app stayed "logged in" (token still on the device)
+ * while EVERY REST call started returning 403 "Invalid or expired token" and
+ * sockets dropped to guest (no calls, no live chat, no push registration).
+ * A fintech app whose users expect to open it occasionally must not destroy
+ * the session that fast. 30 days of inactivity is the new floor; operators
+ * can still tighten it with TOKEN_IDLE_TIMEOUT_MINUTES.
+ */
+export const SESSION_IDLE_TIMEOUT_MINUTES = parseInt(
+  process.env.TOKEN_IDLE_TIMEOUT_MINUTES || "43200",
+  10,
+);
+
 // Secure password hashing with bcrypt
 const SALT_ROUNDS = 12;
 
@@ -45,8 +63,8 @@ export async function verifyToken(
 ): Promise<{ userId: string; businessId: string } | null> {
   try {
     console.log("Verifying token:", token);
-    // Get idle timeout from env (default to 30 minutes)
-    const idleTimeoutMinutes = parseInt(process.env.TOKEN_IDLE_TIMEOUT_MINUTES || "30", 10);
+    // Sliding idle window: every successful verification extends the session.
+    const idleTimeoutMinutes = SESSION_IDLE_TIMEOUT_MINUTES;
     
     // First, try to update the session and get the session info in one query
     const updateResult = await query(

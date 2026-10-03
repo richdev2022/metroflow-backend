@@ -35,6 +35,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
+  await purgeInternalLedgerNoiseRows();
 
   // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
   await ensureBusinessRevenueLadder();
@@ -787,6 +788,54 @@ async function backfillLedgerHistory(): Promise<void> {
     console.log("[migrations] ledger backfill complete");
   } catch (err: any) {
     console.error(`[migrations] ledger backfill failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
+  }
+}
+
+/**
+ * PLATFORM LEDGER = mirror of the provider POOL account.
+ *
+ * Between the first ledger writer and the pool-mirror rework, the writers
+ * recorded internal allocation pairs as transaction_type='platform' rows:
+ *   - "-USER" / "-MERCHANT" / "-PLATFORM" allocation debits (funding / store /
+ *     invoice / payment-link / subscription settlements — internal wallet
+ *     credits that never touch the pool),
+ *   - fee->revenue mirror rows ("Platform Wallet Debit for Revenue" and its
+ *     reversal),
+ *   - transfer "hold" credits written at initiation plus their "Reversal of
+ *     platform hold" counterparts,
+ *   - wallet-internal inflows (bill payments, savings withdrawals, wallet-
+ *     charged subscriptions).
+ * NONE of these correspond to money moving in/out of the provider pool
+ * account, so they made the Platform Ledger history inconsistent and
+ * unrecognizable. The writers no longer create them — this one-off purge
+ * removes the historical noise. Idempotent, safe on every boot.
+ */
+async function purgeInternalLedgerNoiseRows(): Promise<void> {
+  try {
+    const res = await query(
+      `DELETE FROM transactions
+       WHERE transaction_type = 'platform'
+         AND (
+              reference LIKE '%-USER'
+           OR reference LIKE '%-MERCHANT'
+           OR reference LIKE '%-PLATFORM'
+           OR description LIKE 'Platform Wallet Debit for Revenue%'
+           OR description LIKE 'Platform Wallet Credit (Revenue Reversal)%'
+           OR description LIKE 'Platform Wallet Credit for Transfer%'
+           OR description LIKE 'Reversal of platform hold%'
+           OR description LIKE 'Platform Wallet Debit for Savings Payout%'
+           OR description IN (
+                'Bill Payment Received',
+                'Savings Withdrawal Received',
+                'Subscription Charge Collected'
+              )
+         )`,
+    );
+    if (res.rowCount && res.rowCount > 0) {
+      console.log(`[migrations] purged ${res.rowCount} internal platform-ledger noise rows (pool mirror cleanup)`);
+    }
+  } catch (err: any) {
+    console.error(`[migrations] platform ledger purge failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
   }
 }
 

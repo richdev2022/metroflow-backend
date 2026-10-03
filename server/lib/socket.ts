@@ -31,7 +31,7 @@ import {
 import { generateMeetingNotesIfEligible } from "./meeting-notes";
 import { resolveSingleSpeakerName, looksLikeUuid } from "./speaker-names";
 import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "./call-log";
-import { pushIncomingCall, pushMissedCall } from "./call-push";
+import { pushIncomingCall, pushMissedCall, pushCallCancelled } from "./call-push";
 
 let io: Server | null = null;
 
@@ -1027,6 +1027,23 @@ export function initSocketServer(server: http.Server): void {
               callId: resolvedRoomId,
               reason: 'all_participants_left',
             });
+            // Devices that were invited but never joined may still be RINGING
+            // — the leaver's socket room broadcast cannot reach them.
+            let neverJoinedIds: string[] = [];
+            try {
+              const parts = await query(`SELECT user_id FROM call_participants WHERE call_id = $1`, [resolvedRoomId]);
+              neverJoinedIds = (parts.rows.map((row: any) => row.user_id) || []).filter(Boolean);
+            } catch { /* best-effort */ }
+            for (const pid of neverJoinedIds) {
+              if (pid && pid !== data.userId) {
+                ioServer?.to(`user:${pid}`).emit("call:ended", { callId: resolvedRoomId, reason: 'all_participants_left' });
+              }
+            }
+            pushCallCancelled(neverJoinedIds, {
+              callId: resolvedRoomId,
+              callerId: data.userId,
+              reason: "all_participants_left",
+            });
           } catch (endError) {
             logger.error("Error completing emptied call:", endError);
           }
@@ -1592,6 +1609,14 @@ export function initSocketServer(server: http.Server): void {
       if (preEnd?.created_by) {
         io.to(`user:${preEnd.created_by}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
       }
+      // SILENT push for the devices still ringing in another room / with the
+      // app backgrounded: dismiss the full-screen ring notification + the
+      // in-app incoming overlay NOW instead of after the 45s timeout.
+      pushCallCancelled([...preEndParticipantIds, preEnd?.created_by].filter(Boolean), {
+        callId: resolvedCallId,
+        callerId: socket.data.userId,
+        reason: "call_ended",
+      });
       socket.leave(`room:${resolvedCallId}`);
     });
 

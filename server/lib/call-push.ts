@@ -34,8 +34,10 @@ export async function pushIncomingCall(
 
     const callTypeLabel = info.callType === "audio" ? "audio" : "video";
 
-    // FCM (mobile): data-only style payload, no in-app notification mirror —
-    // the app renders its own full-screen incoming-call UI.
+    // FCM (mobile): Android stays data-only so the app's background handler
+    // renders the full-screen ringing notification; iOS gets a real APNs
+    // alert (banner + sound + time-sensitive) so a terminated/locked iPhone
+    // still rings — tap deep-links into the call via the data payload.
     await sendPushToUsers(
       targets.map((userId) => ({ userId })),
       {
@@ -51,6 +53,11 @@ export async function pushIncomingCall(
           ...(info.conversationId ? { conversationId: info.conversationId } : {}),
         },
         androidChannelId: "calls",
+        // A call that nobody answered in 45s is dead — never ring late.
+        // (iOS alerting is automatic: push.ts detects iOS tokens and sends
+        // them a real APNs alert; Android stays data-only.)
+        ttlSeconds: 45,
+        collapseKey: `incoming-call-${info.callId}`,
       },
       { inApp: false },
     ).catch(() => {});
@@ -101,6 +108,8 @@ export async function pushMissedCall(
           status: info.status || "missed",
         },
         androidChannelId: "calls",
+        ttlSeconds: 300,
+        collapseKey: `missed-call-${info.callId}`,
       },
       { inApp: true, type: "call" },
     );

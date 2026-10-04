@@ -95,6 +95,10 @@ export interface PushPayload {
   data?: Record<string, string>;
   /** High priority data-only messages wake the app for incoming calls. */
   androidChannelId?: string;
+  /** Per-platform expiry (seconds) — stale calls/messages must die quietly. */
+  ttlSeconds?: number;
+  /** Collapse key so a re-ring REPLACES the queued notification, not stacks. */
+  collapseKey?: string;
 }
 
 /**
@@ -174,6 +178,11 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
 
     let sent = 0;
     let failed = 0;
+    // Expiry + collapse: a queued ring that arrives after its useful window
+    // must be dropped by the OS, and a re-ring must replace (not stack).
+    const apnsExpiration = payload.ttlSeconds
+      ? String(Math.floor(Date.now() / 1000) + payload.ttlSeconds)
+      : null;
     for (const token of tokens) {
       const isIos = iosTokens.has(token);
       try {
@@ -183,11 +192,17 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
               data: dataPayload,
               android: { priority: "high" },
               apns: {
-                headers: { "apns-priority": "10", "apns-push-type": "alert" },
+                headers: {
+                  "apns-priority": "10",
+                  "apns-push-type": "alert",
+                  ...(apnsExpiration ? { "apns-expiration": apnsExpiration } : {}),
+                  ...(payload.collapseKey ? { "apns-collapse-id": payload.collapseKey } : {}),
+                },
                 payload: {
                   aps: {
                     alert: { title: payload.title, body: payload.body },
                     sound: "default",
+                    "interruption-level": "time-sensitive",
                     ...(Number.isFinite(badgeRaw) && badgeRaw > 0 ? { badge: badgeRaw } : {}),
                     "thread-id": String(dataPayload.type || "general"),
                   },
@@ -199,7 +214,11 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
               // Data-only on Android: wakes the background isolate which
               // renders the rich local notification (full-screen call ring).
               data: dataPayload,
-              android: { priority: "high" },
+              android: {
+                priority: "high",
+                ...(payload.ttlSeconds ? { ttl: `${payload.ttlSeconds}s` } : {}),
+                ...(payload.collapseKey ? { collapse_key: payload.collapseKey } : {}),
+              },
               apns: {
                 headers: { "apns-priority": "5", "apns-push-type": "background" },
                 payload: { aps: { "content-available": 1 } },

@@ -12,6 +12,7 @@ import {
   requirePermission,
 } from "../middleware/adminAuth";
 import { sendEmail } from "../services/email-sender";
+import { emailLogoHeader } from "../services/email";
 import { ApiResponse } from "@shared/api";
 
 /**
@@ -93,7 +94,19 @@ async function emailSupportInbox(subject: string, html: string): Promise<void> {
   const to = process.env.SUPPORT_ALERT_EMAIL || process.env.ADMIN_ALERT_EMAIL;
   if (!to) return;
   try {
-    await sendEmail(to, "Support Desk", subject, html);
+    // Wrap in the branded shell so EVERY support escalation carries the
+    // official logo regardless of which caller built the inner fragment.
+    const branded = `
+      <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+          <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+            ${emailLogoHeader(150)}
+            ${html}
+          </div>
+        </body>
+      </html>
+    `;
+    await sendEmail(to, "Support Desk", subject, branded);
   } catch (error) {
     console.error("support email notify failed (non-fatal):", error);
   }

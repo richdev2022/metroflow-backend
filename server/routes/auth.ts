@@ -16,7 +16,8 @@ import {
   getOTPExpiry,
   generateToken,
 } from "../services/auth";
-import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, parseDeviceInfo } from "../services/email";
+import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, parseDeviceInfo, emailLogoHeader } from "../services/email";
+import { getProfileStatus } from "../services/profile-status";
 import { logActivity } from "../services/activity";
 import { generateBusinessId } from "../utils/idGenerator";
 import {
@@ -264,8 +265,9 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       <html>
         <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
           <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+            ${emailLogoHeader(150)}
             <h2 style="color: #1d4ed8; margin-bottom: 20px;">Verify Your Email</h2>
-            <p style="color: #333; margin-bottom: 15px;">Welcome to MetricFlow!</p>
+            <p style="color: #333; margin-bottom: 15px;">Welcome to Metricorex!</p>
             <p style="color: #666; line-height: 1.6; margin-bottom: 15px;">
               Your business has been registered successfully. Please verify your email using the code below:
             </p>
@@ -283,7 +285,7 @@ export const registerBusiness: RequestHandler = async (req, res) => {
     const emailSent = await sendEmail(
       input.adminEmail,
       input.adminName,
-      "Verify Your MetricFlow Account",
+      "Verify Your Metricorex Account",
       otpEmailHtml,
     );
 
@@ -454,7 +456,7 @@ export const verifyOTP: RequestHandler = async (req, res) => {
       emailSent = await sendEmail(
         input.email,
         user.name,
-        "Welcome to MetricFlow!",
+        "Welcome to Metricorex!",
         welcomeEmailHtml,
       );
     } catch (emailErr: any) {
@@ -469,6 +471,13 @@ export const verifyOTP: RequestHandler = async (req, res) => {
     // Generate token
     const token = await generateToken(user.id, user.businessId);
 
+    const profileStatus = await getProfileStatus(user.id);
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(user.businessId);
+      } catch { completion = true; }
+    }
     const response: AuthResponse = {
       success: true,
       userId: user.id,
@@ -477,6 +486,14 @@ export const verifyOTP: RequestHandler = async (req, res) => {
       name: user.name || "",
       email: user.email || "",
       message: "Email verified successfully",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      profileCompleted: completion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
     };
 
     res.json(response);
@@ -555,6 +572,7 @@ export const forgotPassword: RequestHandler = async (req, res) => {
       <html>
         <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
           <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+            ${emailLogoHeader(150)}
             <h2 style="color: #1d4ed8; margin-bottom: 20px;">Reset Your Password</h2>
             <p style="color: #333; margin-bottom: 15px;">Hi ${user.name},</p>
             <p style="color: #666; line-height: 1.6; margin-bottom: 15px;">
@@ -577,7 +595,7 @@ export const forgotPassword: RequestHandler = async (req, res) => {
     const emailSent = await sendEmail(
       input.email,
       user.name,
-      "Reset Your MetricFlow Password",
+      "Reset Your Metricorex Password",
       resetEmailHtml,
     );
 
@@ -861,6 +879,7 @@ export const resendOTP: RequestHandler = async (req, res) => {
       <html>
         <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
           <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+            ${emailLogoHeader(150)}
             <h2 style="color: #1d4ed8; margin-bottom: 20px;">Verify Your Email</h2>
             <p style="color: #333; margin-bottom: 15px;">Hi ${user.name},</p>
             <p style="color: #666; line-height: 1.6; margin-bottom: 15px;">
@@ -880,7 +899,7 @@ export const resendOTP: RequestHandler = async (req, res) => {
     const emailSent = await sendEmail(
       email,
       user.name,
-      "Verify Your MetricFlow Account",
+      "Verify Your Metricorex Account",
       otpEmailHtml,
     );
 
@@ -1103,6 +1122,17 @@ export const login: RequestHandler = async (req, res) => {
 
     // Name/email ride along so every client (web + mobile) can greet the user
     // by NAME after email/password login — not by their email address.
+    const profileStatus = await getProfileStatus(user.id);
+    // Role-aware completion: admins owe a complete BUSINESS profile,
+    // invited members owe their PERSONAL profile. `profileCompleted=false`
+    // always means "route to the completion screen" — the flag in
+    // `requiresProfileCompletion` tells clients which one.
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(user.businessId);
+      } catch { completion = true; }
+    }
     const response: AuthResponse = {
       success: true,
       userId: user.id,
@@ -1111,6 +1141,14 @@ export const login: RequestHandler = async (req, res) => {
       name: user.name || "",
       email: user.email || "",
       message: "Login successful",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      profileCompleted: completion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
     };
 
     res.json(response);
@@ -1332,8 +1370,15 @@ export const googleAuth: RequestHandler = async (req, res) => {
         requiresPasswordSetup: true,
         // Fresh SSO sign-up: derived workspace name, no phone/industry/logo
         // yet — clients MUST route to the profile-completion screen first.
+        // The creator is a business admin, so the screen they get is the
+        // BUSINESS completion flow (never the personal one).
         profileCompleted: false,
         message: "Google sign-up successful",
+        role: "admin",
+        isBusinessAdmin: true,
+        requiresProfileCompletion: false,
+        phoneVerified: false,
+        profilePromptDismissed: true,
         user: {
           id: newUser.id,
           name: newUser.name,
@@ -1369,6 +1414,13 @@ export const googleAuth: RequestHandler = async (req, res) => {
 
     const token = await generateToken(user.id, user.businessId);
 
+    const profileStatus = await getProfileStatus(user.id);
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(user.businessId);
+      } catch { completion = true; }
+    }
     return res.json({
       success: true,
       token,
@@ -1376,10 +1428,18 @@ export const googleAuth: RequestHandler = async (req, res) => {
       businessId: user.businessId,
       isNewUser,
       requiresPasswordSetup: !user.passwordHash,
-      // Existing SSO accounts still owe a complete business profile (phone,
-      // industry, real name, logo) before reaching the dashboard.
-      profileCompleted: await computeBusinessProfileCompleted(user.businessId),
+      // Existing SSO accounts: admins still owe a complete business profile
+      // (phone, industry, real name, logo); invited members owe their
+      // personal profile (see requiresProfileCompletion).
+      profileCompleted: completion,
       message: isNewUser ? "Google sign-up successful" : "Google login successful",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
       user: {
         id: user.id,
         name: user.name,
@@ -1609,7 +1669,10 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
               avatar_url as "avatarUrl", auth_provider as "authProvider",
               (password_hash IS NOT NULL) as "hasPassword",
               email_verified as "emailVerified", kyc_status as "kycStatus",
-              phone_number as "phoneNumber"
+              phone_number as "phoneNumber",
+              COALESCE(phone_verified, FALSE) as "phoneVerified",
+              COALESCE(profile_completed, FALSE) as "profileCompleted",
+              COALESCE(profile_prompt_dismissed, FALSE) as "profilePromptDismissed"
        FROM users WHERE id = $1`,
       [userId],
     );
@@ -1617,8 +1680,6 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
-
-    const data: Record<string, unknown> = result.rows[0];
 
     // Business identity (logo + name) — SSO LOGO PARITY FIX: clients can
     // render the workspace logo straight from /auth/me without an extra
@@ -1638,9 +1699,20 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
       console.error("Get me business lookup failed:", bizErr);
     }
 
-    // SSO onboarding gate — clients route to the profile-completion screen
-    // until the business profile is fully filled in.
+    // Role-aware profile gates:
+    //  - profileCompleted = BUSINESS profile (owner/admin gate, remote flow).
+    //  - personalProfileCompleted / requiresProfileCompletion = the
+    //    PERSONAL completion gate for invited members (photo/name/email/
+    //    phone-OTP/skip) — business admins never see it.
     data.profileCompleted = await computeBusinessProfileCompleted(data.businessId as string);
+    try {
+      const profileStatus = await getProfileStatus(userId);
+      data.isBusinessAdmin = profileStatus.isBusinessAdmin;
+      data.personalProfileCompleted = profileStatus.profileCompleted;
+      data.requiresProfileCompletion = profileStatus.requiresProfileCompletion;
+    } catch (profileErr) {
+      console.error("Get me profile-status failed:", profileErr);
+    }
 
     return res.json({ success: true, data });
   } catch (error) {
@@ -1761,12 +1833,29 @@ export const biometricLogin: RequestHandler = async (req, res) => {
     } catch { /* best effort */ }
 
     const token = await generateToken(cred.uid, cred.businessId);
+    const profileStatus = await getProfileStatus(cred.uid);
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(cred.businessId);
+      } catch { completion = true; }
+    }
     res.json({
       success: true,
       userId: cred.uid,
       businessId: cred.businessId,
       token,
       message: "Biometric login successful",
+      name: cred.name || "",
+      email: cred.email || "",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      profileCompleted: completion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
     });
   } catch (error: any) {
     console.error("Biometric login error:", error);

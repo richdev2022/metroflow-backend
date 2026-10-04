@@ -5,7 +5,7 @@ import { requireTeamPermission } from "../middleware/teamAuth";
 import { calculateFee, creditPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { createNotification } from "../services/notifications";
 import { getProvider } from "../services/providers/factory";
-import { sendEmail } from "../services/email";
+import { sendEmail, emailLogoHeader } from "../services/email";
 
 const router = express.Router();
 
@@ -1238,12 +1238,19 @@ export async function processDueSubscriptionCharges(): Promise<{ processed: numb
                     sub.customer_email,
                     sub.customer_name || "there",
                     `Your ${sub.plan_name} subscription payment is due`,
-                    `<p>Hi ${sub.customer_name || "there"},</p>
-                     <p>Your <strong>${sub.plan_name}</strong> subscription (${sub.interval}) payment of
-                     <strong>₦${Number(sub.amount).toLocaleString()}</strong> is due.</p>
-                     <p><a href="${payUrl}" style="display:inline-block;background:#4F46E5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;">Pay now</a></p>
-                     <p>If the button doesn't work, open: ${payUrl}</p>
-                     <p style="font-size:12px;color:#888;">Don't want this subscription? <a href="${unsubscribeUrl}">Unsubscribe</a></p>`
+                    `<html>
+                      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+                        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+                          ${emailLogoHeader(150)}
+                          <p style="color: #333;">Hi ${sub.customer_name || "there"},</p>
+                          <p style="color: #666; line-height: 1.6;">Your <strong>${sub.plan_name}</strong> subscription (${sub.interval}) payment of
+                          <strong>₦${Number(sub.amount).toLocaleString()}</strong> is due.</p>
+                          <p style="text-align:center;margin:24px 0;"><a href="${payUrl}" style="display:inline-block;background:#4F46E5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;">Pay now</a></p>
+                          <p style="color: #666;">If the button doesn't work, open: ${payUrl}</p>
+                          <p style="font-size:12px;color:#888;">Don't want this subscription? <a href="${unsubscribeUrl}">Unsubscribe</a></p>
+                        </div>
+                      </body>
+                    </html>`
                 );
             } catch (emailErr) {
                 console.error("Subscription pay-link email failed:", emailErr);

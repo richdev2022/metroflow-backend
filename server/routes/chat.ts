@@ -525,6 +525,9 @@ export const createConversation: RequestHandler = async (
   try {
     // Accept BOTH spellings — the mobile app historically sent
     // `participant_ids` (snake_case), the web app `participantIds`.
+    // (With only snake_case in the body, participantIds used to be
+    // undefined: every conversation was created with ONLY the creator in
+    // it and the direct-dedupe query crashed on `participantIds[0]`.)
     const body = req.body || {};
     const { name, type } = body;
     const participantIds = body.participantIds ?? body.participant_ids;
@@ -591,13 +594,57 @@ export const createConversation: RequestHandler = async (
            WHERE cp_count.conversation_id = cc.id
          ) = 2
          LIMIT 1`,
-        [businessId, userId, participantIds[0]],
+        [businessId, userId, providedIds[0]],
       );
 
       if (existingResult.rows.length > 0) {
+        // Return the FULLY-HYDRATED conversation (same shape as the create
+        // response / GET list) — clients feed this straight into their
+        // conversation model, so a bare `{ id }` used to render a broken
+        // "Direct chat" header with no participants.
+        const hydrated = await query(
+          `SELECT
+            cc.id, cc.business_id as "businessId", cc.name, cc.type,
+            cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
+            (
+              SELECT json_agg(json_build_object(
+                'id', cp.id,
+                'userId', cp.user_id,
+                'role', COALESCE(cp.role, 'member'),
+                'lastReadAt', cp.last_read_at,
+                'lastSeen', (
+                  SELECT us.last_activity_at
+                  FROM user_sessions us
+                  WHERE us.user_id = cp.user_id
+                  ORDER BY us.last_activity_at DESC
+                  LIMIT 1
+                ),
+                'presenceStatus', COALESCE(u.presence_status, 'offline'),
+                'lastSeenAt', u.last_seen_at,
+                'name', u.name,
+                'email', u.email,
+                'avatarUrl', u.avatar_url
+              ))
+              FROM chat_participants cp
+              LEFT JOIN users u ON cp.user_id = u.id
+              WHERE cp.conversation_id = cc.id
+            ) as participants,
+            (SELECT cm.content FROM chat_messages cm
+             WHERE cm.conversation_id = cc.id
+             ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
+            (SELECT cm.created_at FROM chat_messages cm
+             WHERE cm.conversation_id = cc.id
+             ORDER BY cm.created_at DESC LIMIT 1) as "lastMessageAt",
+            0 as "unreadCount"
+          FROM chat_conversations cc
+          WHERE cc.id = $1
+          LIMIT 1`,
+          [existingResult.rows[0].id],
+        );
+
         const response: ApiResponse<any> = {
           success: true,
-          data: { id: existingResult.rows[0].id },
+          data: hydrated.rows[0] || { id: existingResult.rows[0].id },
         };
         return res.json(response);
       }

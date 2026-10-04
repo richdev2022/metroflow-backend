@@ -951,6 +951,11 @@ export const sendMessage: RequestHandler = async (
                   badge: String(unreadByUser.size > 0 ? Math.max(...unreadByUser.values()) : 1),
                 },
                 androidChannelId: "general",
+                // iOS alerts are automatic (push.ts detects iOS tokens and
+                // sends a real APNs alert with the data badge).
+                // A message notification older than an hour is noise.
+                ttlSeconds: 3600,
+                collapseKey: `chat-${conversationId}`,
               },
               // inApp: true — every received message must also land in the
               // in-app notifications panel (createNotification mirrors it into

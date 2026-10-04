@@ -7,6 +7,13 @@ import { sendEmail as sendEmailFromSender } from "./email-sender";
 const EMAIL_LOGO_URL =
   process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
 
+/** Official logo <img> header shared by every email template (inline + generated). */
+export function emailLogoHeader(maxWidth = 180): string {
+  return `<div style="text-align: center; margin-bottom: 24px;"><img src="${EMAIL_LOGO_URL}" alt="Metricorex Logo" style="max-width: ${maxWidth}px; height: auto;" /></div>`;
+}
+
+export const EMAIL_LOGO_URL_EXPORT = EMAIL_LOGO_URL;
+
 export interface EmailPayload {
   to: Array<{
     email: string;
@@ -67,10 +74,14 @@ export function generateLoginAttemptEmailHtml(
     ? 'Your account was just accessed successfully. If this was you, no action is needed.'
     : 'Someone just tried to sign in to your account with an incorrect email or password. If this was you, you can safely ignore this email. If not, we recommend changing your password immediately.';
 
+  const logoUrl = EMAIL_LOGO_URL;
   return `
     <html>
       <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
         <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
           <div style="border-left: 4px solid ${accent}; padding-left: 16px; margin-bottom: 20px;">
             <h2 style="color: ${accent}; margin: 0;">${heading}</h2>
           </div>
@@ -144,10 +155,14 @@ export function generateMaintenanceModeEmailHtml(name: string, isDown: boolean, 
     ? 'Metricorex is undergoing scheduled maintenance to improve performance and reliability. During this time some features may be unavailable. We will notify you as soon as everything is back up.'
     : 'Great news - the scheduled maintenance is complete and Metricorex is fully back up. Thank you for your patience!';
   const accent = isDown ? '#f59e0b' : '#10b981';
+  const logoUrl = EMAIL_LOGO_URL;
   return `
     <html>
       <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
         <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
           <div style="border-left: 4px solid ${accent}; padding-left: 16px; margin-bottom: 20px;">
             <h2 style="color: ${accent}; margin: 0;">${heading}</h2>
           </div>
@@ -164,10 +179,14 @@ export function generateMaintenanceModeEmailHtml(name: string, isDown: boolean, 
  * Generic broadcast email (admin announcements / notifications).
  */
 export function generateBroadcastEmailHtml(name: string, subject: string, message: string): string {
+  const logoUrl = EMAIL_LOGO_URL;
   return `
     <html>
       <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
         <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
           <h2 style="color: #1d4ed8; margin-bottom: 16px;">${subject}</h2>
           <p style="color: #333;">Hi ${name},</p>
           <div style="color: #666; line-height: 1.7;">${message.replace(/\n/g, '<br/>')}</div>
@@ -632,6 +651,9 @@ export async function sendPayrollAdjustmentNotification(
     <html>
       <body style="font-family: 'Segoe UI', Arial, sans-serif; padding: 20px; background-color: #f9fafb;">
         <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${EMAIL_LOGO_URL}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
           <h2 style="color: #111827;">Payroll Adjustment Notice</h2>
           <p>This is to inform you that a <strong>${adjustmentType}</strong> has been applied to the upcoming payroll for <strong>${recipientName}</strong>.</p>
           

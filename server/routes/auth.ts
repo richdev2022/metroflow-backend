@@ -1,4 +1,4 @@
-import { RequestHandler } from "express";
+import { RequestHandler, Response } from "express";
 import { query } from "../db";
 import {
   RegisterBusinessInput,
@@ -25,7 +25,33 @@ import {
   recordSuccessfulLogin,
 } from "../services/login-security";
 import { verifyGoogleIdToken } from "../services/googleAuth";
+import { isMaintenanceMode } from "../services/app-config";
 import { AuthenticatedRequest } from "../middleware/auth";
+
+/**
+ * MAINTENANCE GATE (shared by every auth entry point). When an admin has
+ * maintenance mode ON (`system_settings.maintenance_mode = 'on'`), all
+ * session-creating endpoints — register, OTP verify, password login,
+ * Google SSO and biometric login — refuse to issue sessions with a 503
+ * MAINTENANCE_MODE answer. The mobile/web clients poll the public
+ * /public/app-config endpoint and show a full-screen blocker, but the
+ * server must never trust that alone. Fail-open on check errors.
+ * Returns true when the 503 was sent (caller should `return`).
+ */
+async function rejectIfUnderMaintenance(res: Response): Promise<boolean> {
+  try {
+    if (!(await isMaintenanceMode())) return false;
+    res.status(503).json({
+      success: false,
+      code: "MAINTENANCE_MODE",
+      message:
+        "Metricorex is undergoing scheduled maintenance. Please try again in a little while.",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const registerBusiness: RequestHandler = async (req, res) => {
 /**
@@ -87,6 +113,9 @@ export const registerBusiness: RequestHandler = async (req, res) => {
  */
   try {
     const input: RegisterBusinessInput = req.body;
+
+    // MAINTENANCE GATE: refuse new registrations while maintenance is ON.
+    if (await rejectIfUnderMaintenance(res)) return;
 
     if (
       !input.businessName ||
@@ -348,6 +377,9 @@ export const verifyOTP: RequestHandler = async (req, res) => {
    */
   try {
     const input: OTPVerificationInput = req.body;
+
+    // MAINTENANCE GATE: no OTP-logins during a maintenance window.
+    if (await rejectIfUnderMaintenance(res)) return;
 
     if (!input.email || !input.otpCode) {
       return res.status(400).json({
@@ -918,6 +950,12 @@ export const login: RequestHandler = async (req, res) => {
  */
   try {
     const input: LoginInput = req.body;
+
+    // MAINTENANCE GATE: the backend itself now refuses logins while an admin
+    // has maintenance mode ON (mobile used to slip through because it had no
+    // client-side gate; both clients now poll /public/app-config AND the
+    // server enforces it here).
+    if (await rejectIfUnderMaintenance(res)) return;
     // Get IP address with better detection
     let ipAddress: string | undefined;
     const xForwardedFor = req.headers['x-forwarded-for'];
@@ -1116,6 +1154,9 @@ export const login: RequestHandler = async (req, res) => {
 export const googleAuth: RequestHandler = async (req, res) => {
   try {
     const { credential, businessName, businessIndustry } = req.body || {};
+
+    // MAINTENANCE GATE: Google SSO must not bypass the maintenance window.
+    if (await rejectIfUnderMaintenance(res)) return;
 
     if (!credential) {
       return res.status(400).json({
@@ -1578,6 +1619,25 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
     }
 
     const data: Record<string, unknown> = result.rows[0];
+
+    // Business identity (logo + name) — SSO LOGO PARITY FIX: clients can
+    // render the workspace logo straight from /auth/me without an extra
+    // /settings round-trip (the logo uploaded via the SSO complete-profile
+    // screen lands in businesses.logo_url).
+    try {
+      const bizRes = await query(
+        `SELECT name, logo_url as "logoUrl" FROM businesses WHERE id = $1 LIMIT 1`,
+        [data.businessId as string],
+      );
+      if (bizRes.rows[0]) {
+        data.businessName = bizRes.rows[0].name ?? null;
+        data.businessLogoUrl = bizRes.rows[0].logoUrl ?? null;
+      }
+    } catch (bizErr) {
+      // Non-fatal: the profile response must never break on the logo lookup.
+      console.error("Get me business lookup failed:", bizErr);
+    }
+
     // SSO onboarding gate — clients route to the profile-completion screen
     // until the business profile is fully filled in.
     data.profileCompleted = await computeBusinessProfileCompleted(data.businessId as string);
@@ -1654,6 +1714,9 @@ export const biometricEnroll: RequestHandler = async (req: AuthenticatedRequest,
 export const biometricLogin: RequestHandler = async (req, res) => {
   try {
     const { biometric_token, device_id, device_name } = req.body || {};
+
+    // MAINTENANCE GATE: biometric login is a login path too.
+    if (await rejectIfUnderMaintenance(res)) return;
     if (!biometric_token || !device_id) {
       return res.status(400).json({ success: false, message: "biometric_token and device_id are required" });
     }

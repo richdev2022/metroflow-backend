@@ -376,6 +376,41 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
         const otpCode = generateOTP();
         const otpExpiresAt = getOTPExpiry();
 
+        // Duplicate protection BEFORE storing/sending the OTP: reject contact
+        // details that already belong to another business (email is DB-unique;
+        // phones are app-enforced) or another user's profile phone.
+        const contactValue = String(value).trim();
+        if (type === 'email') {
+            const emailDupe = await query(
+                `SELECT id FROM businesses WHERE email = $1 AND id <> $2 LIMIT 1`,
+                [contactValue, businessId],
+            );
+            if (emailDupe.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    error: "This email is already in use by another business. Please use a different email.",
+                    code: "EMAIL_ALREADY_EXISTS",
+                });
+            }
+        } else if (type === 'phone') {
+            const bizDupe = await query(
+                `SELECT id FROM businesses WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
+                [contactValue, businessId],
+            );
+            const userDupe = await query(
+                `SELECT id FROM users WHERE phone_number = $1
+                   AND business_id <> $2 LIMIT 1`,
+                [contactValue, businessId],
+            );
+            if (bizDupe.rows.length > 0 || userDupe.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    error: "This phone number is already in use by another account. Please use a different number.",
+                    code: "PHONE_ALREADY_EXISTS",
+                });
+            }
+        }
+
         if (type === 'email') {
             // Update DB with temp email and OTP
             await query(
@@ -464,8 +499,21 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
             return res.status(400).json({ success: false, error: "OTP expired" });
         }
 
-        // Perform update
+        // Perform update — re-check duplicates first (the requested value was
+        // stored as temp_* when the OTP was requested; another account may
+        // have taken it in the meantime).
         if (temp_email) {
+            const dupe = await query(
+                `SELECT id FROM businesses WHERE email = $1 AND id <> $2 LIMIT 1`,
+                [temp_email, businessId],
+            );
+            if (dupe.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    error: "This email is already in use by another business. Please use a different email.",
+                    code: "EMAIL_ALREADY_EXISTS",
+                });
+            }
             await query(
                 `UPDATE businesses 
                  SET email = temp_email, temp_email = NULL, otp_code = NULL, otp_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
@@ -473,6 +521,21 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
                 [businessId]
             );
         } else if (temp_phone) {
+            const bizDupe = await query(
+                `SELECT id FROM businesses WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
+                [temp_phone, businessId],
+            );
+            const userDupe = await query(
+                `SELECT id FROM users WHERE phone_number = $1 AND business_id <> $2 LIMIT 1`,
+                [temp_phone, businessId],
+            );
+            if (bizDupe.rows.length > 0 || userDupe.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    error: "This phone number is already in use by another account. Please use a different number.",
+                    code: "PHONE_ALREADY_EXISTS",
+                });
+            }
             await query(
                 `UPDATE businesses 
                  SET phone_number = temp_phone, temp_phone = NULL, otp_code = NULL, otp_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
@@ -1025,7 +1088,40 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             updates.push(`name = $${idx}`); values.push(trimmed); idx++;
         }
         if (phone_number !== undefined) {
-            updates.push(`phone_number = $${idx}`); values.push(String(phone_number).trim() || null); idx++;
+            const phone = String(phone_number).trim() || null;
+
+            // Duplicate protection: a phone number may only belong to ONE
+            // account. Check other users AND business contact numbers —
+            // without this, profile updates silently created duplicates.
+            if (phone) {
+                const userDupe = await query(
+                    `SELECT id FROM users WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
+                    [phone, userId],
+                );
+                if (userDupe.rows.length > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "This phone number is already in use by another account. Please use a different number.",
+                        code: "PHONE_ALREADY_EXISTS",
+                    });
+                }
+                const businessDupe = await query(
+                    `SELECT b.id FROM businesses b
+                     WHERE b.phone_number = $1
+                       AND b.id <> (SELECT business_id FROM users WHERE id = $2)
+                     LIMIT 1`,
+                    [phone, userId],
+                );
+                if (businessDupe.rows.length > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "This phone number is already in use by another business. Please use a different number.",
+                        code: "PHONE_ALREADY_EXISTS",
+                    });
+                }
+            }
+
+            updates.push(`phone_number = $${idx}`); values.push(phone); idx++;
         }
         if (updates.length === 0) {
             return res.status(400).json({ success: false, error: "Nothing to update" });
@@ -1041,7 +1137,14 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
         res.json({ success: true, data: result.rows[0], message: "Profile updated" });
     } catch (error: any) {
         console.error("Update profile error:", error);
-        res.status(500).json({ success: false, error: error.message || "Failed to update profile" });
+        if (error?.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                error: "This phone number is already in use by another account.",
+                code: "PHONE_ALREADY_EXISTS",
+            });
+        }
+        res.status(500).json({ success: false, error: "Failed to update profile" });
     }
 });
 
@@ -1069,20 +1172,23 @@ router.post("/profile/avatar", authenticateToken, (req: AuthenticatedRequest, re
                 return res.status(400).json({ success: false, error: "file field is required" });
             }
 
-            const { r2Storage } = await import("../lib/storage");
+            const { getCloudStorage } = await import("../lib/storage");
             let avatarUrl = '';
-            if (r2Storage.isAvailable()) {
-                try {
+            try {
+                const storage = getCloudStorage();
+                if (storage) {
                     const ext = file.originalname.includes(".")
                         ? file.originalname.split(".").pop()!.toLowerCase()
                         : (file.mimetype.includes('png') ? 'png' : 'jpg');
                     const key = `avatars/${userId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
-                    avatarUrl = await r2Storage.uploadFile(key, file.buffer, file.mimetype);
-                } catch (uploadError) {
-                    console.error("Avatar R2 upload failed, falling back to local:", uploadError);
+                    avatarUrl = await storage.uploadFile(key, file.buffer, file.mimetype);
                 }
+            } catch (uploadError) {
+                console.error("Avatar upload failed, falling back to local:", uploadError);
             }
-            if (!avatarUrl) {
+            // A bare object key (cloud storage without a public base URL)
+            // renders nowhere — fall back to local /uploads + absolute URL.
+            if (!avatarUrl || !avatarUrl.startsWith('http')) {
                 const fs = await import("fs");
                 const baseDir = process.cwd();
                 const uploadDir = path.join(baseDir, "uploads");
@@ -1110,6 +1216,89 @@ router.post("/profile/avatar", authenticateToken, (req: AuthenticatedRequest, re
         } catch (error: any) {
             console.error("Avatar upload error:", error);
             res.status(500).json({ success: false, error: error.message || "Failed to upload avatar" });
+        }
+    });
+});
+
+/**
+ * POST /settings/business/logo (multipart field: 'file')
+ * Upload the BUSINESS logo (owner/admin only) and store it in
+ * businesses.logo_url. Rendered on the dashboard/workspace header and the
+ * SSO "complete your profile" flow. Always returns an ABSOLUTE URL —
+ * R2 without a configured public base returns a bare object key which no
+ * client can render, so we fall back to local /uploads in that case.
+ */
+router.post("/business/logo", authenticateToken, (req: AuthenticatedRequest, res) => {
+    avatarUpload.single('file')(req as any, res as any, async (err: any) => {
+        if (err) {
+            const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
+            return res.status(isTooLarge ? 413 : 400).json({
+                success: false,
+                error: isTooLarge
+                    ? `That image is too large — logos are limited to ${AVATAR_MAX_MB} MB. Try a smaller image.`
+                    : err.message || "Upload failed",
+            });
+        }
+        try {
+            const businessId = req.user!.businessId;
+            const userId = req.user!.userId;
+
+            const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+            const role = roleRes.rows[0]?.role;
+            if (!['owner', 'admin'].includes(role)) {
+                return res.status(403).json({
+                    success: false,
+                    error: "Only business owners and admins can change the business logo.",
+                });
+            }
+
+            const file = (req as any).file as Express.Multer.File | undefined;
+            if (!file) {
+                return res.status(400).json({ success: false, error: "file field is required" });
+            }
+
+            const ext = file.originalname.includes(".")
+                ? file.originalname.split(".").pop()!.toLowerCase()
+                : (file.mimetype.includes('png') ? 'png' : 'jpg');
+            const key = `logos/${businessId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+
+            let logoUrl = '';
+            try {
+                const { getCloudStorage } = await import("../lib/storage");
+                const storage = getCloudStorage();
+                if (storage) {
+                    logoUrl = await storage.uploadFile(key, file.buffer, file.mimetype);
+                }
+            } catch (uploadError) {
+                console.error("Logo cloud upload failed, falling back to local:", uploadError);
+            }
+
+            // A bare object key (cloud storage without a public base URL) is
+            // unrenderable for every client — treat it as a failure and use
+            // the local /uploads fallback with an absolute URL instead.
+            if (!logoUrl || !logoUrl.startsWith('http')) {
+                const fs = await import("fs");
+                const baseDir = process.cwd();
+                const uploadDir = path.join(baseDir, "uploads");
+                if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+                const filename = `logo-${businessId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+                fs.writeFileSync(path.join(uploadDir, filename), file.buffer);
+                const apiOrigin = process.env.API_PUBLIC_BASE_URL
+                    || process.env.APP_BASE_URL
+                    || 'https://api.metricorex.com';
+                logoUrl = `${apiOrigin.replace(/\/$/, '')}/uploads/${filename}`;
+            }
+
+            const result = await query(
+                `UPDATE businesses SET logo_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2
+                 RETURNING id, name, logo_url as "logoUrl"`,
+                [logoUrl, businessId]
+            );
+
+            res.json({ success: true, data: result.rows[0], message: "Business logo updated" });
+        } catch (error: any) {
+            console.error("Business logo upload error:", error);
+            res.status(500).json({ success: false, error: "Failed to upload logo" });
         }
     });
 });

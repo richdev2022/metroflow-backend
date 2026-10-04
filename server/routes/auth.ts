@@ -114,6 +114,23 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       });
     }
 
+    // Duplicate account protection: the admin email must be GLOBALLY unique
+    // across ALL businesses. The DB only enforces UNIQUE(business_id, email),
+    // so without this check the same email could register many accounts —
+    // and logins match users by email globally, which would sign the new
+    // account's owner into someone else's workspace.
+    const existingAdmin = await query(
+      "SELECT id FROM users WHERE email = $1 LIMIT 1",
+      [input.adminEmail],
+    );
+    if (existingAdmin.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "An account with this email already exists. Please sign in instead or use a different email.",
+      });
+    }
+
     // Get default free/trial plan
     const planResult = await query("SELECT * FROM pricing_plans WHERE price = 0 LIMIT 1");
     let planId = null;

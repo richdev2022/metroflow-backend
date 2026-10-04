@@ -1747,6 +1747,22 @@ router.post("/:id/retry", authenticateToken, requireTeamPermission("manage_finan
       return res.status(400).json({ success: false, error: "Only failed transfers can be retried" });
     }
 
+    // REFUND BEFORE RETRY: retrying rewrites the queue row's reference —
+    // every auto-reversal path (webhooks, monitor sweep) matches on that
+    // reference, so an un-refunded debit from the FAILED attempt was
+    // orphaned forever (the "money never came back" bug). Reverse the
+    // original attempt FIRST (idempotent — no-op if already refunded),
+    // then start the fresh attempt which re-debits the wallet cleanly.
+    try {
+      const refunded = await reverseFailedTransfer(check.rows[0], 'Refund of original failed attempt before retry');
+      if (refunded) {
+        console.log(`[Transfers] Pre-retry reversal applied for ${check.rows[0].reference}`);
+      }
+    } catch (reversalErr) {
+      // Never block the retry on the refund bookkeeping — log for follow-up.
+      console.error('[Transfers] Pre-retry reversal failed:', reversalErr);
+    }
+
     const defaultProvider = await getActiveTransferProviderName();
     
     // Reset status to pending and get the updated transfer
@@ -1784,6 +1800,105 @@ router.post("/:id/retry", authenticateToken, requireTeamPermission("manage_finan
 
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed to retry transfer" });
+  }
+});
+
+/**
+ * @swagger
+ * /transfers/{id}/reverse:
+ *   post:
+ *     summary: Manually reverse a failed transfer back to the wallet
+ *     description: Returns the debited amount (including fee) for a FAILED transfer to the source wallet. Idempotent — an already-reversed transfer reports itself instead of double-crediting.
+ *     tags: [Transfers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Reversal applied
+ *       400:
+ *         description: Transfer not eligible for reversal
+ *       404:
+ *         description: Transfer not found
+ */
+router.post("/:id/reverse", authenticateToken, requireTeamPermission("manage_finance"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+
+    const check = await query(`SELECT * FROM transfer_queue WHERE id = $1 AND business_id = $2`, [id, businessId]);
+    if (check.rows.length === 0) return res.status(404).json({ success: false, error: "Transfer not found" });
+
+    const transfer = check.rows[0];
+
+    if (transfer.status !== 'failed') {
+      return res.status(400).json({
+        success: false,
+        error: transfer.status === 'success'
+          ? "Successful transfers cannot be reversed"
+          : "Only failed transfers can be reversed. Transfers stuck in processing are auto-reversed after 24 hours.",
+      });
+    }
+
+    // Eligibility mirrors the automatic reversal: the wallet must actually
+    // have been debited (a type='debit' transaction with this reference) and
+    // no '<ref>-REFUND' row may exist yet. Diagnose WHY it can't reverse so
+    // the user gets an honest answer instead of a silent no-op.
+    const debitCheck = await query(
+      `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit' LIMIT 1`,
+      [transfer.reference],
+    );
+    const refundCheck = await query(
+      `SELECT id FROM transactions WHERE reference = $1 LIMIT 1`,
+      [`${transfer.reference}-REFUND`],
+    );
+    if (refundCheck.rows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: "This transfer has already been reversed — the amount is back in your wallet.",
+        code: "ALREADY_REVERSED",
+      });
+    }
+    if (debitCheck.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "The wallet was never debited for this transfer, so there is nothing to reverse.",
+        code: "NOTHING_TO_REVERSE",
+      });
+    }
+
+    const reversed = await reverseFailedTransfer(transfer, 'Manual reversal requested by user');
+    if (!reversed) {
+      return res.status(500).json({ success: false, error: "Reversal could not be completed. Please contact support." });
+    }
+
+    // Surface the reversal on the queue row so list screens can render an
+    // honest state without probing the transactions table.
+    await query(
+      `UPDATE transfer_queue SET failure_reason = COALESCE(failure_reason, '') || ' [Reversed to wallet]' WHERE id = $1`,
+      [id],
+    );
+
+    const amount = parseFloat(transfer.amount);
+    const fee = parseFloat(transfer.fee || '0');
+    res.json({
+      success: true,
+      message: "Reversal successful — the amount (including the fee) has been returned to your wallet.",
+      data: {
+        id: transfer.id,
+        reference: transfer.reference,
+        refunded: amount + fee,
+        currency: transfer.currency || 'NGN',
+      },
+    });
+  } catch (error) {
+    console.error("Reverse transfer error:", error);
+    res.status(500).json({ success: false, error: "Failed to reverse transfer" });
   }
 });
 

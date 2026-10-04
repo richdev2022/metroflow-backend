@@ -295,6 +295,17 @@ export interface AuthResponse {
   name?: string;
   email?: string;
   message?: string;
+  /** Legacy workspace role string: owner | admin | manager | member. */
+  role?: string;
+  /** True for owner/admin — only these may edit the BUSINESS profile. */
+  isBusinessAdmin?: boolean;
+  /** Invited (non-admin) users must complete their PERSONAL profile once. */
+  requiresProfileCompletion?: boolean;
+  profileCompleted?: boolean;
+  phoneVerified?: boolean;
+  profilePromptDismissed?: boolean;
+  avatarUrl?: string;
+  phoneNumber?: string;
 }
 
 // ---------- Google SSO ----------

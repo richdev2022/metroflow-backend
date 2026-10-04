@@ -3,7 +3,7 @@ import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
-import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert } from "../services/email";
+import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert, emailLogoHeader } from "../services/email";
 import {
   getDisputeAdminEmails,
   setDisputeAdminEmails,
@@ -376,7 +376,22 @@ authRouter.post("/forgot-password", async (req, res) => {
       const otp = generateOTP();
       await query(`UPDATE platform_admins SET reset_token = $1, reset_expires = $2 WHERE email = $3`, 
         [otp, getOTPExpiry(), email]);
-      await sendEmail(email, "Reset Password", `Your reset code is: ${otp}`);
+      await sendEmail(email, "Platform Admin", "Reset Your Metricorex Admin Password", `
+        <html>
+          <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+              ${emailLogoHeader(150)}
+              <h2 style="color: #1d4ed8; margin-bottom: 20px;">Reset Your Password</h2>
+              <p style="color: #333;">Hi,</p>
+              <p style="color: #666; line-height: 1.6;">We received a request to reset your admin password. Use the code below to proceed:</p>
+              <div style="background-color: #f0f0f0; padding: 20px; border-radius: 4px; margin: 20px 0; text-align: center;">
+                <p style="font-size: 32px; font-weight: bold; color: #1d4ed8; margin: 0; letter-spacing: 5px;">${otp}</p>
+              </div>
+              <p style="color: #999; font-size: 12px;">This code expires in 10 minutes. If you didn't request this reset, please ignore this email.</p>
+            </div>
+          </body>
+        </html>
+      `);
     }
     
     // Always return success to prevent email enumeration
@@ -705,9 +720,16 @@ protectedRouter.post("/kyc/business/:id/approve", requirePermission('manage_busi
             
             // Send Email
             await sendEmail(email, name, "KYC Approved", `
-                <h3>KYC Approved</h3>
-                <p>Congratulations, your business verification for <strong>${name}</strong> has been approved.</p>
-                <p>You can now proceed to create your Business Wallet.</p>
+                <html>
+                  <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+                      ${emailLogoHeader(150)}
+                      <h3 style="color: #10b981;">KYC Approved</h3>
+                      <p style="color: #333;">Congratulations, your business verification for <strong>${name}</strong> has been approved.</p>
+                      <p style="color: #666;">You can now proceed to create your Business Wallet.</p>
+                    </div>
+                  </body>
+                </html>
             `);
         }
 
@@ -741,10 +763,17 @@ protectedRouter.post("/kyc/business/:id/reject", requirePermission('manage_busin
             
             // Send Email
             await sendEmail(email, name, "KYC Rejected", `
-                <h3>KYC Update</h3>
-                <p>Your business verification for <strong>${name}</strong> has been rejected.</p>
-                <p><strong>Reason:</strong> ${reason}</p>
-                <p>Please update your information and resubmit.</p>
+                <html>
+                  <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+                      ${emailLogoHeader(150)}
+                      <h3 style="color: #ef4444;">KYC Update</h3>
+                      <p style="color: #333;">Your business verification for <strong>${name}</strong> has been rejected.</p>
+                      <p style="color: #333;"><strong>Reason:</strong> ${reason}</p>
+                      <p style="color: #666;">Please update your information and resubmit.</p>
+                    </div>
+                  </body>
+                </html>
             `);
         }
 

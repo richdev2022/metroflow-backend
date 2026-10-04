@@ -1072,6 +1072,10 @@ const avatarUpload = multer({
 /**
  * PUT /settings/profile
  * Update the CALLER'S OWN profile (any role): name, phone_number.
+ * EMAIL IS DELIBERATELY NOT ACCEPTED — it is read-only in the first-login
+ * profile prompt (SSO or password) and can never be changed here.
+ * Any successful save marks the personal profile as COMPLETED and dismisses
+ * the first-login prompt. Changing the phone number re-opens verification.
  * Business-level info lives in PUT /settings (owner/admin only).
  */
 router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
@@ -1122,15 +1126,23 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             }
 
             updates.push(`phone_number = $${idx}`); values.push(phone); idx++;
+            // A hand-typed phone number is UNVERIFIED until confirmed via the
+            // phone-verify OTP flow.
+            updates.push(`phone_verified = FALSE`);
         }
         if (updates.length === 0) {
             return res.status(400).json({ success: false, error: "Nothing to update" });
         }
+        // Completing the personal profile also permanently dismisses the
+        // first-login prompt (skip + complete both stop the nagging).
+        updates.push(`profile_completed = TRUE`);
+        updates.push(`profile_prompt_dismissed = TRUE`);
 
         const result = await query(
             `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
              WHERE id = $${idx}
-             RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role`,
+             RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role,
+                       COALESCE(phone_verified, FALSE) as "phoneVerified"`,
             [...values, userId]
         );
 
@@ -1145,6 +1157,121 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             });
         }
         res.status(500).json({ success: false, error: "Failed to update profile" });
+    }
+});
+
+/**
+ * POST /settings/profile/phone/send-otp
+ * First-login personal profile completion: send a 6-digit OTP to the phone
+ * number the user wants to verify. Reuses users.otp_hash/otp_type with the
+ * dedicated 'phone_verify' type so it never collides with PIN/transfer OTPs.
+ * Body: { phone }
+ */
+router.post("/profile/phone/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const phone = String(req.body?.phone || "").trim();
+        if (!phone || phone.replace(/\D/g, "").length < 7) {
+            return res.status(400).json({ success: false, error: "A valid phone number is required" });
+        }
+
+        const otpCode = generateOTP();
+        const otpExpiresAt = getOTPExpiry();
+        const otpHash = crypto.createHash("sha256").update(otpCode).digest("hex");
+        await query(
+            `UPDATE users SET otp_hash = $1, otp_expires_at = $2, otp_type = 'phone_verify', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $3`,
+            [otpHash, otpExpiresAt, userId],
+        );
+
+        let smsSent = false;
+        let smsError: string | null = null;
+        try {
+            await sendSMS(phone, `Your Metricorex verification code is: ${otpCode}. Valid for 10 minutes.`);
+            smsSent = true;
+        } catch (e: any) {
+            smsError = e?.message || "SMS delivery failed";
+            console.error("Profile phone OTP SMS failed:", smsError);
+        }
+
+        if (!smsSent) {
+            return res.status(502).json({
+                success: false,
+                error: smsError || "Failed to send verification SMS. Please try again.",
+            });
+        }
+
+        res.json({ success: true, message: `Verification code sent to ${phone}` });
+    } catch (error: any) {
+        console.error("Profile phone send-otp error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to send OTP" });
+    }
+});
+
+/**
+ * POST /settings/profile/phone/verify-otp
+ * Verify the OTP sent to the user's phone. On success the phone number is
+ * committed, phone_verified flips TRUE and the personal profile is marked
+ * complete. Body: { phone, otp }
+ */
+router.post("/profile/phone/verify-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const phone = String(req.body?.phone || "").trim();
+        const otp = String(req.body?.otp || "").trim();
+        if (!phone || !otp) {
+            return res.status(400).json({ success: false, error: "Phone number and OTP are required" });
+        }
+
+        const userRes = await query(
+            `SELECT otp_hash, otp_expires_at, otp_type FROM users WHERE id = $1`,
+            [userId],
+        );
+        const user = userRes.rows[0];
+        if (!user?.otp_hash || user.otp_type !== "phone_verify") {
+            return res.status(400).json({ success: false, error: "No verification code was sent to this phone. Please request a new one." });
+        }
+        if (new Date(user.otp_expires_at) < new Date()) {
+            return res.status(400).json({ success: false, error: "Verification code has expired. Please request a new one." });
+        }
+        const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+        if (otpHash !== user.otp_hash) {
+            return res.status(400).json({ success: false, error: "Invalid verification code" });
+        }
+
+        const result = await query(
+            `UPDATE users
+             SET phone_number = $1, phone_verified = TRUE, profile_completed = TRUE, profile_prompt_dismissed = TRUE,
+                 otp_hash = NULL, otp_expires_at = NULL, otp_type = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2
+             RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role, phone_verified as "phoneVerified"`,
+            [phone, userId],
+        );
+
+        res.json({ success: true, data: result.rows[0], message: "Phone number verified" });
+    } catch (error: any) {
+        console.error("Profile phone verify-otp error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to verify phone" });
+    }
+});
+
+/**
+ * POST /settings/profile/dismiss
+ * Skip CTA for the first-login profile completion prompt — the user can
+ * finish their personal profile later from Settings. Persisted server-side
+ * so the prompt does not reappear on every device.
+ */
+router.post("/profile/dismiss", authenticateToken, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        await query(
+            `UPDATE users SET profile_prompt_dismissed = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [userId],
+        );
+        res.json({ success: true, message: "Profile prompt dismissed — you can complete it later in Settings" });
+    } catch (error: any) {
+        console.error("Profile dismiss error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to dismiss profile prompt" });
     }
 });
 

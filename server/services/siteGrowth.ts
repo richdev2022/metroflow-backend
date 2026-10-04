@@ -1,5 +1,6 @@
 import { query } from "../db";
 import { sendEmail } from "./email-sender";
+import { EMAIL_LOGO_URL_EXPORT as EMAIL_LOGO_URL } from "./email";
 
 /**
  * Site growth service — marketing-site wishlist + email subscriptions and
@@ -83,6 +84,9 @@ function layoutEmail(title: string, bodyHtml: string, cta?: { label: string; url
           <span style="color:#ffffff;font-size:20px;font-weight:800;letter-spacing:.5px;">${escapeHtml(BRAND_NAME)}</span>
         </td></tr>
         <tr><td style="padding:34px 36px 12px;">
+          <div style="text-align:center;margin-bottom:20px;">
+            <img src="${EMAIL_LOGO_URL}" alt="Metricorex Logo" style="max-width:150px;height:auto;" />
+          </div>
           <h1 style="margin:0 0 16px;font-size:22px;line-height:1.3;color:#111827;">${title}</h1>
           <div style="font-size:15px;line-height:1.65;color:#374151;">${bodyHtml}</div>
           ${ctaHtml}

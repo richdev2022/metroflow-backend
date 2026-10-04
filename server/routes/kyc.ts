@@ -5,7 +5,7 @@ import { query } from "../db";
 import { verifyBVN, verifyNIN } from "../services/prembly";
 import { sendSMS } from "../services/sms";
 import { sendWhatsApp } from "../services/whatsapp";
-import { sendEmail, generateKYCOtpEmailHtml } from "../services/email";
+import { sendEmail, generateKYCOtpEmailHtml, emailLogoHeader } from "../services/email";
 import { createWallet } from "../services/wallet";
 import { createVirtualAccount } from "../services/squad";
 import { getProvider } from "../services/providers/factory";
@@ -522,10 +522,17 @@ router.post("/business", authenticateToken, upload.single('proof_of_address'), a
       
       for (const email of adminEmails) {
            await sendEmail(email.trim(), "Admin", "New Business KYC Submission", `
-              <h3>New KYC Submission</h3>
-              <p><strong>Business:</strong> ${busName}</p>
-              <p><strong>Status:</strong> Pending Review</p>
-              <p>Please log in to the admin dashboard to review.</p>
+              <html>
+                <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+                  <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+                    ${emailLogoHeader(150)}
+                    <h3 style="color: #1d4ed8;">New KYC Submission</h3>
+                    <p style="color: #333;"><strong>Business:</strong> ${busName}</p>
+                    <p style="color: #333;"><strong>Status:</strong> Pending Review</p>
+                    <p style="color: #666;">Please log in to the admin dashboard to review.</p>
+                  </div>
+                </body>
+              </html>
            `);
       }
     }

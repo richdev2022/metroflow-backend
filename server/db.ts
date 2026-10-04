@@ -1116,6 +1116,10 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)`);
+    // Profile completion (first-login personal profile for invited team members)
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_completed BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_prompt_dismissed BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT FALSE`);
     
     // Create audit logs table
     await query(`

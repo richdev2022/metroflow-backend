@@ -99,6 +99,8 @@ import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, g
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
+import { isPushConfigured, pushDeliveryMode } from "./services/push";
+import { isWebPushConfigured } from "./services/webPush";
 import {
   initializeDatabase,
   query,
@@ -594,6 +596,11 @@ export async function createServer() {
         gifs: { configured: isTenorConfigured() },
         rtc: getMediasoupDiagnostics(),
         calling: { activeProvider: activeCallingProvider, providers: callingProviders },
+        push: {
+          configured: isPushConfigured(),
+          mode: pushDeliveryMode(),
+          webPush: { configured: isWebPushConfigured() },
+        },
         redis: { configured: !!process.env.REDIS_URL && !process.env.DISABLE_REDIS },
         storage,
         uptimeSeconds: Math.round(process.uptime()),

@@ -1697,6 +1697,8 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
+    const data = { ...result.rows[0] };
+
     // Business identity (logo + name) — SSO LOGO PARITY FIX: clients can
     // render the workspace logo straight from /auth/me without an extra
     // /settings round-trip (the logo uploaded via the SSO complete-profile

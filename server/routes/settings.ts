@@ -1092,7 +1092,10 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             updates.push(`name = $${idx}`); values.push(trimmed); idx++;
         }
         if (phone_number !== undefined) {
-            const phone = String(phone_number).trim() || null;
+            // Sanitize: some clients send the literal strings "null"/"undefined"
+            // (or empty) — all of those mean "no phone", never a real value.
+            const rawPhone = String(phone_number).trim();
+            const phone = !rawPhone || ['null', 'undefined'].includes(rawPhone.toLowerCase()) ? null : rawPhone;
 
             // Duplicate protection: a phone number may only belong to ONE
             // account. Check other users AND business contact numbers —

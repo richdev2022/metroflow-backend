@@ -5,7 +5,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, check
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
-import { accountLookup, processAllPending, reverseFailedTransfer } from "../services/transfer";
+import { accountLookup, processAllPending, reverseFailedTransfer, validateIntlBeneficiary } from "../services/transfer";
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
@@ -447,6 +447,25 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         error: "International payouts require the recipient's street address, city, postal code and country",
         code: "BENEFICIARY_ADDRESS_REQUIRED",
       });
+    }
+    // PRE-TRANSFER BENEFICIARY VALIDATION (before ANY wallet debit): Flutterwave
+    // has no account-resolution for USD/GBP/EUR, so an invalid routing number
+    // used to surface only at DISBURSEMENT ("Invalid account number") — after
+    // the money had left the wallet. Validate the corridor's routing data here
+    // so bad beneficiaries are rejected up-front with an actionable error.
+    if (isIntl) {
+      const intlCheck = validateIntlBeneficiary(currency, {
+        routingNumber,
+        swiftCode,
+        bankName,
+        accountType: (req.body as any)?.accountType || (req.body as any)?.account_type,
+        accountNumber,
+        beneficiaryAddress: recipientAddress,
+        beneficiaryPostalCode: recipientPostalCode,
+      });
+      if (!intlCheck.valid) {
+        return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
+      }
     }
     const hasDebit = debitAmount != null && Number(debitAmount) > 0;
     const dbDebitAmount = hasDebit ? Number(debitAmount) : null;

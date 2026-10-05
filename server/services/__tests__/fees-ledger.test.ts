@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from '../fees';
+import { creditRevenueWallet, creditPlatformWallet, debitPlatformWallet, debitRevenueWallet } from '../fees';
 import * as db from '../../db';
 
 // Mock DB: query returns { rows: [] } unless a per-test override is set.
@@ -34,28 +34,42 @@ function insertedTransactionRows(): { sql: string; params: any[] }[] {
 }
 
 describe('creditRevenueWallet', () => {
-  it('writes ONLY the revenue row (no platform-ledger mirror)', async () => {
-    await creditRevenueWallet(500, 'NGN', 'SUB-REF-1', 'Subscription Payment', 'squad');
+  it('writes ONLY a revenue row (no platform mirror) with subscription type on request', async () => {
+    await creditRevenueWallet(500, 'NGN', 'SUB-REF-1', 'Subscription Payment', 'squad', undefined, { revenueType: 'subscription' });
 
     const inserts = insertedTransactionRows();
-    // The revenue wallet is a VIRTUAL allocation — fees physically stay in the
-    // provider pool. Writing a platform mirror row here polluted the Platform
-    // Ledger, so creditRevenueWallet must produce exactly ONE insert.
+    // Owner invariant: revenue movements must NEVER touch the platform pool.
     expect(inserts.length).toBe(1);
+    expect(inserts[0].sql).not.toContain("'platform'");
+    expect(inserts[0].sql).toContain("'subscription'");
+    expect(inserts[0].params[0]).toBe(500); // amount
+    expect(inserts[0].params[2]).toBe('SUB-REF-1-REVENUE-CREDIT'); // deterministic ref
+    expect(inserts[0].params[3]).toBe('Subscription Payment'); // description
+  });
 
-    // Revenue row SQL carries transaction_type 'fee' and direction 'credit'
-    const revenue = inserts[0];
-    expect(/'fee'/.test(revenue.sql)).toBe(true);
-    expect(/'credit'/.test(revenue.sql)).toBe(true);
-    expect(revenue.params[0]).toBe(500); // amount
-    expect(revenue.params[2]).toContain('SUB-REF-1'); // reference linkage
-    expect(revenue.params[3]).toBe('Subscription Payment'); // description
+  it('defaults to transaction_type fee with a -REVENUE-CREDIT reference', async () => {
+    await creditRevenueWallet(50, 'NGN', 'FEE-REF-1', 'Wallet Funding Fee', 'squad');
+
+    const inserts = insertedTransactionRows();
+    expect(inserts.length).toBe(1);
+    expect(inserts[0].sql).toContain("'fee'");
+    expect(inserts[0].params[2]).toBe('FEE-REF-1-REVENUE-CREDIT');
+  });
+
+  it('records a genuine revenue DEBIT row for negative amounts (reversal)', async () => {
+    await debitRevenueWallet(25, 'NGN', 'FEE-REF-2', 'Reversal of fee revenue for failed transfer X');
+
+    const inserts = insertedTransactionRows();
+    expect(inserts.length).toBe(1);
+    expect(inserts[0].sql).toContain("'debit'");
+    expect(inserts[0].params[0]).toBe(25); // amount stored positive
+    expect(inserts[0].params[2]).toBe('FEE-REF-2-REVENUE-DEBIT');
   });
 
   it('is idempotent: skips the revenue row when the reference already exists', async () => {
     mockedQuery.mockImplementation(async (sql: any) => {
       const s = String(sql || '');
-      if (/SELECT id FROM transactions WHERE reference = \$1 AND transaction_type = 'fee'/i.test(s)) {
+      if (/SELECT id FROM transactions WHERE reference = \$1 AND wallet_id IS NULL/i.test(s)) {
         return { rows: [{ id: 'exists' }] } as any;
       }
       if (/SELECT id FROM wallets/i.test(s) || /SELECT id FROM platform_wallet/i.test(s) || /RETURNING id/i.test(s)) {
@@ -66,15 +80,13 @@ describe('creditRevenueWallet', () => {
 
     await creditRevenueWallet(500, 'NGN', 'SUB-REF-2', 'Subscription Payment', 'squad');
 
-    const inserts = insertedTransactionRows();
-    // Nothing new may be inserted
-    expect(inserts.length).toBe(0);
+    expect(insertedTransactionRows().length).toBe(0);
   });
 });
 
 describe('platform pool helpers', () => {
-  it('creditPlatformWallet records a platform ledger row (gross inflow)', async () => {
-    await creditPlatformWallet(505, 'NGN', 'FUND-REF-1', 'Customer Wallet Funding Received (Card)', 'squad');
+  it('creditPlatformWallet records a platform ledger row (withdrawal hold)', async () => {
+    await creditPlatformWallet(505, 'NGN', 'TRF-REF-1', 'Platform Wallet Credit for Transfer TRF-REF-1', 'squad');
 
     const inserts = insertedTransactionRows();
     expect(inserts.length).toBe(1);
@@ -83,8 +95,8 @@ describe('platform pool helpers', () => {
     expect(inserts[0].sql).toContain("'platform'");
   });
 
-  it('debitPlatformWallet records a platform debit row (real pool payout)', async () => {
-    await debitPlatformWallet(500, 'NGN', 'TRF-REF-1', 'Payout to Jane (TRF-REF-1)', 'squad');
+  it('debitPlatformWallet records a platform debit row (user funding payout)', async () => {
+    await debitPlatformWallet(500, 'NGN', 'FUND-REF-1-USER', 'User Wallet Funding (Squad)', 'squad');
 
     const inserts = insertedTransactionRows();
     expect(inserts.length).toBe(1);

@@ -124,10 +124,18 @@ export const processSubscriptionRenewals = async () => {
                     WHERE id = $2
                 `, [nextDate, sub.business_id]);
 
-                // Log transaction
+                // Business billing-history record. It MUST carry the business
+                // wallet_id: rows with wallet_id NULL + transaction_type
+                // 'subscription' are counted in the admin revenue balance, so
+                // leaving it NULL double-counted auto-renewal revenue (raw row
+                // + the -REVENUE-CREDIT row below + the boot backfill row).
+                const bizWalletRes = await query(
+                    `SELECT id FROM wallets WHERE business_id = $1 ORDER BY created_at ASC LIMIT 1`,
+                    [sub.business_id]
+                );
                 await query(`
-                    INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response, transaction_type, payment_provider)
-                    VALUES ($1, $2, $3, $4, $5, 'success', $6, 'subscription', $7)
+                    INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, gateway_response, transaction_type, wallet_id, type, direction, payment_provider)
+                    VALUES ($1, $2, $3, $4, $5, 'success', $6, 'subscription', $7, 'credit', 'credit', $8)
                 `, [
                     sub.business_id,
                     sub.plan_id,
@@ -135,19 +143,20 @@ export const processSubscriptionRenewals = async () => {
                     'NGN', // Assuming we charged in NGN
                     recurrenceRef,
                     JSON.stringify(chargeRes),
+                    bizWalletRes.rows[0]?.id || null,
                     sub.active_payment_provider
                 ]);
 
-                // Credit Platform Revenue Wallet — with the shared reference +
-                // explicit description so the admin Revenue Ledger history
-                // shows the actual transaction record.
+                // Revenue-LEDGER row (wallet_id NULL, transaction_type
+                // 'subscription') — the actual revenue recognition entry.
                 await creditRevenueWallet(
                     amount,
                     'NGN',
                     recurrenceRef,
                     'Subscription Payment (auto-renewal)',
                     sub.active_payment_provider || null,
-                    'Platform Wallet Debit for Subscription Revenue',
+                    undefined,
+                    { revenueType: 'subscription' },
                 );
 
                 results.success++;

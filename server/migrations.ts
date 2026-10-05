@@ -535,17 +535,24 @@ async function ensureAppTables(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id)`);
 
-  // Login attempt audit (feeds the always-on login attempt emails)
+  // Login attempt audit (feeds the always-on login attempt emails).
+  // NOTE: this table also has an audit-style variant created by
+  // initializeDatabase() (db.ts) with success/failure_reason instead of
+  // status/device_info. Both writer shapes must always work, so include the
+  // union of both variants here; db.ts additionally ALTERs the existing
+  // table to the same union on every boot.
   await query(`
     CREATE TABLE IF NOT EXISTS login_attempts (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email VARCHAR(255),
       user_id UUID,
       business_id VARCHAR(255),
-      status VARCHAR(20) NOT NULL, -- success | failed
+      status VARCHAR(20), -- success | failed
       ip_address VARCHAR(64),
       user_agent TEXT,
       device_info JSONB,
+      success BOOLEAN,
+      failure_reason VARCHAR(100),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -632,13 +639,17 @@ const PLATFORM_SUCCESS_STATES = ["successful", "success", "completed", "paid"];
 
 /**
  * Backfill ledger history so the admin Platform Wallet / Revenue Wallet show
- * EVERY historical movement (previously balances moved silently):
- *  1. For every final-successful transfer: ensure a platform debit row
- *     (main amount) + a revenue credit row (fee) exist.
- *  2. For every subscription/fee transaction missing a revenue-side mirror
- *     row, create one.
- *  3. Reconcile: compare each internal platform wallet balance against the
- *     sum of its recorded rows and insert a balancing adjustment row.
+ * EVERY historical movement (previously balances moved silently).
+ *
+ * ALIGNED WITH THE OWNER-INVARIANT MODEL:
+ *  1. Withdrawal (transfer) -> platform ledger CREDIT (the payout hold) +
+ *     fee -> revenue ledger. Only rows missing entirely are reconstructed.
+ *  2. Wallet funding -> platform ledger DEBIT (the user payout) + fee ->
+ *     revenue ledger. The old gross-inflow reconstruction is gone (noise).
+ *  3. NO balance-reconciliation rows: the previous version inserted a
+ *     'Historical balance reconciliation' row with a Date.now() reference on
+ *     EVERY boot while drift persisted — that spam was the top complaint in
+ *     the admin ledger. Drift is now logged, never written.
  */
 async function backfillLedgerHistory(): Promise<void> {
   try {
@@ -673,17 +684,20 @@ async function backfillLedgerHistory(): Promise<void> {
       const cur = t.currency || "NGN";
 
       if (walletId && amount > 0) {
+        // New model: a withdrawal's platform entry is a CREDIT (the payout
+        // hold), written live since the hold-row fix. Backfill one ONLY for
+        // historical transfers that carry no platform row at all.
         const exists = await query(
-          `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' AND type = 'debit' LIMIT 1`,
+          `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
           [t.reference],
         );
         if (exists.rows.length === 0) {
           await query(
             `INSERT INTO transactions
              (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, created_at)
-             VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6)
+             VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6)
            ON CONFLICT (reference) DO NOTHING`,
-            [amount, cur, t.reference, t.description || "Transfer platform debit (backfill)", walletId, t.created_at],
+            [amount, cur, t.reference, t.description || `Platform Wallet Credit for Transfer ${t.reference} (backfill)`, walletId, t.created_at],
           );
         }
       }
@@ -706,39 +720,11 @@ async function backfillLedgerHistory(): Promise<void> {
       }
     }
 
-    // ---- 2. Subscription payments mirrored into revenue ledger ----
-    // Subscription payments are platform revenue even if historical rows
-    // carried a wallet_id. Mirror any that lack a wallet_id-NULL revenue row.
-    const subRes = await query(
-      `SELECT id, reference, amount, currency, description, created_at
-       FROM transactions
-       WHERE transaction_type = 'subscription' AND status = 'success'
-         AND (wallet_id IS NULL OR wallet_id IN (SELECT id FROM wallets WHERE business_id IS NOT NULL OR user_id IS NOT NULL))
-       ORDER BY created_at ASC`,
-    );
-    for (const s of subRes.rows) {
-      const revRef = s.reference ? `${s.reference}-REVENUE-BACKFILL` : `revenue-backfill-${s.id}`;
-      const revExists = await query(
-        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'subscription' AND wallet_id IS NULL LIMIT 1`,
-        [revRef],
-      );
-      if (revExists.rows.length === 0) {
-        await query(
-          `INSERT INTO transactions
-           (amount, currency, status, reference, type, description, transaction_type, direction, created_at)
-           VALUES ($1, $2, 'success', $3, 'credit', $4, 'subscription', 'credit', $5)
-           ON CONFLICT (reference) DO NOTHING`,
-          [Number(s.amount) || 0, s.currency || "NGN", revRef, s.description || "Subscription revenue (backfill)", s.created_at],
-        );
-      }
-    }
-
-    // ---- 3. Successful wallet fundings missing their platform-side rows ----
-    // The card-funding settlement historically wrote ONLY a wallet_id-attached
-    // fee row: the admin Platform Ledger showed no gross inflow / user payout,
-    // and the fee was invisible to the Revenue Ledger (wallet_id NOT NULL).
-    // Reconstruct the full double-entry for every successful funding that has
-    // no platform credit row yet (the VA webhook flow already writes them).
+    // ---- 2. Successful wallet fundings missing their platform-side row ----
+    // Owner invariant: a funding event's platform entry is ONE DEBIT of the
+    // amount that landed in the user's wallet (fee -> revenue ledger). The
+    // old gross-credit + user-debit reconstruction fought that model and was
+    // part of the "unwanted transactions" noise.
     const fundingsRes = await query(
       `SELECT id, reference, amount, fee, currency, description, created_at, payment_provider
        FROM transactions
@@ -752,30 +738,20 @@ async function backfillLedgerHistory(): Promise<void> {
       const walletId = await getPlatformWallet(cur);
       const net = Number(f.amount) || 0;
       const fee = Number(f.fee) || 0;
-      const gross = Math.round((net + fee) * 100) / 100;
 
-      const grossExists = await query(
-        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' AND type = 'credit' LIMIT 1`,
+      const exists = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
         [ref],
       );
-      if (grossExists.rows.length > 0) continue; // webhook path already recorded the full flow
+      if (exists.rows.length > 0) continue; // live webhook path already recorded it
 
-      if (walletId && gross > 0) {
-        await query(
-          `INSERT INTO transactions
-           (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
-           VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6, $7)
-           ON CONFLICT (reference) DO NOTHING`,
-          [gross, cur, ref, f.description || "Customer Wallet Funding Received (backfill)", walletId, f.payment_provider || null, f.created_at],
-        );
-      }
       if (walletId && net > 0) {
         await query(
           `INSERT INTO transactions
            (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, payment_provider, created_at)
            VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit', $6, $7)
            ON CONFLICT (reference) DO NOTHING`,
-          [net, cur, `${ref}-USER-BACKFILL`, "Platform Wallet Debit for User Funding (backfill)", walletId, f.payment_provider || null, f.created_at],
+          [net, cur, `${ref}-USER-BACKFILL`, "User Wallet Funding (backfill)", walletId, f.payment_provider || null, f.created_at],
         );
       }
       if (fee > 0) {
@@ -789,7 +765,11 @@ async function backfillLedgerHistory(): Promise<void> {
       }
     }
 
-    // ---- 4. Reconcile internal platform wallet balances ----
+    // ---- 3. Drift check — LOG ONLY, never write ----
+    // The previous version inserted a 'Historical balance reconciliation'
+    // adjustment row with a Date.now() reference on every boot while drift
+    // persisted, so the ledger filled with reconciliation spam. Report the
+    // drift to the logs instead; repairs should be deliberate, not automatic.
     const internalWallets = await query(
       `SELECT id, currency, balance FROM wallets WHERE business_id IS NULL AND user_id IS NULL`,
     );
@@ -804,13 +784,8 @@ async function backfillLedgerHistory(): Promise<void> {
       const balance = Number(w.balance) || 0;
       const diff = Math.round((balance - recorded) * 100) / 100;
       if (Math.abs(diff) >= 0.01) {
-        const direction = diff > 0 ? "credit" : "debit";
-        await query(
-          `INSERT INTO transactions
-           (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-           VALUES ($1, $2, 'success', $3, $4, 'Historical balance reconciliation', 'platform', $5, $6)
-           ON CONFLICT (reference) DO NOTHING`,
-          [Math.abs(diff), w.currency || "NGN", `platform-reconcile-${w.id}-${Date.now()}`, direction, w.id, direction],
+        console.warn(
+          `[migrations] Platform wallet ${w.id} (${w.currency}) drift: balance=${balance} vs recorded=${recorded} (diff=${diff}) — logged only, no auto-reconciliation row written`,
         );
       }
     }

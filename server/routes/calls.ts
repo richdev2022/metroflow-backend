@@ -1515,24 +1515,28 @@ export const addCallParticipants: RequestHandler = async (
       });
     }
 
-    // Check if call exists and user has permission
+    // Resolve the call by UUID first, then by call code (business-scoped).
+    // Authorization is checked in code below: host/co-host/creator OR any
+    // existing participant of the call may invite. Restricting invites to
+    // hosts only made the web "Add people" sheet fail with 404 for the
+    // callee in every 1:1 call (the exact reported bug).
     let callResult;
     if (isValidUUID(callId)) {
       callResult = await query(
-        `SELECT id, type, call_code FROM calls
-         WHERE id = $1 AND business_id = $2
-         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
-        [callId, businessId, userId],
+        `SELECT id, type, call_code, status, ended_at, created_by, host_id, co_host_id
+         FROM calls
+         WHERE id = $1 AND business_id = $2`,
+        [callId, businessId],
       );
     }
 
     // If not found by UUID (or not a UUID), try by call code
     if (!callResult || callResult.rows.length === 0) {
       callResult = await query(
-        `SELECT id, type, call_code FROM calls
-         WHERE call_code = $1 AND business_id = $2
-         AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
-        [callId, businessId, userId],
+        `SELECT id, type, call_code, status, ended_at, created_by, host_id, co_host_id
+         FROM calls
+         WHERE call_code = $1 AND business_id = $2`,
+        [callId, businessId],
       );
     }
 
@@ -1546,12 +1550,35 @@ export const addCallParticipants: RequestHandler = async (
     const call = callResult.rows[0];
     const actualCallId = call.id; // Use actual UUID
 
+    // Never invite into an already-ended call — the invitee would ring and
+    // then fail to join with 410 ("Call has already ended").
+    const terminalStatuses = ["completed", "missed", "cancelled", "ended"];
+    if (
+      (call.status && terminalStatuses.includes(String(call.status))) ||
+      call.ended_at
+    ) {
+      return res.status(409).json({
+        success: false,
+        error: "This call has already ended — participants can no longer be added",
+      });
+    }
+
+    // Authorization: hosts/co-hosts/creator OR existing call participants.
+    const isHost = call.created_by === userId || call.host_id === userId || call.co_host_id === userId;
+
     // Get existing participants
     const existingParticipantsResult = await query(
       `SELECT user_id FROM call_participants WHERE call_id = $1`,
       [actualCallId],
     );
     const existingUserIds = new Set(existingParticipantsResult.rows.map((row) => row.user_id));
+
+    if (!isHost && !existingUserIds.has(userId)) {
+      return res.status(403).json({
+        success: false,
+        error: "Only participants of this call can invite others",
+      });
+    }
 
     // Validate all participantIds belong to the business (team-member path only)
     const uniqueParticipantIds = [...new Set(participantIds || [])];

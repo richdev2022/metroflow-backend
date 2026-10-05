@@ -38,6 +38,9 @@ export const InitiateSingleTransferSchema = z.object({
   bankName: z.string().max(150).optional(),
   swiftCode: z.string().max(20).optional(),
   routingNumber: z.string().max(20).optional(),
+  /** USD: "checking" | "depository". GBP: "personal" | "corporate". */
+  accountType: z.string().max(20).optional(),
+  account_type: z.string().max(20).optional(),
 });
 
 export const InitiateBulkTransferSchema = z.object({

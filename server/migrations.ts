@@ -37,6 +37,8 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureLedgerAndVirtualAccountFixes();
   await backfillLedgerHistory();
   await purgeInternalLedgerNoiseRows();
+  await sanitizePlaceholderPhoneNumbers();
+  await repairTransferReferenceCollisions();
 
   // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
   await ensureBusinessRevenueLadder();
@@ -1755,9 +1757,118 @@ async function ensureDisputesSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_disputes_business ON transaction_disputes(business_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_disputes_status ON transaction_disputes(status)`);
-  await query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_disputes_open_txn
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_disputes_open_txn
     ON transaction_disputes (transaction_reference)
     WHERE status IN ('open', 'under_review')
   `);
+}
+
+/**
+ * Some older clients wrote the literal strings 'null' / 'undefined' into
+ * users.phone_number (e.g. a form controller that stringified a null value).
+ * Those rows poison OTP delivery and profile prefill ("phoneNumber": "null").
+ * Idempotent: the UPDATE only matches the placeholder values.
+ */
+async function sanitizePlaceholderPhoneNumbers(): Promise<void> {
+  try {
+    const res = await query(
+      `UPDATE users SET phone_number = NULL
+       WHERE phone_number IS NOT NULL
+         AND LOWER(TRIM(phone_number)) IN ('null', 'undefined', 'none', 'n/a')`
+    );
+    if (res.rowCount && res.rowCount > 0) {
+      console.log(`[migrations] sanitized ${res.rowCount} placeholder phone_number value(s) on users`);
+    }
+  } catch (err: any) {
+    console.warn('[migrations] sanitizePlaceholderPhoneNumbers skipped:', err?.message);
+  }
+}
+
+/**
+ * REPAIR for the "debited but no transaction row / never refunded" prod bug.
+ *
+ * Root cause: the platform-ledger HOLD row was written with the RAW transfer
+ * reference BEFORE the user's debit row. transactions.reference is GLOBALLY
+ * unique, so the debit-row INSERT (ON CONFLICT (reference) DO NOTHING) was
+ * silently swallowed — the wallet was debited with NO debit row, and every
+ * reversal path (webhook, monitor sweep, user "reverse now", admin reverse)
+ * requires that debit row and silently no-op'd.
+ *
+ * Repair (idempotent, bounded):
+ *   1. platform hold rows that stole a raw transfer reference are renamed to
+ *      '<ref>-PLATFORM' (the reference the pipeline now writes),
+ *   2. the missing user debit rows are reconstructed for every transfer whose
+ *      wallet was debited (evidenced by the hold row),
+ *   3. FAILED transfers then carry a debit row, so the existing reconciliation
+ *      sweep auto-reverses them (wallet credit + -REFUND rows + push) on its
+ *      next pass — the user's stuck money returns without manual action.
+ */
+async function repairTransferReferenceCollisions(): Promise<void> {
+  // 1. Rename colliding platform hold rows.
+  try {
+    const collisions = await query(
+      `SELECT t.id, t.reference
+       FROM transactions t
+       JOIN transfer_queue q ON q.reference = t.reference
+       WHERE t.transaction_type = 'platform'
+         AND NOT EXISTS (
+           SELECT 1 FROM transactions d
+           WHERE d.reference = q.reference AND d.type = 'debit' AND d.transaction_type = 'transfer'
+         )
+       LIMIT 500`
+    );
+    for (const row of collisions.rows) {
+      try {
+        await query(`UPDATE transactions SET reference = $1 WHERE id = $2`, [`${row.reference}-PLATFORM`, row.id]);
+      } catch (e: any) {
+        // A '-PLATFORM' row already exists for this ref — drop the duplicate hold quietly.
+        if (e?.code === '23505') {
+          await query(`DELETE FROM transactions WHERE id = $1`, [row.id]).catch(() => {});
+        } else {
+          console.warn(`[migrations] hold rename failed for ${row.reference}:`, e?.message);
+        }
+      }
+    }
+    if (collisions.rows.length > 0) {
+      console.log(`[migrations] renamed ${collisions.rows.length} colliding platform hold row(s)`);
+    }
+  } catch (err: any) {
+    console.warn('[migrations] repairTransferReferenceCollisions (rename) skipped:', err?.message);
+    return;
+  }
+
+  // 2. Reconstruct the missing user debit rows.
+  try {
+    const res = await query(
+      `INSERT INTO transactions
+       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       SELECT q.business_id,
+              COALESCE(q.debit_amount, q.amount),
+              COALESCE(q.debit_currency, q.currency, 'NGN'),
+              'success',
+              q.reference,
+              'debit',
+              'Transfer to ' || COALESCE(q.recipient_name, 'Account') || ' (reconstructed)',
+              'transfer',
+              q.wallet_id,
+              'debit'
+       FROM transfer_queue q
+       WHERE q.wallet_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM transactions p
+           WHERE p.reference IN (q.reference, q.reference || '-PLATFORM') AND p.transaction_type = 'platform'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM transactions d
+           WHERE d.reference = q.reference AND d.type = 'debit' AND d.transaction_type = 'transfer'
+         )
+       ON CONFLICT (reference) DO NOTHING
+       RETURNING reference`
+    );
+    if (res.rows.length > 0) {
+      console.log(`[migrations] reconstructed ${res.rows.length} missing transfer debit row(s):`, res.rows.map((r: any) => r.reference).slice(0, 10));
+    }
+  } catch (err: any) {
+    console.warn('[migrations] repairTransferReferenceCollisions (debit rebuild) skipped:', err?.message);
+  }
 }

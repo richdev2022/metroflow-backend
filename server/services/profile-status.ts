@@ -54,13 +54,17 @@ export async function getProfileStatus(userId: string): Promise<ProfileStatus> {
     const role: string = row.role || "member";
     const admin = isBusinessAdminRole(role);
     const profileCompleted = admin ? true : Boolean(row.profile_completed);
+    // "Skip for now" (profile_prompt_dismissed) must STICK: a member who
+    // dismissed the personal prompt once is never re-routed to the completion
+    // screen — requiresProfileCompletion would otherwise stay true on every
+    // login and the skip button appeared broken.
     return {
       role,
       isBusinessAdmin: admin,
       profileCompleted,
       phoneVerified: Boolean(row.phone_verified),
       profilePromptDismissed: Boolean(row.prompt_dismissed),
-      requiresProfileCompletion: !admin && !profileCompleted,
+      requiresProfileCompletion: !admin && !profileCompleted && !Boolean(row.prompt_dismissed),
       avatarUrl: row.avatar_url || null,
       phoneNumber: row.phone_number || null,
     };

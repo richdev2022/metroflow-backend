@@ -33,6 +33,45 @@ function generateMeetingCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+/**
+ * FCM push for meeting invitations (WhatsApp-style: must reach the device
+ * even when the app was closed). Mirrors nothing in-app — every call site
+ * already inserted the in-app notification row via createNotification, so
+ * inApp:false avoids duplicate notification rows. Fire-and-forget: a push
+ * failure must never fail the invitation itself.
+ */
+async function pushMeetingInvite(
+  attendeeIds: (string | null | undefined)[],
+  info: { inviterName: string; meetingTitle: string; meetingCode: string; meetingId: string; startTime?: Date | null },
+): Promise<void> {
+  try {
+    const targets = [...new Set((attendeeIds || []).filter((id): id is string => !!id))];
+    if (targets.length === 0) return;
+    const { sendPushToUsers } = await import("../services/push");
+    await sendPushToUsers(
+      targets.map((userId) => ({ userId })),
+      {
+        title: "Meeting Invitation",
+        body: `${info.inviterName} invited you to a meeting: ${info.meetingTitle}`,
+        data: {
+          type: "meeting-invite",
+          meetingId: info.meetingId,
+          meetingCode: info.meetingCode,
+          meetingTitle: info.meetingTitle,
+          inviterName: info.inviterName,
+          ...(info.startTime ? { startTime: info.startTime.toISOString() } : {}),
+        },
+        androidChannelId: "general",
+        ttlSeconds: 86400,
+        collapseKey: `meeting-invite-${info.meetingId}`,
+      },
+      { inApp: false },
+    ).catch(() => {});
+  } catch (err: any) {
+    console.error("[meetings] pushMeetingInvite failed (non-fatal):", err?.message || err);
+  }
+}
+
 // Helper to build a meeting link (for responses + emails)
 // Production-safe fallback: if CLIENT_URL is unset on the VPS, links used to
 // read http://localhost:8080 and were unreachable for invitees.
@@ -618,6 +657,17 @@ export const createMeeting: RequestHandler = async (
           await sendEmail(user.email, user.name || 'User', `Meeting Invitation: ${title}`, emailHtml);
         }
       }
+
+      // Device push (FCM) so the invitation reaches a CLOSED app's
+      // notification panel — the socket event and the in-app row above
+      // only cover users currently inside the app.
+      await pushMeetingInvite(uniqueAttendeeIds, {
+        inviterName: currentUserName || "Someone",
+        meetingTitle: title,
+        meetingCode: meeting.meetingCode,
+        meetingId: meeting.id,
+        startTime: finalStartTime,
+      });
     }
 
     // Guest (external email) participants on the series head — email invitation
@@ -1181,6 +1231,16 @@ export const updateMeeting: RequestHandler = async (
             ).catch((err: any) => console.error('Meeting update invite email error:', err?.message || err));
           }
         }
+
+        // Device push (FCM) for the newly-added attendees — reaches a
+        // CLOSED app's notification panel (same contract as creation).
+        await pushMeetingInvite(toAdd, {
+          inviterName,
+          meetingTitle: meeting.title,
+          meetingCode: meeting.meetingCode,
+          meetingId: actualId,
+          startTime: startForEmail,
+        });
 
         // Refresh the roster for the response
         const refreshedRoster = await query(

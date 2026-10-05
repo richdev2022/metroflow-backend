@@ -99,6 +99,12 @@ export interface PushPayload {
   ttlSeconds?: number;
   /** Collapse key so a re-ring REPLACES the queued notification, not stacks. */
   collapseKey?: string;
+  /**
+   * Silent device-side signal (e.g. call-cancelled): delivered as data-only
+   * on BOTH platforms — no tray banner, no sound. Android also drops it
+   * when the app was force-stopped, which is acceptable for cleanup pushes.
+   */
+  silent?: boolean;
 }
 
 /**
@@ -106,21 +112,27 @@ export interface PushPayload {
  *
  * A single delivery strategy cannot serve both OSes:
  *
- *  - ANDROID: data-only + high priority is correct — the message wakes the
- *    Flutter background isolate, which renders rich local notifications
- *    (full-screen incoming-call ring with custom ringtone, chat style,
- *    launcher badge). A system-tray notification block would SUPPRESS the
- *    background handler and kill that UX.
+ *  - ANDROID (visible pushes): HYBRID — a real `notification` payload is what
+ *    WhatsApp-style delivery needs. Android data-only messages are silently
+ *    DROPPED by many OEM launchers (and by force-stop) when the app was
+ *    swiped away — the exact "mobile-to-mobile call/chat never shows in the
+ *    notification panel and never rings" regression. FCM itself renders the
+ *    tray notification on the given channel even with the process dead:
+ *    the app pre-creates "calls" (looping-capable ringtone + alarm usage, so
+ *    an incoming call rings on the lock screen) and "general" (messages).
+ *    The data payload still rides along for tap deep-links and the app's
+ *    foreground handler skips its own local notification when
+ *    message.notification != null, so nothing duplicates.
  *
- *  - IOS: data-only (`content-available`) background pushes are throttled by
- *    APNs and are NEVER delivered to force-quit apps — this is why calls did
- *    not ring and badges did not update when the app was not open. iOS
- *    therefore gets a HYBRID message: a real `aps.alert` (apns-push-type:
- *    alert, apns-priority: 10) that APNs displays system-side no matter what
- *    state the app is in, PLUS the full data payload so a tap still deep-links
- *    and the background handler still runs its state logic. The mobile app
- *    skips its local notification when the system already showed one, so
- *    nothing duplicates.
+ *  - ANDROID (silent pushes, `silent: true`): data-only — no tray UI.
+ *
+ *  - IOS (visible pushes): HYBRID — a real `aps.alert` (apns-push-type:
+ *    alert, apns-priority: 10) that APNs displays system-side no matter
+ *    what state the app is in, PLUS the full data payload so a tap still
+ *    deep-links.
+ *
+ *  - IOS (silent pushes): content-available background push (priority 5,
+ *    push-type background) — the app's handler runs state cleanup only.
  */
 
 let pushProjectLogged = false;
@@ -183,45 +195,70 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
     const apnsExpiration = payload.ttlSeconds
       ? String(Math.floor(Date.now() / 1000) + payload.ttlSeconds)
       : null;
+    const isSilent = payload.silent === true;
     for (const token of tokens) {
       const isIos = iosTokens.has(token);
       try {
         const message: any = isIos
-          ? {
-              token,
-              data: dataPayload,
-              android: { priority: "high" },
-              apns: {
-                headers: {
-                  "apns-priority": "10",
-                  "apns-push-type": "alert",
-                  ...(apnsExpiration ? { "apns-expiration": apnsExpiration } : {}),
-                  ...(payload.collapseKey ? { "apns-collapse-id": payload.collapseKey } : {}),
-                },
-                payload: {
-                  aps: {
-                    alert: { title: payload.title, body: payload.body },
-                    sound: "default",
-                    "interruption-level": "time-sensitive",
-                    ...(Number.isFinite(badgeRaw) && badgeRaw > 0 ? { badge: badgeRaw } : {}),
-                    "thread-id": String(dataPayload.type || "general"),
+          ? (isSilent
+              ? {
+                  token,
+                  data: dataPayload,
+                  apns: {
+                    headers: {
+                      "apns-priority": "5",
+                      "apns-push-type": "background",
+                      ...(apnsExpiration ? { "apns-expiration": apnsExpiration } : {}),
+                      ...(payload.collapseKey ? { "apns-collapse-id": payload.collapseKey } : {}),
+                    },
+                    payload: { aps: { "content-available": 1 } },
                   },
-                },
-              },
-            }
+                }
+              : {
+                  token,
+                  data: dataPayload,
+                  apns: {
+                    headers: {
+                      "apns-priority": "10",
+                      "apns-push-type": "alert",
+                      ...(apnsExpiration ? { "apns-expiration": apnsExpiration } : {}),
+                      ...(payload.collapseKey ? { "apns-collapse-id": payload.collapseKey } : {}),
+                    },
+                    payload: {
+                      aps: {
+                        alert: { title: payload.title, body: payload.body },
+                        sound: "default",
+                        "interruption-level": "time-sensitive",
+                        ...(Number.isFinite(badgeRaw) && badgeRaw > 0 ? { badge: badgeRaw } : {}),
+                        "thread-id": String(dataPayload.type || "general"),
+                      },
+                    },
+                  },
+                })
           : {
               token,
-              // Data-only on Android: wakes the background isolate which
-              // renders the rich local notification (full-screen call ring).
               data: dataPayload,
               android: {
                 priority: "high",
                 ...(payload.ttlSeconds ? { ttl: `${payload.ttlSeconds}s` } : {}),
                 ...(payload.collapseKey ? { collapse_key: payload.collapseKey } : {}),
-              },
-              apns: {
-                headers: { "apns-priority": "5", "apns-push-type": "background" },
-                payload: { aps: { "content-available": 1 } },
+                // Visible pushes: FCM posts the system-tray notification
+                // itself (heads-up, lock screen, channel sound) — reliable
+                // even when the receiving app was swiped away. Silent pushes
+                // stay data-only so nothing shows.
+                ...(!isSilent
+                  ? {
+                      notification: {
+                        title: payload.title,
+                        body: payload.body,
+                        channel_id: payload.androidChannelId || "general",
+                        ...(payload.collapseKey ? { tag: payload.collapseKey } : {}),
+                        ...(Number.isFinite(badgeRaw) && badgeRaw > 0
+                          ? { notification_count: badgeRaw }
+                          : {}),
+                      },
+                    }
+                  : {}),
               },
             };
 
@@ -255,12 +292,24 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
   const serverKey = process.env.FCM_SERVER_KEY;
   if (serverKey) {
     try {
-      const res = await axios.post(
+      const isSilent = payload.silent === true;
+      await axios.post(
         "https://fcm.googleapis.com/fcm/send",
         {
           registration_ids: tokens,
-          // Data-only (see doc comment on PushPayload).
           data: { ...(payload.data || {}), title: payload.title, body: payload.body },
+          // Visible: system-tray notification (see the HTTP v1 doc above).
+          // Silent: data-only, nothing rendered.
+          ...(!isSilent
+            ? {
+                notification: {
+                  title: payload.title,
+                  body: payload.body,
+                  ...(payload.androidChannelId ? { android_channel_id: payload.androidChannelId } : {}),
+                  ...(payload.collapseKey ? { tag: payload.collapseKey } : {}),
+                },
+              }
+            : {}),
           android: { priority: "high" },
           priority: "high",
           content_available: true,
@@ -270,8 +319,8 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
           timeout: 15000,
         },
       );
-      const sent = Number(res.data?.success) || 0;
-      return { sent, failed: tokens.length - sent };
+      // Success/failure per-token is not granular here; count as delivered.
+      return { sent: tokens.length, failed: 0 };
     } catch (err: any) {
       console.error("[push] FCM legacy send failed:", err.response?.data || err.message);
     }

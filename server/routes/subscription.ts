@@ -997,22 +997,20 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
             }
 
             if (transaction.fee > 0) {
-                const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
-                if (platformWalletRes.rows.length > 0) {
-                    const platformWalletId = platformWalletRes.rows[0].id;
-                    const platTxCheck = await client.query(
-                        `SELECT id FROM transactions WHERE reference = $1 AND type = 'credit' AND wallet_id = $2`,
-                        [`${reference}-PLATFORM-FEE`, platformWalletId]
+                // Owner invariant: deposit fees are REVENUE — they must not sit
+                // in the platform operational ledger. (The old code credited
+                // the pool wallet with a 'fee' row here, diverging from the
+                // gateway-webhook funding paths that now use creditRevenueWallet.)
+                try {
+                    await creditRevenueWallet(
+                        Number(transaction.fee),
+                        'NGN',
+                        reference,
+                        'Wallet Funding Fee',
+                        (providerName as string) || null,
                     );
-                    if (platTxCheck.rows.length === 0) {
-                        await client.query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [transaction.fee, platformWalletId]);
-                        await client.query(
-                            `INSERT INTO transactions
-                             (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                             VALUES ($1, 'NGN', 'success', $2, 'credit', 'Fee for Wallet Funding', 'fee', $3, 'credit')`,
-                            [transaction.fee, `${reference}-PLATFORM-FEE`, platformWalletId]
-                        );
-                    }
+                } catch (feeErr: any) {
+                    console.warn(`Funding fee revenue credit skipped for ${reference}:`, (feeErr?.message || feeErr).toString().substring(0, 150));
                 }
             }
 
@@ -1152,7 +1150,8 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
             transaction.reference,
             'Subscription Payment',
             (providerName as string) || null,
-            'Platform Wallet Debit for Subscription Revenue',
+            undefined,
+            { revenueType: 'subscription' },
         );
 
         try {

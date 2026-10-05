@@ -1090,8 +1090,15 @@ export const login: RequestHandler = async (req, res) => {
       });
     }
 
-    // Record successful login
-    await recordSuccessfulLogin(input.email, ipAddress, userAgent);
+    // Record successful login — advisory bookkeeping, never fail the login
+    try {
+      await recordSuccessfulLogin(input.email, ipAddress, userAgent);
+    } catch (loginAuditErr: any) {
+      console.warn(
+        "Login: post-login bookkeeping skipped:",
+        (loginAuditErr?.message || loginAuditErr).toString().substring(0, 200)
+      );
+    }
 
     // Always-on login attempt notification (success) with device info - best effort
     try {
@@ -1403,7 +1410,16 @@ export const googleAuth: RequestHandler = async (req, res) => {
       return res.status(400).json({ success: false, message: "Account error" });
     }
 
-    await recordSuccessfulLogin(user.email);
+    // Advisory post-login bookkeeping — must never break the login response
+    // (recordSuccessfulLogin is internally best-effort; guard the call too).
+    try {
+      await recordSuccessfulLogin(user.email);
+    } catch (loginAuditErr: any) {
+      console.warn(
+        "Google auth: post-login bookkeeping skipped:",
+        (loginAuditErr?.message || loginAuditErr).toString().substring(0, 200)
+      );
+    }
     await logActivity({
       businessId: user.businessId,
       userId: user.id,
@@ -1859,7 +1875,9 @@ export const biometricLogin: RequestHandler = async (req, res) => {
     });
   } catch (error: any) {
     console.error("Biometric login error:", error);
-    res.status(500).json({ success: false, message: error.message || "Biometric login failed" });
+    // Never leak raw server error strings (they show up verbatim in the app's
+    // sign-in dialog); keep the message generic and actionable.
+    res.status(500).json({ success: false, message: "Biometric login failed. Please try again or sign in with your password." });
   }
 };
 

@@ -547,8 +547,11 @@ protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req,
     // Revenue-side ledger rows are the ones written by creditRevenueWallet()
     // (transaction_type fee/subscription with NO wallet_id - user-side fee
     // debits carry a wallet_id and must NOT be double-counted here).
+    // Sign-aware: revenue DEBIT rows (reversals/refunds) reduce the balance.
     const revenueBalancesRes = await query(`
-      SELECT currency, COALESCE(SUM(amount), 0) as balance
+      SELECT currency, COALESCE(SUM(
+        CASE WHEN type = 'debit' OR direction = 'debit' THEN -amount ELSE amount END
+      ), 0) as balance
       FROM transactions
       WHERE status = 'success'
       AND transaction_type IN ('subscription', 'fee')

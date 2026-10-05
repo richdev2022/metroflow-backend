@@ -657,9 +657,10 @@ router.post("/vaults/:id/withdraw", authenticateToken, checkSubscriptionStatus, 
             fee,
         });
 
-        // Savings withdrawal is fully INTERNAL (savings vault -> user wallet);
-        // no pool movement occurs, so NO platform-ledger rows are written.
-        // Only the early-break fee revenue (virtual allocation) is recorded.
+        // Owner invariant: a vault -> wallet withdrawal is an INTERNAL move —
+        // no external money enters or leaves the platform, so the platform
+        // operational ledger must NOT record it. Only the early-break fee, if
+        // any, is revenue.
         if (fee > 0) {
             await creditRevenueWallet(fee, wallet.currency || "NGN", reference, "Savings Early Withdrawal Fee", "savings");
         }

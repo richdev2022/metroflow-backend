@@ -164,13 +164,17 @@ export async function chargeAncillaryFee(
         `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
         [amount, wallet.id]
     );
+    // Derive ONE deterministic-per-attempt reference shared by the wallet
+    // debit row and the revenue row so the two legs of the fee stay linked
+    // and webhook/retry replays cannot duplicate either leg.
+    const feeRef = `${referencePrefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     await query(
         `INSERT INTO transactions
          (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
          VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
-        [businessId || null, amount, wallet.currency, `${referencePrefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`, description, wallet.id, amount]
+        [businessId || null, amount, wallet.currency, feeRef, description, wallet.id, amount]
     );
-    await creditRevenueWallet(amount, opts.revenueCurrency || wallet.currency, undefined, `${description} (revenue)`);
+    await creditRevenueWallet(amount, opts.revenueCurrency || wallet.currency, feeRef, `${description} (revenue)`);
     return { ok: true, wallet, amount, currency: wallet.currency };
 }
 
@@ -302,6 +306,21 @@ export async function debitPlatformWallet(
     await creditPlatformWallet(-amount, currency, reference, description, provider);
 }
 
+/**
+ * Record a REVENUE-LEDGER movement (subscription payment, fee, ...).
+ *
+ * Invariant (owner spec): the platform OPERATIONAL ledger must only ever
+ * record withdrawals (credit) and fundings/settlements (debit). Subscription
+ * payments and fees belong to the REVENUE ledger ONLY — they must NOT create
+ * mirror rows in (or drain) the platform pool wallet. This helper therefore:
+ *   1. moves the amount in/out of `platform_wallet` (the revenue balance), and
+ *   2. writes ONE transaction row with wallet_id NULL and
+ *      transaction_type = opts.revenueType ('fee' | 'subscription').
+ *
+ * Negative amounts record a genuine revenue DEBIT (reversal/refund): the row
+ * gets type/direction 'debit' so revenue aggregations (SUM with sign) go down.
+ * Idempotent by reference.
+ */
 export async function creditRevenueWallet(
     amount: number,
     currency: string = 'NGN',
@@ -309,19 +328,20 @@ export async function creditRevenueWallet(
     description?: string,
     provider?: string | null,
     mirrorDescription?: string,
+    opts?: { revenueType?: 'fee' | 'subscription' },
 ) {
-    // This is the Revenue Wallet (platform_wallet table)
     if (amount === 0) return;
 
+    const isDebit = amount < 0;
     const absAmount = Math.abs(amount);
     const resolvedProvider = provider || inferProviderFromReference(reference);
+    const revenueType = opts?.revenueType === 'subscription' ? 'subscription' : 'fee';
 
     // NOTE: the revenue wallet is a VIRTUAL allocation — fees physically stay
     // in the provider pool account. It must NOT write platform-ledger rows,
     // otherwise every fee pollutes the Platform Ledger with internal
     // "Debit for Revenue" noise and the ledger stops mirroring the real pool
     // account (fundings in, payouts out).
-
     // 1. Mirror the movement into the revenue wallet balance.
     let walletRes = await query(`SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
 
@@ -340,22 +360,30 @@ export async function creditRevenueWallet(
         [amount, walletId]
     );
 
-    // 3. Record the revenue movement itself as a transaction row so the
-    //    Revenue Ledger history reflects fee credits (type 'fee' keeps it
-    //    consistent with the admin revenue balance aggregation).
+    // 2. Record the revenue movement itself so the Revenue Ledger history
+    //    reflects it. Distinct, deterministic reference suffixes per row kind.
     const revenueRef = reference
-        ? `${reference}-REVENUE-CREDIT`
-        : `revenue-credit-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+        ? `${reference}${isDebit ? '-REVENUE-DEBIT' : '-REVENUE-CREDIT'}`
+        : `revenue-${isDebit ? 'debit' : 'credit'}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     const existingRevenue = await query(
-        `SELECT id FROM transactions WHERE reference = $1 AND transaction_type = 'fee' AND type = 'credit' LIMIT 1`,
+        `SELECT id FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
         [revenueRef]
     );
     if (existingRevenue.rows.length === 0) {
         await query(
             `INSERT INTO transactions
              (amount, currency, status, reference, type, description, transaction_type, direction, payment_provider)
-             VALUES ($1, $2, 'success', $3, 'credit', $4, 'fee', 'credit', $5)`,
-            [absAmount, currency, revenueRef, description || 'Revenue Credit (fee)', resolvedProvider]
+             VALUES ($1, $2, 'success', $3, $4, $5, $6, $4, $7)`,
+            [
+                absAmount,
+                currency,
+                revenueRef,
+                isDebit ? 'debit' : 'credit',
+                description ||
+                    (isDebit ? 'Revenue Debit (refund/reversal)' : revenueType === 'subscription' ? 'Subscription Payment' : 'Revenue Credit (fee)'),
+                revenueType,
+                resolvedProvider,
+            ]
         );
     }
 }

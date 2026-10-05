@@ -1141,28 +1141,26 @@ router.get("/verify", async (req, res) => {
 
                 await client.query('COMMIT');
 
-                // 4. Platform ledger (double-entry) — mirrors the Virtual
-                // Account webhook flow so the admin Platform Ledger records
-                // the FULL movement (gross inflow + user payout + fee ->
-                // revenue) instead of "only the fees". Runs AFTER COMMIT:
-                // the ledger helpers use the connection pool while `client`
-                // still held row locks on the wallets row inside the settlement
-                // transaction. Every helper is idempotent by reference, so a
-                // replayed verify callback cannot duplicate rows (and the
-                // status guard above means settlement only happens once).
+                // 4. Platform ledger (owner invariant) — a funding event
+                // produces exactly ONE platform-ledger row: a DEBIT of the
+                // amount that lands in the user's wallet (platform ledger is
+                // debited, user credited). The fee goes to the REVENUE ledger
+                // only. Runs AFTER COMMIT: the ledger helpers use the
+                // connection pool while `client` still held row locks on the
+                // wallets row inside the settlement transaction. Every helper
+                // is idempotent by reference, so a replayed verify callback
+                // cannot duplicate rows (and the status guard above means
+                // settlement only happens once).
                 try {
                     const ledgerProvider = transaction.payment_provider || null;
                     const netAmount = Number(transaction.amount) || 0;
                     const feeAmount = Number(transaction.fee) || 0;
 
-                    // Gross inflow the gateway received (net + fee charged on top).
-                    // ONE row: the internal wallet allocation never touches the
-                    // pool account, so no "-USER" debit row is written.
-                    await creditPlatformWallet(
-                        netAmount + feeAmount,
+                    await debitPlatformWallet(
+                        netAmount,
                         'NGN',
-                        reference,
-                        'Customer Wallet Funding Received (Card)',
+                        `${reference}-PLATFORM`,
+                        'User Wallet Funding (Card)',
                         ledgerProvider,
                     );
                     // The fee lands in the revenue wallet —
@@ -1173,7 +1171,7 @@ router.get("/verify", async (req, res) => {
                             feeAmount,
                             'NGN',
                             reference,
-                            'Revenue Credit (funding fee)',
+                            'Wallet Funding Fee',
                             ledgerProvider,
                         );
                     }

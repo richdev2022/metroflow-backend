@@ -46,7 +46,8 @@ export function getOTPExpiry(): Date {
 export async function generateToken(userId: string, businessId: string): Promise<string> {
   // Generate secure token
   const token = crypto.randomBytes(32).toString("hex");
-  console.log("Generated new token for user:", { userId, businessId, token });
+  // NEVER log the token value — logs are shipped to third parties.
+  console.log("Generated new session token for user:", { userId, businessId });
   
   // Store token in user_sessions table with last_activity_at set explicitly
   await query(

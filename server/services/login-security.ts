@@ -20,18 +20,29 @@ export interface LoginAttempt {
 }
 
 export async function logLoginAttempt(attempt: LoginAttempt) {
-  await query(
-    `INSERT INTO login_attempts
-     (email, ip_address, user_agent, success, failure_reason)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [
-      attempt.email,
-      attempt.ipAddress || null,
-      attempt.userAgent || null,
-      attempt.success,
-      attempt.failureReason || null,
-    ]
-  );
+  // Audit logging is best-effort: a missing/mismatched login_attempts schema
+  // (legacy tables without the `success`/`failure_reason` columns) must NEVER
+  // turn a successful login into an HTTP 500. initializeDatabase() upgrades
+  // the table to the union shape; this guard is the last line of defence.
+  try {
+    await query(
+      `INSERT INTO login_attempts
+       (email, ip_address, user_agent, success, failure_reason)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        attempt.email,
+        attempt.ipAddress || null,
+        attempt.userAgent || null,
+        attempt.success,
+        attempt.failureReason || null,
+      ]
+    );
+  } catch (err: any) {
+    console.warn(
+      "logLoginAttempt skipped (audit only):",
+      (err?.message || err).toString().substring(0, 200)
+    );
+  }
 }
 
 export async function checkAccountLockout(email: string): Promise<{ locked: boolean; lockoutEnd?: Date }> {
@@ -91,18 +102,30 @@ export async function recordFailedLogin(email: string, ipAddress?: string, userA
 }
 
 export async function recordSuccessfulLogin(email: string, ipAddress?: string, userAgent?: string) {
-  // Reset failed attempts and update login info
-  await query(
-    `UPDATE users
-     SET failed_login_attempts = 0,
-         locked_until = NULL,
-         last_login_ip = $2,
-         last_login_user_agent = $3
-     WHERE email = $1`,
-    [email, ipAddress || null, userAgent || null]
-  );
+  // This function is advisory bookkeeping on the happy path — the caller has
+  // ALREADY authenticated the user. Any failure here (schema drift on the
+  // lockout columns, audit insert, email delivery) must never bubble up and
+  // turn the login response into an HTTP 500 (this exact bug broke
+  // POST /auth/google and POST /auth/login in production).
+  try {
+    // Reset failed attempts and update login info
+    await query(
+      `UPDATE users
+       SET failed_login_attempts = 0,
+           locked_until = NULL,
+           last_login_ip = $2,
+           last_login_user_agent = $3
+       WHERE email = $1`,
+      [email, ipAddress || null, userAgent || null]
+    );
+  } catch (err: any) {
+    console.warn(
+      "recordSuccessfulLogin: reset skipped:",
+      (err?.message || err).toString().substring(0, 200)
+    );
+  }
 
-  // Log the attempt
+  // Log the attempt (logLoginAttempt is itself best-effort)
   await logLoginAttempt({
     email,
     ipAddress,
@@ -110,8 +133,15 @@ export async function recordSuccessfulLogin(email: string, ipAddress?: string, u
     success: true,
   });
 
-  // Send login notification email
-  await sendLoginNotificationEmail(email, ipAddress, userAgent);
+  // Send login notification email (sendEmail swallows internally; guard anyway)
+  try {
+    await sendLoginNotificationEmail(email, ipAddress, userAgent);
+  } catch (err: any) {
+    console.warn(
+      "recordSuccessfulLogin: notification email skipped:",
+      (err?.message || err).toString().substring(0, 200)
+    );
+  }
 }
 
 function parseUserAgent(userAgent?: string) {

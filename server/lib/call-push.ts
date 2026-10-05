@@ -107,9 +107,12 @@ export async function pushMissedCall(
           callCode: info.callCode || "",
           status: info.status || "missed",
         },
-        androidChannelId: "calls",
+        androidChannelId: "general",
         ttlSeconds: 300,
-        collapseKey: `missed-call-${info.callId}`,
+        // Deliberately tagged like the INCOMING-CALL push: on Android the
+        // tag makes the missed-call notice REPLACE the still-ringing tray
+        // notification instead of stacking next to it.
+        collapseKey: `incoming-call-${info.callId}`,
       },
       { inApp: true, type: "call" },
     );
@@ -147,6 +150,11 @@ export async function pushCallCancelled(
           reason: info.reason || "caller_hung_up",
         },
         androidChannelId: "calls",
+        // SILENT: data-only on both platforms. The iOS branch in push.ts
+        // sends a content-available background push (no aps.alert) and the
+        // Android branch skips the tray notification — a hung-up call must
+        // never banner or ring.
+        silent: true,
       },
       // inApp:false + no type mirror => silent data push, nothing rendered.
       { inApp: false },

@@ -519,7 +519,6 @@ export async function reverseFailedTransfer(
 
   const amount = parseFloat(transfer.amount);
   const fee = parseFloat(transfer.fee || '0');
-  const totalRefund = amount + fee;
   const currency = transfer.currency || 'NGN';
 
   // Only reverse when money actually left the wallet (debit txn exists)
@@ -529,48 +528,23 @@ export async function reverseFailedTransfer(
   );
   if (txnCheck.rows.length === 0) return false;
 
-  // Idempotency: never reverse twice
-  const refundCheck = await query(
-    `SELECT id FROM transactions WHERE reference = $1`,
-    [transfer.reference + '-REFUND']
-  );
-  if (refundCheck.rows.length > 0) return false;
-
-  // 1. Credit the user's wallet back (amount + fee)
-  await query(
-    `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
-    [totalRefund, transfer.wallet_id]
-  );
-
-  // 2. Pool ledger: the pool only moves when the provider ACTUALLY paid the
-  //    money out and then returned it (e.g. Monnify REVERSED_DISBURSEMENT
-  //    after a successful payout). Failed-before-payout transfers never wrote
-  //    a pool row, so there is nothing to unwind on the pool side.
-  if (opts.providerReturnedFunds) {
-    await creditPlatformWallet(
-      amount,
-      currency,
-      transfer.reference + '-PROVIDER-REVERSAL',
-      `Provider reversal returned funds to pool for ${transfer.reference}`,
-    );
-  }
-
-  // 3. Unwind the fee revenue (it was earned on a transfer that never went through)
-  if (fee > 0) {
-    await debitRevenueWallet(
-      fee,
-      currency,
-      transfer.reference + '-REFUND',
-      `Reversal of fee revenue for failed transfer ${transfer.reference}`,
-    );
-  }
-
-  // 4. Refund transaction rows (amount + fee) — visible in the user's history
-  await query(
+  // CLAIM-FIRST idempotency: the principal refund ROW is the gate (INSERT ...
+  // ON CONFLICT ... RETURNING id). The wallet credit and ledger reversals run
+  // only when THIS call won the claim, so webhook/monitor races and mid-crash
+  // retries can never double-credit the wallet.
+  //
+  // Reference suffix scheme (transactions.reference is GLOBALLY unique —
+  // reusing one suffix for two rows silently swallows the second insert,
+  // which is exactly what dropped the user's refund rows before):
+  //   <ref>-REFUND              user wallet, principal refund row
+  //   <ref>-FEE-REFUND          user wallet, fee refund row
+  //   <ref>-PLATFORM-REFUND     platform ledger, reversal of the hold credit
+  //   <ref>-FEE-REVENUE-REFUND  revenue ledger, reversal of the fee revenue
+  const refundClaim = await query(
     `INSERT INTO transactions
      (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
      VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
-     ON CONFLICT (reference) DO NOTHING`,
+     ON CONFLICT (reference) DO NOTHING RETURNING id`,
     [
       transfer.business_id,
       amount,
@@ -580,13 +554,41 @@ export async function reverseFailedTransfer(
       transfer.wallet_id
     ]
   );
+  if (refundClaim.rows.length === 0) return false;
 
+  // 1. Credit the user's wallet back (principal)
+  await query(
+    `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+    [amount, transfer.wallet_id]
+  );
+
+  // 2. Platform ledger (owner invariant): a withdrawal reversal DEBITS the
+  //    platform ledger — undoing the 'Platform Wallet Credit for Transfer
+  //    <ref>' hold written at initiation. Gated on the hold row actually
+  //    existing (legacy transfers queued before the hold-row fix have none).
+  //    opts.providerReturnedFunds stays accepted for caller compatibility but
+  //    no longer changes the ledger directions.
+  const holdRow = await query(
+    `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
+    [transfer.reference]
+  );
+  if (holdRow.rows.length > 0) {
+    await debitPlatformWallet(
+      amount,
+      currency,
+      transfer.reference + '-PLATFORM-REFUND',
+      `Reversal of platform hold for failed transfer ${transfer.reference}`,
+    );
+  }
+
+  // 3. Unwind the fee revenue (it was earned on a transfer that never went
+  //    through) — a genuine revenue DEBIT row with its OWN reference.
   if (fee > 0) {
-    await query(
+    const feeClaim = await query(
       `INSERT INTO transactions
        (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
        VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
-       ON CONFLICT (reference) DO NOTHING`,
+       ON CONFLICT (reference) DO NOTHING RETURNING id`,
       [
         transfer.business_id,
         fee,
@@ -596,6 +598,18 @@ export async function reverseFailedTransfer(
         transfer.wallet_id
       ]
     );
+    if (feeClaim.rows.length > 0) {
+      await query(
+        `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+        [fee, transfer.wallet_id]
+      );
+      await debitRevenueWallet(
+        fee,
+        currency,
+        transfer.reference + '-FEE-REVENUE-REFUND',
+        `Reversal of fee revenue for failed transfer ${transfer.reference}`,
+      );
+    }
   }
 
   // 5. The original debit rows must NOT keep showing 'success' in the user's
@@ -733,11 +747,15 @@ export async function processAllPending(businessId: string) {
           // Debit Wallet
           await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [totalDebit, transfer.wallet_id]);
 
-          // NOTE: no platform-ledger "hold" row here. The pool account does NOT
-          // move when a payout is queued — it only moves when the provider
-          // actually pays the recipient (payout success) or when a provider
-          // reversal returns funds. Writing hold/reversal pairs here polluted
-          // the Platform Ledger with rows that never touched the pool account.
+          // Owner invariant: a withdrawal DEBITS the user's wallet and CREDITS
+          // the platform ledger — this hold row IS the withdrawal's platform
+          // entry (labelled + idempotent by reference).
+          await creditPlatformWallet(
+            amount,
+            transfer.currency || 'NGN',
+            transfer.reference,
+            `Platform Wallet Credit for Transfer ${transfer.reference}`,
+          );
 
           // Credit Revenue Wallet (Fee) - Earnings
           if (fee > 0) {
@@ -885,16 +903,11 @@ export async function processAllPending(businessId: string) {
         [transfer.id, immediateStatus, failureReason, JSON.stringify(response), provider.name, JSON.stringify(providerMetadata)]
       );
       
-      // Debit Platform Wallet (Amount only) if initial response was success
+      // Owner invariant: the withdrawal's platform entry is the HOLD credit
+      // written at initiation ('Platform Wallet Credit for Transfer <ref>').
+      // No extra platform row on payout success (the previous 'Payout to ...'
+      // debit reused the hold's reference and was always silently deduped).
       if (isSuccess) {
-        const amount = parseFloat(transfer.amount);
-        await debitPlatformWallet(
-          amount,
-          transfer.currency || 'NGN',
-          transfer.reference,
-          `Payout to ${transfer.recipient_name || transfer.recipient_account || 'recipient'} (${transfer.reference})`,
-        );
-
         // Send email notification on success
         if (transfer.wallet_id) {
           const walletRes = await query(`SELECT balance, user_id FROM wallets WHERE id = $1`, [transfer.wallet_id]);
@@ -1073,13 +1086,23 @@ export async function processTransfer(transferId: string) {
 
         // Debit Wallet
         await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [totalDebit, transfer.wallet_id]);
-        
-        // Credit Platform Wallet (Amount) - Intermediary Step for Payout
-        await creditPlatformWallet(amount, transfer.currency || 'NGN');
+
+        // Owner invariant: withdrawal -> platform ledger CREDIT (hold row).
+        await creditPlatformWallet(
+          amount,
+          transfer.currency || 'NGN',
+          transfer.reference,
+          `Platform Wallet Credit for Transfer ${transfer.reference}`,
+        );
 
         // Credit Revenue Wallet (Fee) - Earnings
         if (fee > 0) {
-            await creditRevenueWallet(fee, transfer.currency || 'NGN');
+            await creditRevenueWallet(
+              fee,
+              transfer.currency || 'NGN',
+              transfer.reference,
+              `Transfer fee revenue for ${transfer.reference}`,
+            );
         }
 
         // Record Transaction (Amount) - Idempotent: Check if exists first, UPDATE if so

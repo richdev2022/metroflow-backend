@@ -167,7 +167,7 @@ const handleSquadWebhook = async (event: any) => {
                                 await query(
                                     `INSERT INTO transactions 
                                     (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'Platform Wallet Debit for User Funding', 'wallet_funding', $3, 'debit')`,
+                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'User Wallet Funding (Squad)', 'wallet_funding', $3, 'debit')`,
                                     [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
                                 );
                             }
@@ -198,10 +198,10 @@ const handleSquadWebhook = async (event: any) => {
                         );
 
                         const subAmount = parseFloat(transaction.amount);
-                        // Reference + explicit description so the admin Revenue
-                        // Ledger history shows the actual transaction record
-                        // (previously an unlinked 'Revenue Credit (fee)' row).
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'squad', 'Platform Wallet Debit for Subscription Revenue');
+                        // Revenue-LEDGER row only (wallet_id NULL, transaction_type
+                        // 'subscription') — subscriptions must NEVER touch the
+                        // platform operational ledger (owner invariant).
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'squad', undefined, { revenueType: 'subscription' });
                     }
                 }
             }
@@ -239,12 +239,12 @@ const handleSquadWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Platform ledger: ONE row — the gross inflow the provider
-              // actually sent to the pool account. Internal wallet allocation
-              // never touches the pool, so no "-USER" debit row exists.
-              await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'squad');
-
-              // Credit revenue wallet (virtual allocation; no pool movement)
+              // Platform ledger (owner invariant): a funding event produces
+              // exactly ONE platform-ledger row — a DEBIT of the amount that
+              // lands in the user's wallet. The gross gateway inflow row was
+              // noise ("unwanted transaction") and is gone; the fee goes to
+              // the REVENUE ledger only.
+              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'User Wallet Funding (Virtual Account)', 'squad');
               if (fee > 0) {
                 await creditRevenueWallet(fee, 'NGN', reference, undefined, 'squad');
               }
@@ -381,13 +381,12 @@ const handleMonnifyWebhook = async (event: any) => {
                     if (transaction.transaction_type === 'wallet_funding') {
                         const amount = parseFloat(transaction.amount);
                         const walletId = transaction.wallet_id;
-                        
+
                         if (walletId) {
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
-                            // Pool ledger: ONE gross inflow row (matches the Squad/
-                            // Flutterwave funding paths — the Monnify path previously
-                            // wrote NO pool credit, breaking the pool mirror).
-                            await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'monnify');
+                            // Owner invariant: funding -> platform ledger DEBITED,
+                            // user credited. ONE debit row, no gross-inflow row.
+                            await debitPlatformWallet(amount, 'NGN', `${reference}-PLATFORM`, 'User Wallet Funding (Monnify)', 'monnify');
                         }
                     }
                     
@@ -415,7 +414,9 @@ const handleMonnifyWebhook = async (event: any) => {
                         );
                         
                         const subAmount = parseFloat(transaction.amount);
-                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'monnify', 'Platform Wallet Debit for Subscription Revenue');
+                        // Revenue-LEDGER row only — subscriptions never touch the
+                        // platform operational ledger (owner invariant).
+                        await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'monnify', undefined, { revenueType: 'subscription' });
                     }
                 }
             }
@@ -490,11 +491,12 @@ const handleMonnifyWebhook = async (event: any) => {
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
 
-              // Platform ledger: ONE row — the gross inflow into the pool
-              // (internal wallet allocation never touches the pool).
-              await creditPlatformWallet(amount, 'NGN', reference, 'Customer Wallet Funding Received (Virtual Account)', 'monnify');
+              // Platform ledger (owner invariant): ONE debit row for the user
+              // funding; the gross gateway inflow row was noise.
+              await debitPlatformWallet(creditAmount, 'NGN', `${reference}-USER`, 'User Wallet Funding (Monnify)', 'monnify');
 
-              // Credit revenue wallet (virtual allocation; no pool movement)
+              // Fee -> revenue ledger only (creditRevenueWallet no longer
+              // mirrors revenue movements into the platform pool).
               if (fee > 0) {
                 await creditRevenueWallet(fee, 'NGN', reference, undefined, 'monnify');
               }
@@ -726,25 +728,14 @@ async function creditWalletFundingTransaction(transaction: any, providerName: st
             );
         }
 
-        // 4. Credit platform wallet with the fee (idempotent by reference)
+        // 4. Funding fee -> REVENUE ledger (owner invariant: deposit fees are
+        //    revenue, they must NOT sit in the platform operational ledger).
         const fee = parseFloat(transaction.fee || 0);
         if (fee > 0) {
-            const platformWalletRes = await client.query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL LIMIT 1`);
-            if (platformWalletRes.rows.length > 0) {
-                const platformWalletId = platformWalletRes.rows[0].id;
-                const platTxCheck = await client.query(
-                    `SELECT id FROM transactions WHERE reference = $1 AND type = 'credit' AND wallet_id = $2`,
-                    [`${reference}-PLATFORM-FEE`, platformWalletId]
-                );
-                if (platTxCheck.rows.length === 0) {
-                    await client.query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [fee, platformWalletId]);
-                    await client.query(
-                        `INSERT INTO transactions 
-                        (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                        VALUES ($1, 'NGN', 'success', $2, 'credit', 'Fee for Wallet Funding', 'fee', $3, 'credit')`,
-                        [fee, `${reference}-PLATFORM-FEE`, platformWalletId]
-                    );
-                }
+            try {
+                await creditRevenueWallet(fee, 'NGN', reference, 'Wallet Funding Fee', 'flutterwave');
+            } catch (feeErr: any) {
+                console.warn(`Funding fee revenue credit skipped for ${reference}:`, (feeErr?.message || feeErr).toString().substring(0, 150));
             }
         }
 
@@ -893,7 +884,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 );
 
                 const subAmount = parseFloat(transaction.amount);
-                await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'flutterwave', 'Platform Wallet Debit for Subscription Revenue');
+                await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'flutterwave', undefined, { revenueType: 'subscription' });
             }
 
             return;
@@ -995,10 +986,9 @@ const handleFlutterwaveWebhook = async (event: any) => {
             client.release();
         }
 
-        // Platform ledger: ONE row — the gross inflow into the pool account.
-        // (Flutterwave fundings previously wrote NO platform rows at all, then
-        // an internal "-USER" pair was added — both broke the pool mirror.)
-        await creditPlatformWallet(amount, 'NGN', creditReference, 'Customer Wallet Funding Received (Flutterwave Virtual Account)', 'flutterwave').catch(() => {});
+        // Platform ledger (owner invariant): ONE debit row for the amount that
+        // lands in the user's wallet; the fee goes to the REVENUE ledger.
+        await debitPlatformWallet(creditAmount, 'NGN', `${creditReference}-USER`, 'User Wallet Funding (Flutterwave)', 'flutterwave').catch(() => {});
 
         if (fee > 0) {
             await creditRevenueWallet(fee, 'NGN', creditReference, undefined, 'flutterwave').catch(() => {});

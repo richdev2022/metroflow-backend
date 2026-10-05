@@ -1151,6 +1151,31 @@ export async function initializeDatabase() {
       )
     `);
 
+    // Upgrade legacy login_attempts tables to the UNION shape. This table has
+    // historically existed in two variants: (A) audit-style with
+    // success/failure_reason (services/login-security.ts writers) and (B)
+    // event-style with user_id/business_id/status/device_info (auth.ts
+    // writers). Whichever variant was created first on an existing database,
+    // the other writer failed with 42703 -> HTTP 500 on login. Make every
+    // boot converge on the union so BOTH writer shapes always work.
+    const loginAttemptsUnionColumns: Array<[string, string]> = [
+      ["success", "BOOLEAN"],
+      ["failure_reason", "VARCHAR(100)"],
+      ["user_id", "UUID"],
+      ["business_id", "VARCHAR(255)"],
+      ["status", "VARCHAR(20)"],
+      ["device_info", "JSONB"],
+      ["user_agent", "TEXT"],
+      ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ];
+    for (const [col, def] of loginAttemptsUnionColumns) {
+      try {
+        await query(`ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS ${col} ${def}`);
+      } catch (e: any) {
+        console.warn(`login_attempts union upgrade skipped for ${col}:`, (e?.message || e).toString().substring(0, 150));
+      }
+    }
+
     await fixUuidIdDefaults(['audit_logs', 'login_attempts']);
     
     // Create indexes for security tables

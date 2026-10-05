@@ -41,6 +41,13 @@ export function isPushConfigured(): boolean {
   return Boolean(loadServiceAccount() || process.env.FCM_SERVER_KEY);
 }
 
+/** Diagnostics: which FCM delivery path will actually be used. */
+export function pushDeliveryMode(): "http-v1" | "legacy" | "none" {
+  if (loadServiceAccount()) return "http-v1";
+  if (process.env.FCM_SERVER_KEY) return "legacy";
+  return "none";
+}
+
 async function getAccessToken(): Promise<string | null> {
   const account = loadServiceAccount();
   if (!account) return null;
@@ -136,6 +143,7 @@ export interface PushPayload {
  */
 
 let pushProjectLogged = false;
+let isPushUnconfiguredLogged = false;
 
 function resolveProjectId(account: ServiceAccount | null): string | null {
   const projectId = process.env.FIREBASE_PROJECT_ID || account?.project_id || null;
@@ -370,6 +378,16 @@ export async function sendPushToUsers(
         sent += result.sent;
         failed += result.failed;
         if (result.sent > 0) reachedUsers++;
+      } else if (!isPushUnconfiguredLogged) {
+        // Silent zero-token skips made "no notifications" undiagnosable. Log
+        // ONCE (rate-limited) with the reason so a missing device registration
+        // or unconfigured FCM shows up in the logs immediately.
+        isPushUnconfiguredLogged = true;
+        console.warn(
+          `[push] no FCM tokens registered for user ${target.userId} (${payload.data?.type || type}) — ` +
+            `device never registered via /notifications/register-device, or FCM is ` +
+            `${isPushConfigured() ? "configured" : "NOT configured (FIREBASE_SERVICE_ACCOUNT_JSON missing)"}`
+        );
       }
     } catch (err: any) {
       console.error("[push] sendPushToUsers error:", err.message);

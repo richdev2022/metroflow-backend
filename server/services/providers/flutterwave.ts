@@ -294,21 +294,40 @@ export const flutterwaveProvider: Provider = {
         debit_currency: data.currencyId || "NGN",
       };
 
-      // International rails (USD/GBP/EUR etc.): Flutterwave requires the
-      // beneficiary's address block and (per corridor) bank name / SWIFT /
-      // routing number. Send whatever we collected — domestic NGN payouts
-      // simply omit them.
-      if (data.beneficiaryAddress) payload.beneficiary_address = data.beneficiaryAddress;
-      if (data.beneficiaryCity) payload.beneficiary_city = data.beneficiaryCity;
-      if (data.beneficiaryState) payload.beneficiary_state = data.beneficiaryState;
-      if (data.beneficiaryPostalCode) payload.beneficiary_postal_code = data.beneficiaryPostalCode;
-      if (data.beneficiaryCountry) payload.beneficiary_country = data.beneficiaryCountry.toUpperCase();
-      if (data.bankName) payload.bank_name = data.bankName;
-      if (data.swiftCode) payload.swift_code = data.swiftCode.toUpperCase();
-      if (data.routingNumber) payload.routing_number = data.routingNumber;
-
-      // Sender block (compliance): required for international transfers.
+      // International rails (USD/GBP/EUR): Flutterwave requires the
+      // beneficiary's bank + address details INSIDE `meta[0]` — top-level
+      // fields (bank_name / swift_code / routing_number / beneficiary_*) are
+      // silently IGNORED by /v3/transfers, so the payout reaches disbursement
+      // with no routing data and fails with "DISBURSE FAILED: Invalid account
+      // number" even when the details are correct (verified against the
+      // official reference: developer.flutterwave.com/docs/international-usd-eur-gbp).
       const isIntl = (data.currencyId || "NGN") !== "NGN" || !!data.beneficiaryCountry;
+      if (isIntl) {
+        const meta: Record<string, unknown> = {};
+        if (data.routingNumber) meta.routing_number = data.routingNumber;
+        if (data.swiftCode) meta.swift_code = data.swiftCode.toUpperCase();
+        if (data.bankName) meta.bank_name = data.bankName;
+        // account_type is REQUIRED for USD (checking|depository) and GBP
+        // (personal|corporate). Default sensibly when the client did not send it.
+        if ((data.currencyId || "").toUpperCase() === "USD") {
+          meta.account_type = ["checking", "depository"].includes(String(data.accountType || "").toLowerCase())
+            ? String(data.accountType).toLowerCase()
+            : "checking";
+        } else if ((data.currencyId || "").toUpperCase() === "GBP") {
+          meta.account_type = ["personal", "corporate"].includes(String(data.accountType || "").toLowerCase())
+            ? String(data.accountType).toLowerCase()
+            : "personal";
+        }
+        if (data.beneficiaryAddress) meta.beneficiary_address = data.beneficiaryAddress;
+        if (data.beneficiaryPostalCode) meta.postal_code = data.beneficiaryPostalCode;
+        if (data.beneficiaryCity) meta.city = data.beneficiaryCity;
+        if (data.recipientStreetNumber) meta.street_number = data.recipientStreetNumber;
+        if (data.recipientStreetName) meta.street_name = data.recipientStreetName;
+        if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
+        if (data.senderPhone) meta.sender_mobile_number = data.senderPhone;
+        if (data.senderAddress) meta.sender_address = data.senderAddress;
+        if (Object.keys(meta).length > 0) payload.meta = [meta];
+      }
       if (isIntl) {
         payload.sender = {
           name: data.senderName || data.accountName || "Metroflow business",

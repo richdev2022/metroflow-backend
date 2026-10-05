@@ -58,6 +58,13 @@ export interface TransferRequest {
   bankName?: string;
   swiftCode?: string;
   routingNumber?: string;
+  /** USD: "checking" | "depository". GBP: "personal" | "corporate". */
+  accountType?: string;
+  /** Street components required by the USD corridor (meta[0]). */
+  recipientStreetNumber?: string;
+  recipientStreetName?: string;
+  /** Beneficiary email — optional meta[0] field for intl payouts. */
+  beneficiaryEmail?: string;
   // Sender (the paying business) — compliance data for intl transfers
   senderName?: string;
   senderEmail?: string;

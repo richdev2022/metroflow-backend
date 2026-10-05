@@ -14,6 +14,7 @@ import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-c
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
+import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
 import { verifyPayment } from "../services/squad";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
@@ -3115,6 +3116,89 @@ protectedRouter.get("/transfers", requirePermission('view_dashboard'), async (re
     } catch (error) {
         console.error("Admin transfers error:", error);
         res.status(500).json({ success: false, error: "Failed to fetch transfers" });
+    }
+});
+
+/**
+ * POST /admin/transfers/:id/reverse — platform-admin "click to reverse".
+ *
+ * Reverses a FAILED transfer from the admin console (Admin → Transfers).
+ * Uses the same idempotent, claim-first reverseFailedTransfer() helper the
+ * webhook/monitor paths use, so double-clicks and races are safe. The
+ * provider's live status is re-checked first: a transfer Flutterwave reports
+ * as SUCCESSFUL must NEVER be reversed (money was actually delivered).
+ */
+protectedRouter.post("/transfers/:id/reverse", requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { reason } = req.body || {};
+        if (!id) {
+            return res.status(400).json({ success: false, error: "Transfer id is required" });
+        }
+
+        const transferRes = await query(`SELECT * FROM transfer_queue WHERE id::text = $1 OR reference = $1 LIMIT 1`, [id]);
+        if (transferRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Transfer not found" });
+        }
+        const transfer = transferRes.rows[0];
+
+        if (transfer.status === 'success') {
+            return res.status(409).json({ success: false, error: "This transfer succeeded — it cannot be reversed" });
+        }
+        if (transfer.status !== 'failed') {
+            return res.status(409).json({ success: false, error: `Only failed transfers can be reversed (this one is "${transfer.status}")` });
+        }
+        if (!transfer.wallet_id) {
+            return res.status(409).json({ success: false, error: "This transfer is not linked to a wallet — nothing to reverse" });
+        }
+
+        // Double-check with the provider before touching money: if the live
+        // status is SUCCESSFUL, refuse (the failure signal was stale).
+        try {
+            const provider = getProvider(transfer.payment_provider);
+            if (provider && typeof provider.verifyTransfer === 'function') {
+                const verifyRes = await provider.verifyTransfer(transfer.reference, transfer.provider_metadata);
+                const verified = verifyRes?.data || verifyRes;
+                const liveStatus = String(verified?.status || '').toUpperCase();
+                if (liveStatus === 'SUCCESSFUL') {
+                    await query(
+                        `UPDATE transfer_queue SET status = 'success', failure_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                        [transfer.id]
+                    );
+                    return res.status(409).json({ success: false, error: "Provider reports this transfer as SUCCESSFUL — reversal refused and the transfer was re-marked successful" });
+                }
+            }
+        } catch (verifyErr: any) {
+            // Provider verify is best-effort — a network error must not block
+            // the reversal of a transfer already known to be failed.
+            console.warn(`[admin] provider verify before reversal failed for ${transfer.reference}:`, verifyErr?.message);
+        }
+
+        const reversed = await reverseFailedTransfer(
+            transfer,
+            reason ? `Admin reversal: ${String(reason).slice(0, 200)}` : 'Admin reversal from Admin Console'
+        );
+        if (!reversed) {
+            // reverseFailedTransfer returns false when the refund row already
+            // exists (already reversed) — surface that honestly.
+            const refundCheck = await query(
+                `SELECT reference FROM transactions WHERE reference = $1 LIMIT 1`,
+                [`${transfer.reference}-REFUND`]
+            );
+            if (refundCheck.rows.length > 0) {
+                return res.status(409).json({ success: false, error: "This transfer was already reversed" });
+            }
+            return res.status(500).json({ success: false, error: "Reversal could not be completed — check the server logs" });
+        }
+
+        res.json({
+            success: true,
+            message: `Transfer ${transfer.reference} reversed — the full amount (including the fee) is back in the customer's wallet.`,
+            data: { reference: transfer.reference }
+        });
+    } catch (error) {
+        console.error("Admin reverse transfer error:", error);
+        res.status(500).json({ success: false, error: "Failed to reverse transfer" });
     }
 });
 

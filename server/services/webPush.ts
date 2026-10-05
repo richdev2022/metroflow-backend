@@ -108,6 +108,13 @@ export async function getVapidPublicKey(): Promise<string | null> {
   return keys?.publicKey || null;
 }
 
+/** Diagnostics: web-push VAPID keys available (env or persisted settings). */
+export function isWebPushConfigured(): boolean {
+  if (cachedKeys) return true;
+  if (process.env.VAPID_PUBLIC_KEY?.trim() && process.env.VAPID_PRIVATE_KEY?.trim()) return true;
+  return false;
+}
+
 export interface WebPushPayload {
   type: string;
   [key: string]: unknown;

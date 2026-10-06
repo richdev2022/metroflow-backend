@@ -3155,6 +3155,10 @@ protectedRouter.post("/transfers/:id/reverse", requirePermission('manage_busines
         // Double-check with the provider before touching money: if the live
         // status is SUCCESSFUL, refuse (the failure signal was stale).
         try {
+            // getProvider comes from the factory — import it lazily (this file
+            // only imports adminAuth statically; a static import of the
+            // provider factory here previously crashed tsc AND the runtime).
+            const { getProvider } = await import("../services/providers/factory");
             const provider = getProvider(transfer.payment_provider);
             if (provider && typeof provider.verifyTransfer === 'function') {
                 const verifyRes = await provider.verifyTransfer(transfer.reference, transfer.provider_metadata);
@@ -4188,7 +4192,7 @@ protectedRouter.get("/intl-transfer-config", requirePermission('manage_finance')
     try {
         const config = await getIntlTransferConfig();
         const transferProvider = await getActiveTransferProviderName();
-        res.json({ success: true, data: { ...config, transfer_provider: transferProvider } });
+        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, transfer_provider: transferProvider } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load international transfer config" });
     }
@@ -4196,11 +4200,13 @@ protectedRouter.get("/intl-transfer-config", requirePermission('manage_finance')
 
 /**
  * PUT /admin/intl-transfer-config
- * Body: { markup_percent, fee_percent, fee_flat, transfer_provider? }
+ * Body: { markup_percent, fee_percent, fee_flat, spread_percent, transfer_provider? }
+ * spread_percent is the admin-only margin layered on top of markup — customers
+ * only ever see markup+spread merged as one number in their quote.
  */
 protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
-        const { markup_percent, fee_percent, fee_flat, transfer_provider } = req.body || {};
+        const { markup_percent, fee_percent, fee_flat, spread_percent, transfer_provider } = req.body || {};
         if (markup_percent !== undefined) {
             const v = Number(markup_percent);
             if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "markup_percent must be between 0 and 100" });
@@ -4216,6 +4222,11 @@ protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance')
             if (!Number.isFinite(v) || v < 0) return res.status(400).json({ success: false, error: "fee_flat must be a positive number" });
             await setSetting("intl_transfer_fee_flat", String(v));
         }
+        if (spread_percent !== undefined) {
+            const v = Number(spread_percent);
+            if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "spread_percent must be between 0 and 100" });
+            await setSetting("intl_transfer_spread_percent", String(v));
+        }
         if (transfer_provider !== undefined) {
             const allowed = ['flutterwave'];
             if (transfer_provider && !allowed.includes(transfer_provider)) {
@@ -4226,7 +4237,7 @@ protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance')
         }
         const config = await getIntlTransferConfig();
         const transferProvider = await getActiveTransferProviderName();
-        res.json({ success: true, data: { ...config, transfer_provider: transferProvider } });
+        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, transfer_provider: transferProvider } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to update international transfer config" });
     }
@@ -5154,6 +5165,318 @@ protectedRouter.get("/subscriptions", requirePermission('manage_plans', 'manage_
         res.json({ success: true, summary: summary.rows[0], subscribers: subscribers.rows[0], money: money.rows[0], recent: recent.rows });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load subscriptions overview" });
+    }
+});
+
+// ============================================================================
+// REQUEST LOGS (Activity Logs screen) — every API call from BOTH the user app
+// and this admin panel, with encrypted-at-rest payloads. Filter by actor
+// (email/phone/name), type (admin/user), method, status, date range.
+// ============================================================================
+
+/**
+ * @swagger
+ * /admin/request-logs:
+ *   get:
+ *     summary: Query the encrypted API request log trail
+ *     tags: [Admin]
+ *     security: [ { bearerAuth: [] } ]
+ */
+protectedRouter.get("/request-logs", requirePermission("view_request_logs"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+      const {
+        type = "all", // all | admin | user
+        search = "",
+        method = "",
+        path = "",
+        status = "",
+        startDate = "",
+        endDate = "",
+        page = "1",
+        limit = "25",
+      } = req.query as Record<string, string>;
+
+      const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+      const limitNum = Math.min(200, Math.max(1, parseInt(String(limit), 10) || 25));
+      const offset = (pageNum - 1) * limitNum;
+
+      const where: string[] = [];
+      const params: any[] = [];
+      const push = (val: any) => {
+        params.push(val);
+        return `$${params.length}`;
+      };
+
+      if (type === "admin" || type === "user") {
+        where.push(`l.user_type = ${push(type)}`);
+      }
+      if (method) {
+        where.push(`l.method = ${push(String(method).toUpperCase())}`);
+      }
+      if (path) {
+        where.push(`l.path ILIKE ${push("%" + path + "%")}`);
+      }
+      if (status) {
+        // Accept a class (2xx/4xx/5xx) or an exact code (401).
+        const statusStr = String(status);
+        const classMatch = statusStr.match(/^([2-5])xx$/i);
+        if (classMatch) {
+          const lo = Number(classMatch[1]) * 100;
+          where.push(`l.status_code >= ${lo} AND l.status_code < ${lo + 100}`);
+        } else if (/^\d{3}$/.test(statusStr)) {
+          where.push(`l.status_code = ${push(Number(statusStr))}`);
+        }
+      }
+      if (startDate) {
+        where.push(`l.created_at >= ${push(`${startDate} 00:00:00`)}::timestamptz`);
+      }
+      if (endDate) {
+        where.push(`l.created_at <= ${push(`${endDate} 23:59:59`)}::timestamptz`);
+      }
+      const s = String(search || "").trim();
+      if (s) {
+        const like = `%${s}%`;
+        // Actor search spans business users (users table) and platform admins.
+        where.push(
+          `(
+            u.email ILIKE ${push(like)} OR u.phone ILIKE ${push(like)} OR u.name ILIKE ${push(like)}
+            OR pa.email ILIKE ${push(like)} OR pa.name ILIKE ${push(like)}
+            OR l.path ILIKE ${push(like)}
+          )`,
+        );
+      }
+
+      const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+      const totalRes = await query(
+        `SELECT COUNT(*)::int AS total
+         FROM api_request_logs l
+         LEFT JOIN users u ON u.id = l.user_id
+         LEFT JOIN platform_admins pa ON pa.id = l.user_id
+         ${whereSql}`,
+        params,
+      );
+      const total = totalRes.rows[0]?.total || 0;
+
+      const logsRes = await query(
+        `SELECT l.id, l.user_type AS "userType", l.user_id AS "userId", l.business_id AS "businessId",
+                l.method, l.path, l.status_code AS "statusCode", l.duration_ms AS "durationMs",
+                l.ip, l.user_agent AS "userAgent",
+                (l.request_payload IS NOT NULL OR l.response_payload IS NOT NULL) AS "hasPayload",
+                l.encrypted,
+                l.created_at AS "createdAt",
+                u.name AS "userName", u.email AS "userEmail", u.phone_number AS "userPhone",
+                pa.email AS "adminEmail", pa.name AS "adminName"
+         FROM api_request_logs l
+         LEFT JOIN users u ON u.id = l.user_id
+         LEFT JOIN platform_admins pa ON pa.id = l.user_id
+         ${whereSql}
+         ORDER BY l.created_at DESC
+         LIMIT ${limitNum} OFFSET ${offset}`,
+        params,
+      );
+
+      const logs = logsRes.rows.map((r: any) => ({
+        ...r,
+        userEmail: r.userEmail || r.adminEmail || null,
+        userName: r.userName || r.adminName || null,
+        adminEmail: undefined,
+        adminName: undefined,
+      }));
+
+      res.json({
+        success: true,
+        data: { logs, total, page: pageNum, pages: Math.max(1, Math.ceil(total / limitNum)) },
+      });
+    } catch (error: any) {
+      console.error("Admin request-logs list error:", error);
+      res.status(500).json({ success: false, error: error.message || "Failed to load request logs" });
+    }
+  });
+
+protectedRouter.get("/request-logs/stats", requirePermission("view_request_logs"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+      const result = await query(`
+        SELECT
+          COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)::int AS today,
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE user_type = 'admin')::int AS "adminActions",
+          COUNT(*) FILTER (WHERE user_type = 'user')::int AS "userActions",
+          COUNT(*) FILTER (WHERE status_code >= 400 AND created_at >= NOW() - INTERVAL '24 hours')::int AS "errors24h"
+        FROM api_request_logs
+      `);
+      res.json({ success: true, data: result.rows[0] || { today: 0, total: 0, adminActions: 0, userActions: 0, errors24h: 0 } });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "Failed to load request log stats" });
+    }
+  });
+
+protectedRouter.get("/request-logs/:id", requirePermission("view_request_logs"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+      const { id } = req.params;
+      const logRes = await query(
+        `SELECT l.*, u.name AS "userName", u.email AS "userEmail", u.phone AS "userPhone",
+                pa.email AS "adminEmail", pa.name AS "adminName"
+         FROM api_request_logs l
+         LEFT JOIN users u ON u.id = l.user_id
+         LEFT JOIN platform_admins pa ON pa.id = l.user_id
+         WHERE l.id = $1`,
+        [id],
+      );
+      if (logRes.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Log entry not found" });
+      }
+      const row = logRes.rows[0];
+      res.json({
+        success: true,
+        data: {
+          ...row,
+          userType: row.user_type,
+          userId: row.user_id,
+          businessId: row.business_id,
+          statusCode: row.status_code,
+          durationMs: row.duration_ms,
+          userAgent: row.user_agent,
+          userEmail: row.userEmail || row.adminEmail || null,
+          userName: row.userName || row.adminName || null,
+          createdAt: row.created_at,
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "Failed to load request log" });
+    }
+  });
+
+/**
+ * Decrypt a single log entry's request/response payloads. Requires the
+ * `decrypt_request_logs` permission (super-admins bypass). The response
+ * contains the PLAINTEXT bodies — this is the ONLY place the platform
+ * exposes them.
+ */
+protectedRouter.post("/request-logs/:id/decrypt", requirePermission("decrypt_request_logs"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+      const { id } = req.params;
+      const logRes = await query(`SELECT * FROM api_request_logs WHERE id = $1`, [id]);
+      if (logRes.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Log entry not found" });
+      }
+      const row = logRes.rows[0];
+      if (!row.encrypted) {
+        return res.json({
+          success: true,
+          data: { requestBody: row.request_payload, responseBody: row.response_payload },
+        });
+      }
+      const { decryptString } = await import("../lib/payload-crypto");
+      const requestBody = row.request_payload ? decryptString(row.request_payload) : null;
+      const responseBody = row.response_payload ? decryptString(row.response_payload) : null;
+      if (row.request_payload && requestBody === null) {
+        return res.status(409).json({
+          success: false,
+          error: "Payload cannot be decrypted with the current PAYLOAD_ENCRYPTION_KEY (key may have been rotated)",
+          code: "DECRYPT_KEY_MISMATCH",
+        });
+      }
+      res.json({ success: true, data: { requestBody, responseBody } });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "Failed to decrypt request log" });
+    }
+  });
+
+
+// ============================================================================
+// LOCKED / BLOCKED ACCOUNTS — login lockout escalation. 5 failed passwords
+// lock an account for 30 minutes; after 3 lock cycles the account is blocked
+// until support (here) resolves it.
+// ============================================================================
+
+protectedRouter.get("/locked-accounts", requirePermission("view_dashboard"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { search = "", status = "all" } = req.query as Record<string, string>;
+        const params: any[] = [];
+        const where: string[] = [];
+        let having = "";
+        if (status === "blocked") {
+            where.push("u.account_blocked = TRUE");
+        } else if (status === "locked") {
+            where.push("u.account_blocked = FALSE AND u.locked_until > NOW()");
+        } else if (status === "attempts") {
+            where.push("u.account_blocked = FALSE AND (u.locked_until IS NULL OR u.locked_until <= NOW()) AND u.failed_login_attempts > 0");
+        } else {
+            where.push("(u.account_blocked = TRUE OR u.locked_until > NOW() OR u.failed_login_attempts > 0)");
+        }
+        if (search) {
+            params.push(`%${search}%`);
+            where.push(`(u.email ILIKE $${params.length} OR u.name ILIKE $${params.length})`);
+        }
+        having = where.length ? `WHERE ${where.join(" AND ")}` : "";
+        const result = await query(
+            `SELECT u.id, u.email, u.name, u.business_id as "businessId",
+                    u.failed_login_attempts AS "failedAttempts",
+                    u.lock_count AS "lockCount",
+                    u.locked_until AS "lockedUntil",
+                    u.account_blocked AS "blocked",
+                    u.blocked_at AS "blockedAt",
+                    (SELECT MAX(la.created_at) FROM login_attempts la WHERE la.email = u.email) AS "lastLoginAt",
+                    CASE
+                        WHEN u.account_blocked THEN 'blocked'
+                        WHEN u.locked_until > NOW() THEN 'locked'
+                        ELSE 'failed_attempts'
+                    END AS status
+             FROM users u
+             ${having}
+             ORDER BY u.account_blocked DESC, u.locked_until DESC NULLS LAST, u.failed_login_attempts DESC
+             LIMIT 200`,
+            params,
+        );
+        res.json({ success: true, data: { accounts: result.rows } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load locked accounts" });
+    }
+});
+
+/**
+ * POST /admin/locked-accounts/:userId/resolve — unlock AND unblock: clears the
+ * attempt counter, the lock window and the permanent block flag.
+ */
+protectedRouter.post("/locked-accounts/:userId/resolve", requirePermission("manage_team"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { userId } = req.params;
+        const result = await query(
+            `UPDATE users
+             SET failed_login_attempts = 0,
+                 locked_until = NULL,
+                 account_blocked = FALSE,
+                 blocked_at = NULL,
+                 lock_count = 0
+             WHERE id = $1
+             RETURNING id, email, name, account_blocked, locked_until, lock_count`,
+            [userId],
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Account not found" });
+        }
+        const row = result.rows[0];
+        // Notify the user their access was restored (best-effort).
+        try {
+            const { sendEmail } = await import("../services/email");
+            const logoUrl = process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
+            await sendEmail(
+                row.email,
+                row.name || "User",
+                "Your Metricorex account has been reactivated",
+                `<html><body style="font-family:'Segoe UI',Tahoma,sans-serif;background:#f3f4f6;padding:40px 0;">
+                 <div style="max-width:600px;margin:0 auto;background:#fff;padding:40px;border-radius:12px;">
+                 <div style="text-align:center;margin-bottom:24px;"><img src="${logoUrl}" alt="Metricorex" style="max-width:160px;"/></div>
+                 <h1 style="color:#111827;font-size:22px;text-align:center;">Account Reactivated</h1>
+                 <p style="color:#374151;font-size:15px;line-height:1.6;">Good news — our support team has reactivated your account after the recent sign-in issues. You can sign in again now.</p>
+                 <p style="color:#6b7280;font-size:13px;">If you did not request this, please contact support immediately.</p>
+                 </div></body></html>`,
+            );
+        } catch {}
+        res.json({ success: true, message: "Account unlocked and reactivated", data: row });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to resolve account" });
     }
 });
 

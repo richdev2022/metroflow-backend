@@ -1037,4 +1037,106 @@ router.post("/employees/verify-bulk", authenticateToken, checkSubscriptionStatus
     }
 });
 
+
+/**
+ * GET /payroll/employees/template — real .xlsx template with:
+ *   - "Employees" sheet (16 columns matching the web importer) with example
+ *     NGN + USD rows,
+ *   - "Banks" sheet listing every Nigerian bank (name + 6-digit NIP code),
+ *   - a SEARCHABLE DROPDOWN (Excel data validation) on the Bank Name column,
+ *   - a VLOOKUP formula auto-filling Bank Code from the selected bank name
+ *     (users can still type a code manually — validation is advisory).
+ * SheetJS (xlsx) cannot write data validations, hence exceljs.
+ */
+router.get("/employees/template", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), async (req: AuthenticatedRequest, res) => {
+    try {
+        const ExcelJS = (await import("exceljs")).default;
+        const { BANK_LIST } = await import("../utils/bank-codes");
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = "MetriCorex";
+        wb.created = new Date();
+
+        // ---- Banks sheet (Name in col A, Code in col B for VLOOKUP) ----
+        const banksWs = wb.addWorksheet("Banks", { state: "visible" });
+        banksWs.addRow(["Bank Name", "Bank Code"]);
+        banksWs.getRow(1).font = { bold: true };
+        banksWs.getColumn(1).width = 38;
+        banksWs.getColumn(2).width = 14;
+        for (const bank of BANK_LIST) {
+            banksWs.addRow([bank.name, bank.code]);
+        }
+
+        // ---- Employees sheet ----
+        const HEADERS = ["Name", "Email", "Phone Number", "Department", "Job Title", "Salary", "Currency",
+            "Bank Code", "Account Number", "Account Name", "Bank Name", "SWIFT Code", "Routing Number",
+            "Beneficiary Address", "Beneficiary City", "Beneficiary Country"];
+        const ws = wb.addWorksheet("Employees");
+        const headerRow = ws.addRow(HEADERS);
+        headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+        headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4353FF" } };
+        headerRow.height = 22;
+        const widths = [22, 28, 16, 18, 18, 12, 10, 12, 18, 24, 30, 12, 14, 34, 16, 18];
+        widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+        // Example rows (NGN uses a real 6-digit NIP code; USD shows the intl fields)
+        ws.addRow(["Ada Obi", "ada@example.com", "08012345678", "Engineering", "Developer", 450000, "NGN",
+            "058", "0123456789", "Ada Obi", "Guaranty Trust Bank", "", "", "", "", ""]);
+        ws.addRow(["John Doe", "john@example.com", "+15550123456", "Finance", "Accountant", 1200, "USD",
+            "", "219133096568", "John Doe", "Bank of America", "BOFAUS3N", "026009593", "1 Main Street", "New York", "US"]);
+
+        const lastBankRow = banksWs.rowCount;
+        const lastDataRow = 500;
+
+        // Bank Name (col K=11) dropdown sourced from the Banks sheet — advisory:
+        // showErrorMessage:false keeps the dropdown suggestions while still
+        // allowing free typing for international banks.
+        for (let r = 4; r <= lastDataRow; r++) {
+            ws.getCell(`K${r}`).dataValidation = {
+                type: "list",
+                allowBlank: true,
+                formulae: [`Banks!$A$2:$A$${lastBankRow}`],
+                showErrorMessage: false,
+            };
+            // Bank Code (col H=8) auto-fills from the picked bank name.
+            ws.getCell(`H${r}`).value = {
+                formula: `IF($K${r}="","",IFERROR(VLOOKUP($K${r},Banks!$A:$B,2,FALSE),""))`,
+            } as any;
+            // Currency (col G=7) suggestion list.
+            ws.getCell(`G${r}`).dataValidation = {
+                type: "list",
+                allowBlank: true,
+                formulae: ['"NGN,USD"'],
+                showErrorMessage: false,
+            };
+        }
+
+        // Instructions sheet so users understand the dropdown + autofill.
+        const info = wb.addWorksheet("Instructions");
+        info.getColumn(1).width = 110;
+        [
+            "PAYROLL EMPLOYEES TEMPLATE — HOW TO USE",
+            "1. Fill the Employees sheet. One row per employee. Currency must be NGN or USD.",
+            "2. NGN rows: type the employee's bank name in 'Bank Name' — Excel suggests matching banks as you type (dropdown),",
+            "   and 'Bank Code' auto-fills. You may also type the 6-digit bank code manually.",
+            "3. USD rows: fill Bank Name, SWIFT Code (8 or 11 chars), Routing Number (9-digit ABA), Beneficiary Address, City and Country.",
+            "4. Account Number must be exactly 10 digits for NGN recipients.",
+            "5. Save the file and upload it back via 'Import Employees'.",
+            "6. The Banks sheet lists every supported Nigerian bank with its official NIP code — do not edit it.",
+        ].forEach((line, i) => {
+            const row = info.addRow([line]);
+            row.getCell(1).font = i === 0 ? { bold: true, size: 14 } : { size: 11 };
+        });
+
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", 'attachment; filename="payroll_employees_template.xlsx"');
+        res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+        await wb.xlsx.write(res);
+        res.end();
+    } catch (error: any) {
+        console.error("Payroll template generation error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to generate payroll template" });
+    }
+});
+
 export default router;

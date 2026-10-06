@@ -1523,16 +1523,31 @@ router.get("/transactions", authenticateToken, async (req, res) => {
         const endDate = req.query.endDate as string;
         const reference = req.query.reference as string;
         const status = req.query.status as string;
+        const subscriberId = req.query.subscriber_id as string | undefined;
+        const subscriberEmail = req.query.subscriber_email as string | undefined;
 
         // Build query
         let queryText = `
-            SELECT t.*, p.name as plan_name 
+            SELECT t.*, p.name as plan_name
             FROM transactions t
             LEFT JOIN pricing_plans p ON t.plan_id = p.id
             WHERE t.business_id = $1
         `;
         const queryParams: any[] = [businessId];
         let paramIndex = 2;
+
+        // Per-subscription drill-down: filter by the customer subscriber
+        // (transactions written by the subscription engine carry the charge
+        // reference prefix and subscriber linkage via subscription_charges).
+        if (subscriberId || subscriberEmail) {
+            queryText += ` AND t.reference IN (
+                SELECT c.reference FROM subscription_charges c
+                JOIN customer_subscribers s ON s.id = c.subscriber_id
+                WHERE c.subscriber_id = $${paramIndex} OR s.email = $${paramIndex + 1}
+            )`;
+            queryParams.push(subscriberId || null, subscriberEmail || null);
+            paramIndex += 2;
+        }
 
         if (startDate) {
             queryText += ` AND t.created_at >= $${paramIndex}`;

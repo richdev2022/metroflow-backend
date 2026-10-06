@@ -9,7 +9,11 @@ import { accountLookup, processAllPending, reverseFailedTransfer, validateIntlBe
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
-import { getIntlTransferConfig } from "../services/app-config";
+import { getIntlTransferConfig, effectiveMarkupPercent } from "../services/app-config";
+
+/** Quote lock window (seconds) — clients show a countdown and must re-quote
+ *  when it lapses. The initiation path re-quotes server-side regardless. */
+const INTL_QUOTE_TTL_SECONDS = Math.max(30, parseInt(process.env.INTL_QUOTE_TTL_SECONDS || "60", 10) || 60);
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
@@ -47,6 +51,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       const fee = config.feePercent > 0
         ? Math.round(amount * (config.feePercent / 100) * 100) / 100
         : 0 + (config.feeFlat > 0 ? config.feeFlat : 0);
+      const expiresAt = new Date(Date.now() + INTL_QUOTE_TTL_SECONDS * 1000);
       return res.json({
         success: true,
         data: {
@@ -54,12 +59,14 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           destination_currency: destinationCurrency,
           amount,
           live_rate: 1,
-          markup_percent: config.markupPercent,
+          markup_percent: effectiveMarkupPercent(config),
           marked_up_rate: 1,
           receiving_amount: amount,
           fee,
           total_debit: Math.round((amount + fee) * 100) / 100,
           provider: 'internal',
+          expires_at: expiresAt.toISOString(),
+          expires_in_seconds: INTL_QUOTE_TTL_SECONDS,
         },
       });
     }
@@ -72,8 +79,11 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
     const { rate } = await getFlutterwaveTransferRate(amount, sourceCurrency, destinationCurrency);
     const config = await getIntlTransferConfig();
 
-    // Admin markup is added ON TOP of the live rate and shown to the user
-    const markedUpRate = rate * (1 + config.markupPercent / 100);
+    // Admin markup + ADMIN-ONLY SPREAD are merged into ONE effective markup —
+    // customers never see a separate spread line, the spread is captured
+    // inside the marked-up rate.
+    const effectiveMarkup = effectiveMarkupPercent(config);
+    const markedUpRate = rate * (1 + effectiveMarkup / 100);
     // The recipient receives the amount in destination currency at the marked-up rate
     // (the user asks to send `amount` in the DESTINATION currency, so the debit
     // is computed as amount / markedUpRate in source currency).
@@ -82,6 +92,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       (sourceDebit * (config.feePercent / 100) + config.feeFlat) * 100,
     ) / 100;
     const totalDebit = Math.round((sourceDebit + fee) * 100) / 100;
+    const expiresAt = new Date(Date.now() + INTL_QUOTE_TTL_SECONDS * 1000);
 
     res.json({
       success: true,
@@ -90,12 +101,14 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         destination_currency: destinationCurrency,
         amount,
         live_rate: rate,
-        markup_percent: config.markupPercent,
+        markup_percent: effectiveMarkup,
         marked_up_rate: Math.round(markedUpRate * 1000000) / 1000000,
         receiving_amount: amount,
         fee,
         total_debit: totalDebit,
         provider: 'flutterwave',
+        expires_at: expiresAt.toISOString(),
+        expires_in_seconds: INTL_QUOTE_TTL_SECONDS,
       },
     });
   } catch (error: any) {
@@ -441,10 +454,17 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // endpoint (source-currency total the user actually pays). Flutterwave's
     // international rails require the beneficiary's full address details.
     const isIntl = currency !== 'NGN';
-    if (isIntl && (!recipientAddress || !recipientCity || !recipientPostalCode || !recipientCountry)) {
+    // NGN payouts still require the bank code (schema allows empty for intl).
+    if (!isIntl && !String(bankCode || '').trim()) {
+      return res.status(400).json({ success: false, error: "Bank code is required for NGN transfers", code: "BANK_CODE_REQUIRED" });
+    }
+    // Postal code is OPTIONAL (the web/mobile epic + wallet forms collect
+    // street/city/country; FLW's meta builder only includes postal_code when
+    // provided). Street address, city and country remain required.
+    if (isIntl && (!recipientAddress || !recipientCity || !recipientCountry)) {
       return res.status(400).json({
         success: false,
-        error: "International payouts require the recipient's street address, city, postal code and country",
+        error: "International payouts require the recipient's street address, city and country",
         code: "BENEFICIARY_ADDRESS_REQUIRED",
       });
     }
@@ -522,7 +542,47 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
 
     // Validate Wallet (accept both snake_case and camelCase wallet id)
     let walletId = wallet_id || camelWalletId;
-    const neededCurrency = (dbDebitCurrency || currency).toUpperCase();
+    // Calculate Fee (international payouts use the intl_transfer fee config)
+    const fee = await calculateFee(amount, currency === 'NGN' ? 'transfer' : 'intl_transfer');
+
+    // SERVER-SIDE QUOTE ENFORCEMENT (intl): the client's debitAmount comes
+    // from a quote that may be STALE (rates move) or hand-crafted. Re-quote
+    // here with the live rate + markup + ADMIN SPREAD merged and clamp the
+    // debit to the authoritative server number (1.5% tolerance for rounding).
+    // This is also what makes the admin spread invisible-but-effective.
+    // Runs BEFORE the wallet guard so a client quote-less request resolves to
+    // the SOURCE-currency wallet (the FX debit is charged in NGN).
+    let finalDebitAmount = dbDebitAmount;
+    let finalDebitCurrency = dbDebitCurrency;
+    if (isIntl && !finalDebitAmount) {
+      finalDebitCurrency = 'NGN';
+      try {
+        const { rate } = await getFlutterwaveTransferRate(amount, 'NGN', currency);
+        const cfg = await getIntlTransferConfig();
+        const markedUp = rate * (1 + effectiveMarkupPercent(cfg) / 100);
+        const sourceDebit = amount / markedUp;
+        finalDebitAmount = Math.round((sourceDebit + fee) * 100) / 100;
+        console.log(`[transfers] intl server-side quote: ${amount} ${currency} -> debit ${finalDebitAmount} NGN (markup+spread ${effectiveMarkupPercent(cfg)}%)`);
+      } catch (quoteErr: any) {
+        // Live rate unavailable: reject rather than debit an arbitrary amount.
+        return res.status(503).json({ success: false, error: "Could not price this international transfer right now. Please request a new quote and try again.", code: "QUOTE_UNAVAILABLE" });
+      }
+    } else if (isIntl && finalDebitAmount && finalDebitCurrency === 'NGN') {
+      try {
+        const { rate } = await getFlutterwaveTransferRate(amount, 'NGN', currency);
+        const cfg = await getIntlTransferConfig();
+        const markedUp = rate * (1 + effectiveMarkupPercent(cfg) / 100);
+        const sourceDebit = amount / markedUp;
+        const serverTotal = Math.round((sourceDebit + fee) * 100) / 100;
+        if (Math.abs(finalDebitAmount - serverTotal) / serverTotal > 0.015) {
+          console.log(`[transfers] intl quote clamp: client=${finalDebitAmount} -> server=${serverTotal}`);
+          finalDebitAmount = serverTotal;
+        }
+      } catch (quoteErr: any) {
+        console.warn('[transfers] server-side intl re-quote failed, using client debitAmount:', quoteErr?.message);
+      }
+    }
+    const neededCurrency = (finalDebitCurrency || currency).toUpperCase();
     if (!walletId) {
       // Prefer a wallet in the currency we're actually paying out.
       // Search business wallets first, then the acting user's personal wallet
@@ -563,8 +623,6 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       }
     }
 
-    // Calculate Fee (international payouts use the intl_transfer fee config)
-    const fee = await calculateFee(amount, currency === 'NGN' ? 'transfer' : 'intl_transfer');
     const reference = genRef();
     const defaultProvider = await getActiveTransferProviderName();
 
@@ -578,7 +636,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
        recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
       RETURNING *`,
-      [businessId, reference, accountNumber, bankCode, accountName, amount, currency, dbDebitAmount, dbDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
+      [businessId, reference, accountNumber, bankCode, accountName, amount, currency, finalDebitAmount, finalDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
        recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, (recipientCountry || '').toUpperCase() || null, bankName || null, swiftCode || null, routingNumber || null]
     );
 
@@ -895,7 +953,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
  */
 router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, validateBody(InitiateBulkTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { type, data, otp, pin } = req.body;
+    const { type, data, otp, pin, items, epicId } = req.body;
     // Accept both snake_case and camelCase source wallet id (validation schema
     // allows sourceWalletId but the handler previously only read source_wallet_id)
     const source_wallet_id = req.body.source_wallet_id || req.body.sourceWalletId;
@@ -978,19 +1036,91 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
     // 1. Prepare transfers based on type
     if (type === 'Epic') {
-      // data.items: Array of { amount, bankCode, accountNumber, accountName, remark }
-      if (!Array.isArray(data?.items)) {
+      // New contract: top-level `items` (+ `epicId`). Legacy clients still
+      // send `data.items` — accept both so no client breaks on deploy.
+      const epicItems: any[] = Array.isArray(items)
+        ? items
+        : Array.isArray((data as any)?.items)
+          ? (data as any).items
+          : null;
+      if (!epicItems) {
         return res.status(400).json({ success: false, error: "Items array required for Epic type" });
       }
-      transfersToQueue = await Promise.all(data.items.map(async (item: any) => ({
-        ...item,
-        sourceType: 'Epic',
-        sourceId: null,
-        debitAmount: item.debitAmount || item.debit_amount || null,
-        debitCurrency: item.debitCurrency || item.debit_currency || null,
-        fee: await calculateFee(item.amount, (item.currency || 'NGN').toUpperCase() === 'NGN' ? 'transfer' : 'intl_transfer')
-      })));
+      try {
+        transfersToQueue = await Promise.all(
+        epicItems.map(async (item: any) => {
+          const itemCurrency = String(item.currency || 'NGN').toUpperCase();
+          const isIntlItem = itemCurrency !== 'NGN';
+          const bankCode = String(item.bankCode || '').trim();
+          const accountNumber = String(item.accountNumber || '').trim();
 
+          // PER-RECIPIENT VALIDATION (pre-debit, pre-queue):
+          //  - NGN: bank code + 10-digit account are mandatory.
+          //  - USD/GBP/EUR: Flutterwave has no account resolution — validate
+          //    the corridor's routing data up-front so a bad beneficiary
+          //    never reaches disbursement ("Invalid account number" + a
+          //    debited wallet was the old failure mode).
+          if (!isIntlItem) {
+            if (!bankCode) {
+              throw Object.assign(new Error(`Recipient ${item.accountName || accountNumber}: bank code is required for NGN transfers`), { statusCode: 400 });
+            }
+            if (!/^\d{10}$/.test(accountNumber)) {
+              throw Object.assign(new Error(`Recipient ${item.accountName || accountNumber}: NGN account numbers must be exactly 10 digits`), { statusCode: 400 });
+            }
+          } else {
+            const routingNumber = item.recipientRoutingNumber || item.routingNumber || '';
+            const swiftCode = item.recipientSwiftCode || item.swiftCode || '';
+            const bankName = item.recipientBankName || item.bankName || '';
+            const intlCheck = validateIntlBeneficiary(itemCurrency, {
+              routingNumber,
+              swiftCode,
+              bankName,
+              accountType: item.accountType || item.account_type,
+              accountNumber,
+              beneficiaryAddress: item.recipientAddress,
+              beneficiaryPostalCode: item.recipientPostalCode,
+            });
+            if (!intlCheck.valid) {
+              throw Object.assign(
+                new Error(`Recipient ${item.accountName || accountNumber}: ${intlCheck.error}`),
+                { statusCode: 400, code: intlCheck.code },
+              );
+            }
+          }
+
+          return {
+            ...item,
+            currency: itemCurrency,
+            bankCode,
+            accountNumber,
+            accountName: item.accountName || '',
+            recipientBankName: item.recipientBankName || item.bankName || null,
+            recipientSwiftCode: item.recipientSwiftCode || item.swiftCode || null,
+            recipientRoutingNumber: item.recipientRoutingNumber || item.routingNumber || null,
+            recipientAddress: item.recipientAddress || null,
+            recipientCity: item.recipientCity || null,
+            recipientState: item.recipientState || null,
+            recipientPostalCode: item.recipientPostalCode || null,
+            recipientCountry: (item.recipientCountry || '').toUpperCase() || null,
+            beneficiaryEmail: item.beneficiaryEmail || null,
+            accountType: item.accountType || item.account_type || null,
+            epicId: epicId || null,
+            sourceType: 'Epic',
+            sourceId: null,
+            debitAmount: item.debitAmount || item.debit_amount || null,
+            debitCurrency: item.debitCurrency || item.debit_currency || null,
+            fee: await calculateFee(item.amount, isIntlItem ? 'intl_transfer' : 'transfer'),
+          };
+        }),
+      );
+      } catch (epicErr: any) {
+        // Per-recipient validation failures are CLIENT errors — surface a
+        // precise 400 naming the offending recipient instead of a 500.
+        if (epicErr?.statusCode === 400) {
+          return res.status(400).json({ success: false, error: epicErr.message, code: epicErr.code });
+        }
+        throw epicErr;
+      }
     } else if (type === 'Salary') {
       // Pay all active employees with salary_amount > 0.
       // Only employees with VERIFIED recipient account details are queued;
@@ -1098,8 +1228,9 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
 
       const transferRes = await query(
         `INSERT INTO transfer_queue 
-        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15)
+        (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee,
+         recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         RETURNING *`,
         [
           businessId,
@@ -1116,7 +1247,15 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.sourceId,
           walletId,
           t.payment_provider || defaultProvider,
-          t.fee
+          t.fee,
+          t.recipientAddress || null,
+          t.recipientCity || null,
+          t.recipientState || null,
+          t.recipientPostalCode || null,
+          t.recipientCountry || null,
+          t.recipientBankName || null,
+          t.recipientSwiftCode || null,
+          t.recipientRoutingNumber || null,
         ]
       );
       

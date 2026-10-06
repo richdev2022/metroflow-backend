@@ -90,12 +90,44 @@ export function payloadEncryptionMiddleware(req: Request, res: Response, next: N
     res.setHeader("x-mfv-enc", "1");
     const originalJson = res.json.bind(res);
     (res as any).json = (body: any) => {
+      // Express's res.send delegates plain objects to res.json, and res.json
+      // calls res.send internally — either wrapper may therefore receive an
+      // already-encrypted envelope. Skip it: exactly one wrap, always.
+      if (looksLikeEncryptedEnvelope(body)) {
+        return originalJson(body);
+      }
       try {
         if (req.mfvEnc) req.mfvEnc.plaintextResponse = body;
         return originalJson(encryptJson(body ?? null));
       } catch {
         // Never fail a response because encryption hiccupped.
         return originalJson(body);
+      }
+    };
+    // Some legacy routes answer via res.send(obj) instead of res.json(obj) —
+    // wrap send as well so those responses are not plaintext leaks. Express's
+    // res.json delegates to res.send internally, so the send wrapper MUST
+    // skip already-encrypted envelopes (no double wrap) plus binary/string
+    // payloads (files, HTML, plain text).
+    const originalSend = res.send.bind(res);
+    (res as any).send = (body: any) => {
+      const wrappable =
+        body !== null &&
+        body !== undefined &&
+        typeof body === "object" &&
+        !Buffer.isBuffer(body) &&
+        !(body instanceof Uint8Array) &&
+        !looksLikeEncryptedEnvelope(body);
+      if (!wrappable) {
+        return originalSend(body);
+      }
+      try {
+        if (req.mfvEnc && req.mfvEnc.plaintextResponse === undefined) {
+          req.mfvEnc.plaintextResponse = body;
+        }
+        return originalSend(encryptJson(body));
+      } catch {
+        return originalSend(body);
       }
     };
   }

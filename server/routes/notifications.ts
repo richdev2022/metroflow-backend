@@ -359,7 +359,19 @@ export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, 
       [userId, businessId || null, fcm_token, platform || null, device_name || null, app_version || null],
     );
 
-    res.json({ success: true, message: "Device registered for push notifications" });
+    // Diagnostic counters so "notifications don't arrive" is diagnosable from
+    // the client: how many devices this account can be pushed to right now.
+    let deviceCount = 1;
+    try {
+      const countRes = await query(`SELECT COUNT(*)::int AS c FROM user_devices WHERE user_id = $1`, [userId]);
+      deviceCount = countRes.rows[0]?.c ?? 1;
+    } catch {}
+
+    res.json({
+      success: true,
+      message: "Device registered for push notifications",
+      data: { devices: deviceCount, platform: platform || null },
+    });
   } catch (error: any) {
     console.error("Register device error:", error);
     res.status(500).json({ success: false, error: "Failed to register device" });

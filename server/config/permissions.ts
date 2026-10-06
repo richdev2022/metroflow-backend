@@ -200,4 +200,14 @@ export const AVAILABLE_PERMISSIONS = [
     name: "Manage Recurring Billing",
     description: "Create subscription plans and manage customer subscribers",
   },
+  {
+    id: "view_request_logs",
+    name: "View Request Logs",
+    description: "Access to the Activity Logs screen (all user and admin API requests)",
+  },
+  {
+    id: "decrypt_request_logs",
+    name: "Decrypt Request Logs",
+    description: "Decrypt logged request and response payloads for a specific request",
+  },
 ];

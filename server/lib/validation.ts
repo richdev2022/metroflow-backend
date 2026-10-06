@@ -17,7 +17,9 @@ export const ToggleOtpSchema = z.object({
 });
 
 export const InitiateSingleTransferSchema = z.object({
-  bankCode: z.string().min(1, "Bank code is required"),
+  // Optional: international (USD/GBP/EUR) payouts have no NGN bank code — the
+  // route validates bankCode presence per-currency instead.
+  bankCode: z.string().optional(),
   accountNumber: z.string().min(1, "Account number is required"),
   accountName: z.string().optional(),
   amount: z.union([z.number(), z.string().transform(Number)]).refine((v) => v > 0, "Amount must be positive"),
@@ -49,18 +51,66 @@ export const InitiateBulkTransferSchema = z.object({
   pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
   sourceWalletId: z.string().optional(),
   source_wallet_id: z.string().optional(),
-  data: z.object({
-    items: z.array(
+  /** Epic id the payout belongs to (new web/mobile contract). */
+  epicId: z.string().optional(),
+  /** New-contract top-level items; legacy clients still send data.items. */
+  items: z
+    .array(
       z.object({
         amount: z.union([z.number(), z.string().transform(Number)]).refine((v) => v > 0, "Amount must be positive"),
-        bankCode: z.string().min(1, "Bank code is required"),
+        bankCode: z.string().optional(),
         accountNumber: z.string().min(1, "Account number is required"),
         accountName: z.string().optional(),
         currency: z.string().length(3).optional(),
         remark: z.string().optional(),
-      })
-    ).optional(),
-  }).optional(),
+        // International (USD/GBP/EUR) beneficiary fields.
+        recipientBankName: z.string().optional(),
+        bankName: z.string().optional(),
+        recipientSwiftCode: z.string().optional(),
+        swiftCode: z.string().optional(),
+        recipientRoutingNumber: z.string().optional(),
+        routingNumber: z.string().optional(),
+        recipientAddress: z.string().optional(),
+        recipientCity: z.string().optional(),
+        recipientState: z.string().optional(),
+        recipientPostalCode: z.string().optional(),
+        recipientCountry: z.string().optional(),
+        beneficiaryEmail: z.string().email().optional(),
+        accountType: z.string().max(20).optional(),
+        account_type: z.string().max(20).optional(),
+      }),
+    )
+    .optional(),
+  data: z
+    .object({
+      items: z
+        .array(
+          z.object({
+            amount: z.union([z.number(), z.string().transform(Number)]).refine((v) => v > 0, "Amount must be positive"),
+            bankCode: z.string().optional(),
+            accountNumber: z.string().min(1, "Account number is required"),
+            accountName: z.string().optional(),
+            currency: z.string().length(3).optional(),
+            remark: z.string().optional(),
+            recipientBankName: z.string().optional(),
+            bankName: z.string().optional(),
+            recipientSwiftCode: z.string().optional(),
+            swiftCode: z.string().optional(),
+            recipientRoutingNumber: z.string().optional(),
+            routingNumber: z.string().optional(),
+            recipientAddress: z.string().optional(),
+            recipientCity: z.string().optional(),
+            recipientState: z.string().optional(),
+            recipientPostalCode: z.string().optional(),
+            recipientCountry: z.string().optional(),
+            beneficiaryEmail: z.string().email().optional(),
+            accountType: z.string().max(20).optional(),
+            account_type: z.string().max(20).optional(),
+          }),
+        )
+        .optional(),
+    })
+    .optional(),
 });
 
 export type CreateTransactionPinInput = z.infer<typeof CreateTransactionPinSchema>;

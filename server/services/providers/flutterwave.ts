@@ -1,6 +1,7 @@
 
 import axios from "axios";
 import crypto from "crypto";
+import fs from "fs";
 import {
   Provider,
   VirtualAccountRequest,
@@ -30,6 +31,32 @@ import { BANK_LIST, Bank } from "../../utils/bank-codes";
  */
 
 const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
+
+/**
+ * MOCK MODE (local E2E tests only): FLW_MOCK=true or FLW_SECRET_KEY="mock"
+ * replaces every outbound Flutterwave call with deterministic local behaviour:
+ *   - rates return a fixed 1550 NGN/USD,
+ *   - account resolution returns a canned receiver name,
+ *   - initiateTransfer always queues as PENDING,
+ *   - verifyTransfer reads the outcome for a reference from
+ *     /tmp/flw_mock_outcomes.json ("successful" | "failed"), default pending.
+ * NEVER enabled in production (the flag is ignored unless explicitly set).
+ */
+export const FLW_MOCK = process.env.FLW_MOCK === "true" || FLW_SECRET_KEY === "mock";
+const FLW_MOCK_OUTCOMES_FILE = process.env.FLW_MOCK_OUTCOMES_FILE || "/tmp/flw_mock_outcomes.json";
+function flwMockOutcome(reference: string): string {
+  try {
+    const outcomes = JSON.parse(fs.readFileSync(FLW_MOCK_OUTCOMES_FILE, "utf8"));
+    return String(outcomes?.[reference] || "pending").toLowerCase();
+  } catch {
+    return "pending";
+  }
+}
+function flwMockId(reference: string): number {
+  let h = 0;
+  for (let i = 0; i < reference.length; i++) h = (h * 31 + reference.charCodeAt(i)) >>> 0;
+  return 990000 + (h % 9999);
+}
 // Public key: NOT used for server-to-server REST calls (secret key is the
 // Bearer token). It is required CLIENT-SIDE for Inline checkout (v3.js
 // `FlutterwaveCheckout`) and the mobile SDKs. Served to clients via the
@@ -283,6 +310,20 @@ export const flutterwaveProvider: Provider = {
    */
   async initiateTransfer(data: SingleTransferRequest) {
     try {
+      if (FLW_MOCK) {
+        return {
+          status: "success",
+          message: "Transfer Queued Successfully",
+          data: {
+            id: flwMockId(data.transactionReference),
+            status: "PENDING",
+            reference: data.transactionReference,
+            amount: data.amount,
+            currency: data.currencyId || "NGN",
+            mock: true,
+          },
+        };
+      }
       const payload: Record<string, unknown> = {
         account_bank: data.bankCode,
         account_number: data.accountNumber,
@@ -307,12 +348,11 @@ export const flutterwaveProvider: Provider = {
         if (data.routingNumber) meta.routing_number = data.routingNumber;
         if (data.swiftCode) meta.swift_code = data.swiftCode.toUpperCase();
         if (data.bankName) meta.bank_name = data.bankName;
-        // account_type is REQUIRED for USD (checking|depository) and GBP
+        // account_type for USD (checking|savings|depository→checking) and GBP
         // (personal|corporate). Default sensibly when the client did not send it.
         if ((data.currencyId || "").toUpperCase() === "USD") {
-          meta.account_type = ["checking", "depository"].includes(String(data.accountType || "").toLowerCase())
-            ? String(data.accountType).toLowerCase()
-            : "checking";
+          const usdType = String(data.accountType || "").toLowerCase();
+          meta.account_type = usdType === "savings" ? "savings" : "checking";
         } else if ((data.currencyId || "").toUpperCase() === "GBP") {
           meta.account_type = ["personal", "corporate"].includes(String(data.accountType || "").toLowerCase())
             ? String(data.accountType).toLowerCase()
@@ -361,6 +401,18 @@ export const flutterwaveProvider: Provider = {
    */
   async verifyTransfer(reference: string, providerMetadata?: any) {
     try {
+      if (FLW_MOCK) {
+        const outcome = flwMockOutcome(reference);
+        const id = flwMockId(reference);
+        if (outcome === "successful") {
+          return { status: "success", message: "Transfer fetched", data: { id, status: "SUCCESSFUL", reference, mock: true } };
+        }
+        if (outcome === "failed" || outcome === "reverted" || outcome === "canceled") {
+          const flwStatus = outcome === "failed" ? "FAILED" : outcome.toUpperCase();
+          return { status: "success", message: "Transfer fetched", data: { id, status: flwStatus, reference, complete_message: "DISBURSE FAILED: Mock provider failure", mock: true } };
+        }
+        return { status: "success", message: "Transfer fetched", data: { id, status: "PENDING", reference, mock: true } };
+      }
       // 1. If we stored the FLW transfer id, use it directly.
       const flwId =
         providerMetadata?.data?.id ||
@@ -573,6 +625,15 @@ export const flutterwaveProvider: Provider = {
    */
   async accountLookup(bankCode: string, accountNumber: string) {
     try {
+      if (FLW_MOCK) {
+        return {
+          status: "success",
+          data: {
+            account_number: accountNumber,
+            account_name: `MOCK RECEIVER ${accountNumber}`,
+          },
+        };
+      }
       const response = await flwClient.post("/v3/accounts/resolve", {
         account_bank: bankCode,
         account_number: accountNumber,
@@ -615,6 +676,14 @@ export async function getFlutterwaveTransferRate(
   destinationCurrency: string,
 ): Promise<{ rate: number; raw: any }> {
   try {
+    if (FLW_MOCK) {
+      // Deterministic test rates matching the real API's semantics: the rate
+      // CONVERTS source -> destination, i.e. USD-per-NGN (~1/1550), not the
+      // colloquial "1 USD = 1550 NGN".
+      const mockRates: Record<string, number> = { USD: 1 / 1550, GBP: 1 / 1900, EUR: 1 / 1680 };
+      const rate = mockRates[String(destinationCurrency).toUpperCase()] || 1 / 1550;
+      return { rate, raw: { mock: true } };
+    }
     const response = await flwClient.get("/v3/transfers/rates", {
       params: {
         amount: roundAmount(typeof amount === "string" ? parseFloat(amount) : amount),

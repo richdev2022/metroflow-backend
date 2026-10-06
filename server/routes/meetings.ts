@@ -1951,21 +1951,33 @@ export const joinMeeting: RequestHandler = async (
       `SELECT id FROM meeting_attendees WHERE meeting_id = $1 AND user_id = $2`,
       [actualId, userId],
     );
+    // Atomic upsert below; the SELECT remains only as a cheap pre-check for
+    // the waiting-room vs re-join branches.
+    await query(
+      `INSERT INTO meeting_attendees (meeting_id, user_id, status, joined_at)
+       VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
+       ON CONFLICT (meeting_id, user_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE meeting_attendees.joined_at END,
+         left_at = NULL`,
+      [actualId, userId, effectiveStatus],
+    );
     if (existingAttendee.rows.length === 0) {
+      // first join — nothing extra to do, the upsert handled it
+    } else if (effectiveStatus !== 'joined') {
+      // keep legacy behavior of leaving joined_at untouched for waiting users
+    }
+
+    // Lifecycle: first successful join moves a scheduled meeting to 'ongoing'
+    // and stamps the real start time (previously nothing set 'ongoing', so
+    // meeting:end's guarded UPDATE never fired and reports stayed 'scheduled').
+    if (effectiveStatus === 'joined' && meetingState.status === 'scheduled') {
       await query(
-        `INSERT INTO meeting_attendees (meeting_id, user_id, status) VALUES ($1, $2, $3)`,
-        [actualId, userId, effectiveStatus],
+        `UPDATE meetings SET status = 'ongoing', start_time = COALESCE(start_time, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [actualId],
       );
-    } else if (effectiveStatus === 'joined') {
-      await query(
-        `UPDATE meeting_attendees SET status = $1, joined_at = CURRENT_TIMESTAMP WHERE meeting_id = $2 AND user_id = $3`,
-        [effectiveStatus, actualId, userId],
-      );
-    } else {
-      await query(
-        `UPDATE meeting_attendees SET status = $1 WHERE meeting_id = $2 AND user_id = $3`,
-        [effectiveStatus, actualId, userId],
-      );
+      meetingState.status = 'ongoing';
+      if (!meetingState.start_time) meetingState.start_time = new Date();
     }
 
     // Return the full meeting object with enrichment + access flags

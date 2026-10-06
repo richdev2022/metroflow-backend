@@ -122,6 +122,7 @@ Produce meeting notes as STRICT JSON (no markdown fences, no commentary) with ex
   "importantTimestamps": [{"ts": "reference from transcript", "description": "what happened"}]
 }
 Rules: be factual, only use information from the transcript, write in the meeting's dominant language, keep action items concrete and assignable.
+The transcript lines are raw speech-to-text output: silently skip unintelligible fragments and obvious mis-transcriptions, interpret filler-heavy sentences by their clear meaning, and NEVER quote broken ASR text verbatim.
 
 TRANSCRIPT:
 ${transcript}`;

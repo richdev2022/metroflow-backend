@@ -1006,10 +1006,22 @@ export const login: RequestHandler = async (req, res) => {
     // Check for account lockout
     const lockoutStatus = await checkAccountLockout(input.email);
     if (lockoutStatus.locked) {
-      return res.status(403).json({
+      if (lockoutStatus.blocked) {
+        return res.status(403).json({
+          success: false,
+          code: "ACCOUNT_BLOCKED",
+          message: "This account has been blocked after repeated failed sign-in attempts. Please contact support to reactivate it.",
+        });
+      }
+      const retryAfterSeconds = lockoutStatus.lockoutEnd
+        ? Math.max(1, Math.ceil((lockoutStatus.lockoutEnd.getTime() - Date.now()) / 1000))
+        : 30 * 60;
+      return res.status(423).json({
         success: false,
-        message: "Account temporarily locked. Please try again later.",
+        code: "ACCOUNT_LOCKED",
+        message: `Too many failed attempts. Account temporarily locked — try again in ${Math.ceil(retryAfterSeconds / 60)} minute(s).`,
         lockoutEnd: lockoutStatus.lockoutEnd?.toISOString(),
+        retryAfterSeconds,
       });
     }
 

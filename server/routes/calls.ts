@@ -9,6 +9,7 @@ import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
 import { pushIncomingCall, pushMissedCall } from "../lib/call-push";
+import { roomManager } from "../lib/roomManager";
 import crypto from "crypto";
 import {
   buildCallingCredentials,
@@ -1016,26 +1017,17 @@ export const joinCall: RequestHandler = async (
     const useWaitingRoom = !!callState.waiting_room_enabled && !joiningAsHost;
     const effectiveStatus = useWaitingRoom ? 'waiting' : 'joined';
 
-    const existingParticipant = await query(
-      `SELECT id FROM call_participants WHERE call_id = $1 AND user_id = $2`,
-      [actualId, userId],
+    // Atomic upsert: re-joining (double tap, refresh, retry) refreshes the
+    // SAME row instead of racing check-then-insert into duplicates.
+    await query(
+      `INSERT INTO call_participants (call_id, user_id, status, joined_at)
+       VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
+       ON CONFLICT (call_id, user_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE call_participants.joined_at END,
+         left_at = NULL`,
+      [actualId, userId, effectiveStatus],
     );
-    if (existingParticipant.rows.length === 0) {
-      await query(
-        `INSERT INTO call_participants (call_id, user_id, status) VALUES ($1, $2, $3)`,
-        [actualId, userId, effectiveStatus],
-      );
-    } else if (effectiveStatus === 'joined') {
-      await query(
-        `UPDATE call_participants SET status = $1, joined_at = CURRENT_TIMESTAMP WHERE call_id = $2 AND user_id = $3`,
-        [effectiveStatus, actualId, userId],
-      );
-    } else {
-      await query(
-        `UPDATE call_participants SET status = $1 WHERE call_id = $2 AND user_id = $3`,
-        [effectiveStatus, actualId, userId],
-      );
-    }
 
     const callResult = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
@@ -1633,9 +1625,13 @@ export const addCallParticipants: RequestHandler = async (
       const participantResult = await query(
         `INSERT INTO call_participants (call_id, user_id, status)
          VALUES ($1, $2, 'invited')
+         ON CONFLICT (call_id, user_id) DO UPDATE SET status = 'invited', left_at = NULL
          RETURNING id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"`,
         [actualCallId, pid],
       );
+      // rows can be empty if a concurrent request already inserted — skip
+      // side effects for that participant instead of crashing.
+      if (!participantResult.rows[0]) continue;
       addedParticipants.push(participantResult.rows[0]);
 
       // Side effects are best-effort: a failing notification/email must never
@@ -2067,7 +2063,7 @@ export const generateCallInvite: RequestHandler = async (
 export const guestJoinCall: RequestHandler = async (req, res) => {
   try {
     const { code } = req.params;
-    const { name, password } = req.body || {};
+    const { name, password, guestId } = req.body || {};
 
     if (!code) {
       return res.status(400).json({ success: false, error: "Call code is required" });
@@ -2118,12 +2114,30 @@ export const guestJoinCall: RequestHandler = async (req, res) => {
     }
 
     const { generateGuestToken } = await import("../utils/guestTokens");
+
+    // --- Duplicate-join protection -------------------------------------
+    // 1) The client replays the guestId it stored for this room, so the
+    //    same browser/device keeps ONE identity across refreshes.
+    // 2) If another ACTIVE participant in this room already uses the same
+    //    display name, adopt its identity instead of minting a twin —
+    //    this is what previously let one user appear N times in the room.
+    let resolvedGuestId: string | undefined =
+      typeof guestId === "string" && guestId.startsWith("guest-") ? guestId : undefined;
+    if (!resolvedGuestId) {
+      const roster = roomManager.getParticipants(call.id);
+      const twin = roster.find(
+        (p) => (p.isGuest ?? true) && p.name.toLowerCase() === guestName.toLowerCase(),
+      );
+      if (twin) resolvedGuestId = twin.id;
+    }
+
     const { token, payload } = generateGuestToken({
       name: guestName,
       scope: "call",
       roomId: call.id,
       businessId: call.business_id,
       ttlMinutes: 6 * 60,
+      guestId: resolvedGuestId,
     });
 
     // Provider-specific media credentials for the guest (LiveKit JWT minted

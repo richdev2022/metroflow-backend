@@ -50,7 +50,19 @@ export const subscribePush: RequestHandler = async (req: AuthenticatedRequest, r
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
-    const { endpoint, keys, userAgent } = req.body || {};
+    // Accept BOTH wire shapes: the flat { endpoint, keys, userAgent } and the
+    // nested { subscription: { endpoint, keys, ... } } that PushManager
+    // subscribers naturally send (subscription.toJSON() wrapped). The first
+    // production deploy only understood the flat shape and answered 400 to
+    // every real browser client.
+    const body = (req.body || {}) as Record<string, any>;
+    const sub =
+      body.subscription && typeof body.subscription === "object"
+        ? (body.subscription as Record<string, any>)
+        : body;
+    const endpoint = sub.endpoint;
+    const keys = sub.keys;
+    const userAgent = sub.userAgent || body.userAgent;
     const p256dh = keys?.p256dh;
     const auth = keys?.auth;
     if (!endpoint || typeof endpoint !== "string" || !p256dh || !auth) {
@@ -111,7 +123,13 @@ export const unsubscribePush: RequestHandler = async (req: AuthenticatedRequest,
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
-    const { endpoint } = req.body || {};
+    // Accept flat { endpoint } AND nested { subscription: { endpoint } }.
+    const body = (req.body || {}) as Record<string, any>;
+    const sub =
+      body.subscription && typeof body.subscription === "object"
+        ? (body.subscription as Record<string, any>)
+        : body;
+    const endpoint = sub.endpoint;
     if (!endpoint || typeof endpoint !== "string") {
       return res.status(400).json({ success: false, error: "endpoint is required" });
     }

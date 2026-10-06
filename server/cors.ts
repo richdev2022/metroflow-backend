@@ -58,7 +58,7 @@ export function getCorsHeaders(origin?: string | null, requestedHeaders?: string
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS,PATCH",
     "Access-Control-Allow-Headers": requestedHeaders || DEFAULT_ALLOWED_HEADERS.join(","),
-    "Access-Control-Expose-Headers": "Content-Disposition,Content-Length",
+    "Access-Control-Expose-Headers": "Content-Disposition,Content-Length,x-mfv-enc",
     Vary: "Origin, Access-Control-Request-Headers",
   };
 
@@ -79,7 +79,7 @@ export const corsOptions: CorsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-  exposedHeaders: ["Content-Disposition", "Content-Length"],
+  exposedHeaders: ["Content-Disposition", "Content-Length", "x-mfv-enc"],
   preflightContinue: false,
   optionsSuccessStatus: 204,
 };

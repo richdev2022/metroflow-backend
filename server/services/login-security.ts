@@ -8,8 +8,11 @@ import { sendEmail } from "./email";
 const EMAIL_LOGO_URL =
   process.env.APP_LOGO_URL || "https://metricorex.com/Assets/logo.png";
 
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_FAILED_ATTEMPTS = Math.max(3, parseInt(process.env.LOGIN_MAX_FAILED_ATTEMPTS || "5", 10) || 5);
+const LOCKOUT_DURATION_MS = Math.max(1, parseInt(process.env.LOGIN_LOCK_MINUTES || "30", 10) || 30) * 60 * 1000;
+/** After this many 30-minute lock cycles, the account is BLOCKED until
+ *  support (platform admin) resolves it. */
+const BLOCK_AFTER_LOCKS = Math.max(2, parseInt(process.env.LOGIN_BLOCK_AFTER_LOCKS || "3", 10) || 3);
 
 export interface LoginAttempt {
   email: string;
@@ -45,9 +48,9 @@ export async function logLoginAttempt(attempt: LoginAttempt) {
   }
 }
 
-export async function checkAccountLockout(email: string): Promise<{ locked: boolean; lockoutEnd?: Date }> {
+export async function checkAccountLockout(email: string): Promise<{ locked: boolean; blocked?: boolean; lockoutEnd?: Date; lockCount?: number }> {
   const result = await query(
-    `SELECT locked_until FROM users WHERE email = $1`,
+    `SELECT locked_until, account_blocked, lock_count FROM users WHERE email = $1`,
     [email]
   );
 
@@ -55,9 +58,17 @@ export async function checkAccountLockout(email: string): Promise<{ locked: bool
     return { locked: false };
   }
 
-  const lockedUntil = result.rows[0].locked_until;
+  const row = result.rows[0];
+
+  // PERMANENT block (support must resolve) — takes precedence over the
+  // 30-minute window and never expires on its own.
+  if (row.account_blocked) {
+    return { locked: true, blocked: true, lockCount: row.lock_count || 0 };
+  }
+
+  const lockedUntil = row.locked_until;
   if (lockedUntil && new Date(lockedUntil) > new Date()) {
-    return { locked: true, lockoutEnd: new Date(lockedUntil) };
+    return { locked: true, lockoutEnd: new Date(lockedUntil), lockCount: row.lock_count || 0 };
   }
 
   return { locked: false };
@@ -80,15 +91,26 @@ export async function recordFailedLogin(email: string, ipAddress?: string, userA
   // Check if we need to lock the account
   if (attempts >= MAX_FAILED_ATTEMPTS) {
     const lockoutEnd = new Date(Date.now() + LOCKOUT_DURATION_MS);
-    await query(
+    // lock_count is CUMULATIVE across lock cycles: each completed
+    // MAX_FAILED_ATTEMPTS streak escalates. Once the account has been locked
+    // BLOCK_AFTER_LOCKS times, it is blocked PERMANENTLY — only platform
+    // support (admin unlock) can reactivate it.
+    const escalate = await query(
       `UPDATE users
-       SET locked_until = $2
-       WHERE email = $1`,
-      [email, lockoutEnd]
+       SET locked_until = $2,
+           failed_login_attempts = 0,
+           lock_count = COALESCE(lock_count, 0) + 1,
+           account_blocked = (COALESCE(lock_count, 0) + 1) >= $3,
+           blocked_at = CASE WHEN (COALESCE(lock_count, 0) + 1) >= $3 THEN CURRENT_TIMESTAMP ELSE blocked_at END
+       WHERE email = $1
+       RETURNING lock_count, account_blocked`,
+      [email, lockoutEnd, BLOCK_AFTER_LOCKS]
     );
+    const newLockCount = escalate.rows[0]?.lock_count || 1;
+    const nowBlocked = escalate.rows[0]?.account_blocked === true;
 
-    // Send lockout email notification
-    await sendAccountLockoutEmail(email, lockoutEnd, ipAddress, userAgent);
+    // Send lockout email notification (or the blocked notice)
+    await sendAccountLockoutEmail(email, lockoutEnd, ipAddress, userAgent, nowBlocked, newLockCount);
   }
 
   // Log the attempt
@@ -174,7 +196,7 @@ function parseUserAgent(userAgent?: string) {
   return { browser, device, os };
 }
 
-async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddress?: string, userAgent?: string) {
+async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddress?: string, userAgent?: string, blocked = false, lockCount = 1) {
   const lockoutEndLocal = lockoutEnd.toLocaleString();
   const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL;
   const logoUrl = EMAIL_LOGO_URL;
@@ -188,15 +210,17 @@ async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddres
             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
           </div>
           
-          <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Account Locked</h1>
+          <h1 style="color: #991b1b; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">${blocked ? "Account Blocked" : "Account Locked"}</h1>
 
           <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
-            Your account has been temporarily locked due to multiple failed login attempts.
+            ${blocked
+              ? `Your account has been <strong>permanently blocked</strong> after ${lockCount} consecutive lock cycles of failed sign-in attempts. For your security it can only be reactivated by our support team.`
+              : "Your account has been temporarily locked due to multiple failed login attempts."}
           </p>
           
-          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">
-            Your account will be unlocked at: <strong>${lockoutEndLocal}</strong>
-          </p>
+          ${blocked
+            ? `<p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">Please contact our support team to verify your identity and reactivate your account.</p>`
+            : `<p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px;">Your account will be unlocked at: <strong>${lockoutEndLocal}</strong></p>`}
           
           ${ipAddress ? `<p style="color: #374151; line-height: 1.6; margin-bottom: 8px;"><strong>IP Address:</strong> ${ipAddress}</p>` : ''}
           

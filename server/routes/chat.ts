@@ -235,10 +235,10 @@ export const getConversations: RequestHandler = async (
          END
          FROM chat_messages cm
          WHERE cm.conversation_id = cc.id
-         ORDER BY cm.created_at DESC LIMIT 1) as lastMessage,
+         ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
         (SELECT cm.created_at FROM chat_messages cm
          WHERE cm.conversation_id = cc.id
-         ORDER BY cm.created_at DESC LIMIT 1) as lastMessageAt,
+         ORDER BY cm.created_at DESC LIMIT 1) as "lastMessageAt",
         (
           SELECT COUNT(*)::int
           FROM chat_messages cm
@@ -963,6 +963,31 @@ export const sendMessage: RequestHandler = async (
               // businessId is required for that mirror to insert.
               { inApp: true, type: "chat_message", businessId },
             ).catch(() => {});
+
+            // Fallback channel: Web Push (VAPID) for callees whose BROWSER is
+            // subscribed but who have no socket on this worker. Mirrors the
+            // call-push behaviour so chat is not second-class on web.
+            try {
+              const { sendWebPushToUsers } = await import("../services/webPush");
+              await sendWebPushToUsers(
+                recipientIds,
+                {
+                  type: "chat-message",
+                  conversationId,
+                  messageId: message.id,
+                  senderId: userId,
+                  senderName: message.senderName || "Someone",
+                  conversationName: conversationName || "",
+                  conversationType,
+                  message: preview,
+                  title: pushTitle,
+                  body: pushBody,
+                },
+                { TTL: 3600, urgency: "normal" },
+              );
+            } catch (webPushError) {
+              console.error("Chat web-push error:", webPushError);
+            }
           }
         } catch (chatPushError) {
           console.error("Chat FCM push error:", chatPushError);

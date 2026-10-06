@@ -112,6 +112,12 @@ export interface PushPayload {
    * when the app was force-stopped, which is acceptable for cleanup pushes.
    */
   silent?: boolean;
+  /**
+   * ANDROID data-only: skip the FCM system-tray notification block so the
+   * app's own handlers render the rich UI (full-screen ringing call with
+   * Accept/Decline). iOS is unaffected — it keeps its APNs alert.
+   */
+  androidDataOnly?: boolean;
 }
 
 /**
@@ -253,8 +259,10 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
                 // Visible pushes: FCM posts the system-tray notification
                 // itself (heads-up, lock screen, channel sound) — reliable
                 // even when the receiving app was swiped away. Silent pushes
-                // stay data-only so nothing shows.
-                ...(!isSilent
+                // stay data-only so nothing shows. androidDataOnly pushes
+                // (incoming calls) also stay data-only: the app renders the
+                // full-screen ringing UI itself from the data payload.
+                ...(!isSilent && payload.androidDataOnly !== true
                   ? {
                       notification: {
                         title: payload.title,
@@ -301,14 +309,15 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
   if (serverKey) {
     try {
       const isSilent = payload.silent === true;
+      const androidDataOnly = payload.androidDataOnly === true;
       await axios.post(
         "https://fcm.googleapis.com/fcm/send",
         {
           registration_ids: tokens,
           data: { ...(payload.data || {}), title: payload.title, body: payload.body },
           // Visible: system-tray notification (see the HTTP v1 doc above).
-          // Silent: data-only, nothing rendered.
-          ...(!isSilent
+          // Silent / androidDataOnly: data-only, nothing rendered system-side.
+          ...(!isSilent && !androidDataOnly
             ? {
                 notification: {
                   title: payload.title,

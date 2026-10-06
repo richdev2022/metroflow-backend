@@ -22,6 +22,7 @@ import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
 import { isCorsOriginAllowed } from "../cors";
 import crypto from "crypto";
 import { glmChat, isGlmConfigured } from "./glm";
+import { lightClean, aiCleanCaption } from "./caption-clean";
 import {
   buildCallingCredentials,
   computeRemainingSeconds,
@@ -1867,8 +1868,11 @@ export function initSocketServer(server: http.Server): void {
         const resolvedMeetingId = await resolveMeetingId(data.meetingId || data.roomId || "");
         if (!resolvedMeetingId) return;
 
+        // Guard removed: meetings can now be ended from any non-completed
+        // state. Nothing historically set status='ongoing' (joinMeeting does
+        // now), so the old guard silently swallowed every host "end meeting".
         await query(
-          `UPDATE meetings SET status = 'completed', end_time = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'ongoing'`,
+          `UPDATE meetings SET status = 'completed', end_time = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> 'completed'`,
           [resolvedMeetingId]
         );
         socket.to(`room:${resolvedMeetingId}`).emit("meeting:ended", { meetingId: resolvedMeetingId });
@@ -2330,7 +2334,10 @@ export function initSocketServer(server: http.Server): void {
             roomType,
             speakerId,
             speakerName,
-            text,
+            // FINAL segments are cleaned before relay/persistence (instant
+            // regex pass) so no client ever renders raw ASR garbage. Interim
+            // segments stay raw — they are replaced by the final in <1s.
+            text: data.isFinal !== false ? lightClean(text) : text,
             isFinal: data.isFinal !== false,
             language: data.language || null,
             ts: new Date().toISOString(),
@@ -2346,15 +2353,40 @@ export function initSocketServer(server: http.Server): void {
           // AI notes / call-detail views (meeting_transcripts is keyed by the
           // room id for both room types; GET /calls/:id/transcript reads it).
           if (payload.isFinal) {
+            let segmentId: string | null = null;
             try {
-              await query(
+              const inserted = await query(
                 `INSERT INTO meeting_transcripts (id, meeting_id, speaker_id, speaker_name, text, language, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
-                [crypto.randomUUID(), roomId, String(speakerId), String(speakerName).slice(0, 120), text, payload.language],
+                 VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+                 RETURNING id`,
+                [crypto.randomUUID(), roomId, String(speakerId), String(speakerName).slice(0, 120), payload.text, payload.language],
               );
+              segmentId = inserted.rows[0]?.id || null;
             } catch (err) {
               logger.warn("Failed to persist caption segment:", err);
             }
+            // AI polish (async, never blocks the relay): fix mis-hearings and
+            // update the persisted row + notify open clients.
+            void (async () => {
+              try {
+                const polished = await aiCleanCaption(text, payload.language);
+                if (polished && polished !== payload.text) {
+                  if (segmentId) {
+                    await query(`UPDATE meeting_transcripts SET text = $1 WHERE id = $2`, [polished, segmentId]).catch(() => {});
+                  }
+                  io.to(`room:${roomId}`).emit("caption:polished", {
+                    roomId, roomType, speakerId, speakerName, segmentId,
+                    text: polished, originalText: payload.text, ts: payload.ts,
+                  });
+                  if (roomType === "meeting") {
+                    io.to(`meeting:${roomId}`).emit("caption:polished", {
+                      roomId, roomType, speakerId, speakerName, segmentId,
+                      text: polished, originalText: payload.text, ts: payload.ts,
+                    });
+                  }
+                }
+              } catch { /* polish is best-effort */ }
+            })();
             // MetricAi Call Copilot: per-user translated captions + live AI
             // insights. Both are enhancements — they must NEVER break the
             // caption relay, so every failure is swallowed.
@@ -2387,6 +2419,133 @@ export function initSocketServer(server: http.Server): void {
         if (lang) captionLanguageBySocket.set(socket.id, lang);
         else captionLanguageBySocket.delete(socket.id);
         if (callback) callback({ success: true, language: lang || null });
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // CALL-ROOM REACTIONS + RAISE HAND (web & mobile)
+    // Lightweight room broadcast enhancements carried on the existing socket
+    // transport. Room resolution matches caption:segment so both id shapes
+    // (call uuid, call code, room id) work.
+    // ---------------------------------------------------------------------
+    socket.on(
+      "call:reaction",
+      async (
+        data: { roomCode?: string; roomId?: string; callId?: string; emoji?: string; roomType?: "call" | "meeting" },
+        callback?: (response: any) => void,
+      ) => {
+        try {
+          const key = data?.roomCode || data?.roomId || data?.callId || "";
+          const emoji = String(data?.emoji || "").slice(0, 8);
+          if (!key || !emoji) {
+            if (callback) callback({ success: false, error: "room and emoji are required" });
+            return;
+          }
+          const resolved = await resolveRoomId(key);
+          if (!resolved) {
+            if (callback) callback({ success: false, error: "Room not found" });
+            return;
+          }
+          const rosterName = roomManager.getParticipants(resolved.id).find((p) => p.id === socket.data.userId)?.name;
+          const fromName = (rosterName && !looksLikeUuid(rosterName) && rosterName)
+            || (socket.data.guest as any)?.name
+            || "Someone";
+          const event = {
+            emoji,
+            from: String(socket.data.userId || (socket.data.guest as any)?.guestId || socket.id),
+            fromName,
+            roomId: resolved.id,
+            roomType: data.roomType || resolved.type,
+            ts: new Date().toISOString(),
+          };
+          io.to(`room:${resolved.id}`).emit("call:reaction-received", event);
+          if (event.roomType === "meeting") {
+            io.to(`meeting:${resolved.id}`).emit("call:reaction-received", event);
+          }
+          if (callback) callback({ success: true });
+        } catch (error) {
+          logger.error("Error handling call reaction:", error);
+          if (callback) callback({ success: false, error: "Failed to send reaction" });
+        }
+      },
+    );
+
+    socket.on(
+      "call:raise-hand",
+      async (
+        data: { roomCode?: string; roomId?: string; callId?: string; raised?: boolean; roomType?: "call" | "meeting" },
+        callback?: (response: any) => void,
+      ) => {
+        try {
+          const key = data?.roomCode || data?.roomId || data?.callId || "";
+          if (!key) {
+            if (callback) callback({ success: false, error: "room is required" });
+            return;
+          }
+          const resolved = await resolveRoomId(key);
+          if (!resolved) {
+            if (callback) callback({ success: false, error: "Room not found" });
+            return;
+          }
+          const rosterName = roomManager.getParticipants(resolved.id).find((p) => p.id === socket.data.userId)?.name;
+          const name = (rosterName && !looksLikeUuid(rosterName) && rosterName)
+            || (socket.data.guest as any)?.name
+            || "Someone";
+          const event = {
+            userId: String(socket.data.userId || (socket.data.guest as any)?.guestId || socket.id),
+            name,
+            raised: data?.raised !== false,
+            roomId: resolved.id,
+            roomType: data.roomType || resolved.type,
+            ts: new Date().toISOString(),
+          };
+          io.to(`room:${resolved.id}`).emit("call:hand-updated", event);
+          if (event.roomType === "meeting") {
+            io.to(`meeting:${resolved.id}`).emit("call:hand-updated", event);
+          }
+          if (callback) callback({ success: true });
+        } catch (error) {
+          logger.error("Error handling raise hand:", error);
+          if (callback) callback({ success: false, error: "Failed to update hand state" });
+        }
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // CHAT TYPING INDICATORS — WhatsApp-style "typing…" presence. Ephemeral:
+    // relayed to the conversation room and to each other participant's user
+    // room (mobile listens on the user room), never persisted.
+    // ---------------------------------------------------------------------
+    socket.on(
+      "chat:typing",
+      async (data: { conversationId?: string; isTyping?: boolean }, callback?: (response: any) => void) => {
+        try {
+          const conversationId = String(data?.conversationId || "");
+          if (!conversationId || !socket.data.userId) {
+            if (callback) callback({ success: false, error: "conversationId required" });
+            return;
+          }
+          const participants = await query(
+            `SELECT user_id FROM chat_participants WHERE conversation_id = $1`,
+            [conversationId],
+          );
+          const event = {
+            conversationId,
+            userId: String(socket.data.userId),
+            name: String((socket.data as any).name || socket.data.email || "Someone"),
+            isTyping: data?.isTyping !== false,
+            ts: new Date().toISOString(),
+          };
+          for (const row of participants.rows) {
+            const uid = String((row as any).user_id || "");
+            if (!uid || uid === event.userId) continue;
+            io.to(`user:${uid}`).emit("chat:typing-updated", event);
+          }
+          if (callback) callback({ success: true });
+        } catch (error) {
+          logger.error("Error handling chat typing:", error);
+          if (callback) callback({ success: false, error: "Failed to relay typing state" });
+        }
       },
     );
 

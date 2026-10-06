@@ -47,11 +47,18 @@ export function generateGuestToken(params: {
   roomId: string;
   businessId: string;
   ttlMinutes?: number;
+  /** Reuse an existing guest identity (same human clicking the invite link
+   *  again) so one person cannot fill the room roster N times. */
+  guestId?: string;
 }): { token: string; payload: GuestTokenPayload } {
   const now = Math.floor(Date.now() / 1000);
   const ttl = params.ttlMinutes ?? 6 * 60; // default 6 hours
+  const GUEST_ID_RE = /^guest-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const payload: GuestTokenPayload = {
-    guestId: `guest-${crypto.randomUUID()}`,
+    guestId:
+      params.guestId && GUEST_ID_RE.test(params.guestId)
+        ? params.guestId
+        : `guest-${crypto.randomUUID()}`,
     name: params.name,
     scope: params.scope,
     roomId: params.roomId,

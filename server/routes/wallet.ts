@@ -656,11 +656,15 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
         }
 
         if (isSuccess && paymentUrl) {
+            // Currency follows the SELECTED WALLET (wallet.currency) — the
+            // dashboard wallet picker can now fund a business/NGN or USD
+            // wallet; the transaction row must match or the ledger breaks.
+            const walletCurrency = String(wallet.currency || 'NGN').toUpperCase();
             await query(
                 `INSERT INTO transactions 
                  (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
-                 VALUES ($1, $2, $3, 'NGN', 'pending', $4, 'credit', 'Wallet Funding via Card', 'wallet_funding', $5, 'credit', $6, $7)`,
-                [wallet.business_id, wallet.user_id, amount, reference, wallet.id, fee, provider.name]
+                 VALUES ($1, $2, $3, $4, 'pending', $5, 'credit', 'Wallet Funding via Card', 'wallet_funding', $6, 'credit', $7, $8)`,
+                [wallet.business_id, wallet.user_id, amount, walletCurrency, reference, wallet.id, fee, provider.name]
             );
 
             res.json({ success: true, payment_url: paymentUrl, reference, fee, total_amount: totalAmount });

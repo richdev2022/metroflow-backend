@@ -39,6 +39,9 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await purgeInternalLedgerNoiseRows();
   await sanitizePlaceholderPhoneNumbers();
   await repairTransferReferenceCollisions();
+  await ensureParticipantDedupe();
+  await ensureRequestLogsSchema();
+  await ensureLoginSecurityColumns();
 
   // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
   await ensureBusinessRevenueLadder();
@@ -1871,4 +1874,92 @@ async function repairTransferReferenceCollisions(): Promise<void> {
   } catch (err: any) {
     console.warn('[migrations] repairTransferReferenceCollisions (debit rebuild) skipped:', err?.message);
   }
+}
+
+/**
+ * Call/meeting participant dedupe — the same human joining a call room
+ * multiple times (double-tap, double fire, re-join after refresh) used to
+ * insert duplicate call_participants / meeting_attendees rows on legacy
+ * databases whose tables predate the UNIQUE(call_id, user_id) constraint.
+ * This migration (1) collapses existing duplicates keeping the most recent
+ * row, and (2) enforces the unique constraint so every future upsert is
+ * atomic. Idempotent by construction.
+ */
+async function ensureParticipantDedupe(): Promise<void> {
+  for (const spec of [
+    { table: 'call_participants', keyA: 'call_id', keyB: 'user_id', constraint: 'uq_call_participants_call_user' },
+    { table: 'meeting_attendees', keyA: 'meeting_id', keyB: 'user_id', constraint: 'uq_meeting_attendees_meeting_user' },
+  ] as const) {
+    try {
+      // 1. Collapse duplicates: keep the newest row per (keyA, keyB).
+      await query(
+        `DELETE FROM ${spec.table} a
+         USING ${spec.table} b
+         WHERE a.${spec.keyA} = b.${spec.keyA}
+           AND a.${spec.keyB} = b.${spec.keyB}
+           AND a.id < b.id`,
+      );
+      // 2. Enforce the constraint if it (or an equivalent index) is missing.
+      const existing = await query(
+        `SELECT 1 FROM pg_constraint WHERE conname = $1 AND conrelid = $2::regclass`,
+        [spec.constraint, `public.${spec.table}`],
+      );
+      if (existing.rows.length === 0) {
+        await query(
+          `ALTER TABLE ${spec.table} ADD CONSTRAINT ${spec.constraint} UNIQUE (${spec.keyA}, ${spec.keyB})`,
+        );
+        console.log(`[migrations] ${spec.constraint} added`);
+      }
+    } catch (err: any) {
+      // A pre-existing equivalent index under a different name, or a
+      // concurrent deploy — never block startup on this repair.
+      console.warn(`[migrations] participant dedupe skipped for ${spec.table}:`, err?.message);
+    }
+  }
+}
+
+/**
+ * api_request_logs — encrypted at-rest audit trail of EVERY API call (user
+ * app AND admin panel). Powers the admin Activity Logs screen: filter by
+ * email/phone/name, inspect a single call, decrypt payload/response with
+ * the decrypt_request_logs permission. Payloads are stored as AES-256-GCM
+ * blobs when PAYLOAD_ENCRYPTION_KEY is set (encrypted=true).
+ */
+async function ensureRequestLogsSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS api_request_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_type VARCHAR(10) NOT NULL DEFAULT 'anon',
+      user_id UUID NULL,
+      business_id VARCHAR(255) NULL,
+      method VARCHAR(10) NOT NULL,
+      path TEXT NOT NULL,
+      status_code INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      ip VARCHAR(80) NULL,
+      user_agent TEXT NULL,
+      request_payload TEXT NULL,
+      response_payload TEXT NULL,
+      encrypted BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_request_logs_created ON api_request_logs (created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_request_logs_user ON api_request_logs (user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_request_logs_type ON api_request_logs (user_type)`);
+}
+
+
+/**
+ * Login lockout escalation columns: failed attempts already live on users
+ * (failed_login_attempts / locked_until). This adds the ESCALATION state —
+ * lock_count (completed 30-minute lock cycles) and account_blocked (permanent
+ * until platform support resolves it).
+ */
+async function ensureLoginSecurityColumns(): Promise<void> {
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lock_count INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_blocked BOOLEAN NOT NULL DEFAULT FALSE`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_blocked ON users (account_blocked) WHERE account_blocked = TRUE`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_locked ON users (locked_until) WHERE locked_until IS NOT NULL`);
 }

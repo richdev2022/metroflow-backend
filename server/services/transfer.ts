@@ -118,11 +118,15 @@ export function validateIntlBeneficiary(
       return { valid: false, error: 'The US bank routing number failed checksum validation — please double-check it with the beneficiary', code: 'ROUTING_NUMBER_CHECKSUM' };
     }
     const acctType = String(details.accountType || 'checking').toLowerCase();
-    if (!['checking', 'depository'].includes(acctType)) {
-      return { valid: false, error: 'USD transfers require the account type to be "checking" or "depository"', code: 'ACCOUNT_TYPE_INVALID' };
+    // Flutterwave accepts checking/savings on USD ACH; 'depository' appears in
+    // older wiring guides — accept all three and normalise downstream.
+    if (!['checking', 'savings', 'depository'].includes(acctType)) {
+      return { valid: false, error: 'USD transfers require the account type to be "checking" or "savings"', code: 'ACCOUNT_TYPE_INVALID' };
     }
-    if (!details.beneficiaryAddress || !details.beneficiaryPostalCode) {
-      return { valid: false, error: "USD transfers require the beneficiary's street address and postal code", code: 'BENEFICIARY_ADDRESS_REQUIRED' };
+    // Street address is required; postal code is optional (FLW's meta builder
+    // only includes it when provided — the web/mobile forms do not collect it).
+    if (!details.beneficiaryAddress) {
+      return { valid: false, error: "USD transfers require the beneficiary's street address", code: 'BENEFICIARY_ADDRESS_REQUIRED' };
     }
   } else if (cur === 'GBP') {
     if (!/^\d{6}$/.test(routing)) {

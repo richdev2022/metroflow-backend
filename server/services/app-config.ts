@@ -31,17 +31,30 @@ export interface IntlTransferConfig {
   markupPercent: number;
   feePercent: number;
   feeFlat: number;
+  /**
+   * Admin-only margin layered ON TOP of markupPercent. Never surfaced to
+   * customers: the quote merges it into the effective markup so users only
+   * ever see one markup number.
+   */
+  spreadPercent: number;
 }
 
 export async function getIntlTransferConfig(): Promise<IntlTransferConfig> {
-  const [markup, feePct, feeFlat] = await Promise.all([
+  const [markup, feePct, feeFlat, spread] = await Promise.all([
     getSetting("intl_transfer_markup_percent", "0"),
     getSetting("intl_transfer_fee_percent", "0"),
     getSetting("intl_transfer_fee_flat", "0"),
+    getSetting("intl_transfer_spread_percent", "0"),
   ]);
   return {
     markupPercent: Number(markup) || 0,
     feePercent: Number(feePct) || 0,
     feeFlat: Number(feeFlat) || 0,
+    spreadPercent: Number(spread) || 0,
   };
+}
+
+/** Effective customer-facing markup = markup + spread (spread is invisible). */
+export function effectiveMarkupPercent(config: IntlTransferConfig): number {
+  return Math.round((config.markupPercent + config.spreadPercent) * 10000) / 10000;
 }

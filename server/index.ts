@@ -121,7 +121,9 @@ import { processPendingProductDocJobs } from "./services/productDocJobs";
 import { startTransferMonitor } from "./services/transfer";
 import * as cron from "node-cron";
 import { getStore } from "@netlify/blobs";
-import { initRedis } from "./lib/cache";
+import { initRedis, getRedisClient } from "./lib/cache";
+import { payloadEncryptionMiddleware } from "./middleware/payload-encryption";
+import { requestLoggerMiddleware, startRequestLogRetention } from "./middleware/request-logger";
 import { transferQueue, productDocQueue, scheduledQueue } from "./lib/queues";
 // Import workers for non-serverless environments
 if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
@@ -308,6 +310,13 @@ export async function createServer() {
   if (!isServerlessEnv) {
     void dbReadyPromise.then(() => {
       if (isDbReady) startTransferMonitor();
+    });
+  }
+
+  // api_request_logs retention purge (daily, keeps the audit trail bounded).
+  if (!isServerlessEnv) {
+    void dbReadyPromise.then(() => {
+      startRequestLogRetention();
     });
   }
 
@@ -499,6 +508,13 @@ export async function createServer() {
     next();
   });
 
+  // E2E payload encryption (opt-in via `x-mfv-enc: 1`): decrypt request
+  // envelopes, wrap res.json so every JSON response leaves as ciphertext.
+  // Installed after body parsing/recovery so no stream surgery is needed.
+  app.use(payloadEncryptionMiddleware);
+  // Encrypted-at-rest audit trail of every API call (admin Activity Logs).
+  app.use(requestLoggerMiddleware);
+
   // Single local cron for product documentation jobs (non-serverless only).
   if (!isServerlessEnv) {
     cron.schedule("* * * * *", async () => {
@@ -601,7 +617,35 @@ export async function createServer() {
           mode: pushDeliveryMode(),
           webPush: { configured: isWebPushConfigured() },
         },
-        redis: { configured: !!process.env.REDIS_URL && !process.env.DISABLE_REDIS },
+        redis: await (async () => {
+          // Report REAL connectivity, not just env presence: production ran
+          // with configured:false for weeks because REDIS_URL was simply not
+          // set on the server (no code could have detected that).
+          const url = process.env.REDIS_URL;
+          const configured = !!url && !process.env.DISABLE_REDIS;
+          if (!configured) {
+            return {
+              configured: false,
+              connected: false,
+              reason: process.env.DISABLE_REDIS
+                ? "disabled by DISABLE_REDIS env"
+                : "REDIS_URL env is not set on this server — set it (e.g. redis://127.0.0.1:6379 or a managed rediss:// URL) and restart",
+            };
+          }
+          try {
+            const client = getRedisClient();
+            if (!client || client.status !== "ready") {
+              return { configured: true, connected: false, reason: `client status: ${client?.status || "null"}` };
+            }
+            const pong = await Promise.race([
+              client.ping(),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("ping timeout")), 1500)),
+            ]);
+            return { configured: true, connected: pong === "PONG", url: String(url).replace(/:\/\/[^@]*@/, "://***@") };
+          } catch (err: any) {
+            return { configured: true, connected: false, reason: err?.message || "ping failed" };
+          }
+        })(),
         storage,
         uptimeSeconds: Math.round(process.uptime()),
         nodeVersion: process.version,

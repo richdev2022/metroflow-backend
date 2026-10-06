@@ -5239,7 +5239,7 @@ protectedRouter.get("/request-logs", requirePermission("view_request_logs"), asy
         // Actor search spans business users (users table) and platform admins.
         where.push(
           `(
-            u.email ILIKE ${push(like)} OR u.phone ILIKE ${push(like)} OR u.name ILIKE ${push(like)}
+            u.email ILIKE ${push(like)} OR u.phone_number ILIKE ${push(like)} OR u.name ILIKE ${push(like)}
             OR pa.email ILIKE ${push(like)} OR pa.name ILIKE ${push(like)}
             OR l.path ILIKE ${push(like)}
           )`,
@@ -5315,7 +5315,7 @@ protectedRouter.get("/request-logs/:id", requirePermission("view_request_logs"),
     try {
       const { id } = req.params;
       const logRes = await query(
-        `SELECT l.*, u.name AS "userName", u.email AS "userEmail", u.phone AS "userPhone",
+        `SELECT l.*, u.name AS "userName", u.email AS "userEmail", u.phone_number AS "userPhone",
                 pa.email AS "adminEmail", pa.name AS "adminName"
          FROM api_request_logs l
          LEFT JOIN users u ON u.id = l.user_id

@@ -45,8 +45,9 @@ The backend powering **Metricorex** (project: Metroflow) — an all-in-one busin
 ### Fintech
 - Multi-currency wallets (NGN/USD), funding via card (Monnify / Squad / Flutterwave providers), virtual accounts (personal & business, business-name VAs, regeneration).
 - Transfers (single/bulk) with admin-toggled payout provider, account lookup, transfer history with filters + CSV export.
-- **International payouts via Flutterwave** with live FX quotes, admin markup % + fee % + flat fee, three-ledger accounting: debit user wallet → credit platform wallet → credit revenue wallet (fees + markup), all recorded idempotently with historical backfill.
-- Payroll: employees (NGN & USD recipients), Excel import, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
+- **International payouts via Flutterwave** with live FX quotes, admin markup % + fee % + **hidden spread %**, quote lock windows (`expires_at`), server-side pricing enforcement and auto-reversal on every failure path, three-ledger accounting: debit user wallet → credit platform wallet → credit revenue wallet (fees + markup), all recorded idempotently with historical backfill.
+- **Epic transfers** — one-off payments to multiple recipients from an epic, NGN + USD rows validated per corridor (10-digit NGN accounts, ABA checksum + account type for USD).
+- Payroll: employees (NGN & USD recipients), **Excel template with a Banks sheet + dropdown + VLOOKUP bank-code autofill**, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
 - Transaction OTP/PIN, KYC (BVN/NIN/business docs via Prembly), biometric unlock, login-attempt alert emails.
 
 ### Revenue Features (all plan-configurable via /admin/pricing)
@@ -59,14 +60,27 @@ Five monetised surfaces, each wired into `pricing_plans` (feature toggles + limi
 5. **MetricAi Credit Packs** (`/api/ai-credits`) — one-time AI credit top-ups purchasable from any wallet when a plan's MetricAi allowance runs out; plan-level `ai_credit_discount_percent` prices packs per plan. Admin manages packs via `/api/admin/ai-credit-packs`.
 
 ### Platform Operations (Admin)
-- Role & permission management (roles carry permission slugs; includes `support`), admin management.
-- Payment provider toggles (global + transfer provider), fees & international transfer config, platform/revenue ledgers with movements + reconciliation.
+- Role & permission management (roles carry permission slugs; includes `support`, `view_request_logs`, `decrypt_request_logs`), admin management.
+- Payment provider toggles (global + transfer provider), fees & international transfer config (markup + spread), platform/revenue ledgers with movements + reconciliation.
+- **Activity Logs** (`/admin/request-logs`): every user + admin API request with actor/email/phone search, type/method/path/status/date filters, stats, per-log **decrypt** (permission-gated) revealing endpoint + payload + response.
+- **Locked Accounts** (`/admin/locked-accounts`): see and resolve login-lockout escalations (5 failed passwords → 30-min lock; 3 cycles → permanent block until an admin resolves).
 - Maintenance mode (emails + pushes all users), announcements ticker, broadcast email/push, KYC review, webhook monitoring, subscriptions & pricing plans (incl. per-plan RTC limits and MetricAi toggle).
 
 ### Notifications
-- In-app notifications + FCM push (HTTP v1, token registry with auto-pruning).
+- In-app notifications + FCM push (HTTP v1, token registry with auto-pruning) with **multi-channel delivery fallback**: pushes fan out to **every registered device** of the user, incoming calls are delivered as Android data-only messages (the app renders the full-screen ringing UI itself), a hybrid retry fires when FCM reports 0 delivered, and chat/call events additionally fall back to **Web Push (VAPID)** for browsers (`POST /push/subscribe` accepts both flat and nested subscription payloads).
 - Login-attempt emails with device info, welcome emails, task notifications, support desk notifications.
 - Maintenance/announcement/broadcast pipelines.
+
+---
+
+## E2E Payload Encryption (x-mfv-enc)
+
+Every JSON request/response body can travel as an **AES-256-GCM envelope** `{ v, iv, tag, ct }` so the browser/app network inspector never shows raw payloads.
+
+- **Opt-in per client**: a request carries `x-mfv-enc: 1` (all clients send it on every request once `*_PAYLOAD_ENCRYPTION_KEY` is configured) → the server decrypts envelope bodies and encrypts **every response** (success AND error paths, GETs included).
+- **Backward compatible**: keyless servers, old clients, multipart uploads, provider webhooks and infra paths (`/health`, `/api-docs`, …) bypass entirely — mismatched deployments degrade, never break (clients retry once in plaintext on `400 DECRYPT_FAILED`).
+- **Audit trail**: the request logger stores each request/response (payloads **encrypted at rest**, secrets redacted) into `api_request_logs`. Admins with `view_request_logs` browse them in the Activity Logs screen; `decrypt_request_logs` (super-admin bypass) unlocks `POST /admin/request-logs/:id/decrypt` which returns the plaintext bodies. If the key was rotated, decrypt answers `409 DECRYPT_KEY_MISMATCH`.
+- **Client keys**: web/admin `VITE_PAYLOAD_ENCRYPTION_KEY`, mobile `EXPO_PUBLIC_PAYLOAD_ENCRYPTION_KEY` — all MUST equal the backend value. **Rotating the key makes previously stored encrypted log rows undecryptable.**
 
 ---
 
@@ -96,6 +110,12 @@ Key variables (see `ENVIRONMENT_SETUP.md` for the full list):
 | `CLOUDINARY_URL` / R2 vars | Upload storage chain |
 | `BREVO_API_KEY` | Transactional email |
 | `FCM_*` | Push notifications |
+| `VAPID_*` (public/private/subject) | Web Push for browsers (incoming-call rings when the tab is closed) |
+| `PAYLOAD_ENCRYPTION_KEY` | **E2E payload encryption** — 32-byte base64 key shared with all clients. Generate: `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Unset = plaintext mode (fully backward compatible). |
+| `PAYLOAD_ENCRYPTION_DISABLED` | Set `true` to force-disable encryption even when a key exists |
+| `API_REQUEST_LOG_MODE` | Request audit trail volume: `all` (default) \| `writes` \| `off` |
+| `API_REQUEST_LOG_RETENTION_DAYS` | Daily purge of `api_request_logs` (default 30) |
+| `REDIS_URL` | `redis://127.0.0.1:6379` on the VPS — powers the waiting-room queue + caching. `/health` reports `{configured, connected, reason}` diagnostics; **`DISABLE_REDIS=true` disables Redis entirely** (remove it to enable) |
 | `SUPPORT_ALERT_EMAIL` | Optional email ping on new support requests |
 
 | `JOBS_SECRET` | Optional shared secret for `/internal/jobs/*` endpoints |

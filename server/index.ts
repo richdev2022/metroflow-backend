@@ -405,6 +405,18 @@ export async function createServer() {
   }));
   app.use(express.urlencoded({ extended: true }));
 
+  // Express 5 leaves `req.body` UNDEFINED when no JSON body was sent (v4 used
+  // to default it to {}). Dozens of routes destructure req.body directly
+  // (e.g. joinCall: `const { password } = req.body`) and crashed with a 500
+  // whenever a client POSTed without a body — mobile's passwordless call
+  // join is bodyless, so every mobile-to-mobile call failed with
+  // "Failed to join call" AFTER the callee's phone already rang. Normalise
+  // once here so every route can rely on req.body being an object.
+  app.use((req: any, _res, next) => {
+    if (req.body === undefined || req.body === null) req.body = {};
+    next();
+  });
+
   // Swagger Documentation
   const CSS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui.min.css";
   const JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-bundle.min.js";

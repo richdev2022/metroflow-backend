@@ -51,11 +51,26 @@ async function buildTransferProviderPayload(transfer: any): Promise<SingleTransf
   const isIntl = payload.currencyId !== 'NGN' || !!payload.beneficiaryCountry;
   if (isIntl && transfer.business_id) {
     try {
-      const bRes = await query(`SELECT name, email FROM businesses WHERE id = $1`, [transfer.business_id]);
-      payload.senderName = bRes.rows[0]?.name || payload.accountName;
-      payload.senderEmail = bRes.rows[0]?.email || undefined;
-      payload.senderAddress = payload.beneficiaryAddress;
-      payload.senderCountry = payload.beneficiaryCountry;
+      // Sender compliance data: prefer the business's KYC address block;
+      // fall back to the beneficiary address only when the business has not
+      // completed its profile (Flutterwave rejects intl payouts whose sender
+      // address is missing, but sender == beneficiary looks fraudulent).
+      const bRes = await query(
+        `SELECT name, email, address_street, address_house_number, address_city,
+                address_state, address_country
+         FROM businesses WHERE id = $1`,
+        [transfer.business_id],
+      );
+      const b = bRes.rows[0] || {};
+      payload.senderName = b.name || payload.accountName;
+      payload.senderEmail = b.email || undefined;
+      const senderStreet = [b.address_house_number, b.address_street].filter(Boolean).join(' ').trim();
+      const hasBusinessAddress = !!(senderStreet && b.address_city);
+      payload.senderAddress = hasBusinessAddress ? senderStreet : payload.beneficiaryAddress;
+      payload.senderCity = hasBusinessAddress ? b.address_city : payload.beneficiaryCity;
+      payload.senderState = hasBusinessAddress ? b.address_state : payload.beneficiaryState;
+      payload.senderPostalCode = payload.beneficiaryPostalCode;
+      payload.senderCountry = (b.address_country || payload.beneficiaryCountry);
     } catch (e) {
       console.warn('[transfer] could not load sender details for intl payout:', e);
     }

@@ -230,6 +230,9 @@ export const getConversations: RequestHandler = async (
            WHEN cm.attachment_type = 'video' THEN '🎬 Video'
            WHEN cm.attachment_type = 'audio' THEN '🎤 Voice note'
            WHEN cm.attachment_type = 'sticker' THEN 'Sticker'
+           WHEN cm.attachment_type = 'gif' THEN 'GIF'
+           WHEN cm.attachment_name IS NOT NULL AND btrim(cm.attachment_name) <> ''
+             THEN ('📎 ' || cm.attachment_name)
            WHEN cm.attachment_url IS NOT NULL THEN '📎 Attachment'
            ELSE 'Message'
          END
@@ -629,7 +632,20 @@ export const createConversation: RequestHandler = async (
               LEFT JOIN users u ON cp.user_id = u.id
               WHERE cp.conversation_id = cc.id
             ) as participants,
-            (SELECT cm.content FROM chat_messages cm
+            (SELECT CASE
+               WHEN cm.deleted_for_everyone THEN 'This message was deleted'
+               WHEN cm.content IS NOT NULL AND btrim(cm.content) <> '' THEN cm.content
+               WHEN cm.attachment_type = 'image' THEN '📷 Photo'
+               WHEN cm.attachment_type = 'video' THEN '🎬 Video'
+               WHEN cm.attachment_type = 'audio' THEN '🎤 Voice note'
+               WHEN cm.attachment_type = 'gif' THEN 'GIF'
+               WHEN cm.attachment_type = 'sticker' THEN 'Sticker'
+               WHEN cm.attachment_name IS NOT NULL AND btrim(cm.attachment_name) <> ''
+                 THEN ('📎 ' || cm.attachment_name)
+               WHEN cm.attachment_url IS NOT NULL THEN '📎 Attachment'
+               ELSE 'Message'
+             END
+             FROM chat_messages cm
              WHERE cm.conversation_id = cc.id
              ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
             (SELECT cm.created_at FROM chat_messages cm

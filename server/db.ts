@@ -351,6 +351,8 @@ const EXPECTED_TABLES = [
   "tasks",
   "transactions",
   "transfer_queue",
+  "transaction_disputes",
+  "transfer_beneficiaries",
   "user_sessions",
   "users",
   "virtual_accounts",

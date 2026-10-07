@@ -1,7 +1,7 @@
 import express from "express";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
-import { calculateFee, creditRevenueWallet, creditPlatformWallet } from "../services/fees";
+import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
 import { settlePaymentLinkPayment } from "./payment_links";
 import { settleInvoicePayment } from "./invoices";
 import { settleStoreOrderPayment } from "./store";

@@ -76,6 +76,18 @@ async function ensureBeneficiariesSchema(): Promise<void> {
   await query(
     `CREATE INDEX IF NOT EXISTS idx_beneficiaries_user ON transfer_beneficiaries(user_id, last_used_at DESC)`,
   );
+  // Align business_id with businesses.id (VARCHAR(255)) — legacy installs
+  // created it as UUID, which breaks the upsert for short business ids.
+  const benefBizCol = await query(
+    `SELECT data_type FROM information_schema.columns
+     WHERE table_name = 'transfer_beneficiaries' AND column_name = 'business_id'`,
+  );
+  if (benefBizCol.rows[0]?.data_type === "uuid") {
+    await query(
+      `ALTER TABLE transfer_beneficiaries
+       ALTER COLUMN business_id TYPE VARCHAR(255) USING business_id::text`,
+    );
+  }
 }
 
 /**
@@ -1741,7 +1753,7 @@ async function ensureDisputesSchema(): Promise<void> {
   await query(`
     CREATE TABLE IF NOT EXISTS transaction_disputes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      business_id UUID NOT NULL,
+      business_id VARCHAR(255) NOT NULL,
       user_id UUID,
       transaction_reference VARCHAR(255) NOT NULL,
       transaction_source VARCHAR(20),            -- 'transfer_queue' | 'transactions'
@@ -1758,6 +1770,20 @@ async function ensureDisputesSchema(): Promise<void> {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // businesses.id was migrated to VARCHAR(255) — earlier installs created
+  // business_id as UUID, which breaks both the admin list JOIN
+  // (varchar = uuid -> 42883) and filing disputes for any business whose id
+  // is a short generateBusinessId() string (22P02). Align the column type.
+  const disputesBizCol = await query(
+    `SELECT data_type FROM information_schema.columns
+     WHERE table_name = 'transaction_disputes' AND column_name = 'business_id'`,
+  );
+  if (disputesBizCol.rows[0]?.data_type === "uuid") {
+    await query(
+      `ALTER TABLE transaction_disputes
+       ALTER COLUMN business_id TYPE VARCHAR(255) USING business_id::text`,
+    );
+  }
   await query(`CREATE INDEX IF NOT EXISTS idx_disputes_business ON transaction_disputes(business_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_disputes_status ON transaction_disputes(status)`);
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_disputes_open_txn

@@ -3779,6 +3779,58 @@ protectedRouter.put("/settings/dispute-emails", requirePermission('manage_settin
 });
 
 /**
+ * GET /admin/settings/app-store-urls — mobile app download links shown by
+ * the marketing site download sections, the web meeting interstitial and
+ * push/link deep-links. Persisted in system_settings (setSetting upsert).
+ */
+protectedRouter.get("/settings/app-store-urls", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const [appStore, playStore] = await Promise.all([
+            getSetting("app_store_url"),
+            getSetting("play_store_url"),
+        ]);
+        res.json({ success: true, data: { app_store_url: appStore || "", play_store_url: playStore || "" } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load app store URLs" });
+    }
+});
+
+/**
+ * PUT /admin/settings/app-store-urls
+ * Body: { app_store_url?: string, play_store_url?: string } — either key may
+ * be empty to clear it. Must be an https(s) or market:// URL.
+ */
+protectedRouter.put("/settings/app-store-urls", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { app_store_url, play_store_url } = req.body || {};
+        if (app_store_url === undefined && play_store_url === undefined) {
+            return res.status(400).json({ success: false, error: "Provide app_store_url and/or play_store_url" });
+        }
+        const validUrl = (v: unknown) => {
+            const s = String(v || "").trim();
+            if (!s) return "";
+            if (!/^(https:\/\/|http:\/\/|market:\/\/)/i.test(s) || s.length > 500) return null;
+            return s;
+        };
+        if (app_store_url !== undefined) {
+            const app = validUrl(app_store_url);
+            if (app === null) return res.status(400).json({ success: false, error: "app_store_url must be a valid https:// (or market://) URL" });
+            await setSetting("app_store_url", app, "Apple App Store download link for the Metroflow mobile app");
+        }
+        if (play_store_url !== undefined) {
+            const play = validUrl(play_store_url);
+            if (play === null) return res.status(400).json({ success: false, error: "play_store_url must be a valid https:// (or market://) URL" });
+            await setSetting("play_store_url", play, "Google Play Store download link for the Metroflow mobile app");
+        }
+        const [appStore, playStore] = await Promise.all([getSetting("app_store_url"), getSetting("play_store_url")]);
+        console.log(`[admin] app store URLs updated by admin ${req.admin?.adminId}`);
+        res.json({ success: true, data: { app_store_url: appStore || "", play_store_url: playStore || "" } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save app store URLs" });
+    }
+});
+
+/**
  * POST /admin/settings/dispute-emails/test
  * Sends a test dispute alert to every configured inbox and reports the
  * per-address delivery result, so admins can verify the wiring instantly.
@@ -4192,7 +4244,7 @@ protectedRouter.get("/intl-transfer-config", requirePermission('manage_finance')
     try {
         const config = await getIntlTransferConfig();
         const transferProvider = await getActiveTransferProviderName();
-        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, transfer_provider: transferProvider } });
+        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, quote_ttl_seconds: config.quoteTtlSeconds, transfer_provider: transferProvider } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to load international transfer config" });
     }
@@ -4206,7 +4258,7 @@ protectedRouter.get("/intl-transfer-config", requirePermission('manage_finance')
  */
 protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
     try {
-        const { markup_percent, fee_percent, fee_flat, spread_percent, transfer_provider } = req.body || {};
+        const { markup_percent, fee_percent, fee_flat, spread_percent, quote_ttl_seconds, transfer_provider } = req.body || {};
         if (markup_percent !== undefined) {
             const v = Number(markup_percent);
             if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "markup_percent must be between 0 and 100" });
@@ -4227,6 +4279,11 @@ protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance')
             if (!Number.isFinite(v) || v < 0 || v > 100) return res.status(400).json({ success: false, error: "spread_percent must be between 0 and 100" });
             await setSetting("intl_transfer_spread_percent", String(v));
         }
+        if (quote_ttl_seconds !== undefined) {
+            const v = Number(quote_ttl_seconds);
+            if (!Number.isFinite(v) || v < 30 || v > 1800) return res.status(400).json({ success: false, error: "quote_ttl_seconds must be between 30 and 1800" });
+            await setSetting("intl_quote_ttl_seconds", String(Math.round(v)), "Quote lock countdown window for international transfers");
+        }
         if (transfer_provider !== undefined) {
             const allowed = ['flutterwave'];
             if (transfer_provider && !allowed.includes(transfer_provider)) {
@@ -4237,7 +4294,7 @@ protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance')
         }
         const config = await getIntlTransferConfig();
         const transferProvider = await getActiveTransferProviderName();
-        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, transfer_provider: transferProvider } });
+        res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, quote_ttl_seconds: config.quoteTtlSeconds, transfer_provider: transferProvider } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to update international transfer config" });
     }
@@ -5337,6 +5394,15 @@ protectedRouter.get("/request-logs/:id", requirePermission("view_request_logs"),
           statusCode: row.status_code,
           durationMs: row.duration_ms,
           userAgent: row.user_agent,
+          // Payload bodies in their STORED form (ciphertext when encrypted).
+          // The admin UI renders them in the payload sections and shows the
+          // Decrypt action for encrypted rows; plaintext arrives only through
+          // POST /request-logs/:id/decrypt.
+          requestBody: row.request_payload ?? null,
+          responseBody: row.response_payload ?? null,
+          requestPayload: row.request_payload ?? null,
+          responsePayload: row.response_payload ?? null,
+          encrypted: !!row.encrypted,
           userEmail: row.userEmail || row.adminEmail || null,
           userName: row.userName || row.adminName || null,
           createdAt: row.created_at,
@@ -5344,6 +5410,41 @@ protectedRouter.get("/request-logs/:id", requirePermission("view_request_logs"),
       });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error.message || "Failed to load request log" });
+    }
+  });
+
+/**
+ * Clear the request-log trail. Permission-gated; supports three modes:
+ *   scope=old   -> delete everything older than 24h (default)
+ *   scope=all   -> wipe the whole table
+ *   scope=range -> delete between startDate/endDate (inclusive)
+ * Returns the number of deleted rows.
+ */
+protectedRouter.post("/request-logs/clear", requirePermission("decrypt_request_logs"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+      const scope = String((req.body as any)?.scope || "old").toLowerCase();
+      let result: { rowCount?: number | null };
+      if (scope === "all") {
+        result = await query(`DELETE FROM api_request_logs`);
+      } else if (scope === "range") {
+        const startDate = String((req.body as any)?.startDate || "").slice(0, 10);
+        const endDate = String((req.body as any)?.endDate || "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+          return res.status(400).json({ success: false, error: "startDate and endDate (YYYY-MM-DD) are required for scope=range" });
+        }
+        result = await query(
+          `DELETE FROM api_request_logs
+           WHERE created_at >= $1::timestamptz AND created_at < ($2::date + INTERVAL '1 day')`,
+          [`${startDate} 00:00:00`, endDate],
+        );
+      } else {
+        result = await query(`DELETE FROM api_request_logs WHERE created_at < NOW() - INTERVAL '24 hours'`);
+      }
+      const deleted = result.rowCount || 0;
+      console.log(`[admin] request-logs cleared by admin ${req.admin?.adminId}: scope=${scope} deleted=${deleted}`);
+      res.json({ success: true, data: { deleted, scope } });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "Failed to clear request logs" });
     }
   });
 

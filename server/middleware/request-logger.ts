@@ -15,7 +15,9 @@ import * as cron from "node-cron";
  *
  * Volume controls (env):
  *   API_REQUEST_LOG_MODE            all (default) | writes | off
- *   API_REQUEST_LOG_RETENTION_DAYS  30 (default) — daily purge via node-cron
+ *   API_REQUEST_LOG_RETENTION_HOURS 24 (default) — hourly purge keeps the table
+ *                                   small (overrides RETENTION_DAYS when set)
+ *   API_REQUEST_LOG_RETENTION_DAYS  legacy days-based retention (default 1 now)
  */
 
 const MODE = (process.env.API_REQUEST_LOG_MODE || "all").toLowerCase();
@@ -103,17 +105,36 @@ export function requestLoggerMiddleware(req: Request, res: Response, next: NextF
   next();
 }
 
-/** Daily retention purge (call once at boot). */
+/** Retention purge (call once at boot). Default: keep logs for 24 hours. */
 export function startRequestLogRetention(): void {
-  const days = parseInt(process.env.API_REQUEST_LOG_RETENTION_DAYS || "30", 10);
-  if (!Number.isFinite(days) || days <= 0) return;
+  const hoursEnv = process.env.API_REQUEST_LOG_RETENTION_HOURS;
+  const daysEnv = process.env.API_REQUEST_LOG_RETENTION_DAYS;
+  // Resolution: explicit HOURS wins; else explicit DAYS; else default 24h.
+  let hours: number | null = null;
+  if (hoursEnv !== undefined && hoursEnv !== "") {
+    const h = parseFloat(hoursEnv);
+    if (Number.isFinite(h) && h > 0) hours = h;
+  } else if (daysEnv !== undefined && daysEnv !== "") {
+    const d = parseFloat(daysEnv);
+    if (Number.isFinite(d) && d > 0) hours = d * 24;
+  } else {
+    hours = 24;
+  }
+  if (hours === null) return;
+  const label = hours >= 24 ? `${hours / 24} day(s)` : `${hours} hour(s)`;
   const purge = async () => {
     try {
-      await query(`DELETE FROM api_request_logs WHERE created_at < NOW() - ($1 || ' days')::interval`, [String(days)]);
+      const res = await query(
+        `DELETE FROM api_request_logs WHERE created_at < NOW() - ($1 || ' hours')::interval`,
+        [String(hours)],
+      );
+      const removed = res.rowCount || 0;
+      if (removed > 0) console.log(`[request-logs] retention purge removed ${removed} row(s) older than ${label}`);
     } catch (err: any) {
       console.warn("[request-logs] retention purge failed:", err?.message);
     }
   };
   purge();
-  cron.schedule("17 4 * * *", purge);
+  // Hourly sweep — cheap (indexed on created_at? PK scan OK for this volume)
+  cron.schedule("23 * * * *", purge);
 }

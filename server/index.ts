@@ -95,7 +95,7 @@ import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByC
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
@@ -919,6 +919,9 @@ export async function createServer() {
   }, postAiAttachment);
 
   // Calls API routes
+  // Push delivery-ack FIRST (public, no auth): the mobile background isolate
+  // posts it fire-and-forget on rendering an incoming-call push.
+  mainRouter.post("/calls/push-ack", pushAckCall);
   mainRouter.get("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCalls);
   mainRouter.get("/calls/code/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), getCallByCode);
   mainRouter.get("/calls/validate/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), validateCallAccess);

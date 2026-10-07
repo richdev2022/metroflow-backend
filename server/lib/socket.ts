@@ -389,7 +389,15 @@ export function initSocketServer(server: http.Server): void {
           socket.data.businessId = session.businessId;
           socket.data.authenticated = true;
         } else {
-          logger.warn("Socket presented an invalid/expired token - continuing as guest");
+          // An INVALID/EXPIRED token must NOT silently downgrade to guest:
+          // guest sockets never join user:{id}, so call:incoming / chat
+          // events would never reach this client and in-app ringing would
+          // quietly die (the "phone only rings on web" bug). Reject the
+          // handshake instead — Socket.IO clients auto-reconnect, and the
+          // mobile app refreshes its token on connect_error, so the next
+          // attempt authenticates properly.
+          logger.warn("Socket presented an invalid/expired token - rejecting handshake (client will reconnect with a fresh token)");
+          return next(new Error("auth_failed_token_invalid"));
         }
       }
     } catch (err) {

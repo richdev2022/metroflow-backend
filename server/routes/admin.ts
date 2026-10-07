@@ -10,7 +10,7 @@ import {
   parseEmailList,
   disputeAdminEmails,
 } from "./disputes";
-import { getSetting, setSetting, getIntlTransferConfig } from "../services/app-config";
+import { getSetting, setSetting, getIntlTransferConfig, getIntlPayoutLimits, getIntlPayoutSourceCurrency, DEFAULT_PAYOUT_LIMITS } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
@@ -4297,6 +4297,72 @@ protectedRouter.put("/intl-transfer-config", requirePermission('manage_finance')
         res.json({ success: true, data: { ...config, spread_percent: config.spreadPercent, quote_ttl_seconds: config.quoteTtlSeconds, transfer_provider: transferProvider } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to update international transfer config" });
+    }
+});
+
+// ============================================================================
+// International payout limits (min / max per currency) + platform float
+// ============================================================================
+
+/**
+ * GET /admin/intl-payout-limits
+ */
+protectedRouter.get("/intl-payout-limits", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const limits = await getIntlPayoutLimits();
+        const sourceCurrency = await getIntlPayoutSourceCurrency();
+        res.json({ success: true, data: { limits, defaults: DEFAULT_PAYOUT_LIMITS, source_currency: sourceCurrency } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load payout limits" });
+    }
+});
+
+/**
+ * PUT /admin/intl-payout-limits
+ * Body: { limits: { USD: {min,max}, GBP: {...}, EUR: {...} }, source_currency? }
+ * Flutterwave's published rails: min 10 / max 20,000 per transfer for
+ * USD, GBP and EUR. Clients surface these as an amount-field hint.
+ */
+protectedRouter.put("/intl-payout-limits", requirePermission('manage_finance'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { limits, source_currency } = req.body || {};
+        if (limits !== undefined) {
+            if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) {
+                return res.status(400).json({ success: false, error: "limits must be an object keyed by currency" });
+            }
+            const cleaned: Record<string, { min: number; max: number }> = {};
+            for (const [cur, val] of Object.entries(limits)) {
+                const currency = String(cur).toUpperCase();
+                if (!['USD', 'GBP', 'EUR'].includes(currency)) {
+                    return res.status(400).json({ success: false, error: `Unsupported payout currency: ${cur}` });
+                }
+                const min = Number((val as any)?.min);
+                const max = Number((val as any)?.max);
+                if (!Number.isFinite(min) || min <= 0) {
+                    return res.status(400).json({ success: false, error: `${currency} min must be a positive number` });
+                }
+                if (!Number.isFinite(max) || max <= 0) {
+                    return res.status(400).json({ success: false, error: `${currency} max must be a positive number` });
+                }
+                if (max < min) {
+                    return res.status(400).json({ success: false, error: `${currency} max must be greater than or equal to min` });
+                }
+                cleaned[currency] = { min, max };
+            }
+            await setSetting("intl_payout_limits", JSON.stringify(cleaned), "International payout min/max per currency");
+        }
+        if (source_currency !== undefined) {
+            const src = String(source_currency || 'NGN').toUpperCase();
+            if (!['NGN', 'USD', 'GBP', 'EUR'].includes(src)) {
+                return res.status(400).json({ success: false, error: "source_currency must be one of NGN, USD, GBP, EUR" });
+            }
+            await setSetting("intl_payout_source_currency", src, "Platform float currency funding international payouts");
+        }
+        const saved = await getIntlPayoutLimits();
+        const savedSource = await getIntlPayoutSourceCurrency();
+        res.json({ success: true, data: { limits: saved, source_currency: savedSource } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update payout limits" });
     }
 });
 

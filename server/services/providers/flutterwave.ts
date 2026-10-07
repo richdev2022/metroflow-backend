@@ -332,8 +332,28 @@ export const flutterwaveProvider: Provider = {
         currency: data.currencyId || "NGN",
         reference: data.transactionReference,
         beneficiary_name: data.accountName,
-        debit_currency: data.currencyId || "NGN",
       };
+
+      // Cross-currency funding: when the payout currency differs from the
+      // platform float currency, Flutterwave converts automatically via
+      // `payment_instruction` (source NGN -> destination USD/GBP/EUR) — no
+      // pre-funded foreign wallet needed. Same-currency payouts keep the
+      // classic `debit_currency` form. (docs: developer.flutterwave.com —
+      // "International (USD, EUR & GBP)" + payment_instruction guide.)
+      const destCurrency = (data.currencyId || "NGN").toUpperCase();
+      const sourceCurrency = (data.sourceCurrency || "NGN").toUpperCase();
+      if (destCurrency !== "NGN" && sourceCurrency !== destCurrency) {
+        payload.payment_instruction = {
+          source_currency: sourceCurrency,
+          destination_currency: destCurrency,
+          amount: {
+            applies_to: "destination_currency",
+            value: roundAmount(toMajorUnit(data.amount)),
+          },
+        };
+      } else {
+        payload.debit_currency = destCurrency;
+      }
 
       // International rails (USD/GBP/EUR): Flutterwave requires the
       // beneficiary's bank + address details INSIDE `meta[0]` — top-level
@@ -374,6 +394,9 @@ export const flutterwaveProvider: Provider = {
         if (data.recipientStreetNumber) meta.street_number = data.recipientStreetNumber;
         if (data.recipientStreetName) meta.street_name = data.recipientStreetName;
         if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
+        if (data.beneficiaryCountry) {
+          meta.beneficiary_country = String(data.beneficiaryCountry).toUpperCase();
+        }
         if (data.senderPhone) meta.sender_mobile_number = data.senderPhone;
         if (data.senderAddress) meta.sender_address = data.senderAddress;
         if (Object.keys(meta).length > 0) payload.meta = [meta];
@@ -393,7 +416,25 @@ export const flutterwaveProvider: Provider = {
         };
       }
 
-      const response = await flwClient.post("/v3/transfers", payload);
+      let response;
+      try {
+        response = await flwClient.post("/v3/transfers", payload);
+      } catch (piError: any) {
+        // Fallback: some Flutterwave integrations reject `payment_instruction`
+        // (older API revision). Retry ONCE with the classic cross-currency
+        // form — currency stays the destination, debit_currency the platform
+        // float — before giving up.
+        const piMsg = String(piError?.response?.data?.message || piError?.message || "");
+        const usedPaymentInstruction = "payment_instruction" in payload;
+        if (usedPaymentInstruction && destCurrency !== "NGN") {
+          console.warn(`[flutterwave] payment_instruction rejected (${piMsg}); retrying with debit_currency=${sourceCurrency}`);
+          delete payload.payment_instruction;
+          payload.debit_currency = sourceCurrency;
+          response = await flwClient.post("/v3/transfers", payload);
+        } else {
+          throw piError;
+        }
+      }
       return response.data;
     } catch (error: any) {
       console.error(

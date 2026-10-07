@@ -88,6 +88,27 @@ async function ensureBeneficiariesSchema(): Promise<void> {
        ALTER COLUMN business_id TYPE VARCHAR(255) USING business_id::text`,
     );
   }
+  // International beneficiaries (USD/GBP/EUR): store the full corridor
+  // details so the beneficiary page can prefill an international payout
+  // end-to-end (bank, routing/SWIFT, address block) without retyping.
+  await query(`
+    ALTER TABLE transfer_beneficiaries
+      ADD COLUMN IF NOT EXISTS recipient_country VARCHAR(5),
+      ADD COLUMN IF NOT EXISTS routing_number VARCHAR(30),
+      ADD COLUMN IF NOT EXISTS swift_code VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS account_type VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS address_line VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS city VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS state VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS postal_code VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS is_intl BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS email VARCHAR(160)
+  `);
+  // IBANs run up to 34 characters — widen the legacy VARCHAR(20) column.
+  await query(`ALTER TABLE transfer_beneficiaries ALTER COLUMN account_number TYPE VARCHAR(40)`);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_beneficiaries_user_currency ON transfer_beneficiaries(user_id, currency, last_used_at DESC)`,
+  );
 }
 
 /**
@@ -390,6 +411,11 @@ async function ensureChatAndAiSchema(): Promise<void> {
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_bank_name TEXT`);
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_swift_code TEXT`);
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_routing_number TEXT`);
+  // Account type on the intl rails (USD: checking|savings|depository,
+  // GBP: personal|corporate) — persisted so beneficiary prefill + provider
+  // meta[] survive the queue round-trip.
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_account_type VARCHAR(20)`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_email TEXT`);
   // Ledger backfill reads transfer_queue.description (see backfillLedgerHistory)
   // but the column was never part of the CREATE — boot-time backfill errored.
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS description TEXT`);

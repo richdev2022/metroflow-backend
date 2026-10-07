@@ -38,6 +38,9 @@ async function buildTransferProviderPayload(transfer: any): Promise<SingleTransf
     recipientStreetNumber: transfer.recipient_street_number || undefined,
     recipientStreetName: transfer.recipient_street_name || undefined,
     beneficiaryEmail: transfer.recipient_email || undefined,
+    // Platform float funding the payout (Flutterwave converts NGN -> dest
+    // automatically via payment_instruction when they differ).
+    sourceCurrency: (transfer as any)._platformSourceCurrency || 'NGN',
   };
 
   if (!payload.recipientStreetNumber && payload.beneficiaryAddress) {
@@ -115,7 +118,7 @@ export function validateIntlBeneficiary(
   const cur = String(currency || 'NGN').toUpperCase();
   if (cur === 'NGN') return { valid: true }; // domestic — provider resolves accounts
 
-  const routing = String(details.routingNumber || '').trim();
+  const routing = String(details.routingNumber || '').trim().replace(/[\s-]/g, '');
   const swift = String(details.swiftCode || '').trim();
   const bankName = String(details.bankName || '').trim();
 
@@ -167,6 +170,64 @@ export function validateIntlBeneficiary(
 // Flutterwave transfer status buckets
 const FLW_SUCCESS_STATUSES = ['SUCCESSFUL'];
 const FLW_PENDING_STATUSES = ['NEW', 'PENDING', 'QUEUED', 'ONGOING', 'PROCESSING', 'CREATED'];
+
+// ---------------------------------------------------------------------------
+// International quote calculator — SINGLE SOURCE OF TRUTH for the FX math.
+//
+// Flutterwave's /v3/transfers/rates returns a MULTIPLIER that converts the
+// source amount INTO the destination currency (rate ≈ 0.000645 USD-per-NGN).
+// Customers, however, think in the colloquial direction ("1 USD = ₦1,550"),
+// so every customer-facing rate is exposed COLLOQUIAL (destination-per-source
+// inverted: 1/rate).
+//
+// The admin markup + the ADMIN-ONLY spread are merged into ONE effective
+// margin and baked INTO the conversion rate — users never see a separate
+// spread or markup line, only "Conversion rate", "Fee" and "Total".
+//
+// Fee lives in the DEBIT (source) currency so it can be charged from the
+// source wallet together with the conversion amount.
+// ---------------------------------------------------------------------------
+export interface IntlQuote {
+  /** Colloquial mid-market rate: 1 destination = `liveRateColloquial` source. */
+  liveRateColloquial: number;
+  /** Colloquial rate AFTER margin — what the customer is actually charged at. */
+  conversionRate: number;
+  /** Destination-currency amount the beneficiary receives. */
+  receivingAmount: number;
+  /** Source-currency cost of the conversion (excl. fee). */
+  sourceDebit: number;
+  /** Source-currency fee. */
+  fee: number;
+  /** Source-currency total (sourceDebit + fee). */
+  totalDebit: number;
+  effectiveMarginPercent: number;
+}
+
+export function computeIntlQuote(
+  amount: number,
+  rawRate: number,
+  config: { feePercent: number; feeFlat: number },
+  effectiveMarginPercent: number,
+): IntlQuote {
+  const liveRateColloquial = Math.round((1 / rawRate) * 1000000) / 1000000;
+  // Margin INFLATES the source cost: customer pays (1 + margin) colloquial units
+  // per destination unit. (The raw multiplier direction would require DIVIDING
+  // — the previous implementation multiplied the USD-per-NGN rate, which gave
+  // customers a DISCOUNT instead of a margin.)
+  const conversionRate = Math.round(liveRateColloquial * (1 + effectiveMarginPercent / 100) * 100) / 100;
+  const sourceDebit = Math.round(amount * conversionRate * 100) / 100;
+  const fee = Math.round((sourceDebit * (config.feePercent / 100) + config.feeFlat) * 100) / 100;
+  const totalDebit = Math.round((sourceDebit + fee) * 100) / 100;
+  return {
+    liveRateColloquial,
+    conversionRate,
+    receivingAmount: Math.round(amount * 100) / 100,
+    sourceDebit,
+    fee,
+    totalDebit,
+    effectiveMarginPercent,
+  };
+}
 
 // Helper function to convert amount to minor units for both providers
 export function toMinorUnit(amount: number | string): string {
@@ -596,18 +657,20 @@ export function startTransferMonitor(firstRunDelayMs: number = IDLE_INTERVAL_MS)
  * are the DEBIT values and `_providerAmount`/`_providerCurrency` the provider
  * (destination) values.
  */
-export function normalizeTransferForProcessing(transfer: any): any {
+export function normalizeTransferForProcessing(transfer: any, platformSourceCurrency?: string): any {
   const debitAmount = transfer.debit_amount != null ? parseFloat(transfer.debit_amount) : NaN;
+  const source = platformSourceCurrency || 'NGN';
   if (Number.isFinite(debitAmount) && debitAmount > 0 && debitAmount !== parseFloat(transfer.amount)) {
     return {
       ...transfer,
       _providerAmount: transfer.amount,
       _providerCurrency: transfer.currency || 'NGN',
+      _platformSourceCurrency: source,
       amount: debitAmount,
       currency: transfer.debit_currency || transfer.currency || 'NGN',
     };
   }
-  return { ...transfer, _providerAmount: transfer.amount, _providerCurrency: transfer.currency || 'NGN' };
+  return { ...transfer, _providerAmount: transfer.amount, _providerCurrency: transfer.currency || 'NGN', _platformSourceCurrency: source };
 }
 
 /**
@@ -865,7 +928,19 @@ export async function processAllPending(businessId: string) {
 
   if (pendingTransfers.rows.length === 0) return;
 
-  pendingTransfers.rows = pendingTransfers.rows.map(normalizeTransferForProcessing);
+  // Platform float currency funding the provider side of international
+  // payouts (payment_instruction source). Fetched once per batch.
+  let platformFloatCurrency = 'NGN';
+  try {
+    const { getIntlPayoutSourceCurrency } = await import("./app-config");
+    platformFloatCurrency = await getIntlPayoutSourceCurrency();
+  } catch {
+    // default NGN
+  }
+
+  pendingTransfers.rows = pendingTransfers.rows.map((t: any) =>
+    normalizeTransferForProcessing(t, platformFloatCurrency),
+  );
 
   console.log(`Processing ${pendingTransfers.rows.length} pending transfers for business ${businessId}`);
 
@@ -1255,7 +1330,14 @@ export async function processTransfer(transferId: string) {
   // Fetch transfer
   const res = await query(`SELECT * FROM transfer_queue WHERE id = $1`, [transferId]);
   if (res.rows.length === 0) throw new Error("Transfer not found");
-  const transfer = normalizeTransferForProcessing(res.rows[0]);
+  let platformFloatCurrency = 'NGN';
+  try {
+    const { getIntlPayoutSourceCurrency } = await import("./app-config");
+    platformFloatCurrency = await getIntlPayoutSourceCurrency();
+  } catch {
+    // default NGN
+  }
+  const transfer = normalizeTransferForProcessing(res.rows[0], platformFloatCurrency);
   
   if (transfer.status === 'success') return { message: "Already successful" };
   

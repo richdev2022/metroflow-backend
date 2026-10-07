@@ -65,6 +65,13 @@ export interface TransferRequest {
   recipientStreetName?: string;
   /** Beneficiary email — optional meta[0] field for intl payouts. */
   beneficiaryEmail?: string;
+  /**
+   * Platform float currency the payout should be DEBITED from on the
+   * provider side (e.g. "NGN"). When it differs from the destination
+   * currency, Flutterwave converts automatically via payment_instruction —
+   * no pre-funded USD/GBP/EUR wallet needed.
+   */
+  sourceCurrency?: string;
   // Sender (the paying business) — compliance data for intl transfers
   senderName?: string;
   senderEmail?: string;

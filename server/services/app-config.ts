@@ -37,20 +37,29 @@ export interface IntlTransferConfig {
    * ever see one markup number.
    */
   spreadPercent: number;
+  /** Quote lock window (seconds) — admin-editable countdown duration. */
+  quoteTtlSeconds: number;
 }
 
 export async function getIntlTransferConfig(): Promise<IntlTransferConfig> {
-  const [markup, feePct, feeFlat, spread] = await Promise.all([
+  const [markup, feePct, feeFlat, spread, quoteTtl] = await Promise.all([
     getSetting("intl_transfer_markup_percent", "0"),
     getSetting("intl_transfer_fee_percent", "0"),
     getSetting("intl_transfer_fee_flat", "0"),
     getSetting("intl_transfer_spread_percent", "0"),
+    getSetting("intl_quote_ttl_seconds", ""),
   ]);
+  // Quote lock TTL: system_settings wins, then env INTL_QUOTE_TTL_SECONDS,
+  // then 60s. Clamped to a sane 30s..30min window.
+  const envTtl = parseInt(process.env.INTL_QUOTE_TTL_SECONDS || "60", 10) || 60;
+  const rawTtl = quoteTtl.trim() !== "" ? parseInt(quoteTtl, 10) : envTtl;
+  const ttl = Number.isFinite(rawTtl) ? rawTtl : 60;
   return {
     markupPercent: Number(markup) || 0,
     feePercent: Number(feePct) || 0,
     feeFlat: Number(feeFlat) || 0,
     spreadPercent: Number(spread) || 0,
+    quoteTtlSeconds: Math.min(1800, Math.max(30, ttl)),
   };
 }
 

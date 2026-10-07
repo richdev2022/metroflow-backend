@@ -89,6 +89,7 @@ import invoicesRouter from "./routes/invoices";
 import storeRouter from "./routes/store";
 import recurringRouter from "./routes/recurring";
 import providersRouter from "./routes/providers";
+import geoRouter from "./routes/geo";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
@@ -835,6 +836,10 @@ export async function createServer() {
 
   // Providers API routes
   mainRouter.use("/providers", providersRouter);
+
+  // Address autocomplete (OpenStreetMap proxy — shared UA identity for web
+  // and mobile; browser-direct Nominatim fetches get 503 on a browser UA).
+  mainRouter.use("/geo", geoRouter);
 
   // Test Communications API routes
   mainRouter.use("/test-communications", testCommunicationsRouter);

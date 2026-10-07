@@ -1079,11 +1079,16 @@ router.get("/employees/template", authenticateToken, checkSubscriptionStatus, ch
         const widths = [22, 28, 16, 18, 18, 12, 10, 12, 18, 24, 30, 12, 14, 34, 16, 18];
         widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        // Example rows (NGN uses a real 6-digit NIP code; USD shows the intl fields)
+        // Example rows: NGN (NIP code), USD (ABA + SWIFT), GBP (sort code),
+        // EUR (IBAN + BIC) — one per supported payout corridor.
         ws.addRow(["Ada Obi", "ada@example.com", "08012345678", "Engineering", "Developer", 450000, "NGN",
             "058", "0123456789", "Ada Obi", "Guaranty Trust Bank", "", "", "", "", ""]);
         ws.addRow(["John Doe", "john@example.com", "+15550123456", "Finance", "Accountant", 1200, "USD",
             "", "219133096568", "John Doe", "Bank of America", "BOFAUS3N", "026009593", "1 Main Street", "New York", "US"]);
+        ws.addRow(["Jane Smith", "jane@example.com", "+447700900123", "Operations", "Manager", 900, "GBP",
+            "", "82094660", "Jane Smith", "LLOYDS BANK", "", "308463", "10 Downing Street", "London", "GB"]);
+        ws.addRow(["Klaus Muller", "klaus@example.com", "+4915112345678", "Sales", "Associate", 1000, "EUR",
+            "", "IE091983888373BGH", "Klaus Muller", "LLOYDS BANK", "BECFDE7HKKX", "", "Handelsbank Elsenheimer Str. 31", "München", "DE"]);
 
         const lastBankRow = banksWs.rowCount;
         const lastDataRow = 500;
@@ -1102,11 +1107,11 @@ router.get("/employees/template", authenticateToken, checkSubscriptionStatus, ch
             ws.getCell(`H${r}`).value = {
                 formula: `IF($K${r}="","",IFERROR(VLOOKUP($K${r},Banks!$A:$B,2,FALSE),""))`,
             } as any;
-            // Currency (col G=7) suggestion list.
+            // Currency (col G=7) suggestion list — all supported payout corridors.
             ws.getCell(`G${r}`).dataValidation = {
                 type: "list",
                 allowBlank: true,
-                formulae: ['"NGN,USD"'],
+                formulae: ['"NGN,USD,GBP,EUR"'],
                 showErrorMessage: false,
             };
         }
@@ -1116,13 +1121,15 @@ router.get("/employees/template", authenticateToken, checkSubscriptionStatus, ch
         info.getColumn(1).width = 110;
         [
             "PAYROLL EMPLOYEES TEMPLATE — HOW TO USE",
-            "1. Fill the Employees sheet. One row per employee. Currency must be NGN or USD.",
+            "1. Fill the Employees sheet. One row per employee. Currency must be NGN, USD, GBP or EUR.",
             "2. NGN rows: type the employee's bank name in 'Bank Name' — Excel suggests matching banks as you type (dropdown),",
             "   and 'Bank Code' auto-fills. You may also type the 6-digit bank code manually.",
             "3. USD rows: fill Bank Name, SWIFT Code (8 or 11 chars), Routing Number (9-digit ABA), Beneficiary Address, City and Country.",
-            "4. Account Number must be exactly 10 digits for NGN recipients.",
-            "5. Save the file and upload it back via 'Import Employees'.",
-            "6. The Banks sheet lists every supported Nigerian bank with its official NIP code — do not edit it.",
+            "4. GBP rows: fill Bank Name, Routing Number (6-digit sort code, e.g. 308463) and Country (GB). Account type is personal/corporate.",
+            "5. EUR rows: fill Bank Name, SWIFT/BIC code (8 or 11 chars); Account Number is the IBAN. Include the beneficiary city.",
+            "6. Account Number must be exactly 10 digits for NGN recipients.",
+            "7. Save the file and upload it back via 'Import Employees'.",
+            "8. The Banks sheet lists every supported Nigerian bank with its official NIP code — do not edit it.",
         ].forEach((line, i) => {
             const row = info.addRow([line]);
             row.getCell(1).font = i === 0 ? { bold: true, size: 14 } : { size: 11 };

@@ -8,7 +8,7 @@ import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
-import { pushIncomingCall, pushMissedCall } from "../lib/call-push";
+import { pushIncomingCall, pushMissedCall, acknowledgeCallPush } from "../lib/call-push";
 import { roomManager } from "../lib/roomManager";
 import crypto from "crypto";
 import {
@@ -1124,13 +1124,40 @@ export const joinCall: RequestHandler = async (
       data: call,
     };
     res.json(response);
-  } catch (error) {
-    console.error("Join call error:", error);
+  } catch (error: any) {
+    // Log the REAL failure server-side; never leak internals to clients.
+    console.error("Join call error:", error?.stack || error);
+    const isDbUniqueConflict =
+      error?.code === "23505" ||
+      String(error?.message || "").includes("duplicate key");
     const response: ApiResponse<null> = {
       success: false,
-      error: "Failed to join call",
+      error: isDbUniqueConflict
+        ? "Join conflict — please retry"
+        : "Failed to join call",
     };
-    res.status(500).json(response);
+    res.status(isDbUniqueConflict ? 409 : 500).json(response);
+  }
+};
+
+/**
+ * POST /calls/push-ack — delivery receipt for incoming-call pushes.
+ * The mobile app fires this as soon as an incoming-call push is rendered
+ * (including from the background isolate). It cancels the server-side
+ * escalation that would otherwise re-send the call as a VISIBLE tray
+ * notification 8s later (OEM launchers silently drop data-only pushes while
+ * the app is swiped away — FCM still reports them as delivered).
+ * Auth optional-by-design: the background isolate posts fire-and-forget with
+ * whatever token it has; callId alone gates a notification resend, which is
+ * harmless.
+ */
+export const pushAckCall: RequestHandler = async (req, res) => {
+  try {
+    const { callId } = req.body || {};
+    if (callId) acknowledgeCallPush(String(callId));
+    res.status(204).end();
+  } catch {
+    res.status(204).end(); // never fail an ack
   }
 };
 

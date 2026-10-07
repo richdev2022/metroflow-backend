@@ -18,14 +18,55 @@ export interface IncomingCallPushInfo {
   conversationId?: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Delivery-ack ledger: Android OEM launchers (Xiaomi, Oppo, Vivo, some
+// Samsung power-savers) SILENTLY DROP data-only FCM messages when the app was
+// swiped away — FCM reports the send as accepted (`sent: 1`), so a
+// send-failure fallback never fires and the phone never rings. The mobile app
+// therefore ACKs every received incoming-call push via POST /calls/push-ack;
+// when no ack lands within the window below, we escalate to a VISIBLE tray
+// notification (notification + data hybrid), which Android delivers through
+// the system tray path that OEMs do not drop.
+// ---------------------------------------------------------------------------
+const ACK_WINDOW_MS = 8000;
+const pendingAckFallbacks = new Map<string, NodeJS.Timeout>();
+
+export function acknowledgeCallPush(callId: string): void {
+  if (!callId) return;
+  const timer = pendingAckFallbacks.get(callId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingAckFallbacks.delete(callId);
+  }
+}
+
+function scheduleVisibleFallback(
+  targets: { userId: string }[],
+  fcmPayload: any,
+  callId: string,
+): void {
+  // Never double-schedule for the same call (re-invites ring again).
+  const existing = pendingAckFallbacks.get(callId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    pendingAckFallbacks.delete(callId);
+    console.warn(`[call-push] no delivery ack for call ${callId} within ${ACK_WINDOW_MS}ms — escalating to visible tray notification`);
+    sendPushToUsers(targets, { ...fcmPayload, androidDataOnly: false }, { inApp: false }).catch(() => {});
+  }, ACK_WINDOW_MS);
+  // Unref so a pending fallback never keeps the process alive.
+  if (typeof timer.unref === "function") timer.unref();
+  pendingAckFallbacks.set(callId, timer);
+}
+
 /**
  * Ring every callee device through layered fallbacks:
  *   1. FCM data-only (Android): the app's own handler renders the rich
  *      full-screen ringing UI (Accept/Decline, ringtone) in EVERY app state
  *      — foreground, background and killed. iOS gets a real APNs alert.
- *   2. FCM hybrid retry: if delivery attempt #1 failed outright (no send
- *      succeeded — bad gateway, FCM 5xx, all tokens pruned), a system-tray
- *      notification is the last-resort fallback 1.5s later.
+ *   2. Delivery-ack fallback: the app acks the push via POST /calls/push-ack.
+ *      If NO ack arrives within 8s (OEM dropped the data-only message while
+ *      the app was swiped away), a VISIBLE system-tray notification is sent
+ *      so the callee's phone still rings and the tap still opens the call.
  *   3. Web Push (VAPID, TTL 60s, urgency high) for browser callees.
  *   4. Socket room ring + invite email are sent by the callers upstream.
  * Never pushes to the caller.
@@ -66,10 +107,18 @@ export async function pushIncomingCall(
       { inApp: false },
     ).catch(() => ({ sent: 0, failed: 0, users: 0 }));
 
-    // --- Attempt 2 (fallback): if nothing was accepted by FCM, retry as a
-    // hybrid so the SYSTEM tray at least rings even though the rich UI may
-    // not render. Skipped entirely when attempt 1 succeeded.
-    if (primary.sent === 0 && targets.length > 0) {
+    // --- Attempt 2 (delivery-ack fallback): even when FCM ACCEPTED the
+    // send, the device may never render a data-only message (OEM drop while
+    // the app is killed/swiped). The app acks on receipt; no ack within the
+    // window escalates to a visible tray notification.
+    if (primary.sent > 0) {
+      scheduleVisibleFallback(
+        targets.map((userId) => ({ userId })),
+        fcmPayload,
+        info.callId,
+      );
+    } else if (targets.length > 0) {
+      // Nothing was accepted at all — fall back immediately.
       setTimeout(() => {
         sendPushToUsers(
           targets.map((userId) => ({ userId })),

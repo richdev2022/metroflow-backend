@@ -959,6 +959,16 @@ export const joinCall: RequestHandler = async (
       [id, businessId],
     );
     const callState = validationResult.rows[0];
+    // Race guard: the row was found by the first lookup but vanished before
+    // this re-read (deleted mid-join). Reading `callState.status` on an empty
+    // result used to throw TypeError -> generic 500 "Failed to join call".
+    if (!callState) {
+      return res.status(404).json({
+        success: false,
+        error: "Call not found",
+        errorCode: 'call_not_found',
+      });
+    }
     const now = new Date();
 
     if (callState.status === 'cancelled') {
@@ -1019,15 +1029,21 @@ export const joinCall: RequestHandler = async (
 
     // Atomic upsert: re-joining (double tap, refresh, retry) refreshes the
     // SAME row instead of racing check-then-insert into duplicates.
-    await query(
-      `INSERT INTO call_participants (call_id, user_id, status, joined_at)
-       VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
-       ON CONFLICT (call_id, user_id) DO UPDATE SET
-         status = EXCLUDED.status,
-         joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE call_participants.joined_at END,
-         left_at = NULL`,
-      [actualId, userId, effectiveStatus],
-    );
+    // Best-effort: a transient DB hiccup here must not 500 the whole join —
+    // the socket join handler admits the user to the room regardless.
+    try {
+      await query(
+        `INSERT INTO call_participants (call_id, user_id, status, joined_at)
+         VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
+         ON CONFLICT (call_id, user_id) DO UPDATE SET
+           status = EXCLUDED.status,
+           joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE call_participants.joined_at END,
+           left_at = NULL`,
+        [actualId, userId, effectiveStatus],
+      );
+    } catch (participantErr: any) {
+      console.error("Participant upsert failed (non-fatal):", participantErr?.code || participantErr);
+    }
 
     const callResult = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 

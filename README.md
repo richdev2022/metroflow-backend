@@ -44,8 +44,8 @@ The backend powering **Metricorex** (project: Metroflow) — an all-in-one busin
 
 ### Fintech
 - Multi-currency wallets (NGN/USD), funding via card (Monnify / Squad / Flutterwave providers), virtual accounts (personal & business, business-name VAs, regeneration).
-- Transfers (single/bulk) with admin-toggled payout provider, account lookup, transfer history with filters + CSV export.
-- **International payouts via Flutterwave** with live FX quotes, admin markup % + fee % + **hidden spread %**, quote lock windows (`expires_at`), server-side pricing enforcement and auto-reversal on every failure path, three-ledger accounting: debit user wallet → credit platform wallet → credit revenue wallet (fees + markup), all recorded idempotently with historical backfill.
+- Transfers (single/bulk) with admin-toggled payout provider, account lookup, transfer history with filters + CSV export, **raise-a-dispute flow** (`POST /disputes` with category + message + optional attachment; web + mobile).
+- **International payouts via Flutterwave** with live FX quotes, admin markup % + fee % + **hidden spread %** + **admin-editable quote-lock countdown**, quote lock windows (`expires_at`/`expires_in_seconds`), server-side pricing enforcement and auto-reversal on every failure path, three-ledger accounting: debit user wallet → credit platform wallet → credit revenue wallet (fees + markup), all recorded idempotently with historical backfill. USD meta sends the documented `beneficiary_city/beneficiary_state/beneficiary_postal_code` keys (plus legacy aliases) and the sender block uses the business KYC address — fixes Flutterwave's "Invalid account number" disbursement rejections.
 - **Epic transfers** — one-off payments to multiple recipients from an epic, NGN + USD rows validated per corridor (10-digit NGN accounts, ABA checksum + account type for USD).
 - Payroll: employees (NGN & USD recipients), **Excel template with a Banks sheet + dropdown + VLOOKUP bank-code autofill**, invite emails, **bank-account verification** (only verified employees enter payout), bulk verification, salary payouts honoring verification.
 - Transaction OTP/PIN, KYC (BVN/NIN/business docs via Prembly), biometric unlock, login-attempt alert emails.
@@ -61,9 +61,11 @@ Five monetised surfaces, each wired into `pricing_plans` (feature toggles + limi
 
 ### Platform Operations (Admin)
 - Role & permission management (roles carry permission slugs; includes `support`, `view_request_logs`, `decrypt_request_logs`), admin management.
-- Payment provider toggles (global + transfer provider), fees & international transfer config (markup + spread), platform/revenue ledgers with movements + reconciliation.
-- **Activity Logs** (`/admin/request-logs`): every user + admin API request with actor/email/phone search, type/method/path/status/date filters, stats, per-log **decrypt** (permission-gated) revealing endpoint + payload + response.
+- Payment provider toggles (global + transfer provider), fees & international transfer config (**markup + hidden spread + fee % + flat fee + quote-lock countdown TTL**, all admin-editable), platform/revenue ledgers with movements + reconciliation.
+- **Activity Logs** (`/admin/request-logs`): every user + admin API request with actor/email/phone search, type/method/path/status/date filters, stats, per-log **decrypt** (permission-gated) revealing endpoint + payload + response, **manual Clear buttons** (older-than-24h / full wipe), and **automatic 24-hour retention** (`API_REQUEST_LOG_RETENTION_HOURS`, default 24 — hourly purge keeps the DB small).
 - **Locked Accounts** (`/admin/locked-accounts`): see and resolve login-lockout escalations (5 failed passwords → 30-min lock; 3 cycles → permanent block until an admin resolves).
+- **Transaction Disputes desk** (`/admin/disputes`): list/filter/review customer disputes with recheck / reverse / status / close actions (business_id aligned to `VARCHAR(255)` so every business can file + list).
+- **Mobile app download links** (`/admin/settings/app-store-urls`): App Store + Google Play URLs consumed by the marketing site download sections and the web meeting interstitial via the public `GET /api/public/app-links` endpoint.
 - Maintenance mode (emails + pushes all users), announcements ticker, broadcast email/push, KYC review, webhook monitoring, subscriptions & pricing plans (incl. per-plan RTC limits and MetricAi toggle).
 
 ### Notifications
@@ -114,7 +116,8 @@ Key variables (see `ENVIRONMENT_SETUP.md` for the full list):
 | `PAYLOAD_ENCRYPTION_KEY` | **E2E payload encryption** — 32-byte base64 key shared with all clients. Generate: `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Unset = plaintext mode (fully backward compatible). |
 | `PAYLOAD_ENCRYPTION_DISABLED` | Set `true` to force-disable encryption even when a key exists |
 | `API_REQUEST_LOG_MODE` | Request audit trail volume: `all` (default) \| `writes` \| `off` |
-| `API_REQUEST_LOG_RETENTION_DAYS` | Daily purge of `api_request_logs` (default 30) |
+| `API_REQUEST_LOG_RETENTION_HOURS` | Request-log retention (default **24** = hourly purge). `API_REQUEST_LOG_RETENTION_DAYS` still works as a legacy override |
+| `INTL_QUOTE_TTL_SECONDS` | Legacy fallback for the quote-lock window (default 60s) — the admin-editable `intl_quote_ttl_seconds` system setting wins |
 | `REDIS_URL` | `redis://127.0.0.1:6379` on the VPS — powers the waiting-room queue + caching. `/health` reports `{configured, connected, reason}` diagnostics; **`DISABLE_REDIS=true` disables Redis entirely** (remove it to enable) |
 | `SUPPORT_ALERT_EMAIL` | Optional email ping on new support requests |
 

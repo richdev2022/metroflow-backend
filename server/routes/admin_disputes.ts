@@ -126,7 +126,7 @@ const listDisputes: RequestHandler = async (req, res) => {
 /** GET /admin/disputes/:id */
 const getDispute: RequestHandler = async (req, res) => {
   try {
-    const dispute = await loadDispute(req.params.id);
+    const dispute = await loadDispute(String(req.params.id));
     if (!dispute) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;
@@ -183,7 +183,7 @@ const updateStatus: RequestHandler = async (req, res) => {
       res.status(400).json({ success: false, error: "Invalid status" });
       return;
     }
-    const dispute = await loadDispute(req.params.id);
+    const dispute = await loadDispute(String(req.params.id));
     if (!dispute) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;
@@ -247,7 +247,7 @@ const updateStatus: RequestHandler = async (req, res) => {
  */
 const reverseDispute: RequestHandler = async (req, res) => {
   try {
-    const dispute = await loadDispute(req.params.id);
+    const dispute = await loadDispute(String(req.params.id));
     if (!dispute) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;
@@ -352,7 +352,7 @@ const reverseDispute: RequestHandler = async (req, res) => {
  */
 const recheckDispute: RequestHandler = async (req, res) => {
   try {
-    const dispute = await loadDispute(req.params.id);
+    const dispute = await loadDispute(String(req.params.id));
     if (!dispute) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;
@@ -461,7 +461,7 @@ const recheckDispute: RequestHandler = async (req, res) => {
 /** POST /admin/disputes/:id/close { note } */
 const closeDispute: RequestHandler = async (req, res) => {
   try {
-    const dispute = await loadDispute(req.params.id);
+    const dispute = await loadDispute(String(req.params.id));
     if (!dispute) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;

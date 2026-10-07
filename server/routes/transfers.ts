@@ -1920,7 +1920,7 @@ router.get("/beneficiaries", authenticateToken, async (req: AuthenticatedRequest
       `SELECT id, bank_code, bank_name, account_number, account_name, currency,
               recipient_country, routing_number, swift_code, account_type,
               address_line, city, state, postal_code, email, is_intl,
-              use_count, last_used_at
+              use_count, last_used_at, verification_status, verified_at
        FROM transfer_beneficiaries
        WHERE ${clauses.join(' AND ')}
        ORDER BY last_used_at DESC
@@ -1949,6 +1949,8 @@ router.get("/beneficiaries", authenticateToken, async (req: AuthenticatedRequest
         isIntl: r.is_intl === true || (r.currency || 'NGN').toUpperCase() !== 'NGN',
         useCount: Number(r.use_count || 0),
         lastUsedAt: r.last_used_at,
+        verificationStatus: r.verification_status || 'unverified',
+        verifiedAt: r.verified_at || null,
       })),
     });
   } catch (error) {
@@ -2041,8 +2043,9 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
       `INSERT INTO transfer_beneficiaries
          (user_id, business_id, bank_code, account_number, account_name, currency,
           bank_name, recipient_country, routing_number, swift_code, account_type,
-          address_line, city, state, postal_code, email, is_intl)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          address_line, city, state, postal_code, email, is_intl,
+          verification_status, verified_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
        ON CONFLICT (user_id, bank_code, account_number)
        DO UPDATE SET
          account_name = COALESCE(EXCLUDED.account_name, transfer_beneficiaries.account_name),
@@ -2058,6 +2061,8 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
          postal_code = COALESCE(EXCLUDED.postal_code, transfer_beneficiaries.postal_code),
          email = COALESCE(EXCLUDED.email, transfer_beneficiaries.email),
          is_intl = EXCLUDED.is_intl,
+         verification_status = EXCLUDED.verification_status,
+         verified_at = EXCLUDED.verified_at,
          last_used_at = CURRENT_TIMESTAMP
        RETURNING *`,
       [
@@ -2073,6 +2078,8 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
         b.postalCode || b.postal_code || null,
         b.email || null,
         isIntl,
+        verification,
+        verification === 'unverified' ? null : new Date(),
       ],
     );
     const r = insert.rows[0];
@@ -2097,6 +2104,262 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
   } catch (error) {
     console.error("Create beneficiary error:", error);
     res.status(500).json({ success: false, error: "Failed to save beneficiary" });
+  }
+});
+
+/**
+ * PUT /transfers/beneficiaries/:id — edit a saved beneficiary. Any detail can
+ * be corrected (name, bank, routing/SWIFT, address block, email). When the
+ * identifying fields of an NGN beneficiary change (bank or account number),
+ * the record is re-resolved through the provider before saving; international
+ * corridors are re-validated against the corridor rules. An edit that touches
+ * the identifying fields resets the verification status until the new details
+ * pass their check.
+ */
+router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const { id } = req.params;
+
+    const existing = await query(
+      `SELECT id, user_id, bank_code, account_number, currency, is_intl
+       FROM transfer_beneficiaries WHERE id = $1 AND user_id = $2`,
+      [id, userId],
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
+    const row = existing.rows[0];
+    const currency = String(row.currency || 'NGN').toUpperCase();
+    const isIntl = row.is_intl === true || currency !== 'NGN';
+
+    const b = req.body || {};
+    const accountNumber = String(b.accountNumber ?? b.account_number ?? row.account_number).trim();
+    if (!accountNumber) {
+      return res.status(400).json({ success: false, error: "Account number is required", code: 'ACCOUNT_NUMBER_REQUIRED' });
+    }
+    const bankCode = String(b.bankCode ?? b.bank_code ?? row.bank_code ?? (isIntl ? 'SWIFT' : '')).trim();
+    const accountName = String(b.accountName ?? b.account_name ?? '').trim();
+
+    let verification: 'resolved' | 'format' | 'unverified' = 'unverified';
+    let resolvedName: string | null = null;
+    const identityChanged = bankCode !== row.bank_code || accountNumber !== row.account_number;
+
+    if (!isIntl) {
+      if (identityChanged) {
+        // NGN + changed identity: MUST resolve through the provider again.
+        if (!bankCode) {
+          return res.status(400).json({ success: false, error: "Bank is required for NGN beneficiaries", code: 'BANK_CODE_REQUIRED' });
+        }
+        try {
+          const lookup = await accountLookup(bankCode, accountNumber);
+          const name = lookup?.data?.account_name || lookup?.data?.accountName || null;
+          if (!name) {
+            return res.status(400).json({ success: false, error: "Account could not be verified. Check the account number and bank.", code: 'ACCOUNT_RESOLVE_FAILED' });
+          }
+          resolvedName = name;
+          verification = 'resolved';
+        } catch (err: any) {
+          return res.status(400).json({ success: false, error: err?.message || "Account could not be verified. Check the account number and bank.", code: 'ACCOUNT_RESOLVE_FAILED' });
+        }
+      } else {
+        verification = (row as any).verification_status === 'resolved' ? 'resolved' : 'format';
+      }
+    } else {
+      const intlCheck = validateIntlBeneficiary(currency, {
+        routingNumber: b.routingNumber ?? b.routing_number,
+        swiftCode: b.swiftCode ?? b.swift_code,
+        bankName: b.bankName ?? b.bank_name,
+        accountType: b.accountType ?? b.account_type,
+        accountNumber,
+        beneficiaryAddress: b.address ?? b.addressLine ?? b.address_line,
+        beneficiaryPostalCode: b.postalCode ?? b.postal_code,
+      });
+      if (!intlCheck.valid) {
+        return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
+      }
+      if (identityChanged) {
+        try {
+          const railCode = currency === 'USD' ? String(b.routingNumber ?? b.routing_number ?? 'ACH').toUpperCase()
+            : currency === 'GBP' ? String(b.routingNumber ?? b.routing_number ?? '').replace(/[\s-]/g, '')
+            : String(b.swiftCode ?? b.swift_code ?? '');
+          if (railCode) {
+            const lookup = await accountLookup(railCode, accountNumber);
+            const name = lookup?.data?.account_name || lookup?.data?.accountName || null;
+            if (name) {
+              resolvedName = name;
+              verification = 'resolved';
+            }
+          }
+        } catch {
+          // Foreign rails usually cannot resolve — format validation stands.
+        }
+        if (verification !== 'resolved') verification = 'format';
+      } else {
+        verification = (row as any).verification_status === 'resolved' ? 'resolved' : 'format';
+      }
+    }
+
+    const updated = await query(
+      `UPDATE transfer_beneficiaries SET
+         bank_code = $3,
+         account_number = $4,
+         account_name = COALESCE(NULLIF($5, ''), account_name),
+         bank_name = COALESCE($6, bank_name),
+         recipient_country = COALESCE($7, recipient_country),
+         routing_number = COALESCE($8, routing_number),
+         swift_code = COALESCE($9, swift_code),
+         account_type = COALESCE($10, account_type),
+         address_line = COALESCE($11, address_line),
+         city = COALESCE($12, city),
+         state = COALESCE($13, state),
+         postal_code = COALESCE($14, postal_code),
+         email = COALESCE($15, email),
+         verification_status = $16,
+         verified_at = CASE WHEN $16 = 'unverified' THEN NULL ELSE CURRENT_TIMESTAMP END,
+         last_used_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [
+        id, userId, bankCode, accountNumber,
+        accountName || resolvedName || '',
+        b.bankName ?? b.bank_name ?? null,
+        b.country ?? b.recipient_country ?? null,
+        b.routingNumber ?? b.routing_number ?? null,
+        b.swiftCode ? String(b.swiftCode).toUpperCase() : (b.swift_code ? String(b.swift_code).toUpperCase() : null),
+        b.accountType ?? b.account_type ?? null,
+        b.address ?? b.addressLine ?? b.address_line ?? null,
+        b.city ?? null,
+        b.state ?? null,
+        b.postalCode ?? b.postal_code ?? null,
+        b.email ?? null,
+        verification,
+      ],
+    );
+    const u = updated.rows[0];
+
+    res.json({
+      success: true,
+      message: "Beneficiary updated",
+      data: {
+        id: u.id,
+        bankCode: u.bank_code,
+        bankName: u.bank_name || null,
+        accountNumber: u.account_number,
+        accountName: u.account_name || '',
+        currency: (u.currency || 'NGN').toUpperCase(),
+        isIntl: u.is_intl === true,
+        verificationStatus: u.verification_status || 'unverified',
+        resolvedName,
+      },
+    });
+  } catch (error) {
+    console.error("Update beneficiary error:", error);
+    res.status(500).json({ success: false, error: "Failed to update beneficiary" });
+  }
+});
+
+/**
+ * POST /transfers/beneficiaries/:id/verify — re-run verification for a saved
+ * beneficiary. NGN resolves the real account name through the provider;
+ * international corridors re-run the corridor validation (and a best-effort
+ * provider resolve). Persists the fresh result so the Verified/Unverified
+ * chip on the beneficiary page reflects reality.
+ */
+router.post("/beneficiaries/:id/verify", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const { id } = req.params;
+
+    const existing = await query(
+      `SELECT id, user_id, bank_code, account_number, currency, is_intl,
+              routing_number, swift_code, bank_name, account_type,
+              address_line, postal_code
+       FROM transfer_beneficiaries WHERE id = $1 AND user_id = $2`,
+      [id, userId],
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
+    const row = existing.rows[0];
+    const currency = String(row.currency || 'NGN').toUpperCase();
+    const isIntl = row.is_intl === true || currency !== 'NGN';
+
+    let verification: 'resolved' | 'format' | 'unverified' = 'unverified';
+    let resolvedName: string | null = null;
+
+    if (!isIntl) {
+      try {
+        const lookup = await accountLookup(row.bank_code, row.account_number);
+        const name = lookup?.data?.account_name || lookup?.data?.accountName || null;
+        if (!name) {
+          return res.status(400).json({ success: false, error: "Account could not be verified. Check the account number and bank.", code: 'ACCOUNT_RESOLVE_FAILED' });
+        }
+        resolvedName = name;
+        verification = 'resolved';
+      } catch (err: any) {
+        return res.status(400).json({ success: false, error: err?.message || "Account could not be verified. Check the account number and bank.", code: 'ACCOUNT_RESOLVE_FAILED' });
+      }
+    } else {
+      const intlCheck = validateIntlBeneficiary(currency, {
+        routingNumber: row.routing_number,
+        swiftCode: row.swift_code,
+        bankName: row.bank_name,
+        accountType: row.account_type,
+        accountNumber: row.account_number,
+        beneficiaryAddress: row.address_line,
+        beneficiaryPostalCode: row.postal_code,
+      });
+      if (!intlCheck.valid) {
+        return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
+      }
+      try {
+        const railCode = currency === 'USD' ? String(row.routing_number || 'ACH').toUpperCase()
+          : currency === 'GBP' ? String(row.routing_number || '').replace(/[\s-]/g, '')
+          : String(row.swift_code || '');
+        if (railCode) {
+          const lookup = await accountLookup(railCode, row.account_number);
+          const name = lookup?.data?.account_name || lookup?.data?.accountName || null;
+          if (name) {
+            resolvedName = name;
+            verification = 'resolved';
+          }
+        }
+      } catch {
+        // Expected for foreign rails.
+      }
+      if (verification !== 'resolved') verification = 'format';
+    }
+
+    const upd = await query(
+      `UPDATE transfer_beneficiaries
+       SET verification_status = $3,
+           verified_at = CURRENT_TIMESTAMP,
+           account_name = CASE WHEN $4 IS NOT NULL AND COALESCE(account_name, '') = '' THEN $4 ELSE account_name END
+       WHERE id = $1 AND user_id = $2
+       RETURNING verification_status, verified_at, account_name`,
+      [id, userId, verification, resolvedName],
+    );
+    const u = upd.rows[0];
+
+    res.json({
+      success: true,
+      message: verification === 'resolved'
+        ? "Beneficiary verified"
+        : "Details passed validation for this corridor",
+      data: {
+        id,
+        verificationStatus: u.verification_status || verification,
+        verifiedAt: u.verified_at || new Date().toISOString(),
+        resolvedName,
+        accountName: u.account_name || '',
+      },
+    });
+  } catch (error) {
+    console.error("Verify beneficiary error:", error);
+    res.status(500).json({ success: false, error: "Failed to verify beneficiary" });
   }
 });
 

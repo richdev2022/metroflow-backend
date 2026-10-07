@@ -109,6 +109,20 @@ async function ensureBeneficiariesSchema(): Promise<void> {
   await query(
     `CREATE INDEX IF NOT EXISTS idx_beneficiaries_user_currency ON transfer_beneficiaries(user_id, currency, last_used_at DESC)`,
   );
+  // Beneficiary verification status — persisted result of the last
+  // verification pass: 'resolved' (NGN provider account-name match or an
+  // intl rail that resolved), 'format' (corridor format-validation passed),
+  // 'unverified' (never verified / edited since). The user-facing
+  // beneficiary pages show a Verified/Unverified chip from this column and
+  // offer a one-tap verify CTA that re-runs the check.
+  await query(`
+    ALTER TABLE transfer_beneficiaries
+      ADD COLUMN IF NOT EXISTS verification_status VARCHAR(20) NOT NULL DEFAULT 'unverified'
+  `);
+  await query(`
+    ALTER TABLE transfer_beneficiaries
+      ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP
+  `);
 }
 
 /**

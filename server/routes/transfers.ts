@@ -2116,11 +2116,45 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
  * the identifying fields resets the verification status until the new details
  * pass their check.
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Map a beneficiary-route DB failure to an actionable HTTP response instead
+ * of the opaque 500 "Failed to update beneficiary": malformed ids are a
+ * miss (404), UNIQUE violations are a duplicate the user can fix (409),
+ * and unexpected failures carry the truncated server reason so field
+ * reports stay diagnosable.
+ */
+function beneficiaryErrorResponse(res: any, action: string, error: any) {
+  const code = (error as any)?.code || "";
+  if (code === "23505") {
+    return res.status(409).json({
+      success: false,
+      error: "Another saved beneficiary already uses these bank details for this account",
+      code: 'BENEFICIARY_DUPLICATE',
+    });
+  }
+  if (code === "22P02" || code === "23514") {
+    return res.status(404).json({ success: false, error: "Beneficiary not found" });
+  }
+  const detail = error instanceof Error && error.message ? error.message.slice(0, 160) : "";
+  console.error(`${action} error:`, error);
+  return res.status(500).json({
+    success: false,
+    error: detail ? `Failed to ${action.toLowerCase()}: ${detail}` : `Failed to ${action.toLowerCase()}`,
+  });
+}
+
 router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
     const { id } = req.params;
+    // Guard BEFORE the uuid-cast query: a malformed id used to reach Postgres
+    // and surface as 500 "Failed to update beneficiary".
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
 
     const existing = await query(
       `SELECT id, user_id, bank_code, account_number, currency, is_intl
@@ -2255,8 +2289,7 @@ router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedReq
       },
     });
   } catch (error) {
-    console.error("Update beneficiary error:", error);
-    res.status(500).json({ success: false, error: "Failed to update beneficiary" });
+    return beneficiaryErrorResponse(res, "Update beneficiary", error);
   }
 });
 
@@ -2272,6 +2305,9 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
     const { id } = req.params;
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
 
     const existing = await query(
       `SELECT id, user_id, bank_code, account_number, currency, is_intl,
@@ -2358,8 +2394,7 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
       },
     });
   } catch (error) {
-    console.error("Verify beneficiary error:", error);
-    res.status(500).json({ success: false, error: "Failed to verify beneficiary" });
+    return beneficiaryErrorResponse(res, "Verify beneficiary", error);
   }
 });
 
@@ -2371,6 +2406,9 @@ router.delete("/beneficiaries/:id", authenticateToken, async (req: Authenticated
     const userId = req.user?.userId;
     const { id } = req.params;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: "Beneficiary not found" });
+    }
 
     const result = await query(
       `DELETE FROM transfer_beneficiaries WHERE id = $1 AND user_id = $2`,
@@ -2381,8 +2419,7 @@ router.delete("/beneficiaries/:id", authenticateToken, async (req: Authenticated
     }
     res.json({ success: true, message: "Beneficiary removed" });
   } catch (error) {
-    console.error("Delete beneficiary error:", error);
-    res.status(500).json({ success: false, error: "Failed to remove beneficiary" });
+    return beneficiaryErrorResponse(res, "Remove beneficiary", error);
   }
 });
 

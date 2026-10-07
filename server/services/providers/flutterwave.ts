@@ -359,8 +359,18 @@ export const flutterwaveProvider: Provider = {
             : "personal";
         }
         if (data.beneficiaryAddress) meta.beneficiary_address = data.beneficiaryAddress;
-        if (data.beneficiaryPostalCode) meta.postal_code = data.beneficiaryPostalCode;
-        if (data.beneficiaryCity) meta.city = data.beneficiaryCity;
+        if (data.beneficiaryCity) {
+          meta.beneficiary_city = data.beneficiaryCity;
+          meta.city = data.beneficiaryCity; // legacy key kept for older rails
+        }
+        if (data.beneficiaryState) {
+          meta.beneficiary_state = data.beneficiaryState;
+          meta.state = data.beneficiaryState;
+        }
+        if (data.beneficiaryPostalCode) {
+          meta.beneficiary_postal_code = data.beneficiaryPostalCode;
+          meta.postal_code = data.beneficiaryPostalCode; // legacy key
+        }
         if (data.recipientStreetNumber) meta.street_number = data.recipientStreetNumber;
         if (data.recipientStreetName) meta.street_name = data.recipientStreetName;
         if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
@@ -374,6 +384,9 @@ export const flutterwaveProvider: Provider = {
           ...(data.senderEmail ? { email: data.senderEmail } : {}),
           ...(data.senderPhone ? { phone_number: data.senderPhone } : {}),
           ...(data.senderAddress ? { address: data.senderAddress } : {}),
+          ...(data.senderCity ? { city: data.senderCity } : {}),
+          ...(data.senderState ? { state: data.senderState } : {}),
+          ...(data.senderPostalCode ? { postal_code: data.senderPostalCode } : {}),
           ...(data.senderCountry || data.beneficiaryCountry
             ? { country: (data.senderCountry || data.beneficiaryCountry).toUpperCase() }
             : {}),

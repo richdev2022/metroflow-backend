@@ -70,6 +70,9 @@ export interface TransferRequest {
   senderEmail?: string;
   senderPhone?: string;
   senderAddress?: string;
+  senderCity?: string;
+  senderState?: string;
+  senderPostalCode?: string;
   senderCountry?: string;
 }
 

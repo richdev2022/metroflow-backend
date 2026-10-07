@@ -1,6 +1,6 @@
 import express from "express";
 import { query } from "../db";
-import { isMaintenanceMode } from "../services/app-config";
+import { isMaintenanceMode, getSetting } from "../services/app-config";
 import { postPublicMetricAiAsk } from "./ai";
 
 /**
@@ -104,6 +104,52 @@ function compareVersionNames(a: string, b: string): number {
  *       200:
  *         description: Update availability + release metadata (always 200)
  */
+/**
+ * GET /public/app-links
+ * Mobile app download links configured by admins (system_settings), with a
+ * fallback to the latest active release store_url per platform. Consumed by
+ * the marketing site "Download our mobile app" sections and the web meeting
+ * interstitial. No sensitive data is exposed.
+ */
+router.get("/app-links", async (req, res) => {
+  try {
+    let [appStoreUrl, playStoreUrl] = await Promise.all([
+      getSetting("app_store_url"),
+      getSetting("play_store_url"),
+    ]);
+
+    // Fallback: per-platform store_url from the newest active app release.
+    if (!appStoreUrl || !playStoreUrl) {
+      try {
+        const relRes = await query(
+          `SELECT platform, store_url FROM app_versions
+           WHERE is_active = TRUE AND store_url IS NOT NULL AND store_url <> ''
+           ORDER BY version_code DESC`,
+        );
+        for (const row of relRes.rows) {
+          if (!appStoreUrl && row.platform === "ios" && /^https?:\/\//i.test(row.store_url)) {
+            appStoreUrl = row.store_url;
+          }
+          if (!playStoreUrl && row.platform === "android" && /^(https?:\/\/|market:\/\/)/i.test(row.store_url)) {
+            playStoreUrl = row.store_url;
+          }
+        }
+      } catch { /* app_versions may not exist yet — settings only is fine */ }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        app_store_url: appStoreUrl || null,
+        play_store_url: playStoreUrl || null,
+      },
+    });
+  } catch (error: any) {
+    console.error("Public app-links error:", error.message);
+    res.json({ success: true, data: { app_store_url: null, play_store_url: null } });
+  }
+});
+
 router.get("/app-updates/check", async (req, res) => {
   const platform = String(req.query.platform || "android").toLowerCase().trim();
   const currentVersionName = String(req.query.current_version_name || "").trim();

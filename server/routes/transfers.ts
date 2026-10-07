@@ -11,9 +11,11 @@ import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
 import { getIntlTransferConfig, effectiveMarkupPercent } from "../services/app-config";
 
-/** Quote lock window (seconds) — clients show a countdown and must re-quote
- *  when it lapses. The initiation path re-quotes server-side regardless. */
-const INTL_QUOTE_TTL_SECONDS = Math.max(30, parseInt(process.env.INTL_QUOTE_TTL_SECONDS || "60", 10) || 60);
+/** Quote lock window fallback (seconds) — the live value comes from the
+ *  admin-editable `intl_quote_ttl_seconds` system setting (getIntlTransferConfig),
+ *  with INTL_QUOTE_TTL_SECONDS env as the legacy override. Clients show a
+ *  countdown and must re-quote when it lapses; the initiation path re-quotes
+ *  server-side regardless. */
 import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
@@ -51,7 +53,8 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       const fee = config.feePercent > 0
         ? Math.round(amount * (config.feePercent / 100) * 100) / 100
         : 0 + (config.feeFlat > 0 ? config.feeFlat : 0);
-      const expiresAt = new Date(Date.now() + INTL_QUOTE_TTL_SECONDS * 1000);
+      const quoteTtl = config.quoteTtlSeconds;
+      const expiresAt = new Date(Date.now() + quoteTtl * 1000);
       return res.json({
         success: true,
         data: {
@@ -66,7 +69,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           total_debit: Math.round((amount + fee) * 100) / 100,
           provider: 'internal',
           expires_at: expiresAt.toISOString(),
-          expires_in_seconds: INTL_QUOTE_TTL_SECONDS,
+          expires_in_seconds: quoteTtl,
         },
       });
     }
@@ -92,7 +95,8 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       (sourceDebit * (config.feePercent / 100) + config.feeFlat) * 100,
     ) / 100;
     const totalDebit = Math.round((sourceDebit + fee) * 100) / 100;
-    const expiresAt = new Date(Date.now() + INTL_QUOTE_TTL_SECONDS * 1000);
+    const quoteTtl = config.quoteTtlSeconds;
+    const expiresAt = new Date(Date.now() + quoteTtl * 1000);
 
     res.json({
       success: true,
@@ -108,7 +112,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         total_debit: totalDebit,
         provider: 'flutterwave',
         expires_at: expiresAt.toISOString(),
-        expires_in_seconds: INTL_QUOTE_TTL_SECONDS,
+        expires_in_seconds: quoteTtl,
       },
     });
   } catch (error: any) {
@@ -1826,7 +1830,7 @@ router.post("/:id/force-reversal", authenticateToken, async (req: AuthenticatedR
       return res.status(401).json({ success: false, error: "Unauthorized" });
     }
 
-    const isUuid = /^[0-9a-fA-F-]{36}$/.test(id);
+    const isUuid = /^[0-9a-fA-F-]{36}$/.test(String(id));
     const transferRes = await query(
       isUuid
         ? `SELECT * FROM transfer_queue WHERE id = $1 AND business_id = $2`

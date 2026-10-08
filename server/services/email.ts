@@ -1,4 +1,34 @@
 import { sendEmail as sendEmailFromSender } from "./email-sender";
+import {
+  buildEmailFooterHtml,
+  ensureEmailFooter,
+  EMAIL_FOOTER_MARKER,
+  DEFAULT_EMAIL_CONFIG,
+  EMAIL_CONFIG_KEYS,
+  getEmailConfig,
+  getEmailConfigWithMeta,
+  invalidateEmailConfigCache,
+  saveEmailConfig,
+} from "./email-footer";
+
+/**
+ * Shared email footer + admin-editable email config (app download links,
+ * social links). Implemented in ./email-footer (reuses the system_settings
+ * KV table with a 60s in-process cache); re-exported here because this module
+ * is the central email library every caller already imports.
+ */
+export {
+  buildEmailFooterHtml,
+  ensureEmailFooter,
+  EMAIL_FOOTER_MARKER,
+  DEFAULT_EMAIL_CONFIG,
+  EMAIL_CONFIG_KEYS,
+  getEmailConfig,
+  getEmailConfigWithMeta,
+  invalidateEmailConfigCache,
+  saveEmailConfig,
+};
+export type { EmailConfig, EmailConfigKey } from "./email-footer";
 
 // Official brand logo used across every email template. Always points at
 // the official Metricorex artwork hosted on the marketing site — app-host
@@ -101,6 +131,7 @@ export function generateLoginAttemptEmailHtml(
           <p style="color: #9ca3af; font-size: 12px; line-height: 1.5;">
             You are receiving this email because login attempt notifications are enabled for your Metricorex account.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -139,6 +170,7 @@ export function generateAccountCreationEmailHtml(name: string, loginLink: string
           <p style="color: #9ca3af; font-size: 12px;">
             If you did not expect this email, you can safely ignore it.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -169,6 +201,7 @@ export function generateMaintenanceModeEmailHtml(name: string, isDown: boolean, 
           <p style="color: #333;">Hi ${name},</p>
           <p style="color: #666; line-height: 1.6;">${body}</p>
           <p style="color: #9ca3af; font-size: 12px;">Time (UTC): ${time.toISOString().replace('T', ' ').slice(0, 19)}</p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -191,6 +224,7 @@ export function generateBroadcastEmailHtml(name: string, subject: string, messag
           <p style="color: #333;">Hi ${name},</p>
           <div style="color: #666; line-height: 1.7;">${message.replace(/\n/g, '<br/>')}</div>
           <p style="color: #9ca3af; font-size: 12px; margin-top: 24px;">This message was sent by the Metricorex team.</p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -254,6 +288,7 @@ export function generateInviteEmailHtml(
           <p style="color: #999; font-size: 12px; margin-top: 15px;">
             This link will expire in 7 days.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -316,12 +351,8 @@ export function generateAdminInviteEmailHtml(
             If the button above doesn't work, copy and paste this link into your browser:<br/>
             <a href="${loginLink}" style="color: #2563eb; text-decoration: none; word-break: break-all;">${loginLink}</a>
           </p>
-          
-          <div style="text-align: center; margin-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -373,6 +404,7 @@ export function generateBusinessRegistrationEmailHtml(
           <p style="color: #999; font-size: 12px; margin-top: 20px; text-align: center;">
             If you have any questions, feel free to contact our support team.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -472,6 +504,7 @@ export async function sendCommentNotification(
               <p style="color: #999; font-size: 12px; margin-top: 20px;">
                 You received this email because you are a member of this business.
               </p>
+              ${buildEmailFooterHtml()}
             </div>
           </body>
         </html>
@@ -550,6 +583,7 @@ export async function sendMentionNotification(
               <p style="color: #999; font-size: 12px; margin-top: 20px;">
                 You received this email because you were mentioned in a comment.
               </p>
+              ${buildEmailFooterHtml()}
             </div>
           </body>
         </html>
@@ -612,11 +646,7 @@ export async function sendTransferFailureNotification(
             Please check your dashboard to retry the transaction or investigate the issue.
           </p>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -664,6 +694,7 @@ export async function sendPayrollAdjustmentNotification(
           </div>
 
           <p style="color: #6b7280; font-size: 14px;">This adjustment will be reflected in the next salary processing.</p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -764,9 +795,7 @@ export function generateMeetingInvitationEmailHtml(
             <span style="word-break: break-all; color: #2563eb;">${meetingLink}</span>
           </p>
 
-          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-          </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -865,9 +894,7 @@ export function generateMeetingReminderEmailHtml(input: MeetingReminderEmailInpu
             <span style="word-break: break-all; color: #2563eb;">${input.link}</span>
           </p>
 
-          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-          </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -957,9 +984,7 @@ export function generateCallInvitationEmailHtml(
             <span style="word-break: break-all; color: #10b981;">${callLink}</span>
           </p>
 
-          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-          </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -999,11 +1024,7 @@ export function generateOtpEmailHtml(
             Do not share this code with anyone.
           </p>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1059,6 +1080,7 @@ export function generateTaskActivityEmailHtml(
           <p style="color: #999; font-size: 12px; margin-top: 20px;">
             You received this email because you are assigned to this task or are an admin.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1107,11 +1129,7 @@ export function generateKYCOtpEmailHtml(
             Do not share this code with anyone. Metricorex support will never ask for this code.
           </p>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1159,11 +1177,7 @@ export function generateSubscriptionCancelledEmail(
             </a>
           </div>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1212,11 +1226,7 @@ export function generateSubscriptionDowngradedEmail(
             </a>
           </div>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1278,11 +1288,7 @@ export function generateSubscriptionActivatedEmail(
             </a>
           </div>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1330,11 +1336,7 @@ export function generateRenewalFailedEmail(
             </a>
           </div>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1438,10 +1440,8 @@ export function generateTransactionAlertEmailHtml(
             <p style="color: #9ca3af; font-size: 12px;">
               If you did not initiate this transaction, please contact our support team immediately.
             </p>
-            <p style="color: #9ca3af; font-size: 12px; margin-top: 8px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
           </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -1562,10 +1562,10 @@ export function generateDisputeEmailHtml(
 
           ${cta}
 
-          <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-top: 28px;">
-            Need help? Contact us at support@metricorex.com.<br/>
-            &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
+          <p style="color: #9ca3af; font-size: 12px; text-align: center; margin: 20px 0 0;">
+            Need help? Contact us at support@metricorex.com.
           </p>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>`;
@@ -1604,4 +1604,50 @@ export async function sendDisputeCustomerUpdate(
     `${heading} - ${data.reference}`,
     html,
   );
+}
+
+/* ==========================================================================
+ * CHAT INVITE EMAIL
+ * Sent when a user invites someone to chat on Metricorex. Subject line is
+ * chosen by the caller; this builder renders the body + shared footer.
+ * ========================================================================== */
+
+export interface ChatInviteEmailInput {
+  inviterName: string;
+  inviteUrl: string;
+}
+
+export function generateChatInviteEmailHtml({ inviterName, inviteUrl }: ChatInviteEmailInput): string {
+  const logoUrl = EMAIL_LOGO_URL;
+
+  return `
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 40px 0; margin: 0;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+          <div style="text-align: center; margin-bottom: 30px;">
+             <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 180px; height: auto;" />
+          </div>
+
+          <h1 style="color: #111827; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 24px;">Chat Invite 💬</h1>
+
+          <p style="color: #374151; font-size: 16px; line-height: 1.6; margin-bottom: 24px; text-align: center;">
+            ${inviterName} has invited you to Metricorex to chat with them. Kindly use the web app or download the mobile app and register to start chatting.
+          </p>
+
+          <div style="text-align: center; margin-bottom: 32px;">
+            <a href="${inviteUrl}" style="background-color: #2563eb; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">
+              Join Metricorex &amp; Chat
+            </a>
+          </div>
+
+          <p style="color: #6b7280; font-size: 14px; text-align: center; margin-top: 12px; margin-bottom: 24px;">
+            If the button doesn't work, copy this link: <br/>
+            <span style="word-break: break-all; color: #2563eb;">${inviteUrl}</span>
+          </p>
+
+          ${buildEmailFooterHtml()}
+        </div>
+      </body>
+    </html>
+  `;
 }

@@ -11,6 +11,7 @@ import {
 } from "../services/media-upload";
 import { getTenorApiKey } from "../lib/config-flags";
 import { glmChat, isGlmConfigured } from "../lib/glm";
+import { sendEmail, generateChatInviteEmailHtml } from "../services/email";
 
 // Call-log messages (WhatsApp-style call history in chat) are inserted by the
 // SHARED helper in lib/call-log.ts — used by both the REST call paths and the
@@ -181,6 +182,206 @@ async function ensureConversationParticipant(
  *       200:
  *         description: Conversations fetched successfully
  */
+// ---------------------------------------------------------------------------
+// GUEST CONTACTS (chat "add anyone by email")
+// Users can add ANY email as a chat contact. Registered workspace members
+// resolve to their profile (the client starts a normal direct chat); unknown
+// emails become GUESTS: the inviter's chat list shows the contact with an
+// "Invited" badge and the invitee receives an email pointing at registration.
+// ---------------------------------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_MAX = 254;
+
+/**
+ * @swagger
+ * /chat/contacts/lookup:
+ *   get:
+ *     summary: Resolve an email for the chat add-contact flow
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: email
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: registered users resolve with name+userId; others are guests
+ */
+export const lookupChatContact: RequestHandler = async (req, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const email = String(req.query.email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
+      return res.status(400).json({ success: false, error: "Enter a valid email address" });
+    }
+
+    const member = await query(
+      `SELECT id, name FROM users WHERE business_id = $1 AND LOWER(email) = $2 LIMIT 1`,
+      [businessId, email],
+    );
+    if (member.rows.length > 0) {
+      return res.json({
+        success: true,
+        data: { registered: true, name: member.rows[0].name, userId: member.rows[0].id },
+      });
+    }
+
+    const guest = await query(
+      `SELECT id, invited_at FROM chat_guest_contacts WHERE owner_user_id = $1 AND email = $2 LIMIT 1`,
+      [req.user!.userId, email],
+    );
+    if (guest.rows.length > 0) {
+      return res.json({
+        success: true,
+        data: { registered: false, guest: true, invited: true, contactId: guest.rows[0].id },
+      });
+    }
+
+    return res.json({ success: true, data: { registered: false, guest: true, invited: false } });
+  } catch (error) {
+    console.error("Chat contact lookup error:", error);
+    res.status(500).json({ success: false, error: "Failed to look up that email" });
+  }
+};
+
+/**
+ * @swagger
+ * /chat/contacts/invite:
+ *   post:
+ *     summary: Invite an unregistered email to Metricorex chat
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Guest contact stored + invite email sent
+ */
+export const inviteChatContact: RequestHandler = async (req, res) => {
+  try {
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    const inviterName = req.user?.name || "A Metricorex user";
+    if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
+      return res.status(400).json({ success: false, error: "Enter a valid email address" });
+    }
+
+    // Workspace members don't need invites — they are already chattable.
+    const member = await query(
+      `SELECT id FROM users WHERE business_id = $1 AND LOWER(email) = $2 LIMIT 1`,
+      [businessId, email],
+    );
+    if (member.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: "This person is already on your workspace — start a chat with them directly",
+      });
+    }
+
+    await query(
+      `INSERT INTO chat_guest_contacts (owner_user_id, email)
+       VALUES ($1, $2)
+       ON CONFLICT (owner_user_id, email)
+       DO UPDATE SET invited_at = NOW(), updated_at = NOW()`,
+      [userId, email],
+    );
+
+    const baseUrl =
+      process.env.CLIENT_URL || process.env.APP_BASE_URL || process.env.APP_URL || "https://metricorex.com";
+    let emailSent = false;
+    try {
+      emailSent = await sendEmail(
+        email,
+        null,
+        `${inviterName} invited you to Metricorex`,
+        generateChatInviteEmailHtml({
+          inviterName,
+          inviteUrl: `${baseUrl}/register?email=${encodeURIComponent(email)}&source=chat-invite`,
+        }),
+      );
+    } catch (emailError) {
+      console.error("Chat invite email failed (non-fatal):", emailError);
+    }
+
+    const contact = await query(
+      `SELECT id, email, invited_at as "invitedAt" FROM chat_guest_contacts
+       WHERE owner_user_id = $1 AND email = $2 LIMIT 1`,
+      [userId, email],
+    );
+
+    res.json({
+      success: true,
+      message: emailSent ? "Invitation sent" : "Contact saved — the invite email could not be sent right now",
+      data: { invited: true, emailSent, contact: contact.rows[0] || null },
+    });
+  } catch (error) {
+    console.error("Chat contact invite error:", error);
+    res.status(500).json({ success: false, error: "Failed to send the invite" });
+  }
+};
+
+/**
+ * @swagger
+ * /chat/contacts:
+ *   get:
+ *     summary: List the caller's invited (guest) chat contacts
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ */
+export const getChatGuestContacts: RequestHandler = async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const rows = await query(
+      `SELECT id, email, invited_at as "invitedAt" FROM chat_guest_contacts
+       WHERE owner_user_id = $1
+       ORDER BY invited_at DESC LIMIT 100`,
+      [userId],
+    );
+    res.json({ success: true, data: { contacts: rows.rows } });
+  } catch (error) {
+    console.error("Chat guest contacts list error:", error);
+    res.status(500).json({ success: false, error: "Failed to load invited contacts" });
+  }
+};
+
+/**
+ * @swagger
+ * /chat/contacts/:id:
+ *   delete:
+ *     summary: Remove an invited (guest) chat contact
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ */
+export const deleteChatGuestContact: RequestHandler = async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const { id } = req.params;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      return res.status(404).json({ success: false, error: "Contact not found" });
+    }
+    const result = await query(
+      `DELETE FROM chat_guest_contacts WHERE id = $1 AND owner_user_id = $2`,
+      [id, userId],
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, error: "Contact not found" });
+    }
+    res.json({ success: true, message: "Contact removed" });
+  } catch (error) {
+    console.error("Chat guest contact delete error:", error);
+    res.status(500).json({ success: false, error: "Failed to remove the contact" });
+  }
+};
+
 export const getConversations: RequestHandler = async (
   req: AuthenticatedRequest,
   res,

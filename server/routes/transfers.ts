@@ -1232,7 +1232,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       const usersRes = await query(
         `SELECT id, name, salary_amount, salary_currency, bank_code, account_number, account_name,
                 verification_status, verified_account_name, bank_name, bank_country, swift_code, routing_number,
-                beneficiary_address, beneficiary_city, beneficiary_country
+                beneficiary_address, beneficiary_city, beneficiary_state, beneficiary_postal_code, beneficiary_country
          FROM users 
          WHERE business_id = $1 AND status = 'active' AND salary_amount > 0`,
         [businessId]
@@ -1310,6 +1310,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           recipientRoutingNumber: u.routing_number || null,
           recipientAddress: u.beneficiary_address || null,
           recipientCity: u.beneficiary_city || null,
+          recipientState: u.beneficiary_state || null,
+          recipientPostalCode: u.beneficiary_postal_code || null,
           fee: isIntlEmp
             ? // Face-value destination-currency payout: the flat fee is
               // NGN-denominated, so only the percentage applies here.
@@ -2250,8 +2252,8 @@ router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedReq
          state = COALESCE($13, state),
          postal_code = COALESCE($14, postal_code),
          email = COALESCE($15, email),
-         verification_status = $16,
-         verified_at = CASE WHEN $16 = 'unverified' THEN NULL ELSE CURRENT_TIMESTAMP END,
+         verification_status = $16::varchar,
+         verified_at = CASE WHEN $16::varchar = 'unverified' THEN NULL ELSE CURRENT_TIMESTAMP END,
          last_used_at = CURRENT_TIMESTAMP
        WHERE id = $1 AND user_id = $2
        RETURNING *`,

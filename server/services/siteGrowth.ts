@@ -1,6 +1,7 @@
 import { query } from "../db";
 import { sendEmail } from "./email-sender";
 import { EMAIL_LOGO_URL_EXPORT as EMAIL_LOGO_URL } from "./email";
+import { buildEmailFooterHtml } from "./email-footer";
 
 /**
  * Site growth service — marketing-site wishlist + email subscriptions and
@@ -91,11 +92,13 @@ function layoutEmail(title: string, bodyHtml: string, cta?: { label: string; url
           <div style="font-size:15px;line-height:1.65;color:#374151;">${bodyHtml}</div>
           ${ctaHtml}
         </td></tr>
-        <tr><td style="padding:26px 36px 30px;border-top:1px solid #eef0f4;margin-top:24px;">
+        <tr><td style="padding:26px 36px 6px;border-top:1px solid #eef0f4;">
           <p style="margin:0;font-size:12px;line-height:1.6;color:#9ca3af;">
             You are receiving this because you subscribed at metricorex.com.
-            <br>© ${new Date().getFullYear()} ${escapeHtml(BRAND_NAME)}. All rights reserved.
           </p>
+        </td></tr>
+        <tr><td style="padding:10px 24px 30px;">
+          ${buildEmailFooterHtml()}
         </td></tr>
       </table>
     </td></tr>

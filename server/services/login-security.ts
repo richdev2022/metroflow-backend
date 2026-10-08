@@ -1,5 +1,6 @@
 import { query } from "../db";
 import { sendEmail } from "./email";
+import { buildEmailFooterHtml } from "./email-footer";
 
 // Official brand logo used across every email template. Always points at
 // the official Metricorex artwork hosted on the marketing site — app-host
@@ -236,11 +237,7 @@ async function sendAccountLockoutEmail(email: string, lockoutEnd: Date, ipAddres
             If you didn't attempt to login, please reset your password immediately and contact support.
           </p>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>
@@ -282,11 +279,7 @@ async function sendLoginNotificationEmail(email: string, ipAddress?: string, use
             If this was you, you can ignore this email. If you didn't login, please reset your password immediately and contact support.
           </p>
 
-          <div style="text-align: center; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 24px;">
-            <p style="color: #9ca3af; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} Metricorex. All rights reserved.
-            </p>
-          </div>
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>

@@ -110,7 +110,16 @@ export async function uploadMediaBuffer(opts: {
       : (cloudinaryStorage.isAvailable() ? cloudinaryStorage : null);
     if (cloud) {
       try {
-        const url = await cloud.uploadFile(key, buffer, mimeType);
+        const rawUrl = await cloud.uploadFile(key, buffer, mimeType);
+        // R2 WITHOUT a configured public URL returns the bare object KEY
+        // ("metricai/123-abc.png") — clients cannot load a bare key as a
+        // URL, which is exactly why MetricAi generated images (and other
+        // cloud uploads) rendered as broken images on web and mobile.
+        // Normalize to the API's /files/<key> media route; the mobile/web
+        // media resolvers already absolutize root-relative paths.
+        const url = /^https?:\/\//i.test(rawUrl) || rawUrl.startsWith("/")
+          ? rawUrl
+          : `/files/${rawUrl}`;
         return {
           url,
           filename: originalname || `${stem}.${ext}`,

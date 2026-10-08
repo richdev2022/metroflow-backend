@@ -633,6 +633,8 @@ async function ensurePayrollVerificationColumns(): Promise<void> {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS routing_number VARCHAR(50)`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS beneficiary_address TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS beneficiary_city VARCHAR(120)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS beneficiary_state VARCHAR(120)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS beneficiary_postal_code VARCHAR(20)`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS beneficiary_country VARCHAR(5)`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS payroll_currency VARCHAR(3)`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(120)`,

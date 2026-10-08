@@ -120,6 +120,32 @@ function safeEquals(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+/**
+ * EUR/GBP street split: Flutterwave's European address block wants
+ * street_number and street_name as SEPARATE meta fields, but the app forms
+ * collect one street line. Prefer explicit fields when the client sends
+ * them; otherwise split the first whitespace token as the number when it
+ * contains a digit ("1801 Main Street" -> "1801" + "Main Street").
+ */
+function splitStreetAddress(
+  explicitNumber?: string | null,
+  explicitName?: string | null,
+  full?: string | null,
+): { streetNumber: string; streetName: string } {
+  const num = String(explicitNumber || "").trim();
+  const name = String(explicitName || "").trim();
+  if (num && name) return { streetNumber: num, streetName: name };
+  const raw = String(full || "").trim();
+  if (!raw) return { streetNumber: num, streetName: name };
+  const first = raw.split(/\s+/)[0] || "";
+  const rest = raw.slice(first.length).trim();
+  if (/\d/.test(first)) {
+    return { streetNumber: num || first, streetName: name || rest || raw };
+  }
+  return { streetNumber: num, streetName: name || raw };
+}
+
+
 export const flutterwaveProvider: Provider = {
   name: "flutterwave",
 
@@ -364,56 +390,65 @@ export const flutterwaveProvider: Provider = {
       // official reference: developer.flutterwave.com/docs/international-usd-eur-gbp).
       const isIntl = (data.currencyId || "NGN") !== "NGN" || !!data.beneficiaryCountry;
       if (isIntl) {
-        const meta: Record<string, unknown> = {};
-        if (data.routingNumber) meta.routing_number = data.routingNumber;
-        if (data.swiftCode) meta.swift_code = data.swiftCode.toUpperCase();
-        if (data.bankName) meta.bank_name = data.bankName;
-        // account_type for USD (checking|savings|depository→checking) and GBP
-        // (personal|corporate). Default sensibly when the client did not send it.
-        if ((data.currencyId || "").toUpperCase() === "USD") {
-          const usdType = String(data.accountType || "").toLowerCase();
-          meta.account_type = usdType === "savings" ? "savings" : "checking";
-        } else if ((data.currencyId || "").toUpperCase() === "GBP") {
-          meta.account_type = ["personal", "corporate"].includes(String(data.accountType || "").toLowerCase())
-            ? String(data.accountType).toLowerCase()
-            : "personal";
-        }
-        if (data.beneficiaryAddress) meta.beneficiary_address = data.beneficiaryAddress;
-        if (data.beneficiaryCity) {
-          meta.beneficiary_city = data.beneficiaryCity;
-          meta.city = data.beneficiaryCity; // legacy key kept for older rails
-        }
-        if (data.beneficiaryState) {
-          meta.beneficiary_state = data.beneficiaryState;
-          meta.state = data.beneficiaryState;
-        }
-        if (data.beneficiaryPostalCode) {
-          meta.beneficiary_postal_code = data.beneficiaryPostalCode;
-          meta.postal_code = data.beneficiaryPostalCode; // legacy key
-        }
-        if (data.recipientStreetNumber) meta.street_number = data.recipientStreetNumber;
-        if (data.recipientStreetName) meta.street_name = data.recipientStreetName;
-        if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
-        if (data.beneficiaryCountry) {
-          meta.beneficiary_country = String(data.beneficiaryCountry).toUpperCase();
-        }
-        if (data.senderPhone) meta.sender_mobile_number = data.senderPhone;
-        if (data.senderAddress) meta.sender_address = data.senderAddress;
-        if (Object.keys(meta).length > 0) payload.meta = [meta];
-      }
-      if (isIntl) {
-        payload.sender = {
-          name: data.senderName || data.accountName || "Metroflow business",
-          ...(data.senderEmail ? { email: data.senderEmail } : {}),
-          ...(data.senderPhone ? { phone_number: data.senderPhone } : {}),
-          ...(data.senderAddress ? { address: data.senderAddress } : {}),
-          ...(data.senderCity ? { city: data.senderCity } : {}),
-          ...(data.senderState ? { state: data.senderState } : {}),
-          ...(data.senderPostalCode ? { postal_code: data.senderPostalCode } : {}),
-          ...(data.senderCountry || data.beneficiaryCountry
-            ? { country: (data.senderCountry || data.beneficiaryCountry).toUpperCase() }
-            : {}),
+        // -----------------------------------------------------------------
+        // PER-CURRENCY META CONTRACT (Flutterwave international payout docs,
+        // USD / GBP / EUR): every corridor has an EXACT meta[0] shape and the
+        // request carries NO top-level account_bank / account_number — the
+        // beneficiary's account lives inside meta[0]. Top-level bank fields
+        // are silently ignored by /v3/transfers.
+        //
+        //  USD: account_number, routing_number (ABA), swift_code, bank_name,
+        //       beneficiary_name, beneficiary_address (single string),
+        //       beneficiary_country, email, account_type (checking |
+        //       depository — "Use checking for Grey virtual accounts").
+        //  EUR: account_number = IBAN, routing_number + swift_code = BIC,
+        //       bank_name, beneficiary_name, beneficiary_country,
+        //       postal_code, street_number, street_name, city (REQUIRED).
+        //  GBP: same shape as EUR; account_number = UK account number,
+        //       routing_number = sort code or BIC; beneficiary_country is
+        //       "UK" (not "GB").
+        // -----------------------------------------------------------------
+        const ccy = (data.currencyId || "NGN").toUpperCase();
+        const meta: Record<string, unknown> = {
+          account_number: data.accountNumber,
+          bank_name: data.bankName || "",
+          beneficiary_name: data.accountName || "",
+          beneficiary_country:
+            ccy === "GBP" ? "UK" : String(data.beneficiaryCountry || "").toUpperCase(),
         };
+
+        if (ccy === "USD") {
+          if (data.routingNumber) meta.routing_number = data.routingNumber;
+          if (data.swiftCode) meta.swift_code = String(data.swiftCode).toUpperCase();
+          const usdType = String(data.accountType || "").toLowerCase();
+          meta.account_type = usdType === "depository" ? "depository" : "checking";
+          meta.beneficiary_address = data.beneficiaryAddress || "";
+          if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
+        } else {
+          // EUR + GBP share the European address-block contract.
+          if (data.routingNumber) meta.routing_number = data.routingNumber;
+          meta.swift_code = String(data.swiftCode || data.routingNumber || "").toUpperCase();
+          meta.postal_code = data.beneficiaryPostalCode || "";
+          const street = splitStreetAddress(
+            data.recipientStreetNumber,
+            data.recipientStreetName,
+            data.beneficiaryAddress,
+          );
+          if (street.streetNumber) meta.street_number = street.streetNumber;
+          meta.street_name = street.streetName || data.beneficiaryAddress || "";
+          meta.city = data.beneficiaryCity || "";
+          if (ccy === "GBP") {
+            const gbpType = String(data.accountType || "").toLowerCase();
+            if (gbpType === "personal" || gbpType === "corporate") {
+              meta.account_type = gbpType;
+            }
+          }
+        }
+        payload.meta = [meta];
+        // Doc-exact: intl requests do NOT carry the domestic top-level
+        // account_bank / account_number pair.
+        delete payload.account_bank;
+        delete payload.account_number;
       }
 
       let response;

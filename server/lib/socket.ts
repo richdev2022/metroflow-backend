@@ -396,7 +396,10 @@ export function initSocketServer(server: http.Server): void {
           // handshake instead — Socket.IO clients auto-reconnect, and the
           // mobile app refreshes its token on connect_error, so the next
           // attempt authenticates properly.
-          logger.warn("Socket presented an invalid/expired token - rejecting handshake (client will reconnect with a fresh token)");
+          // Expected self-healing churn (expired token mid-session) — debug
+          // level so it doesn't pollute the error log; set LOG_LEVEL=debug
+          // to see it when diagnosing "calls not ringing" reports.
+          logger.debug("Socket presented an invalid/expired token - rejecting handshake (client will reconnect with a fresh token)");
           return next(new Error("auth_failed_token_invalid"));
         }
       }

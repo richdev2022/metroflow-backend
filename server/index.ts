@@ -112,7 +112,7 @@ import { runPostInitializeMigrations } from "./migrations";
 import { isGlmConfigured } from "./lib/glm";
 import { isTenorConfigured } from "./lib/config-flags";
 import { getMediasoupDiagnostics } from "./lib/mediasoup";
-import { getCloudStorage } from "./lib/storage";
+import { getCloudStorage, r2Storage } from "./lib/storage";
 import publicRouter from "./routes/public";
 import supportRouter from "./routes/support";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
@@ -433,6 +433,42 @@ export async function createServer() {
   // app.use(express.static(path.join(__dirname, "../public")));
   app.use(express.static(path.join(process.cwd(), "public")));
   
+  // Serve cloud-stored media by key: GET /files/<key>. R2 uploads without a
+  // configured public URL come back as bare object keys — without this route
+  // (and the /files/<key> normalization in media-upload) those media render
+  // as broken images on web and mobile. Public read is safe: keys embed a
+  // random per-upload suffix, mirroring the /uploads fallback's exposure.
+  app.get("/files/*", async (req, res) => {
+    try {
+      const rawKey = (req.params as any)["0"] || "";
+      const key = String(rawKey).replace(/^\/+/, "");
+      if (!key || key.includes("..") || key.includes("\\") || !r2Storage.isAvailable()) {
+        return res.status(404).send("Not found");
+      }
+      const buffer = await r2Storage.getFile(key);
+      const ext = path.extname(key).toLowerCase();
+      const contentType =
+        ext === ".png" ? "image/png" :
+        ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" :
+        ext === ".gif" ? "image/gif" :
+        ext === ".webp" ? "image/webp" :
+        ext === ".svg" ? "image/svg+xml" :
+        ext === ".mp4" ? "video/mp4" :
+        ext === ".webm" ? "video/webm" :
+        ext === ".mp3" ? "audio/mpeg" :
+        ext === ".wav" ? "audio/wav" :
+        ext === ".ogg" || ext === ".oga" ? "audio/ogg" :
+        ext === ".m4a" ? "audio/mp4" :
+        ext === ".pdf" ? "application/pdf" :
+        "application/octet-stream";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      return res.send(buffer);
+    } catch (err) {
+      return res.status(404).send("Not found");
+    }
+  });
+
   // Serve uploaded files
   const isLambda = !!process.env.LAMBDA_TASK_ROOT || !!process.env.NETLIFY;
   const uploadDir = isLambda ? path.join("/tmp", "uploads") : path.join(process.cwd(), "uploads");

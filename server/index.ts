@@ -438,9 +438,13 @@ export async function createServer() {
   // (and the /files/<key> normalization in media-upload) those media render
   // as broken images on web and mobile. Public read is safe: keys embed a
   // random per-upload suffix, mirroring the /uploads fallback's exposure.
-  app.get("/files/*", async (req, res) => {
+  // Express 5 (path-to-regexp v8): wildcards must be named ("/files/*splat" —
+  // the old Express 4 "/files/*" throws PathError at startup) and capture an
+  // ARRAY of segments in req.params.splat, so join with "/" to rebuild the key.
+  app.get("/files/*splat", async (req, res) => {
     try {
-      const rawKey = (req.params as any)["0"] || "";
+      const splat = (req.params as any)["splat"];
+      const rawKey = (Array.isArray(splat) ? splat.join("/") : String(splat ?? "")).replace(/^\/+/, "");
       const key = String(rawKey).replace(/^\/+/, "");
       if (!key || key.includes("..") || key.includes("\\") || !r2Storage.isAvailable()) {
         return res.status(404).send("Not found");

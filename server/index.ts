@@ -90,10 +90,11 @@ import storeRouter from "./routes/store";
 import recurringRouter from "./routes/recurring";
 import providersRouter from "./routes/providers";
 import geoRouter from "./routes/geo";
+import { getStatuses, createStatus, deleteStatus, viewStatus, likeStatus, getStatusLikes, repostStatus } from "./routes/statuses";
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall } from "./routes/calls";
@@ -438,9 +439,13 @@ export async function createServer() {
   // (and the /files/<key> normalization in media-upload) those media render
   // as broken images on web and mobile. Public read is safe: keys embed a
   // random per-upload suffix, mirroring the /uploads fallback's exposure.
-  app.get("/files/*", async (req, res) => {
+  // Express 5 (path-to-regexp v8): wildcards must be named ("/files/*splat" —
+  // the old Express 4 "/files/*" throws PathError at startup) and capture an
+  // ARRAY of segments in req.params.splat, so join with "/" to rebuild the key.
+  app.get("/files/*splat", async (req, res) => {
     try {
-      const rawKey = (req.params as any)["0"] || "";
+      const splat = (req.params as any)["splat"];
+      const rawKey = (Array.isArray(splat) ? splat.join("/") : String(splat ?? "")).replace(/^\/+/, "");
       const key = String(rawKey).replace(/^\/+/, "");
       if (!key || key.includes("..") || key.includes("\\") || !r2Storage.isAvailable()) {
         return res.status(404).send("Not found");
@@ -877,6 +882,15 @@ export async function createServer() {
   // and mobile; browser-direct Nominatim fetches get 503 on a browser UA).
   mainRouter.use("/geo", geoRouter);
 
+  // Chat status (WhatsApp-style 24h stories) — same permission family as chat.
+  mainRouter.get("/statuses", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getStatuses);
+  mainRouter.post("/statuses", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), createStatus);
+  mainRouter.post("/statuses/:id/view", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), viewStatus);
+  mainRouter.post("/statuses/:id/like", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), likeStatus);
+  mainRouter.get("/statuses/:id/likes", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getStatusLikes);
+  mainRouter.post("/statuses/:id/repost", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), repostStatus);
+  mainRouter.delete("/statuses/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), deleteStatus);
+
   // Test Communications API routes
   mainRouter.use("/test-communications", testCommunicationsRouter);
 
@@ -913,6 +927,13 @@ export async function createServer() {
   mainRouter.post("/chat/conversations/:conversationId/read", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), markConversationAsRead);
   // Voice-note / media upload for chat (WhatsApp-style audio messages)
   mainRouter.post("/chat/media", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), uploadChatMedia);
+
+  // Chat guest contacts — "add anyone by email" (registered members resolve
+  // to a normal DM; unknown emails get an invite + an Invited badge row).
+  mainRouter.get("/chat/contacts", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getChatGuestContacts);
+  mainRouter.get("/chat/contacts/lookup", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), lookupChatContact);
+  mainRouter.post("/chat/contacts/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), inviteChatContact);
+  mainRouter.delete("/chat/contacts/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), deleteChatGuestContact);
   // GIF picker (Tenor proxy — key stays server-side)
   mainRouter.get("/chat/gifs", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), searchChatGifs);
 

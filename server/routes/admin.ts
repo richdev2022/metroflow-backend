@@ -3,7 +3,7 @@ import { loginAdmin } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
 import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
-import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert, emailLogoHeader } from "../services/email";
+import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert, emailLogoHeader, getEmailConfigWithMeta, saveEmailConfig, EMAIL_CONFIG_KEYS } from "../services/email";
 import {
   getDisputeAdminEmails,
   setDisputeAdminEmails,
@@ -3827,6 +3827,64 @@ protectedRouter.put("/settings/app-store-urls", requirePermission('manage_settin
         res.json({ success: true, data: { app_store_url: appStore || "", play_store_url: playStore || "" } });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to save app store URLs" });
+    }
+});
+
+/**
+ * GET /admin/email-config — the shared EMAIL footer configuration (app
+ * download links + social links) that every outbound email renders. Returns
+ * the effective values (stored override or sensible default) plus a
+ * using_defaults map so the console can show which keys are unedited.
+ */
+protectedRouter.get("/email-config", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { config, usingDefaults } = await getEmailConfigWithMeta();
+        res.json({ success: true, data: { ...config, using_defaults: usingDefaults } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load email config" });
+    }
+});
+
+/**
+ * PUT /admin/email-config
+ * Body: any subset of { play_store_url, app_store_url, instagram_link,
+ * twitter_link, linkedin_link, facebook_link }. Values must be http(s) URLs
+ * (max 500 chars); an empty string clears the override so the default shows
+ * again. Persists to system_settings and invalidates the 60s email cache.
+ */
+protectedRouter.put("/email-config", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const body = req.body || {};
+        const provided = EMAIL_CONFIG_KEYS.filter((k) => body[k] !== undefined);
+        if (provided.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: `Provide at least one of: ${EMAIL_CONFIG_KEYS.join(", ")}`,
+            });
+        }
+
+        const result = await saveEmailConfig(body);
+        if (result.ok === false) {
+            return res.status(400).json({ success: false, error: result.error });
+        }
+
+        try {
+            const { logAuditEvent } = await import("../services/audit");
+            await logAuditEvent({
+                action: 'email_config_updated',
+                entityType: 'system_settings',
+                entityId: 'email_config',
+                newValues: Object.fromEntries(provided.map((k) => [k, result.config[k]])),
+            });
+        } catch (auditErr) {
+            console.warn("Failed to audit log email config change:", auditErr);
+        }
+
+        console.log(`[admin] email footer config updated by admin ${req.admin?.adminId}: ${provided.join(", ")}`);
+        const { config, usingDefaults } = await getEmailConfigWithMeta();
+        res.json({ success: true, message: "Email footer configuration saved", data: { ...config, using_defaults: usingDefaults } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save email config" });
     }
 });
 

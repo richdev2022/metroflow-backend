@@ -1,6 +1,7 @@
 import { query } from "../db";
 import { generateProductDocumentation, regenerateProductDocumentation } from "./ai";
 import { sendEmail } from "./email";
+import { buildEmailFooterHtml } from "./email-footer";
 
 type JobType = "generate" | "regenerate";
 
@@ -220,6 +221,8 @@ async function sendProductDocReadyEmail(
           <p style="color: #6b7280; font-size: 13px; text-align: center; margin-top: 24px;">
             You received this email because you requested product documentation generation in Metricorex.
           </p>
+
+          ${buildEmailFooterHtml()}
         </div>
       </body>
     </html>

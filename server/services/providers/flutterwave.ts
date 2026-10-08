@@ -435,7 +435,16 @@ export const flutterwaveProvider: Provider = {
           if (data.swiftCode) meta.swift_code = String(data.swiftCode).toUpperCase();
           const usdType = String(data.accountType || "").toLowerCase();
           meta.account_type = usdType === "depository" ? "depository" : "checking";
-          meta.beneficiary_address = data.beneficiaryAddress || "";
+          // Doc-style single address string: street, city, state — the forms
+          // collect them separately, disbursement wants one beneficiary_address.
+          meta.beneficiary_address = [
+            data.beneficiaryAddress,
+            data.beneficiaryCity,
+            data.beneficiaryState,
+          ]
+            .map((p) => String(p || "").trim())
+            .filter(Boolean)
+            .join(", ");
           if (data.beneficiaryEmail) meta.email = data.beneficiaryEmail;
         } else {
           // EUR + GBP share the European address-block contract.

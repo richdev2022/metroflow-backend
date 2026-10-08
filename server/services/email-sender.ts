@@ -1,5 +1,6 @@
 import axios from "axios";
 import nodemailer from "nodemailer";
+import { ensureEmailFooter } from "./email-footer";
 
 interface EmailPayload {
   to: Array<{
@@ -23,6 +24,16 @@ export async function sendEmail(
   subject: string,
   htmlContent: string,
 ): Promise<boolean> {
+  // Safety net: EVERY outbound email carries the shared footer (app download
+  // badges + social links). Templates built with buildEmailFooterHtml()
+  // already embed the marker and pass through untouched; inline fragments
+  // built in route handlers get the footer injected before </body>.
+  let html = htmlContent;
+  try {
+    html = ensureEmailFooter(htmlContent);
+  } catch (footerError) {
+    console.warn("Email footer injection skipped:", footerError instanceof Error ? footerError.message : footerError);
+  }
   try {
     if (!process.env.BREVO_API_KEY || !process.env.BREVO_BASE_URL) {
       // Fallback to Nodemailer if SMTP vars are present
@@ -42,7 +53,7 @@ export async function sendEmail(
             from: `"${process.env.SMTP_FROM_NAME || 'MetricFlow'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@metricflow.com'}>`,
             to: to,
             subject: subject,
-            html: htmlContent,
+            html: html,
           });
           console.log("Email sent successfully via Nodemailer:", { to, subject });
           return true;
@@ -64,7 +75,7 @@ export async function sendEmail(
         },
       ],
       subject,
-      htmlContent,
+      htmlContent: html,
       sender: {
         name: process.env.BREVO_SENDER_NAME || "VeloBank",
         email: process.env.BREVO_SENDER_EMAIL || "noreply@quantigrate.com",
@@ -119,7 +130,7 @@ export async function sendEmail(
           from: `"${process.env.SMTP_FROM_NAME || 'MetricFlow'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@metricflow.com'}>`,
           to: to,
           subject: subject,
-          html: htmlContent,
+          html: html,
         });
         console.log("Email sent via SMTP fallback after Brevo failure:", { to, subject });
         return true;

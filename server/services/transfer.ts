@@ -135,28 +135,38 @@ export function validateIntlBeneficiary(
     if (checksum % 10 !== 0) {
       return { valid: false, error: 'The US bank routing number failed checksum validation — please double-check it with the beneficiary', code: 'ROUTING_NUMBER_CHECKSUM' };
     }
+    // USD contract (Flutterwave intl docs): account_type accepts checking or
+    // depository only — "Use checking for Grey virtual accounts".
     const acctType = String(details.accountType || 'checking').toLowerCase();
-    // Flutterwave accepts checking/savings on USD ACH; 'depository' appears in
-    // older wiring guides — accept all three and normalise downstream.
-    if (!['checking', 'savings', 'depository'].includes(acctType)) {
-      return { valid: false, error: 'USD transfers require the account type to be "checking" or "savings"', code: 'ACCOUNT_TYPE_INVALID' };
+    if (!['checking', 'depository'].includes(acctType)) {
+      return { valid: false, error: 'USD transfers require the account type to be "checking" or "depository"', code: 'ACCOUNT_TYPE_INVALID' };
     }
-    // Street address is required; postal code is optional (FLW's meta builder
-    // only includes it when provided — the web/mobile forms do not collect it).
     if (!details.beneficiaryAddress) {
       return { valid: false, error: "USD transfers require the beneficiary's street address", code: 'BENEFICIARY_ADDRESS_REQUIRED' };
     }
-  } else if (cur === 'GBP') {
-    if (!/^\d{6}$/.test(routing)) {
-      return { valid: false, error: 'A valid 6-digit UK sort code is required for GBP transfers', code: 'ROUTING_NUMBER_INVALID' };
+  } else if (cur === 'GBP' || cur === 'EUR') {
+    // GBP contract: routing_number = UK sort code OR BIC/SWIFT.
+    // EUR contract: account_number = IBAN, routing_number + swift_code = BIC.
+    const isSortCode = /^\d{6}$/.test(routing);
+    const bicCandidate = String(swift || details.routingNumber || '').trim();
+    const isBic = /^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(bicCandidate) && /[A-Za-z]/.test(bicCandidate);
+    if (!isSortCode && !isBic) {
+      return cur === 'GBP'
+        ? { valid: false, error: 'A valid 6-digit UK sort code or BIC/SWIFT is required for GBP transfers', code: 'ROUTING_NUMBER_INVALID' }
+        : { valid: false, error: 'A valid BIC/SWIFT code (8 or 11 characters) is required for EUR transfers', code: 'SWIFT_CODE_INVALID' };
     }
-    const acctType = String(details.accountType || 'personal').toLowerCase();
-    if (!['personal', 'corporate'].includes(acctType)) {
-      return { valid: false, error: 'GBP transfers require the account type to be "personal" or "corporate"', code: 'ACCOUNT_TYPE_INVALID' };
+    // account_type is optional for GBP (personal|corporate when provided).
+    const acctType = String(details.accountType || '').toLowerCase();
+    if (acctType && !['personal', 'corporate'].includes(acctType)) {
+      return { valid: false, error: 'GBP account type must be "personal" or "corporate" when provided', code: 'ACCOUNT_TYPE_INVALID' };
     }
-  } else if (cur === 'EUR') {
-    if (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift)) {
-      return { valid: false, error: 'A valid SWIFT/BIC code (8 or 11 characters) is required for EUR transfers', code: 'SWIFT_CODE_INVALID' };
+    // European address block (both corridors): postal code + street + city
+    // are part of the documented meta contract (city is REQUIRED by FLW).
+    if (!details.beneficiaryPostalCode) {
+      return { valid: false, error: `${cur} transfers require the beneficiary's postal code`, code: 'POSTAL_CODE_REQUIRED' };
+    }
+    if (!details.beneficiaryAddress) {
+      return { valid: false, error: `${cur} transfers require the beneficiary's street address`, code: 'BENEFICIARY_ADDRESS_REQUIRED' };
     }
   } else {
     // Other corridors: at least one routing identifier must be present.

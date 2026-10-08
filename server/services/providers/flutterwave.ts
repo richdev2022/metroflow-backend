@@ -125,7 +125,9 @@ function safeEquals(a: string, b: string): boolean {
  * street_number and street_name as SEPARATE meta fields, but the app forms
  * collect one street line. Prefer explicit fields when the client sends
  * them; otherwise split the first whitespace token as the number when it
- * contains a digit ("1801 Main Street" -> "1801" + "Main Street").
+ * contains a digit ("1801 Main Street" -> "1801" + "Main Street"), or the
+ * LAST token when the address ends in a house number (the common European
+ * format, "Elsenheimer Str. 31" -> "31" + "Elsenheimer Str.").
  */
 function splitStreetAddress(
   explicitNumber?: string | null,
@@ -141,6 +143,17 @@ function splitStreetAddress(
   const rest = raw.slice(first.length).trim();
   if (/\d/.test(first)) {
     return { streetNumber: num || first, streetName: name || rest || raw };
+  }
+  // European style: trailing house number, optionally with a letter suffix
+  // ("Elsenheimer Str. 31", "High Street 31B"). Only when the trailing token
+  // is short + alnum so postal codes that leaked into the street line
+  // ("Main Street 80489") still split sensibly — 5-digit DE postcodes exceed
+  // the 4-char house-number shape and stay in the street name instead.
+  if (!num) {
+    const trailing = raw.match(/^(.+?)\s+(\d{1,4}[A-Za-z]?)$/);
+    if (trailing) {
+      return { streetNumber: trailing[2], streetName: name || trailing[1] };
+    }
   }
   return { streetNumber: num, streetName: name || raw };
 }

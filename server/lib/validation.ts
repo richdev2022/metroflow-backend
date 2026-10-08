@@ -43,6 +43,14 @@ export const InitiateSingleTransferSchema = z.object({
   /** USD: "checking" | "depository". GBP: "personal" | "corporate". */
   accountType: z.string().max(20).optional(),
   account_type: z.string().max(20).optional(),
+  /** Beneficiary email — required by the USD meta[0] contract. */
+  beneficiaryEmail: z.string().max(160).optional(),
+  beneficiary_email: z.string().max(160).optional(),
+  /** Explicit street components (EUR/GBP meta[0]) — derived from the address when absent. */
+  recipientStreetNumber: z.string().max(20).optional(),
+  recipientStreetName: z.string().max(200).optional(),
+  recipient_street_number: z.string().max(20).optional(),
+  recipient_street_name: z.string().max(200).optional(),
 });
 
 export const InitiateBulkTransferSchema = z.object({
@@ -75,9 +83,11 @@ export const InitiateBulkTransferSchema = z.object({
         recipientState: z.string().optional(),
         recipientPostalCode: z.string().optional(),
         recipientCountry: z.string().optional(),
-        beneficiaryEmail: z.string().email().optional(),
+        beneficiaryEmail: z.preprocess((v) => (typeof v === "string" && !v.trim() ? undefined : v), z.string().email().optional()),
         accountType: z.string().max(20).optional(),
         account_type: z.string().max(20).optional(),
+        recipientStreetNumber: z.string().max(20).optional(),
+        recipientStreetName: z.string().max(200).optional(),
       }),
     )
     .optional(),
@@ -103,9 +113,11 @@ export const InitiateBulkTransferSchema = z.object({
             recipientState: z.string().optional(),
             recipientPostalCode: z.string().optional(),
             recipientCountry: z.string().optional(),
-            beneficiaryEmail: z.string().email().optional(),
+            beneficiaryEmail: z.preprocess((v) => (typeof v === "string" && !v.trim() ? undefined : v), z.string().email().optional()),
             accountType: z.string().max(20).optional(),
             account_type: z.string().max(20).optional(),
+            recipientStreetNumber: z.string().max(20).optional(),
+            recipientStreetName: z.string().max(200).optional(),
           }),
         )
         .optional(),

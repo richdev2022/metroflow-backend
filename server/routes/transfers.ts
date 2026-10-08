@@ -480,7 +480,11 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, requireT
 // The 403 carries code "KYC_REQUIRED" so clients can open the KYC flow.
 router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeaturePermission('manage_finance'), requireTeamPermission('manage_finance'), checkKycStatus, validateBody(InitiateSingleTransferSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId, recipientAddress, recipientCity, recipientState, recipientPostalCode, recipientCountry, bankName, swiftCode, routingNumber, accountType, beneficiaryEmail } = req.body;
+    const { bankCode, accountNumber, accountName, amount, currency: requestCurrency, remark, otp, pin, debitAmount, debitCurrency, wallet_id, walletId: camelWalletId, recipientAddress, recipientCity, recipientState, recipientPostalCode, recipientCountry, bankName, swiftCode, routingNumber, accountType, beneficiaryEmail, recipientStreetNumber, recipientStreetName } = req.body;
+    // Explicit street components (EUR/GBP meta[0]); snake_case aliases accepted.
+    const streetNumber = recipientStreetNumber || (req.body as any)?.recipient_street_number || null;
+    const streetName = recipientStreetName || (req.body as any)?.recipient_street_name || null;
+    const beneficiaryEmailNorm = beneficiaryEmail || (req.body as any)?.beneficiary_email || null;
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
     const currency = (requestCurrency || 'NGN').toUpperCase();
@@ -516,6 +520,9 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         accountNumber,
         beneficiaryAddress: recipientAddress,
         beneficiaryPostalCode: recipientPostalCode,
+        beneficiaryEmail: beneficiaryEmailNorm,
+        recipientStreetNumber: streetNumber,
+        recipientStreetName: streetName,
       });
       if (!intlCheck.valid) {
         return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
@@ -679,12 +686,12 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     const insertRes = await query(
       `INSERT INTO transfer_queue
       (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by,
-       recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number, recipient_account_type, recipient_email)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+       recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number, recipient_account_type, recipient_email, recipient_street_number, recipient_street_name)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
       RETURNING *`,
       [businessId, reference, accountNumber, bankCode, accountName, amount, currency, finalDebitAmount, finalDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
        recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, (recipientCountry || '').toUpperCase() || null, bankName || null, swiftCode || null, routingNumber || null,
-       accountType || (req.body as any)?.account_type || null, beneficiaryEmail || null]
+       accountType || (req.body as any)?.account_type || null, beneficiaryEmailNorm, streetNumber, streetName]
     );
 
     // Log audit event
@@ -1166,6 +1173,9 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
               accountNumber,
               beneficiaryAddress: item.recipientAddress,
               beneficiaryPostalCode: item.recipientPostalCode,
+              beneficiaryEmail: item.beneficiaryEmail || item.beneficiary_email,
+              recipientStreetNumber: item.recipientStreetNumber || item.recipient_street_number,
+              recipientStreetName: item.recipientStreetName || item.recipient_street_name,
             });
             if (!intlCheck.valid) {
               throw Object.assign(
@@ -1197,7 +1207,9 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
             recipientState: item.recipientState || null,
             recipientPostalCode: item.recipientPostalCode || null,
             recipientCountry: (item.recipientCountry || '').toUpperCase() || null,
-            beneficiaryEmail: item.beneficiaryEmail || null,
+            beneficiaryEmail: item.beneficiaryEmail || item.beneficiary_email || null,
+            recipientStreetNumber: item.recipientStreetNumber || item.recipient_street_number || null,
+            recipientStreetName: item.recipientStreetName || item.recipient_street_name || null,
             accountType: item.accountType || item.account_type || null,
             epicId: epicId || null,
             sourceType: 'Epic',
@@ -1230,7 +1242,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       // Only employees with VERIFIED recipient account details are queued;
       // unverified ones are returned so the UI can flag them.
       const usersRes = await query(
-        `SELECT id, name, salary_amount, salary_currency, bank_code, account_number, account_name,
+        `SELECT id, name, email, salary_amount, salary_currency, bank_code, account_number, account_name,
                 verification_status, verified_account_name, bank_name, bank_country, swift_code, routing_number,
                 beneficiary_address, beneficiary_city, beneficiary_state, beneficiary_postal_code, beneficiary_country
          FROM users 
@@ -1312,6 +1324,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           recipientCity: u.beneficiary_city || null,
           recipientState: u.beneficiary_state || null,
           recipientPostalCode: u.beneficiary_postal_code || null,
+          // USD meta[0] contract: the beneficiary's email (the employee's own).
+          beneficiaryEmail: u.email || null,
           fee: isIntlEmp
             ? // Face-value destination-currency payout: the flat fee is
               // NGN-denominated, so only the percentage applies here.
@@ -1362,8 +1376,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       const transferRes = await query(
         `INSERT INTO transfer_queue 
         (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee,
-         recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number, recipient_account_type, recipient_email)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+         recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number, recipient_account_type, recipient_email, recipient_street_number, recipient_street_name)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
         RETURNING *`,
         [
           businessId,
@@ -1391,6 +1405,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.recipientRoutingNumber || null,
           t.accountType || t.recipient_account_type || null,
           t.beneficiaryEmail || t.recipient_email || null,
+          t.recipientStreetNumber || null,
+          t.recipientStreetName || null,
         ]
       );
       

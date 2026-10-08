@@ -44,10 +44,19 @@ async function buildTransferProviderPayload(transfer: any): Promise<SingleTransf
   };
 
   if (!payload.recipientStreetNumber && payload.beneficiaryAddress) {
-    const m = String(payload.beneficiaryAddress).trim().match(/^(\d+[A-Za-z]?)\s+(.+)$/);
-    if (m) {
-      payload.recipientStreetNumber = m[1];
-      payload.recipientStreetName = m[2];
+    const addr = String(payload.beneficiaryAddress).trim();
+    // Leading house number ("1801 Main Street") — Americas style.
+    const lead = addr.match(/^(\d+[A-Za-z]?)\s+(.+)$/);
+    if (lead) {
+      payload.recipientStreetNumber = lead[1];
+      payload.recipientStreetName = lead[2];
+    } else {
+      // European style: trailing house number ("Elsenheimer Str. 31").
+      const trail = addr.match(/^(.+?)\s+(\d{1,4}[A-Za-z]?)$/);
+      if (trail) {
+        payload.recipientStreetNumber = trail[2];
+        payload.recipientStreetName = trail[1];
+      }
     }
   }
 
@@ -111,6 +120,7 @@ export function validateIntlBeneficiary(
     accountNumber?: string;
     beneficiaryAddress?: string;
     beneficiaryPostalCode?: string;
+    beneficiaryEmail?: string;
     recipientStreetNumber?: string;
     recipientStreetName?: string;
   },
@@ -143,6 +153,12 @@ export function validateIntlBeneficiary(
     }
     if (!details.beneficiaryAddress) {
       return { valid: false, error: "USD transfers require the beneficiary's street address", code: 'BENEFICIARY_ADDRESS_REQUIRED' };
+    }
+    // Doc contract: the USD request's meta[0] carries the beneficiary's email
+    // — missing it is a documented payload requirement, so enforce it BEFORE
+    // any wallet debit instead of failing at Flutterwave disbursement.
+    if (!String(details.beneficiaryEmail || '').trim()) {
+      return { valid: false, error: "USD transfers require the beneficiary's email address", code: 'BENEFICIARY_EMAIL_REQUIRED' };
     }
   } else if (cur === 'GBP' || cur === 'EUR') {
     // GBP contract: routing_number = UK sort code OR BIC/SWIFT.
@@ -1107,6 +1123,7 @@ export async function processAllPending(businessId: string) {
           accountNumber: payload.accountNumber,
           beneficiaryAddress: payload.beneficiaryAddress,
           beneficiaryPostalCode: payload.beneficiaryPostalCode,
+          beneficiaryEmail: payload.beneficiaryEmail,
           recipientStreetNumber: payload.recipientStreetNumber,
           recipientStreetName: payload.recipientStreetName,
         });

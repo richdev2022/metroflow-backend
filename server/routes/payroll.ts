@@ -672,6 +672,8 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                 const routingNumber = row.routing_number || row.routingNumber || row.aba || row.routing || null;
                 const beneficiaryAddress = row.beneficiary_address || row.address || null;
                 const beneficiaryCity = row.beneficiary_city || row.city || null;
+                const beneficiaryState = row.beneficiary_state || row.state || row.region || null;
+                const beneficiaryPostalCode = row.beneficiary_postal_code || row.postal_code || row.postcode || row.zip || null;
                 const beneficiaryCountry = (row.beneficiary_country || row.country || null)
                     ? String(row.beneficiary_country || row.country).toUpperCase().slice(0, 5)
                     : null;
@@ -714,7 +716,9 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                             routing_number = COALESCE($15, routing_number),
                             beneficiary_address = COALESCE($16, beneficiary_address),
                             beneficiary_city = COALESCE($17, beneficiary_city),
-                            beneficiary_country = COALESCE($18, beneficiary_country),
+                            beneficiary_state = COALESCE($18, beneficiary_state),
+                            beneficiary_postal_code = COALESCE($19, beneficiary_postal_code),
+                            beneficiary_country = COALESCE($20, beneficiary_country),
                             verification_status = CASE
                                 WHEN ($5 IS NOT NULL AND bank_code IS DISTINCT FROM $5)
                                   OR ($6 IS NOT NULL AND account_number IS DISTINCT FROM $6)
@@ -722,10 +726,10 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                                 ELSE verification_status
                             END,
                             updated_at = CURRENT_TIMESTAMP
-                         WHERE id = $19`,
+                         WHERE id = $21`,
                         [name, role, salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate,
                          department, jobTitle, phoneNumber, bankName, bankCountry, swiftCode, routingNumber,
-                         beneficiaryAddress, beneficiaryCity, beneficiaryCountry, memberId]
+                         beneficiaryAddress, beneficiaryCity, beneficiaryState, beneficiaryPostalCode, beneficiaryCountry, memberId]
                     );
                     updated += 1;
                     rowResult.action = 'updated';
@@ -740,8 +744,8 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                          (business_id, name, email, role, status, invite_token, invite_expires_at,
                           salary_amount, salary_currency, bank_code, account_number, account_name, contract_start_date,
                           department, job_title, phone_number, bank_name, bank_country, swift_code, routing_number,
-                          beneficiary_address, beneficiary_city, beneficiary_country, verification_status)
-                         VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, 'unverified')
+                          beneficiary_address, beneficiary_city, beneficiary_state, beneficiary_postal_code, beneficiary_country, verification_status)
+                         VALUES ($1, $2, $3, $4, 'invited', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 'unverified')
                          ON CONFLICT (business_id, email) DO UPDATE SET
                            name = EXCLUDED.name,
                            role = EXCLUDED.role,
@@ -760,12 +764,14 @@ router.post("/employees/import", authenticateToken, checkSubscriptionStatus, che
                            routing_number = COALESCE(EXCLUDED.routing_number, users.routing_number),
                            beneficiary_address = COALESCE(EXCLUDED.beneficiary_address, users.beneficiary_address),
                            beneficiary_city = COALESCE(EXCLUDED.beneficiary_city, users.beneficiary_city),
+                           beneficiary_state = COALESCE(EXCLUDED.beneficiary_state, users.beneficiary_state),
+                           beneficiary_postal_code = COALESCE(EXCLUDED.beneficiary_postal_code, users.beneficiary_postal_code),
                            beneficiary_country = COALESCE(EXCLUDED.beneficiary_country, users.beneficiary_country)
                          RETURNING id, status`,
                         [businessId, name, email, role, inviteToken, inviteExpiresAt,
                          salary, salaryCurrency, bankCode, bankAccountNumber, accountName, contractStartDate,
                          department, jobTitle, phoneNumber, bankName, bankCountry, swiftCode, routingNumber,
-                         beneficiaryAddress, beneficiaryCity, beneficiaryCountry]
+                         beneficiaryAddress, beneficiaryCity, beneficiaryState, beneficiaryPostalCode, beneficiaryCountry]
                     );
                     memberId = inserted.rows[0].id;
                     status = inserted.rows[0].status;
@@ -909,7 +915,10 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
         const employeeId = req.params.id;
 
         const empRes = await query(
-            `SELECT id, name, bank_code, account_number, verification_status FROM users
+            `SELECT id, name, bank_code, account_number, account_name, verification_status,
+                    salary_currency, bank_country, bank_name, swift_code, routing_number,
+                    beneficiary_address, beneficiary_city, beneficiary_state, beneficiary_postal_code, beneficiary_country
+             FROM users
              WHERE id = $1 AND business_id = $2`,
             [employeeId, businessId],
         );
@@ -919,6 +928,48 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
         const employee = empRes.rows[0];
         if (!employee.bank_code || !employee.account_number) {
             return res.status(400).json({ success: false, error: "Employee has no bank account details to verify" });
+        }
+
+        // International employees (USD/GBP/EUR): Flutterwave has NO account
+        // resolution for foreign rails, so the provider lookup below would
+        // always fail and mark the employee 'failed' — excluding them from
+        // payouts forever. Verify by the per-corridor format contract instead.
+        const empCurrency = String(
+            employee.salary_currency ||
+            (employee.bank_country && employee.bank_country !== 'NG' ? employee.bank_country : 'NGN') ||
+            'NGN',
+        ).toUpperCase();
+        if (empCurrency !== 'NGN') {
+            const intlCheck = validateIntlBeneficiary(empCurrency, {
+                routingNumber: employee.routing_number,
+                swiftCode: employee.swift_code,
+                bankName: employee.bank_name,
+                accountNumber: employee.account_number,
+                beneficiaryAddress: employee.beneficiary_address,
+                beneficiaryPostalCode: employee.beneficiary_postal_code,
+            });
+            if (!intlCheck.valid) {
+                await query(
+                    `UPDATE users SET verification_status = 'failed', verification_error = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                    [intlCheck.error, employeeId],
+                );
+                return res.status(400).json({ success: false, error: intlCheck.error });
+            }
+            await query(
+                `UPDATE users SET verification_status = 'verified',
+                     verified_account_name = COALESCE(NULLIF(account_name, ''), name),
+                     verified_at = CURRENT_TIMESTAMP, verification_error = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1`,
+                [employeeId],
+            );
+            return res.json({
+                success: true,
+                data: {
+                    verification_status: 'verified',
+                    account_name: employee.account_name || employee.name,
+                    verification: 'format',
+                },
+            });
         }
 
         try {

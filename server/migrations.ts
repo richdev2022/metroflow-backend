@@ -29,6 +29,8 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureStoreSchema(); // + store_enabled etc.
   await ensureRecurringBillingSchema(); // + recurring_enabled etc.
   await ensureTeamRolesSchema(); // + users.role_id
+  await ensureChatGuestContacts(); // chat: invite non-registered contacts by email
+  await ensureChatStatusesSchema(); // WhatsApp-style 24h status (stories)
   await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
   await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
@@ -47,6 +49,71 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
   await ensurePlanPricingLadder();
+}
+
+/**
+ * Chat statuses — WhatsApp-style 24h stories for the workspace. Text card
+ * (background colour) and/or an image; views + likes tracked per user; the
+ * poster sees who liked. Rows past expires_at are purged lazily on read.
+ */
+async function ensureChatStatusesSchema(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS chat_statuses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      business_id UUID,
+      content TEXT,
+      media_url TEXT,
+      media_type VARCHAR(10),
+      background_color VARCHAR(9) DEFAULT '#1E3A8A',
+      reposted_from UUID,
+      repost_author VARCHAR(255),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )
+  `);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_chat_statuses_business_active ON chat_statuses(business_id, expires_at)`,
+  );
+  await query(`
+    CREATE TABLE IF NOT EXISTS chat_status_views (
+      status_id UUID NOT NULL REFERENCES chat_statuses(id) ON DELETE CASCADE,
+      viewer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (status_id, viewer_id)
+    )
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS chat_status_likes (
+      status_id UUID NOT NULL REFERENCES chat_statuses(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      liked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (status_id, user_id)
+    )
+  `);
+}
+
+/**
+ * Chat guest contacts — people invited to Metricorex BY EMAIL from the chat
+ * "add contact" flow. They are NOT users yet: the row keeps the inviter's
+ * chat list showing the contact with an "Invited" badge across devices, and
+ * the invite email (generateChatInviteEmailHtml) points them at the register
+ * page. When they register for real, normal user-to-user chats take over.
+ */
+async function ensureChatGuestContacts(): Promise<void> {
+  await query(`
+    CREATE TABLE IF NOT EXISTS chat_guest_contacts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email VARCHAR(255) NOT NULL,
+      invited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (owner_user_id, email)
+    )
+  `);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_chat_guest_contacts_owner ON chat_guest_contacts(owner_user_id)`,
+  );
 }
 
 /**

@@ -163,12 +163,12 @@ const handleSquadWebhook = async (event: any) => {
                             const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
                             if (platformWallet.rows.length > 0) {
                                 await query(`UPDATE wallets SET balance = balance - $1 WHERE id = $2`, [amount, platformWallet.rows[0].id]);
-                                
+
                                 await query(
-                                    `INSERT INTO transactions 
+                                    `INSERT INTO transactions
                                     (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                                    VALUES ($1, 'NGN', 'success', $2, 'debit', 'User Wallet Funding (Squad)', 'wallet_funding', $3, 'debit')`,
-                                    [amount, `${reference}-PLATFORM`, platformWallet.rows[0].id]
+                                    VALUES ($1, $2, 'success', $3, 'debit', 'User Wallet Funding (Squad)', 'platform', $4, 'debit')`,
+                                    [amount, transaction.currency || 'NGN', `${reference}-PLATFORM`, platformWallet.rows[0].id]
                                 );
                             }
                         }
@@ -386,7 +386,7 @@ const handleMonnifyWebhook = async (event: any) => {
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
                             // Owner invariant: funding -> platform ledger DEBITED,
                             // user credited. ONE debit row, no gross-inflow row.
-                            await debitPlatformWallet(amount, 'NGN', `${reference}-PLATFORM`, 'User Wallet Funding (Monnify)', 'monnify');
+                            await debitPlatformWallet(amount, transaction.currency || 'NGN', `${reference}-PLATFORM`, 'User Wallet Funding (Monnify)', 'monnify');
                         }
                     }
                     
@@ -740,6 +740,28 @@ async function creditWalletFundingTransaction(transaction: any, providerName: st
         }
 
         await client.query('COMMIT');
+
+        // 5. Platform ledger (owner invariant, AFTER COMMIT — the helper uses
+        //    the pool while `client` held wallet row locks): a funding event
+        //    produces exactly ONE platform-ledger row, a DEBIT of the amount
+        //    that landed in the user's wallet. This path previously omitted
+        //    the platform side entirely, so Flutterwave/verify-path fundings
+        //    left both the platform balance and its ledger untouched while
+        //    the startup backfill later added the missing ledger row —
+        //    recording a movement the balance never made. Idempotent by
+        //    reference; never fails the funding itself.
+        try {
+            await debitPlatformWallet(
+                parseFloat(transaction.amount),
+                transaction.currency || 'NGN',
+                `${reference}-PLATFORM`,
+                `User Wallet Funding (${providerName === 'flutterwave' ? 'Flutterwave' : providerName})`,
+                providerName,
+            );
+        } catch (ledgerErr: any) {
+            console.error(`Funding platform ledger debit failed for ${reference}:`, ledgerErr?.message || ledgerErr);
+        }
+
         return true;
     } catch (error) {
         await client.query('ROLLBACK');

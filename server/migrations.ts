@@ -37,6 +37,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
+  await reconcilePlatformLedger();
   await backfillLedgerHistory();
   await purgeInternalLedgerNoiseRows();
   await sanitizePlaceholderPhoneNumbers();
@@ -764,6 +765,61 @@ async function ensureSystemSettingsDefaults(): Promise<void> {
 const PLATFORM_SUCCESS_STATES = ["successful", "success", "completed", "paid"];
 
 /**
+ * One-time (idempotent) platform-ledger reconciliation — repairs the two
+ * deterministic classes of historical damage that made the startup drift
+ * check report balance-vs-recorded mismatches (observed: NGN platform wallet
+ * balance 4614.95 vs recorded -1568.50, diff 6183.45):
+ *
+ * 1. Mis-typed live rows: the Squad funding webhook and the admin settlement
+ *    fix wrote the platform-side funding debit with transaction_type=
+ *    'wallet_funding' instead of 'platform' (both writers now fixed). These
+ *    rows sit on internal wallets and describe real pool movements — re-type.
+ * 2. Backfill duplicates: the ledger backfill's exists-checks only matched
+ *    bare references, so it wrote a second platform row ('*-USER-BACKFILL' /
+ *    bare transfer refs) for every funding and transfer that already had a
+ *    live '*-PLATFORM' row. Keep the live row, delete the backfill twin.
+ *
+ * Runs BEFORE the backfill so the per-row exists-checks then see clean data;
+ * both statements are idempotent (second boot: 0 rows).
+ */
+async function reconcilePlatformLedger(): Promise<void> {
+  try {
+    // 1. Re-type mis-typed funding debits on internal wallets.
+    const retyped = await query(
+      `UPDATE transactions SET transaction_type = 'platform'
+       WHERE transaction_type = 'wallet_funding'
+         AND type = 'debit' AND direction = 'debit'
+         AND status = 'success'
+         AND wallet_id IN (SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL)`,
+    );
+    if ((retyped.rowCount || 0) > 0) {
+      console.log(`[migrations] platform ledger: re-typed ${retyped.rowCount} mis-typed funding debit row(s) to 'platform'`);
+    }
+
+    // 2. Deduplicate backfill twins — prefer the live (non-backfill) row.
+    const deduped = await query(
+      `WITH ranked AS (
+         SELECT id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY wallet_id,
+                    regexp_replace(reference, '(-PLATFORM|-USER-BACKFILL)$', '')
+                  ORDER BY (description LIKE '%(backfill)%') ASC, created_at ASC, id ASC
+                ) AS rn
+         FROM transactions
+         WHERE transaction_type = 'platform'
+           AND wallet_id IN (SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL)
+       )
+       DELETE FROM transactions t USING ranked r WHERE t.id = r.id AND r.rn > 1`,
+    );
+    if ((deduped.rowCount || 0) > 0) {
+      console.log(`[migrations] platform ledger: deleted ${deduped.rowCount} duplicate backfill row(s)`);
+    }
+  } catch (err: any) {
+    console.error(`[migrations] platform ledger reconciliation failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
+  }
+}
+
+/**
  * Backfill ledger history so the admin Platform Wallet / Revenue Wallet show
  * EVERY historical movement (previously balances moved silently).
  *
@@ -814,7 +870,7 @@ async function backfillLedgerHistory(): Promise<void> {
         // hold), written live since the hold-row fix. Backfill one ONLY for
         // historical transfers that carry no platform row at all.
         const exists = await query(
-          `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
+          `SELECT 1 FROM transactions WHERE reference IN ($1, $1 || '-PLATFORM') AND transaction_type = 'platform' LIMIT 1`,
           [t.reference],
         );
         if (exists.rows.length === 0) {
@@ -866,7 +922,7 @@ async function backfillLedgerHistory(): Promise<void> {
       const fee = Number(f.fee) || 0;
 
       const exists = await query(
-        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
+        `SELECT 1 FROM transactions WHERE reference IN ($1, $1 || '-PLATFORM') AND transaction_type = 'platform' LIMIT 1`,
         [ref],
       );
       if (exists.rows.length > 0) continue; // live webhook path already recorded it

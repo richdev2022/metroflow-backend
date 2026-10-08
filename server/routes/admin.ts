@@ -1810,10 +1810,10 @@ protectedRouter.post("/transactions/settle", requirePermission('manage_businesse
              );
              
              await client.query(
-                `INSERT INTO transactions 
+                `INSERT INTO transactions
                 (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-                VALUES ($1, 'NGN', 'success', $2, 'debit', $3, 'wallet_funding', $4, 'debit')`,
-                [transaction.amount, `${reference}-PLATFORM`, `Platform Wallet Debit for ${reference}`, platformWalletId]
+                VALUES ($1, $2, 'success', $3, 'debit', $4, 'platform', $5, 'debit')`,
+                [transaction.amount, transaction.currency || 'NGN', `${reference}-PLATFORM`, `Platform Wallet Debit for ${reference}`, platformWalletId]
             );
         }
 

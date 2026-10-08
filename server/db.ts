@@ -151,6 +151,12 @@ pool.on('error', (err: any) => {
 
 // Retry logic for transient errors (like DNS/Connection timeouts)
 const MAX_RETRIES = parseIntegerEnv("DB_MAX_RETRIES", 3);
+// Query logging: queries slower than DB_SLOW_QUERY_MS are ALWAYS logged
+// (actionable, rare). Everything else is silent unless DB_LOG_QUERIES=true —
+// the previous unconditional mutation log emitted one line per request
+// (api_request_logs INSERT) and drowned the production logs.
+const DB_SLOW_QUERY_MS = parseIntegerEnv("DB_SLOW_QUERY_MS", 1000);
+const DB_LOG_QUERIES = process.env.DB_LOG_QUERIES === "true";
 const RETRY_DELAY = parseIntegerEnv("DB_RETRY_DELAY_MS", 1000);
 const RETRY_WRITES = parseBooleanEnv("DB_RETRY_WRITES", false);
 
@@ -279,8 +285,11 @@ export async function query(text: string, params?: unknown[]) {
     try {
       const res = await pool.query(text, params);
       const duration = Date.now() - start;
-      // Only log slow queries or mutations to reduce noise
-      if (duration > 1000 || !text.trim().toLowerCase().startsWith('select')) {
+      // Slow queries are always logged (actionable); all other queries are
+      // silent unless DB_LOG_QUERIES=true (opt-in debugging).
+      if (duration > DB_SLOW_QUERY_MS) {
+         console.log("Slow query", { text: text.substring(0, 50) + '...', duration, rows: res.rowCount });
+      } else if (DB_LOG_QUERIES && !text.trim().toLowerCase().startsWith('select')) {
          console.log("Executed query", { text: text.substring(0, 50) + '...', duration, rows: res.rowCount });
       }
       return res;

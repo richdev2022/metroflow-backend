@@ -1162,7 +1162,7 @@ router.get("/verify", async (req, res) => {
 
                     await debitPlatformWallet(
                         netAmount,
-                        'NGN',
+                        transaction.currency || 'NGN',
                         `${reference}-PLATFORM`,
                         'User Wallet Funding (Card)',
                         ledgerProvider,
@@ -1173,7 +1173,7 @@ router.get("/verify", async (req, res) => {
                     if (feeAmount > 0) {
                         await creditRevenueWallet(
                             feeAmount,
-                            'NGN',
+                            transaction.currency || 'NGN',
                             reference,
                             'Wallet Funding Fee',
                             ledgerProvider,

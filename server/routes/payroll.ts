@@ -915,7 +915,7 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
         const employeeId = req.params.id;
 
         const empRes = await query(
-            `SELECT id, name, bank_code, account_number, account_name, verification_status,
+            `SELECT id, name, email, bank_code, account_number, account_name, verification_status,
                     salary_currency, bank_country, bank_name, swift_code, routing_number,
                     beneficiary_address, beneficiary_city, beneficiary_state, beneficiary_postal_code, beneficiary_country
              FROM users
@@ -947,6 +947,8 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
                 accountNumber: employee.account_number,
                 beneficiaryAddress: employee.beneficiary_address,
                 beneficiaryPostalCode: employee.beneficiary_postal_code,
+                // USD meta[0] contract: the beneficiary's email (employee's own).
+                beneficiaryEmail: employee.email,
             });
             if (!intlCheck.valid) {
                 await query(

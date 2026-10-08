@@ -2081,7 +2081,7 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
         b.email || null,
         isIntl,
         verification,
-        verification === 'unverified' ? null : new Date(),
+        verification === 'resolved' ? new Date() : null,
       ],
     );
     const r = insert.rows[0];

@@ -3,7 +3,7 @@ import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, checkFeaturePermission, checkKycStatus } from "../middleware/auth";
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { sendPayrollAdjustmentNotification, sendEmail, generateInviteEmailHtml } from "../services/email";
-import { accountLookup } from "../services/transfer";
+import { accountLookup, validateIntlBeneficiary } from "../services/transfer";
 import crypto from "crypto";
 
 const router = express.Router();

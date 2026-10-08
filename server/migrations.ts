@@ -40,6 +40,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await reconcilePlatformLedger();
   await backfillLedgerHistory();
   await purgeInternalLedgerNoiseRows();
+  await checkPlatformLedgerDrift();
   await sanitizePlaceholderPhoneNumbers();
   await repairTransferReferenceCollisions();
   await ensureParticipantDedupe();
@@ -824,18 +825,29 @@ async function reconcilePlatformLedger(): Promise<void> {
  * EVERY historical movement (previously balances moved silently).
  *
  * ALIGNED WITH THE OWNER-INVARIANT MODEL:
- *  1. Withdrawal (transfer) -> platform ledger CREDIT (the payout hold) +
- *     fee -> revenue ledger. Only rows missing entirely are reconstructed.
+ *  1. Withdrawal (transfer) platform rows are written LIVE by the transfer
+ *     service (initiation hold 'Platform Wallet Credit for Transfer
+ *     <ref>-PLATFORM' + payout debit / failure reversal). Reconstructing hold
+ *     credits for legacy transfers that never had one would create ledger
+ *     rows that never touched the balance — that step is gone. Only the
+ *     fee -> revenue-ledger rows are reconstructed here.
  *  2. Wallet funding -> platform ledger DEBIT (the user payout) + fee ->
- *     revenue ledger. The old gross-inflow reconstruction is gone (noise).
+ *     revenue ledger. The exists-check recognises every historical row shape
+ *     (bare ref, '-PLATFORM', '-USER', '-USER-BACKFILL') so a prior backfill
+ *     row is never duplicated on the next boot.
  *  3. NO balance-reconciliation rows: the previous version inserted a
  *     'Historical balance reconciliation' row with a Date.now() reference on
  *     EVERY boot while drift persisted — that spam was the top complaint in
- *     the admin ledger. Drift is now logged, never written.
+ *     the admin ledger. Drift is checked in checkPlatformLedgerDrift(),
+ *     logged, never written.
  */
 async function backfillLedgerHistory(): Promise<void> {
   try {
-    // ---- 1. Platform debits + revenue credits from successful transfers ----
+    // ---- 1. Revenue-ledger fee rows for historical successful transfers ----
+    // (Platform-side rows are written live by the transfer service: hold
+    // credit at initiation + payout debit / failure reversal. Reconstructing
+    // hold credits for legacy transfers without one would create rows that
+    // never touched the balance, so only fees are backfilled.)
     const transfersRes = await query(
       `SELECT id, reference, amount, fee, currency, status, description, created_at
        FROM transfer_queue
@@ -860,29 +872,8 @@ async function backfillLedgerHistory(): Promise<void> {
     };
 
     for (const t of transfersRes.rows) {
-      const walletId = await getPlatformWallet(t.currency || "NGN");
-      const amount = Number(t.amount) || 0;
       const fee = Number(t.fee) || 0;
       const cur = t.currency || "NGN";
-
-      if (walletId && amount > 0) {
-        // New model: a withdrawal's platform entry is a CREDIT (the payout
-        // hold), written live since the hold-row fix. Backfill one ONLY for
-        // historical transfers that carry no platform row at all.
-        const exists = await query(
-          `SELECT 1 FROM transactions WHERE reference IN ($1, $1 || '-PLATFORM') AND transaction_type = 'platform' LIMIT 1`,
-          [t.reference],
-        );
-        if (exists.rows.length === 0) {
-          await query(
-            `INSERT INTO transactions
-             (amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, created_at)
-             VALUES ($1, $2, 'success', $3, 'credit', $4, 'platform', $5, 'credit', $6)
-           ON CONFLICT (reference) DO NOTHING`,
-            [amount, cur, t.reference, t.description || `Platform Wallet Credit for Transfer ${t.reference} (backfill)`, walletId, t.created_at],
-          );
-        }
-      }
 
       if (fee > 0) {
         const revRef = `${t.reference}-FEE`;
@@ -921,11 +912,19 @@ async function backfillLedgerHistory(): Promise<void> {
       const net = Number(f.amount) || 0;
       const fee = Number(f.fee) || 0;
 
+      // Recognise EVERY historical platform-row shape for this funding so a
+      // prior backfill ('-USER-BACKFILL') or live row (bare, '-PLATFORM'
+      // Squad/Monnify, '-USER' virtual-account/Flutterwave) is never
+      // duplicated. NOTE: without the explicit ::varchar casts Postgres
+      // fails with 42P08 (inconsistent types deduced for parameter $1).
       const exists = await query(
-        `SELECT 1 FROM transactions WHERE reference IN ($1, $1 || '-PLATFORM') AND transaction_type = 'platform' LIMIT 1`,
+        `SELECT 1 FROM transactions
+         WHERE reference IN ($1::varchar, $1::varchar || '-PLATFORM', $1::varchar || '-USER', $1::varchar || '-USER-BACKFILL')
+           AND transaction_type = 'platform'
+         LIMIT 1`,
         [ref],
       );
-      if (exists.rows.length > 0) continue; // live webhook path already recorded it
+      if (exists.rows.length > 0) continue; // live webhook path or prior backfill already recorded it
 
       if (walletId && net > 0) {
         await query(
@@ -947,11 +946,24 @@ async function backfillLedgerHistory(): Promise<void> {
       }
     }
 
-    // ---- 3. Drift check — LOG ONLY, never write ----
-    // The previous version inserted a 'Historical balance reconciliation'
-    // adjustment row with a Date.now() reference on every boot while drift
-    // persisted, so the ledger filled with reconciliation spam. Report the
-    // drift to the logs instead; repairs should be deliberate, not automatic.
+    console.log("[migrations] ledger backfill complete");
+  } catch (err: any) {
+    console.error(`[migrations] ledger backfill failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
+  }
+}
+
+/**
+ * Platform-ledger drift check — LOG ONLY, never write.
+ * Compares every internal (operational) wallet's balance column against the
+ * sum of its platform-typed successful ledger rows. All live writers
+ * (creditPlatformWallet/debitPlatformWallet, webhook funding, admin
+ * settlement) move balance AND ledger together, so any drift is historical
+ * damage. Repairs are deliberate (scripts/repair-platform-ledger-trueup.mjs),
+ * never automatic.
+ * Runs unconditionally AFTER the purge so a backfill crash can never skip it.
+ */
+async function checkPlatformLedgerDrift(): Promise<void> {
+  try {
     const internalWallets = await query(
       `SELECT id, currency, balance FROM wallets WHERE business_id IS NULL AND user_id IS NULL`,
     );
@@ -971,31 +983,32 @@ async function backfillLedgerHistory(): Promise<void> {
         );
       }
     }
-
-    console.log("[migrations] ledger backfill complete");
   } catch (err: any) {
-    console.error(`[migrations] ledger backfill failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
+    console.error(`[migrations] platform ledger drift check failed [${err?.code || "UNKNOWN"}]: ${err?.message}`);
   }
 }
 
 /**
  * PLATFORM LEDGER = mirror of the provider POOL account.
  *
- * Between the first ledger writer and the pool-mirror rework, the writers
- * recorded internal allocation pairs as transaction_type='platform' rows:
- *   - "-USER" / "-MERCHANT" / "-PLATFORM" allocation debits (funding / store /
- *     invoice / payment-link / subscription settlements — internal wallet
- *     credits that never touch the pool),
+ * Purges only rows from DEAD writers whose shapes no live writer produces:
  *   - fee->revenue mirror rows ("Platform Wallet Debit for Revenue" and its
- *     reversal),
- *   - transfer "hold" credits written at initiation plus their "Reversal of
- *     platform hold" counterparts,
- *   - wallet-internal inflows (bill payments, savings withdrawals, wallet-
- *     charged subscriptions).
- * NONE of these correspond to money moving in/out of the provider pool
- * account, so they made the Platform Ledger history inconsistent and
- * unrecognizable. The writers no longer create them — this one-off purge
- * removes the historical noise. Idempotent, safe on every boot.
+ *     reversal — fees now go to the revenue ledger with wallet_id NULL),
+ *   - savings-payout mirror rows,
+ *   - wallet-internal inflow mirrors (bill payments, savings withdrawals,
+ *     wallet-charged subscriptions),
+ *   - 'Historical balance reconciliation' adjustment spam from the removed
+ *     auto-reconcile that wrote a row on every boot while drift persisted.
+ *
+ * ⚠️ The earlier '-USER' / '-MERCHANT' / '-PLATFORM' reference patterns and
+ * the 'Platform Wallet Credit for Transfer%' / 'Reversal of platform hold%'
+ * description patterns were REMOVED: since the owner-invariant rework the
+ * LIVE balance-coupled writers produce exactly those shapes (virtual-account
+ * & Flutterwave funding debits '-USER', Squad/Monnify funding + admin
+ * settlement debits '-PLATFORM', transfer hold credits and their reversals).
+ * Purging them deleted real rows while their balance side-effect stayed —
+ * silently re-creating drift after every funding/withdrawal.
+ * Idempotent, safe on every boot.
  */
 async function purgeInternalLedgerNoiseRows(): Promise<void> {
   try {
@@ -1003,14 +1016,10 @@ async function purgeInternalLedgerNoiseRows(): Promise<void> {
       `DELETE FROM transactions
        WHERE transaction_type = 'platform'
          AND (
-              reference LIKE '%-USER'
-           OR reference LIKE '%-MERCHANT'
-           OR reference LIKE '%-PLATFORM'
-           OR description LIKE 'Platform Wallet Debit for Revenue%'
+              description LIKE 'Platform Wallet Debit for Revenue%'
            OR description LIKE 'Platform Wallet Credit (Revenue Reversal)%'
-           OR description LIKE 'Platform Wallet Credit for Transfer%'
-           OR description LIKE 'Reversal of platform hold%'
            OR description LIKE 'Platform Wallet Debit for Savings Payout%'
+           OR description LIKE 'Historical balance reconciliation%'
            OR description IN (
                 'Bill Payment Received',
                 'Savings Withdrawal Received',

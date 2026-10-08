@@ -145,6 +145,14 @@ export function validateIntlBeneficiary(
     if (checksum % 10 !== 0) {
       return { valid: false, error: 'The US bank routing number failed checksum validation — please double-check it with the beneficiary', code: 'ROUTING_NUMBER_CHECKSUM' };
     }
+    // Doc contract (Flutterwave intl USD): swift_code is a REQUIRED meta[0]
+    // field for every USD payout (ACH included) — 8 or 11 character BIC.
+    if (!swift) {
+      return { valid: false, error: "The beneficiary's SWIFT/BIC code is required for USD transfers", code: 'SWIFT_CODE_REQUIRED' };
+    }
+    if (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift) || !/[A-Za-z]/.test(swift)) {
+      return { valid: false, error: 'The SWIFT/BIC code must be 8 or 11 characters for USD transfers', code: 'SWIFT_CODE_INVALID' };
+    }
     // USD contract (Flutterwave intl docs): account_type accepts checking or
     // depository only — "Use checking for Grey virtual accounts".
     const acctType = String(details.accountType || 'checking').toLowerCase();
@@ -161,18 +169,44 @@ export function validateIntlBeneficiary(
       return { valid: false, error: "USD transfers require the beneficiary's email address", code: 'BENEFICIARY_EMAIL_REQUIRED' };
     }
   } else if (cur === 'GBP' || cur === 'EUR') {
-    // GBP contract: routing_number = UK sort code OR BIC/SWIFT.
-    // EUR contract: account_number = IBAN, routing_number + swift_code = BIC.
+    // GBP contract: routing_number = UK sort code OR BIC/SWIFT, swift_code is
+    // REQUIRED (same structure as EUR), account_type = personal | corporate.
+    // EUR contract: account_number = IBAN, routing_number AND swift_code are
+    // BOTH required and both carry the BIC.
     const isSortCode = /^\d{6}$/.test(routing);
     const bicCandidate = String(swift || details.routingNumber || '').trim();
     const isBic = /^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(bicCandidate) && /[A-Za-z]/.test(bicCandidate);
-    if (!isSortCode && !isBic) {
-      return cur === 'GBP'
-        ? { valid: false, error: 'A valid 6-digit UK sort code or BIC/SWIFT is required for GBP transfers', code: 'ROUTING_NUMBER_INVALID' }
-        : { valid: false, error: 'A valid BIC/SWIFT code (8 or 11 characters) is required for EUR transfers', code: 'SWIFT_CODE_INVALID' };
+    if (cur === 'EUR') {
+      // EUR: both meta fields are mandatory — routing_number and swift_code
+      // each carry the BIC (Flutterwave rejects EUR payouts missing either).
+      if (!routing || !isBic || !/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(routing) || !/[A-Za-z]/.test(routing)) {
+        return { valid: false, error: 'A valid BIC/SWIFT code (8 or 11 characters) is required as the EUR routing number', code: 'ROUTING_NUMBER_INVALID' };
+      }
+      if (!swift) {
+        return { valid: false, error: 'A valid BIC/SWIFT code (8 or 11 characters) is required for EUR transfers', code: 'SWIFT_CODE_REQUIRED' };
+      }
+      if (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift) || !/[A-Za-z]/.test(swift)) {
+        return { valid: false, error: 'The SWIFT/BIC code must be 8 or 11 characters for EUR transfers', code: 'SWIFT_CODE_INVALID' };
+      }
+    } else {
+      if (!isSortCode && !isBic) {
+        return { valid: false, error: 'A valid 6-digit UK sort code or BIC/SWIFT is required for GBP transfers', code: 'ROUTING_NUMBER_INVALID' };
+      }
+      // Doc contract: GBP meta[0] mirrors EUR — swift_code is required even
+      // when the sort code is used for local clearing.
+      if (!swift) {
+        return { valid: false, error: "The beneficiary's SWIFT/BIC code is required for GBP transfers", code: 'SWIFT_CODE_REQUIRED' };
+      }
+      if (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift) || !/[A-Za-z]/.test(swift)) {
+        return { valid: false, error: 'The SWIFT/BIC code must be 8 or 11 characters for GBP transfers', code: 'SWIFT_CODE_INVALID' };
+      }
     }
-    // account_type is optional for GBP (personal|corporate when provided).
+    // account_type is REQUIRED for GBP (personal | corporate) and rides the
+    // meta[0] contract exactly like the USD checking|depository field.
     const acctType = String(details.accountType || '').toLowerCase();
+    if (cur === 'GBP' && !acctType) {
+      return { valid: false, error: 'GBP transfers require the account type to be "personal" or "corporate"', code: 'ACCOUNT_TYPE_REQUIRED' };
+    }
     if (acctType && !['personal', 'corporate'].includes(acctType)) {
       return { valid: false, error: 'GBP account type must be "personal" or "corporate" when provided', code: 'ACCOUNT_TYPE_INVALID' };
     }

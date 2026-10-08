@@ -499,6 +499,11 @@ async function ensureChatAndAiSchema(): Promise<void> {
   // meta[] survive the queue round-trip.
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_account_type VARCHAR(20)`);
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_email TEXT`);
+  // Flutterwave EUR/GBP meta[0] carries street_number + street_name as SEPARATE
+  // required fields — persist the explicit components so the provider mapping
+  // doesn't depend on the address-split heuristic surviving the queue round-trip.
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_street_number VARCHAR(20)`);
+  await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS recipient_street_name TEXT`);
   // Ledger backfill reads transfer_queue.description (see backfillLedgerHistory)
   // but the column was never part of the CREATE — boot-time backfill errored.
   await query(`ALTER TABLE transfer_queue ADD COLUMN IF NOT EXISTS description TEXT`);

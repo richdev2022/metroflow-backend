@@ -523,6 +523,8 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         beneficiaryEmail: beneficiaryEmailNorm,
         recipientStreetNumber: streetNumber,
         recipientStreetName: streetName,
+        // USD payout rail: "ACH" (local) or "SWIFT" (wire) — rides bankCode.
+        bankCode,
       });
       if (!intlCheck.valid) {
         return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
@@ -1176,6 +1178,8 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
               beneficiaryEmail: item.beneficiaryEmail || item.beneficiary_email,
               recipientStreetNumber: item.recipientStreetNumber || item.recipient_street_number,
               recipientStreetName: item.recipientStreetName || item.recipient_street_name,
+              // USD payout rail when the batch carries it (ACH default in the validator).
+              bankCode: item.bankCode || item.bank_code,
             });
             if (!intlCheck.valid) {
               throw Object.assign(
@@ -2015,6 +2019,8 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
         accountNumber,
         beneficiaryAddress: b.address || b.addressLine || b.address_line,
         beneficiaryPostalCode: b.postalCode || b.postal_code,
+        // USD payout rail as chosen by the user (ACH default in the validator).
+        bankCode: b.bankCode || b.bank_code,
       });
       if (!intlCheck.valid) {
         return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
@@ -2227,6 +2233,8 @@ router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedReq
         accountNumber,
         beneficiaryAddress: b.address ?? b.addressLine ?? b.address_line,
         beneficiaryPostalCode: b.postalCode ?? b.postal_code,
+        // Keep the saved rail when the request omits it (USD ACH/SWIFT).
+        bankCode: b.bankCode ?? b.bank_code ?? row.bank_code,
       });
       if (!intlCheck.valid) {
         return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });
@@ -2365,6 +2373,8 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
         accountNumber: row.account_number,
         beneficiaryAddress: row.address_line,
         beneficiaryPostalCode: row.postal_code,
+        // Re-validate against the SAVED rail (USD ACH/SWIFT).
+        bankCode: row.bank_code,
       });
       if (!intlCheck.valid) {
         return res.status(400).json({ success: false, error: intlCheck.error, code: intlCheck.code });

@@ -150,6 +150,7 @@ export interface PushPayload {
 
 let pushProjectLogged = false;
 let isPushUnconfiguredLogged = false;
+let pushMismatchWarned = false;
 
 function resolveProjectId(account: ServiceAccount | null): string | null {
   const projectId = process.env.FIREBASE_PROJECT_ID || account?.project_id || null;
@@ -164,8 +165,35 @@ function resolveProjectId(account: ServiceAccount | null): string | null {
   return projectId;
 }
 
-async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ sent: number; failed: number }> {
+/** Per-token delivery outcome, filled when the caller passes a diagnostics array. */
+export interface PushSendDiagnostic {
+  tokenPreview: string;
+  platform: string;
+  ok: boolean;
+  httpStatus: number | null;
+  error: string | null;
+}
+
+async function sendToTokens(
+  tokens: string[],
+  payload: PushPayload,
+  diagnostics?: PushSendDiagnostic[],
+): Promise<{ sent: number; failed: number }> {
   if (tokens.length === 0) return { sent: 0, failed: 0 };
+
+  // Platform lookup once for the whole batch (diagnostics + prune logs below).
+  let platformByToken = new Map<string, string>();
+  try {
+    const platRes = await query(
+      `SELECT fcm_token, platform FROM user_devices WHERE fcm_token = ANY($1)`,
+      [tokens],
+    );
+    platformByToken = new Map(
+      platRes.rows.map((r: any) => [r.fcm_token, String(r.platform || "unknown")]),
+    );
+  } catch {
+    // Table missing / DB hiccup — diagnostics just report "unknown".
+  }
 
   // Mode 1: FCM HTTP v1
   const account = loadServiceAccount();
@@ -173,10 +201,30 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
     const projectId = resolveProjectId(account);
     if (!projectId) {
       console.error("[push] FIREBASE_PROJECT_ID missing - cannot send via HTTP v1");
+      diagnostics?.push(
+        ...tokens.map((t) => ({
+          tokenPreview: t.slice(0, 18),
+          platform: platformByToken.get(t) || "unknown",
+          ok: false,
+          httpStatus: null,
+          error: "FIREBASE_PROJECT_ID missing — cannot send via HTTP v1",
+        })),
+      );
       return { sent: 0, failed: tokens.length };
     }
     const accessToken = await getAccessToken();
-    if (!accessToken) return { sent: 0, failed: tokens.length };
+    if (!accessToken) {
+      diagnostics?.push(
+        ...tokens.map((t) => ({
+          tokenPreview: t.slice(0, 18),
+          platform: platformByToken.get(t) || "unknown",
+          ok: false,
+          httpStatus: null,
+          error: "Failed to obtain Google OAuth access token — check FIREBASE_SERVICE_ACCOUNT_JSON",
+        })),
+      );
+      return { sent: 0, failed: tokens.length };
+    }
 
     // title/body folded into data — clients render/handle them either way.
     const dataPayload: Record<string, string> = {
@@ -186,21 +234,13 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
     };
     const badgeRaw = dataPayload.badge ? parseInt(String(dataPayload.badge), 10) : NaN;
 
-    // Split tokens by platform so each OS gets the strategy it needs.
-    let iosTokens = new Set<string>();
-    try {
-      const platRes = await query(
-        `SELECT fcm_token, platform FROM user_devices WHERE fcm_token = ANY($1)`,
-        [tokens],
-      );
-      iosTokens = new Set(
-        platRes.rows
-          .filter((r: any) => String(r.platform || "").toLowerCase().startsWith("ios"))
-          .map((r: any) => r.fcm_token),
-      );
-    } catch {
-      // Table missing / DB hiccup — default everything to Android strategy.
-    }
+    // Split tokens by platform so each OS gets the strategy it needs
+    // (reuses the single platform lookup from above).
+    const iosTokens = new Set(
+      [...platformByToken.entries()]
+        .filter(([, platform]) => platform.toLowerCase().startsWith("ios"))
+        .map(([token]) => token),
+    );
 
     let sent = 0;
     let failed = 0;
@@ -287,16 +327,64 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
           },
         );
         sent++;
+        diagnostics?.push({
+          tokenPreview: token.slice(0, 18),
+          platform: platformByToken.get(token) || "unknown",
+          ok: true,
+          httpStatus: 200,
+          error: null,
+        });
       } catch (err: any) {
         failed++;
         const status = err.response?.status;
+        const fcmError = JSON.stringify(err.response?.data?.error || err.message).slice(0, 300);
+        diagnostics?.push({
+          tokenPreview: token.slice(0, 18),
+          platform: platformByToken.get(token) || "unknown",
+          ok: false,
+          httpStatus: status ?? null,
+          error: fcmError,
+        });
         if (status === 404 || status === 410) {
-          // Token no longer valid - remove it
-          await query(`DELETE FROM user_devices WHERE fcm_token = $1`, [token]).catch(() => {});
+          // Token no longer valid — remove it, but leave a paper trail so
+          // "my device disappeared from push-status" is diagnosable.
+          try {
+            const freshRes = await query(
+              `SELECT created_at, last_seen_at FROM user_devices WHERE fcm_token = $1`,
+              [token],
+            );
+            const row = freshRes.rows[0];
+            const freshMs = row
+              ? Date.now() - new Date(row.last_seen_at || row.created_at).getTime()
+              : Infinity;
+            await query(`DELETE FROM user_devices WHERE fcm_token = $1`, [token]);
+            console.error(
+              `[push] pruned invalid token (${platformByToken.get(token) || "unknown"}, ` +
+                `${token.slice(0, 12)}…) status=${status} fcm=${fcmError}`,
+            );
+            // A token registered MINUTES ago that already 404s is almost never
+            // "stale" — it is a Firebase PROJECT MISMATCH (the app fetched its
+            // token from a different project than FIREBASE_PROJECT_ID) or an
+            // APNs key missing on the Firebase console (iOS). Shout once per
+            // process so the operator sees it.
+            if (freshMs < 15 * 60_000 && !pushMismatchWarned) {
+              pushMismatchWarned = true;
+              console.error(
+                `[push] ⚠️ FRESH token pruned with ${status} — this is a CONFIG problem, not a stale device. ` +
+                  `Backend sends to project "${projectId}". The apps' project lives in ` +
+                  `android/app/google-services.json + ios/Runner/GoogleService-Info.plist — ` +
+                  `project_id / PROJECT_ID there MUST equal FIREBASE_PROJECT_ID. iOS also needs ` +
+                  `an APNs auth key uploaded in the Firebase console. Until they match, EVERY ` +
+                  `push 404s and devices keep disappearing from user_devices.`,
+              );
+            }
+          } catch (pruneErr: any) {
+            console.error(`[push] prune failed:`, pruneErr?.message || pruneErr);
+          }
         } else {
           console.error(
-            `[push] send failed (${isIos ? "ios" : "android"}) status=${status || "?"}:`,
-            JSON.stringify(err.response?.data?.error || err.message).slice(0, 300),
+            `[push] send failed (${platformByToken.get(token) || (isIos ? "ios" : "android")}) status=${status || "?"}:`,
+            fcmError,
           );
         }
       }
@@ -337,11 +425,39 @@ async function sendToTokens(tokens: string[], payload: PushPayload): Promise<{ s
         },
       );
       // Success/failure per-token is not granular here; count as delivered.
+      diagnostics?.push(
+        ...tokens.map((t) => ({
+          tokenPreview: t.slice(0, 18),
+          platform: platformByToken.get(t) || "unknown",
+          ok: true,
+          httpStatus: 200 as number | null,
+          error: null as string | null,
+        })),
+      );
       return { sent: tokens.length, failed: 0 };
     } catch (err: any) {
       console.error("[push] FCM legacy send failed:", err.response?.data || err.message);
+      diagnostics?.push(
+        ...tokens.map((t) => ({
+          tokenPreview: t.slice(0, 18),
+          platform: platformByToken.get(t) || "unknown",
+          ok: false,
+          httpStatus: (err.response?.status ?? null) as number | null,
+          error: String(err.response?.data || err.message).slice(0, 300),
+        })),
+      );
     }
   }
+  // Neither mode configured — nothing went out.
+  diagnostics?.push(
+    ...tokens.map((t) => ({
+      tokenPreview: t.slice(0, 18),
+      platform: platformByToken.get(t) || "unknown",
+      ok: false,
+      httpStatus: null,
+      error: "Push NOT configured (FIREBASE_SERVICE_ACCOUNT_JSON / FCM_SERVER_KEY missing)",
+    })),
+  );
   return { sent: 0, failed: tokens.length };
 }
 

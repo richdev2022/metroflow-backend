@@ -356,6 +356,64 @@ export const monnifyProvider: Provider = {
     }
   },
 
+  /**
+   * Automatic refund of a collected payment (over-limit funding guard).
+   * API: POST /api/v1/refunds — keys off MONNIFY's transactionReference.
+   * When only our paymentReference is known, query the transaction first to
+   * resolve Monnify's own reference. Direction defaults to the payer's
+   * source account (Monnify refund API default), which is the correct
+   * behaviour for returning a rejected funding to its sender.
+   */
+  async refundPayment(request: {
+    transactionId?: string | number;
+    providerReference?: string;
+    reference?: string;
+    amount?: number;
+    currency?: string;
+    reason?: string;
+  }) {
+    try {
+      let txnReference = request.providerReference || null;
+      if (!txnReference && request.reference) {
+        const verify = await monnifyClient.get(
+          `/api/v2/merchant/transactions/query?paymentReference=${request.reference}`
+        );
+        txnReference = verify.data?.responseBody?.transactionReference || null;
+      }
+      if (!txnReference) {
+        return { success: false, message: "Refund skipped: Monnify transactionReference missing" };
+      }
+
+      const refundPayload: Record<string, unknown> = {
+        transactionReference: txnReference,
+        refundReason: request.reason || "Transaction limit exceeded — automatic refund",
+        customerNote: request.reason || "Transaction limit exceeded — automatic refund",
+        currencyCode: request.currency || "NGN",
+      };
+      if (request.amount && request.amount > 0) {
+        refundPayload.refundAmount = request.amount;
+      }
+
+      const response = await monnifyClient.post("/api/v1/refunds", refundPayload);
+      const body = response.data;
+      return {
+        success: !!body?.requestSuccessful,
+        message: body?.responseMessage || (body?.requestSuccessful ? "Refund initiated" : "Refund failed"),
+        data: body?.responseBody,
+      };
+    } catch (error: any) {
+      console.error(
+        "Monnify Refund Error:",
+        error.response?.data || error.message
+      );
+      return {
+        success: false,
+        message: error.response?.data?.responseMessage || "Refund request failed",
+        data: error.response?.data,
+      };
+    }
+  },
+
   async cancelRecurring(token: string) {
     console.log(`[Monnify] Cancel recurring for token: ${token}`);
     return { success: true, message: "Recurring subscription cancelled locally" };

@@ -40,6 +40,7 @@ export interface LimitCheckResult {
     category: RegistrationCategory;
     currency: string;
     upgradeHint: boolean;
+    direction?: "inflow" | "outflow";
   };
 }
 
@@ -103,6 +104,34 @@ export async function getBusinessCategory(businessId: string | null | undefined)
   }
 }
 
+/**
+ * Successful NGN inflow (wallet funding) volume for the business today / this
+ * calendar month. Funding credits land as transaction_type 'wallet_funding',
+ * direction 'credit'. Both checkout (card) and virtual-account fundings are
+ * recorded through this type, so one query covers every inflow rail.
+ */
+export async function getBusinessInflowUsage(businessId: string): Promise<LimitUsage> {
+  try {
+    const res = await query(
+      `SELECT
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('day', NOW())), 0)::float8 AS used_today,
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::float8 AS used_month
+       FROM transactions
+       WHERE business_id = $1
+         AND direction = 'credit'
+         AND status = 'success'
+         AND transaction_type = 'wallet_funding'
+         AND currency = 'NGN'`,
+      [businessId],
+    );
+    const row: any = res.rows[0] || {};
+    return { usedToday: Number(row.used_today || 0), usedThisMonth: Number(row.used_month || 0) };
+  } catch (err: any) {
+    console.error("[transaction-limits] inflow usage query failed:", err?.message);
+    return { usedToday: 0, usedThisMonth: 0 };
+  }
+}
+
 /** Successful NGN debit volume for the business today / this calendar month. */
 export async function getBusinessUsage(businessId: string): Promise<LimitUsage> {
   try {
@@ -124,6 +153,79 @@ export async function getBusinessUsage(businessId: string): Promise<LimitUsage> 
     console.error("[transaction-limits] usage query failed:", err?.message);
     return { usedToday: 0, usedThisMonth: 0 };
   }
+}
+
+/**
+ * Enforce the category limits for a proposed INFLOW (wallet funding) of
+ * `amount` (NGN). Mirrors enforceTransactionLimits but measures the
+ * funding (credit) volume instead of the transfer (debit) volume.
+ */
+export async function enforceInflowLimits(
+  businessId: string,
+  amount: number,
+  options: { currency?: string } = {},
+): Promise<LimitCheckResult> {
+  const currency = (options.currency || "NGN").toUpperCase();
+  if (currency !== "NGN") return { ok: true };
+
+  const value = Number(amount) || 0;
+  const category = await getBusinessCategory(businessId);
+  const limits = await getCategoryLimits(category);
+  const usage = await getBusinessInflowUsage(businessId);
+
+  const buildFail = (
+    limitType: "single" | "daily" | "monthly",
+    code: LimitCheckResult["code"],
+    message: string,
+  ): LimitCheckResult => ({
+    ok: false,
+    code,
+    error: message,
+    data: {
+      limitType,
+      limit:
+        limitType === "single"
+          ? limits.singleTransactionLimit
+          : limitType === "daily"
+            ? limits.dailyLimit
+            : limits.monthlyLimit,
+      amount: value,
+      usedToday: usage.usedToday,
+      usedThisMonth: usage.usedThisMonth,
+      category,
+      currency: limits.currency,
+      upgradeHint: category === "non_registered",
+      direction: "inflow",
+    },
+  });
+
+  const fmt = (n: number) =>
+    `${limits.currency} ${Number(n).toLocaleString("en-NG", { maximumFractionDigits: 2 })}`;
+  const tier = category === "registered" ? "Registered Business" : "Non-Registered Business";
+
+  if (value > limits.singleTransactionLimit) {
+    return buildFail(
+      "single",
+      "SINGLE_LIMIT_EXCEEDED",
+      `Your ${tier} funding limit is ${fmt(limits.singleTransactionLimit)} per transaction. A funding of ${fmt(value)} exceeds it.`,
+    );
+  }
+  if (usage.usedToday + value > limits.dailyLimit) {
+    return buildFail(
+      "daily",
+      "DAILY_LIMIT_EXCEEDED",
+      `Your ${tier} daily funding limit is ${fmt(limits.dailyLimit)} (funded ${fmt(usage.usedToday)} today). This funding of ${fmt(value)} would exceed it.`,
+    );
+  }
+  if (usage.usedThisMonth + value > limits.monthlyLimit) {
+    return buildFail(
+      "monthly",
+      "MONTHLY_LIMIT_EXCEEDED",
+      `Your ${tier} monthly funding limit is ${fmt(limits.monthlyLimit)} (funded ${fmt(usage.usedThisMonth)} this month). Upgrade your business registration to unlock higher limits.`,
+    );
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -201,11 +303,12 @@ export async function enforceTransactionLimits(
   return { ok: true };
 }
 
-/** Dashboard payload: current tier + limits + live usage. */
+/** Dashboard payload: current tier + limits + live usage (both directions). */
 export async function getBusinessLimitInfo(businessId: string) {
   const category = await getBusinessCategory(businessId);
   const limits = await getCategoryLimits(category);
   const usage = await getBusinessUsage(businessId);
+  const inflowUsage = await getBusinessInflowUsage(businessId);
   const target = await getCategoryLimits("registered");
   return {
     category,
@@ -221,6 +324,14 @@ export async function getBusinessLimitInfo(businessId: string) {
       usedThisMonth: usage.usedThisMonth,
       remainingToday: Math.max(0, limits.dailyLimit - usage.usedToday),
       remainingThisMonth: Math.max(0, limits.monthlyLimit - usage.usedThisMonth),
+    },
+    // INFLOW (funding) view of the SAME tier limits — used by the funding
+    // UIs (checkout + virtual account) and by the webhook credit gate.
+    inflow: {
+      usedToday: inflowUsage.usedToday,
+      usedThisMonth: inflowUsage.usedThisMonth,
+      remainingToday: Math.max(0, limits.dailyLimit - inflowUsage.usedToday),
+      remainingThisMonth: Math.max(0, limits.monthlyLimit - inflowUsage.usedThisMonth),
     },
     registeredLimits: {
       singleTransactionLimit: target.singleTransactionLimit,

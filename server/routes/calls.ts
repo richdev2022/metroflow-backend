@@ -6,7 +6,7 @@ import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
-import { postCallLogMessage } from "../lib/call-log";
+import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
 import { pushIncomingCall, pushMissedCall, acknowledgeCallPush } from "../lib/call-push";
 import { roomManager } from "../lib/roomManager";
@@ -1174,6 +1174,131 @@ export const pushAckCall: RequestHandler = async (req, res) => {
     res.status(204).end();
   } catch {
     res.status(204).end(); // never fail an ack
+  }
+};
+
+/**
+ * POST /calls/:id/reject — REST decline for incoming calls.
+ *
+ * Needed by the mobile notification ACTION buttons ("Decline" on the
+ * full-screen ringing notification): the background isolate has no live
+ * socket, so the socket-only `call:reject` path cannot be used from there.
+ * Mirrors the socket handler's lifecycle exactly: first decline closes the
+ * call as MISSED, writes the call-log chat message, pushes "Missed call" to
+ * the other callees, and emits `call:rejected` to the room + the creator so
+ * the caller's ringback stops instantly.
+ */
+export const rejectCallRest: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const userId = req.user?.userId;
+    const rawId = String(req.params?.id || "");
+    if (!userId || !rawId) {
+      return res.status(400).json({ success: false, error: "call id required" });
+    }
+
+    // Accept both the call UUID and the shareable call code.
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let callRow: any = null;
+    if (uuidRegex.test(rawId)) {
+      const byId = await query(`SELECT id FROM calls WHERE id = $1 LIMIT 1`, [rawId]);
+      callRow = byId.rows[0] || null;
+    }
+    if (!callRow) {
+      const byCode = await query(`SELECT id FROM calls WHERE call_code = $1 LIMIT 1`, [rawId]);
+      callRow = byCode.rows[0] || null;
+    }
+    if (!callRow) {
+      return res.status(404).json({ success: false, error: "Call not found" });
+    }
+    const callId = callRow.id as string;
+
+    // Only an invited participant may reject.
+    const membership = await query(
+      `SELECT 1 FROM call_participants WHERE call_id = $1 AND user_id = $2 LIMIT 1`,
+      [callId, userId],
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "You are not a participant of this call" });
+    }
+
+    const callRes = await query(
+      `SELECT id, business_id, type, status, duration, call_code, created_by, conversation_id
+       FROM calls WHERE id = $1`,
+      [callId],
+    );
+    const preReject = callRes.rows[0] || null;
+    const creatorId: string | null = preReject?.created_by || null;
+    const io = getSocketServer();
+
+    if (preReject && !CALL_LOG_FINAL_STATUSES.has(preReject.status)) {
+      try {
+        await query(
+          `UPDATE calls SET status = 'missed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 AND status NOT IN ('completed','missed','cancelled')`,
+          [callId],
+        );
+      } catch (error) {
+        console.error(`[calls/reject] failed to persist missed status for ${callId}:`, error);
+      }
+      try {
+        const parts = await query(`SELECT user_id FROM call_participants WHERE call_id = $1`, [callId]);
+        const participantIds = (parts.rows.map((r: any) => r.user_id) || []).filter(Boolean);
+        postCallLogMessage(
+          {
+            businessId: preReject.business_id,
+            senderId: preReject.created_by,
+            conversationId: preReject.conversation_id || undefined,
+            participantIds,
+            callType: preReject.type,
+            status: "missed",
+            durationSeconds: null,
+            callCode: preReject.call_code,
+            callId,
+            endedAt: new Date(),
+          },
+          io,
+        ).catch(() => undefined);
+
+        const calleeIds = participantIds.filter((pid: string) => pid !== preReject.created_by);
+        let callerName: string | null = null;
+        try {
+          const nameRes = await query(`SELECT name FROM users WHERE id = $1`, [preReject.created_by]);
+          callerName = nameRes.rows[0]?.name || null;
+        } catch { /* best-effort */ }
+        pushMissedCall(calleeIds, {
+          callId,
+          callerName: callerName || "Someone",
+          callerId: preReject.created_by,
+          callCode: preReject.call_code,
+          status: "missed",
+        });
+      } catch (sideEffectErr) {
+        console.error("[calls/reject] side effects failed (non-fatal):", sideEffectErr);
+      }
+    }
+
+    try {
+      await query(
+        `UPDATE call_participants SET status = 'rejected', left_at = CURRENT_TIMESTAMP
+         WHERE call_id = $1 AND user_id = $2`,
+        [callId, userId],
+      );
+    } catch { /* status column is informational */ }
+
+    if (io) {
+      io.to(`room:${callId}`).emit("call:rejected", { callId, userId });
+      if (creatorId && creatorId !== userId) {
+        io.to(`user:${creatorId}`).emit("call:rejected", { callId, userId });
+      }
+    }
+
+    res.json({ success: true, data: { callId, rejected: true } });
+  } catch (error) {
+    console.error("[calls/reject] failed:", error);
+    res.status(500).json({ success: false, error: "Failed to reject call" });
   }
 };
 

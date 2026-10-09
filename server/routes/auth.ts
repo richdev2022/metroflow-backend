@@ -183,11 +183,19 @@ export const registerBusiness: RequestHandler = async (req, res) => {
 
     // Create business
     const businessId = generateBusinessId(input.businessName);
+    // Business type preference captured at signup. IMPORTANT: this does NOT
+    // grant the 'registered' category — every account starts in the
+    // non_registered transaction-limit tier until Business KYC is approved.
+    const requestedCategory =
+      input.businessType === "registered" || input.businessType === "non_registered"
+        ? input.businessType
+        : "non_registered";
+
     const businessResult = await query(
-      `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at, requested_registration_category)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, name, email, created_at as "createdAt"`,
-      [businessId, input.businessName, input.businessEmail, input.businessIndustry || null, planId, trialEndsAt],
+      [businessId, input.businessName, input.businessEmail, input.businessIndustry || null, planId, trialEndsAt, requestedCategory],
     );
 
     const business = businessResult.rows[0];
@@ -1065,8 +1073,8 @@ export const login: RequestHandler = async (req, res) => {
       try {
         const deviceInfo = parseDeviceInfo(userAgent);
         await query(
-          `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
-           VALUES ($1, $2, $3, 'failed', $4, $5, $6)`,
+          `INSERT INTO login_attempts (email, user_id, business_id, status, success, ip_address, user_agent, device_info)
+           VALUES ($1, $2, $3, 'failed', FALSE, $4, $5, $6)`,
           [user.email, user.id, user.businessId, ipAddress, String(userAgent || ''), deviceInfo],
         );
         const attemptEmail = generateLoginAttemptEmailHtml(user.email, 'failed', deviceInfo, ipAddress);
@@ -1116,8 +1124,8 @@ export const login: RequestHandler = async (req, res) => {
     try {
       const deviceInfo = parseDeviceInfo(userAgent);
       await query(
-        `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
-         VALUES ($1, $2, $3, 'success', $4, $5, $6)`,
+        `INSERT INTO login_attempts (email, user_id, business_id, status, success, ip_address, user_agent, device_info)
+         VALUES ($1, $2, $3, 'success', TRUE, $4, $5, $6)`,
         [user.email, user.id, user.businessId, ipAddress, String(userAgent || ''), deviceInfo],
       );
       const attemptEmail = generateLoginAttemptEmailHtml(user.email, 'success', deviceInfo, ipAddress);
@@ -1854,8 +1862,8 @@ export const biometricLogin: RequestHandler = async (req, res) => {
     try {
       const deviceInfo = parseDeviceInfo(req.headers['user-agent']);
       await query(
-        `INSERT INTO login_attempts (email, user_id, business_id, status, ip_address, user_agent, device_info)
-         VALUES ($1, $2, $3, 'success', $4, $5, $6)`,
+        `INSERT INTO login_attempts (email, user_id, business_id, status, success, ip_address, user_agent, device_info)
+         VALUES ($1, $2, $3, 'success', TRUE, $4, $5, $6)`,
         [cred.email, cred.uid, cred.businessId, req.ip || null, String(req.headers['user-agent'] || ''), { ...deviceInfo, method: 'biometric' }],
       );
       const attemptEmail = generateLoginAttemptEmailHtml(cred.email, 'success', deviceInfo, req.ip);
@@ -1975,7 +1983,7 @@ export const listWorkspaces: RequestHandler = async (req: AuthenticatedRequest, 
       `SELECT u.id as "userId", u.business_id as "businessId", u.role, u.status,
               u.email_verified as "emailVerified",
               b.name as "businessName", b.logo_url as "businessLogo",
-              b.business_id as "workspaceCode"
+              b.id as "workspaceCode"
          FROM users u
          JOIN businesses b ON b.id = u.business_id
         WHERE LOWER(u.email) = LOWER($1)

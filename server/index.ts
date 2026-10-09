@@ -1,3 +1,6 @@
+// env-override MUST be first: re-applies .env over stale pm2-injected env vars
+// (dotenv alone does not override, so an edited .env silently lost to old pm2 snapshots).
+import "./env-override";
 import "dotenv/config";
 import * as Sentry from "@sentry/node";
 import express from "express";
@@ -82,6 +85,7 @@ import settingsRouter from "./routes/settings";
 import { rtcRouter } from "./lib/calling/routes";
 import { livekitWebhookRouter } from "./lib/calling/webhook";
 import kycRouter from "./routes/kyc";
+import businessKycRouter from "./routes/business-kyc";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
@@ -125,7 +129,7 @@ import { processPendingProductDocJobs } from "./services/productDocJobs";
 import { startTransferMonitor } from "./services/transfer";
 import * as cron from "node-cron";
 import { getStore } from "@netlify/blobs";
-import { initRedis, getRedisClient } from "./lib/cache";
+import { initRedis, getRedisClient, isRedisDisabled } from "./lib/cache";
 import { payloadEncryptionMiddleware } from "./middleware/payload-encryption";
 import { requestLoggerMiddleware, startRequestLogRetention } from "./middleware/request-logger";
 import { transferQueue, productDocQueue, scheduledQueue } from "./lib/queues";
@@ -677,13 +681,16 @@ export async function createServer() {
           // Report REAL connectivity, not just env presence: production ran
           // with configured:false for weeks because REDIS_URL was simply not
           // set on the server (no code could have detected that).
+          // NOTE: DISABLE_REDIS must be parsed as a boolean ("false" !== disabled);
+          // the old `!process.env.DISABLE_REDIS` treated the STRING "false" as truthy.
           const url = process.env.REDIS_URL;
-          const configured = !!url && !process.env.DISABLE_REDIS;
+          const disabled = isRedisDisabled();
+          const configured = !!url && !disabled;
           if (!configured) {
             return {
               configured: false,
               connected: false,
-              reason: process.env.DISABLE_REDIS
+              reason: disabled
                 ? "disabled by DISABLE_REDIS env"
                 : "REDIS_URL env is not set on this server — set it (e.g. redis://127.0.0.1:6379 or a managed rediss:// URL) and restart",
             };
@@ -691,7 +698,11 @@ export async function createServer() {
           try {
             const client = getRedisClient();
             if (!client || client.status !== "ready") {
-              return { configured: true, connected: false, reason: `client status: ${client?.status || "null"}` };
+              return {
+                configured: true,
+                connected: false,
+                reason: `client status: ${client?.status || "null"} (if this stays 'connecting'/'end', the URL may need the rediss:// TLS scheme)`,
+              };
             }
             const pong = await Promise.race([
               client.ping(),
@@ -873,6 +884,9 @@ export async function createServer() {
 
   // KYC API routes
     mainRouter.use("/kyc", kycRouter);
+
+  // Business KYC upgrade (Registered vs Non-Registered business) + transaction limits
+  mainRouter.use("/business-kyc", businessKycRouter);
 
     // Wallet API routes
     mainRouter.use("/wallet", walletRouter);

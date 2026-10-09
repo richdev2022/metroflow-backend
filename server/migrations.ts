@@ -35,6 +35,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
+  await ensureChatInviteSchema(); // group chat invite links (join by code)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2234,4 +2235,15 @@ async function ensureBusinessRegistrationSchema(): Promise<void> {
   `);
 
   console.log("[migrations] business registration + KYC upgrade schema applied");
+}
+
+/**
+ * Group chat invite links: a shareable invite code per conversation so any
+ * member can copy "https://app.metricorex.com/chat/join/<code>" and other
+ * users can self-join the group. Codes are 10 chars (unambiguous alphabet)
+ * and regenerate-able (POST .../invite/rotate resets them).
+ */
+async function ensureChatInviteSchema(): Promise<void> {
+  await query(`ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS invite_code VARCHAR(16)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_conversations_invite_code ON chat_conversations (invite_code) WHERE invite_code IS NOT NULL`);
 }

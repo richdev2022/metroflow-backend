@@ -28,7 +28,7 @@ export interface IncomingCallPushInfo {
 // notification (notification + data hybrid), which Android delivers through
 // the system tray path that OEMs do not drop.
 // ---------------------------------------------------------------------------
-const ACK_WINDOW_MS = 8000;
+const ACK_WINDOW_MS = 4000;
 const pendingAckFallbacks = new Map<string, NodeJS.Timeout>();
 
 export function acknowledgeCallPush(callId: string): void {
@@ -64,7 +64,7 @@ function scheduleVisibleFallback(
  *      full-screen ringing UI (Accept/Decline, ringtone) in EVERY app state
  *      — foreground, background and killed. iOS gets a real APNs alert.
  *   2. Delivery-ack fallback: the app acks the push via POST /calls/push-ack.
- *      If NO ack arrives within 8s (OEM dropped the data-only message while
+ *      If NO ack arrives within 4s (OEM dropped the data-only message while
  *      the app was swiped away), a VISIBLE system-tray notification is sent
  *      so the callee's phone still rings and the tap still opens the call.
  *   3. Web Push (VAPID, TTL 60s, urgency high) for browser callees.
@@ -95,6 +95,12 @@ export async function pushIncomingCall(
         ...(info.conversationId ? { conversationId: info.conversationId } : {}),
       },
       androidChannelId: "calls",
+      // Max-priority heads-up rendering for the VISIBLE fallback (the 4s
+      // no-ack escalation): category "call" + PRIORITY_MAX makes FCM's own
+      // tray notification banner over anything and use the channel's alarm
+      // sound — a swiped-away app still rings even when its own full-screen
+      // render never got a chance.
+      androidCallStyle: true,
       // A call that nobody answered in 45s is dead — never ring late.
       ttlSeconds: 45,
       collapseKey: `incoming-call-${info.callId}`,

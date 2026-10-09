@@ -1949,3 +1949,141 @@ export const biometricRevoke: RequestHandler = async (req: AuthenticatedRequest,
     res.status(500).json({ success: false, message: error.message || "Failed to disable biometric unlock" });
   }
 };
+
+/**
+ * GET /auth/workspaces (auth required)
+ *
+ * MULTI-WORKSPACE SWITCHING: the schema keeps one users row per business
+ * (UNIQUE(business_id, email)), so the same person who is a member of two
+ * workspaces exists as two rows. This endpoint lists every VERIFIED, ACTIVE
+ * row that shares the caller's (case-insensitive) email so clients can
+ * render a workspace switcher. The caller's current workspace is flagged.
+ */
+export const listWorkspaces: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    const me = await query(
+      `SELECT id, email FROM users WHERE id = $1 LIMIT 1`,
+      [userId],
+    );
+    if (!me.rows.length) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const email = String(me.rows[0].email || "");
+
+    const rows = await query(
+      `SELECT u.id as "userId", u.business_id as "businessId", u.role, u.status,
+              u.email_verified as "emailVerified",
+              b.name as "businessName", b.logo_url as "businessLogo",
+              b.business_id as "workspaceCode"
+         FROM users u
+         JOIN businesses b ON b.id = u.business_id
+        WHERE LOWER(u.email) = LOWER($1)
+          AND u.status = 'active'
+          AND u.email_verified = TRUE
+        ORDER BY (u.id = $2) DESC, b.name ASC
+        LIMIT 50`,
+      [email, userId],
+    );
+
+    const workspaces = rows.rows.map((r) => ({ ...r, isCurrent: r.userId === userId }));
+    res.json({
+      success: true,
+      data: {
+        workspaces,
+        canSwitch: workspaces.length > 1,
+      },
+    });
+  } catch (error: any) {
+    console.error("List workspaces error:", error?.message);
+    res.status(500).json({ success: false, message: "Failed to load your workspaces" });
+  }
+};
+
+/**
+ * POST /auth/switch-workspace (auth required)
+ * Body: { businessId }
+ *
+ * Issues a fresh token bound to the TARGET workspace's user row — only when
+ * that row shares the caller's verified email and is active. Password is NOT
+ * re-asked: the JWT already proves ownership of the email identity. Returns
+ * the same payload shape as /auth/login so clients can swap their session
+ * atomically (token + userId + businessId + profile flags).
+ */
+export const switchWorkspace: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    const targetBusinessId = String(req.body?.businessId || "").trim();
+    if (!targetBusinessId) {
+      return res.status(400).json({ success: false, message: "businessId is required" });
+    }
+
+    const me = await query(
+      `SELECT id, email FROM users WHERE id = $1 LIMIT 1`,
+      [userId],
+    );
+    if (!me.rows.length) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const email = String(me.rows[0].email || "");
+
+    if (req.user?.businessId === targetBusinessId) {
+      return res.status(400).json({ success: false, message: "You are already in this workspace" });
+    }
+
+    const target = await query(
+      `SELECT u.id, u.business_id as "businessId", u.name, u.email, u.status, u.email_verified as "emailVerified"
+         FROM users u
+        WHERE LOWER(u.email) = LOWER($1)
+          AND u.business_id = $2
+        LIMIT 1`,
+      [email, targetBusinessId],
+    );
+
+    if (!target.rows.length) {
+      return res.status(403).json({ success: false, message: "You are not a member of that workspace" });
+    }
+    const t = target.rows[0];
+    if (t.status !== "active" || !t.emailVerified) {
+      return res.status(403).json({ success: false, message: "That workspace membership is not active" });
+    }
+
+    const token = await generateToken(t.id, t.businessId);
+    const profileStatus = await getProfileStatus(t.id);
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(t.businessId);
+      } catch { completion = true; }
+    }
+
+    await logActivity({
+      businessId: t.businessId,
+      userId: t.id,
+      action: "workspace_switch",
+      actionType: "authentication",
+      description: "User switched into this workspace",
+    }).catch(() => {});
+
+    res.json({
+      success: true,
+      message: "Workspace switched",
+      userId: t.id,
+      businessId: t.businessId,
+      token,
+      name: t.name || "",
+      email: t.email || "",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      profileCompleted: completion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
+    });
+  } catch (error: any) {
+    console.error("Switch workspace error:", error?.message);
+    res.status(500).json({ success: false, message: "Failed to switch workspace" });
+  }
+};

@@ -100,10 +100,10 @@ import { getStatuses, createStatus, deleteStatus, viewStatus, likeStatus, getSta
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact, addChatParticipants, getChatInvite, rotateChatInvite, joinChatByInvite } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
@@ -972,6 +972,12 @@ export async function createServer() {
   mainRouter.patch("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), updateParticipantRole);
   mainRouter.delete("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), removeParticipant);
 
+  // Chat groups: any member can add users + shareable invite links (WhatsApp-style)
+  mainRouter.post("/chat/conversations/:conversationId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), addChatParticipants);
+  mainRouter.get("/chat/conversations/:conversationId/invite", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getChatInvite);
+  mainRouter.post("/chat/conversations/:conversationId/invite/rotate", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), rotateChatInvite);
+  mainRouter.post("/chat/join/:code", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), joinChatByInvite);
+
   // Contact blocking (direct chats; enforced in sendMessage/createConversation)
   mainRouter.get("/users/blocked", authenticateToken, checkSubscriptionStatus, listBlocked);
   mainRouter.post("/users/:userId/block", authenticateToken, checkSubscriptionStatus, blockUser);
@@ -1016,6 +1022,7 @@ export async function createServer() {
   mainRouter.post("/calls", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), createCall);
   mainRouter.put("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), updateCall);
   mainRouter.post("/calls/:id/join", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), joinCall);
+  mainRouter.post("/calls/:id/reject", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), rejectCallRest);
   mainRouter.post("/calls/:id/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), leaveCall);
   mainRouter.delete("/calls/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), deleteCall);
   mainRouter.post("/calls/:callId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission(["use_calls", "use_chat"]), requireTeamPermission("use_calls"), addCallParticipants);

@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
 import { reverseFailedTransfer } from "../services/transfer";
+import { checkFundingLimit, rejectOverLimitFunding } from "../services/funding-limits";
 
 const router = express.Router();
 
@@ -158,6 +159,35 @@ const handleSquadWebhook = async (event: any) => {
                         const walletId = transaction.wallet_id;
 
                         if (walletId) {
+                            // INFLOW LIMIT GATE (Squad checkout): the user has
+                            // PAID — if the amount now exceeds the tier
+                            // limits, do not credit; fail + auto-refund.
+                            const fundingLimit = await checkFundingLimit(
+                                {
+                                    businessId: transaction.business_id,
+                                    userId: transaction.user_id,
+                                    ownerKey: transaction.business_id || transaction.user_id,
+                                },
+                                amount,
+                                { currency: String(transaction.currency || 'NGN').toUpperCase() },
+                            );
+                            if (!fundingLimit.ok) {
+                                await rejectOverLimitFunding({
+                                    walletId,
+                                    businessId: transaction.business_id,
+                                    userId: transaction.user_id,
+                                    amount,
+                                    currency: String(transaction.currency || 'NGN').toUpperCase(),
+                                    reference,
+                                    provider: 'squad',
+                                    source: 'checkout',
+                                    gatewayEvent: body,
+                                    existingTransactionId: transaction.id,
+                                    limitResult: fundingLimit,
+                                });
+                                return;
+                            }
+
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
 
                             const platformWallet = await query(`SELECT id FROM wallets WHERE business_id IS NULL AND user_id IS NULL`);
@@ -235,6 +265,35 @@ const handleSquadWebhook = async (event: any) => {
               const fee = await calculateFee(amount, 'funding_account');
               const creditAmount = Math.max(0, amount - fee);
               const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
+
+              // INFLOW LIMIT GATE (Squad virtual account): the sender has
+              // already moved money into the VA. Over the tier limit -> do
+              // not credit; record the failed funding (Squad has no refund
+              // API, so rejectOverLimitFunding flags it for manual refund).
+              const fundingLimit = await checkFundingLimit(
+                {
+                  businessId: wallet.business_id,
+                  userId: wallet.user_id,
+                  ownerKey: wallet.business_id || wallet.user_id,
+                },
+                amount,
+                { currency: 'NGN' },
+              );
+              if (!fundingLimit.ok) {
+                await rejectOverLimitFunding({
+                  walletId: wallet.id,
+                  businessId: wallet.business_id,
+                  userId: wallet.user_id,
+                  amount,
+                  currency: 'NGN',
+                  reference,
+                  provider: 'squad',
+                  source: 'virtual_account',
+                  gatewayEvent: body,
+                  limitResult: fundingLimit,
+                });
+                return;
+              }
 
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
@@ -383,6 +442,36 @@ const handleMonnifyWebhook = async (event: any) => {
                         const walletId = transaction.wallet_id;
 
                         if (walletId) {
+                            // INFLOW LIMIT GATE (Monnify checkout): the user
+                            // has PAID — if the amount now exceeds the tier
+                            // limits, do not credit; fail + auto-refund.
+                            const fundingLimit = await checkFundingLimit(
+                                {
+                                    businessId: transaction.business_id,
+                                    userId: transaction.user_id,
+                                    ownerKey: transaction.business_id || transaction.user_id,
+                                },
+                                amount,
+                                { currency: String(transaction.currency || 'NGN').toUpperCase() },
+                            );
+                            if (!fundingLimit.ok) {
+                                await rejectOverLimitFunding({
+                                    walletId,
+                                    businessId: transaction.business_id,
+                                    userId: transaction.user_id,
+                                    amount,
+                                    currency: String(transaction.currency || 'NGN').toUpperCase(),
+                                    reference,
+                                    provider: 'monnify',
+                                    source: 'checkout',
+                                    providerReference: transactionData.transactionReference || null,
+                                    gatewayEvent: transactionData,
+                                    existingTransactionId: transaction.id,
+                                    limitResult: fundingLimit,
+                                });
+                                return;
+                            }
+
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
                             // Owner invariant: funding -> platform ledger DEBITED,
                             // user credited. ONE debit row, no gross-inflow row.
@@ -482,11 +571,40 @@ const handleMonnifyWebhook = async (event: any) => {
                     }
                     
                     const txnCheck = await query(`SELECT id FROM transactions WHERE reference = $1`, [reference]);
-                    
+
                     if (txnCheck.rows.length === 0) {
               const fee = await calculateFee(amount, 'funding_account');
               const creditAmount = Math.max(0, amount - fee);
               const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
+
+              // INFLOW LIMIT GATE (Monnify virtual account): over the tier
+              // limit -> do not credit; record failed funding + auto-refund
+              // (Monnify supports the refunds API).
+              const fundingLimit = await checkFundingLimit(
+                {
+                  businessId: wallet.business_id,
+                  userId: wallet.user_id,
+                  ownerKey: wallet.business_id || wallet.user_id,
+                },
+                amount,
+                { currency: 'NGN' },
+              );
+              if (!fundingLimit.ok) {
+                await rejectOverLimitFunding({
+                  walletId: wallet.id,
+                  businessId: wallet.business_id,
+                  userId: wallet.user_id,
+                  amount,
+                  currency: 'NGN',
+                  reference,
+                  provider: 'monnify',
+                  source: 'virtual_account',
+                  providerReference: transactionData.transactionReference || null,
+                  gatewayEvent: transactionData,
+                  limitResult: fundingLimit,
+                });
+                return;
+              }
 
               // Credit user wallet first
               await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
@@ -846,6 +964,37 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 await settleSubscriptionCharge(reference, 'flutterwave');
                 return;
             }
+            // INFLOW LIMIT GATE (Flutterwave checkout): the user has PAID —
+            // if the amount now exceeds the tier limits, do not credit; fail
+            // the funding and auto-refund via Flutterwave's refunds API.
+            if (transaction.transaction_type === 'wallet_funding') {
+                const fundingLimit = await checkFundingLimit(
+                    {
+                        businessId: transaction.business_id,
+                        userId: transaction.user_id,
+                        ownerKey: transaction.business_id || transaction.user_id,
+                    },
+                    parseFloat(transaction.amount),
+                    { currency: String(transaction.currency || 'NGN').toUpperCase() },
+                );
+                if (!fundingLimit.ok) {
+                    await rejectOverLimitFunding({
+                        walletId: String(transaction.wallet_id),
+                        businessId: transaction.business_id,
+                        userId: transaction.user_id,
+                        amount: parseFloat(transaction.amount),
+                        currency: String(transaction.currency || 'NGN').toUpperCase(),
+                        reference,
+                        provider: 'flutterwave',
+                        source: 'checkout',
+                        providerTransactionId: verified.id || data.id || null,
+                        gatewayEvent: event,
+                        existingTransactionId: transaction.id,
+                        limitResult: fundingLimit,
+                    });
+                    return;
+                }
+            }
             const credited = await creditWalletFundingTransaction(transaction, 'flutterwave');
             if (credited && transaction.transaction_type === 'wallet_funding') {
                 const newBalanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [transaction.wallet_id]);
@@ -985,6 +1134,37 @@ const handleFlutterwaveWebhook = async (event: any) => {
 
         const fee = await calculateFee(amount, 'funding_account');
         const creditAmount = Math.max(0, amount - fee);
+
+        // INFLOW LIMIT GATE (Flutterwave virtual account): over the tier
+        // limit -> do not credit; record the failed funding + auto-refund
+        // via the Flutterwave refunds API.
+        {
+            const fundingLimit = await checkFundingLimit(
+                {
+                    businessId: wallet.business_id,
+                    userId: wallet.user_id,
+                    ownerKey: wallet.business_id || wallet.user_id,
+                },
+                amount,
+                { currency: 'NGN' },
+            );
+            if (!fundingLimit.ok) {
+                await rejectOverLimitFunding({
+                    walletId: wallet.id,
+                    businessId: wallet.business_id,
+                    userId: wallet.user_id,
+                    amount,
+                    currency: 'NGN',
+                    reference: creditReference,
+                    provider: 'flutterwave',
+                    source: 'virtual_account',
+                    providerTransactionId: verified.id || data.id || null,
+                    gatewayEvent: event,
+                    limitResult: fundingLimit,
+                });
+                return;
+            }
+        }
 
         const client = await pool.connect();
         try {

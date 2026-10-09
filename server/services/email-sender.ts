@@ -71,7 +71,11 @@ export async function sendEmail(
       to: [
         {
           email: to,
-          name: toName,
+          // Brevo rejects a literal null name with a 400 — coerce to a
+          // string and omit the key entirely when empty. This is why the
+          // chat guest-invite email (which passed null) silently failed
+          // while every named email (registration OTP, welcome) went out.
+          ...(toName ? { name: String(toName) } : {}),
         },
       ],
       subject,

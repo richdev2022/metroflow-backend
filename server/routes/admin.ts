@@ -847,11 +847,25 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
             breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
             paymentLinksEnabled, maxPaymentLinks, paymentLinkFeeDiscountPercent,
-            aiCreditDiscountPercent
+            aiCreditDiscountPercent,
+            pricesByCurrency
         } = req.body;
         
         if (!name || !price || !currency || !duration) {
             return res.status(400).json({ success: false, error: "Missing required fields" });
+        }
+
+        // PER-CURRENCY PRICING: optional map { USD: 29, NGN: 49000, ... }.
+        // Only whitelisted currencies with positive numbers are stored.
+        const SUPPORTED = ["USD", "NGN", "GBP", "EUR"];
+        let pricesJsonb: string | null = null;
+        if (pricesByCurrency && typeof pricesByCurrency === "object") {
+            const clean: Record<string, number> = {};
+            for (const c of SUPPORTED) {
+                const v = Number((pricesByCurrency as Record<string, unknown>)[c]);
+                if (Number.isFinite(v) && v > 0) clean[c] = v;
+            }
+            if (Object.keys(clean).length > 0) pricesJsonb = JSON.stringify(clean);
         }
 
         const result = await query(
@@ -861,8 +875,8 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
             waiting_room_enabled, recording_enabled, screen_sharing_enabled,
             breakout_rooms_enabled, virtual_backgrounds, live_captions,
             payment_links_enabled, max_payment_links, payment_link_fee_discount_percent,
-            ai_credit_discount_percent)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            ai_credit_discount_percent, prices_by_currency)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb)
              RETURNING *`,
             [
                 name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions),
@@ -870,7 +884,7 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
                 waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
                 breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
                 paymentLinksEnabled ?? true, maxPaymentLinks ?? 3, paymentLinkFeeDiscountPercent ?? 0,
-                aiCreditDiscountPercent ?? 0
+                aiCreditDiscountPercent ?? 0, pricesJsonb
             ]
         );
 
@@ -931,7 +945,8 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             aiCreditDiscountPercent,
             invoicesEnabled, maxInvoicesPerMonth, invoiceFeeDiscountPercent,
             storeEnabled, maxStoreProducts, storeFeeDiscountPercent,
-            recurringEnabled, maxSubscriptionPlans, subscriptionFeeDiscountPercent
+            recurringEnabled, maxSubscriptionPlans, subscriptionFeeDiscountPercent,
+            pricesByCurrency
         } = req.body;
 
         // Dynamic update
@@ -968,6 +983,25 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             queryStr += `, is_active = $${paramCount}`;
             params.push(is_active);
             paramCount++;
+        }
+        if (pricesByCurrency !== undefined) {
+            // PER-CURRENCY PRICING: null clears, object stores whitelisted
+            // positive numbers only ({ USD: 29, NGN: 49000, GBP: 25, EUR: 27 }).
+            if (pricesByCurrency === null) {
+                queryStr += `, prices_by_currency = NULL`;
+            } else if (typeof pricesByCurrency === "object") {
+                const SUPPORTED = ["USD", "NGN", "GBP", "EUR"];
+                const clean: Record<string, number> = {};
+                for (const c of SUPPORTED) {
+                    const v = Number((pricesByCurrency as Record<string, unknown>)[c]);
+                    if (Number.isFinite(v) && v > 0) clean[c] = v;
+                }
+                if (Object.keys(clean).length > 0) {
+                    queryStr += `, prices_by_currency = $${paramCount}::jsonb`;
+                    params.push(JSON.stringify(clean));
+                    paramCount++;
+                }
+            }
         }
         if (maxMeetingDuration !== undefined) {
             queryStr += `, max_meeting_duration = $${paramCount}`;

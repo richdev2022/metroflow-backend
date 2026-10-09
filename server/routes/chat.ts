@@ -85,6 +85,39 @@ export const BLOCK_ERROR_BLOCKER = "You blocked this contact. Unblock to send me
 export const BLOCK_ERROR_BLOCKED = "You can no longer reply to this contact.";
 
 /**
+ * Pretty preview for a conversation's last message when the latest row is a
+ * CALL LOG system message. Those store a JSON blob in `content` (the in-thread
+ * renderer swaps it for a rich call-log row), but raw JSON in the chat list
+ * preview looks broken — format it as "📞 Voice call · 1m 5s" / "Missed" etc.
+ * Returns null when the text is not a call-log blob (caller keeps raw text).
+ */
+export function formatCallLogPreview(content: unknown): string | null {
+  const raw = String(content || "").trim();
+  if (!raw.startsWith("{") || !raw.includes("callType")) return null;
+  try {
+    const meta = JSON.parse(raw);
+    if (!meta || typeof meta !== "object" || !meta.callType) return null;
+    const isVideo = meta.callType === "video";
+    const icon = isVideo ? "📹" : "📞";
+    const label = isVideo ? "Video call" : "Voice call";
+    const status = String(meta.status || "").toLowerCase();
+    const duration = Number(meta.durationSeconds || 0);
+    let detail = "";
+    if (status === "missed") detail = " · Missed";
+    else if (status === "declined") detail = " · Declined";
+    else if (status === "cancelled" || status === "canceled") detail = " · Cancelled";
+    else if (duration > 0) {
+      const m = Math.floor(duration / 60);
+      const s = duration % 60;
+      detail = ` · ${m}m ${s}s`;
+    }
+    return `${icon} ${label}${detail}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * For a DIRECT conversation, return the OTHER participant's user id (null for
  * group conversations / conversations without another participant). Groups are
  * never block-enforced.
@@ -462,6 +495,13 @@ export const getConversations: RequestHandler = async (
       ORDER BY cc.updated_at DESC`,
       [businessId, userId],
     );
+
+    // Call-log blobs store JSON in content — swap in the human preview so
+    // the chat list never shows raw JSON for the latest message.
+    for (const row of result.rows) {
+      const pretty = formatCallLogPreview((row as any)?.lastMessage);
+      if (pretty) (row as any).lastMessage = pretty;
+    }
 
     // Blocks involving the requester (both directions) — one query for the
     // whole list; direct conversations surface blockedByMe/blockedMe flags.
@@ -863,7 +903,12 @@ export const createConversation: RequestHandler = async (
 
         const response: ApiResponse<any> = {
           success: true,
-          data: hydrated.rows[0] || { id: existingResult.rows[0].id },
+          data: (() => {
+            const row: any = hydrated.rows[0] || { id: existingResult.rows[0].id };
+            const pretty = formatCallLogPreview(row?.lastMessage);
+            if (pretty) row.lastMessage = pretty;
+            return row;
+          })(),
         };
         return res.json(response);
       }

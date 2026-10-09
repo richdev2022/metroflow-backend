@@ -126,6 +126,26 @@ export interface Provider {
   createBusinessVirtualAccount(data: BusinessVirtualAccountRequest): Promise<any>;
   initiatePayment(data: InitiatePaymentRequest): Promise<any>;
   verifyPayment(reference: string): Promise<any>;
+  /**
+   * Best-effort automatic refund of a COLLECTED payment (checkout or
+   * virtual-account inflow). Used by the over-limit funding guard to return
+   * money to the payer when a funding must be rejected after collection.
+   * Implementations should return a normalized
+   * { success: boolean, message: string, data?: any } envelope and must
+   * never throw for "provider does not support refunds" — return
+   * { success: false, message: "not supported" } instead.
+   */
+  refundPayment?(request: {
+    /** Provider-native transaction id (e.g. Flutterwave numeric id). */
+    transactionId?: string | number;
+    /** Provider-native transaction reference (e.g. Monnify transactionReference). */
+    providerReference?: string;
+    /** Our own FUND-xxx / FLW-VA-xxx reference, when the provider keys refunds off it. */
+    reference?: string;
+    amount?: number;
+    currency?: string;
+    reason?: string;
+  }): Promise<any>;
   chargeCard(data: ChargeCardRequest): Promise<any>;
   cancelRecurring(token: string): Promise<any>;
   initiateTransfer(data: SingleTransferRequest): Promise<any>;

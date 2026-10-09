@@ -123,6 +123,8 @@ export function validateIntlBeneficiary(
     beneficiaryEmail?: string;
     recipientStreetNumber?: string;
     recipientStreetName?: string;
+    /** USD only: the payout rail — "ACH" (US local rails, default) or "SWIFT" (international wire). */
+    bankCode?: string;
   },
 ): { valid: boolean; error?: string; code?: string } {
   const cur = String(currency || 'NGN').toUpperCase();
@@ -145,12 +147,15 @@ export function validateIntlBeneficiary(
     if (checksum % 10 !== 0) {
       return { valid: false, error: 'The US bank routing number failed checksum validation — please double-check it with the beneficiary', code: 'ROUTING_NUMBER_CHECKSUM' };
     }
-    // Doc contract (Flutterwave intl USD): swift_code is a REQUIRED meta[0]
-    // field for every USD payout (ACH included) — 8 or 11 character BIC.
-    if (!swift) {
-      return { valid: false, error: "The beneficiary's SWIFT/BIC code is required for USD transfers", code: 'SWIFT_CODE_REQUIRED' };
+    // USD payout rails: "ACH" (US local rails — account_number + ABA routing
+    // only) vs "SWIFT" (international wire — BIC required). ACH is the default
+    // because US beneficiaries are locally routed; swift_code is validated
+    // whenever present and REQUIRED only on the SWIFT rail.
+    const rail = String(details.bankCode || '').trim().toUpperCase() === 'SWIFT' ? 'SWIFT' : 'ACH';
+    if (rail === 'SWIFT' && !swift) {
+      return { valid: false, error: "The beneficiary's SWIFT/BIC code is required for USD SWIFT wire transfers", code: 'SWIFT_CODE_REQUIRED' };
     }
-    if (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift) || !/[A-Za-z]/.test(swift)) {
+    if (swift && (!/^[A-Za-z0-9]{8}(?:[A-Za-z0-9]{3})?$/.test(swift) || !/[A-Za-z]/.test(swift))) {
       return { valid: false, error: 'The SWIFT/BIC code must be 8 or 11 characters for USD transfers', code: 'SWIFT_CODE_INVALID' };
     }
     // USD contract (Flutterwave intl docs): account_type accepts checking or

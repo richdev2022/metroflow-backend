@@ -228,6 +228,11 @@ export interface PushPayload {
    * Accept/Decline). iOS is unaffected — it keeps its APNs alert.
    */
   androidDataOnly?: boolean;
+  // Max-priority call rendering for the ANDROID system-tray notification:
+  // category "call" + PRIORITY_MAX (heads-up over everything, alarm-channel
+  // sound). Used by the incoming-call visible fallback so a swiped-away app
+  // still rings loudly even when its own full-screen render never ran.
+  androidCallStyle?: boolean;
 }
 
 /**
@@ -419,6 +424,9 @@ async function sendToTokens(
                         body: payload.body,
                         channel_id: payload.androidChannelId || "general",
                         ...(payload.collapseKey ? { tag: payload.collapseKey } : {}),
+                        ...(payload.androidCallStyle === true
+                          ? { notification_priority: "PRIORITY_MAX", category: "call" as const }
+                          : {}),
                         ...(Number.isFinite(badgeRaw) && badgeRaw > 0
                           ? { notification_count: badgeRaw }
                           : {}),

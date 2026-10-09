@@ -338,6 +338,60 @@ export const flutterwaveProvider: Provider = {
     throw new Error("Direct card charge not implemented for Flutterwave");
   },
 
+  /**
+   * Automatic refund of a collected payment (over-limit funding guard).
+   * API: POST /v3/charges/:id/refund — `id` is Flutterwave's NUMERIC
+   * transaction id (from verify_by_reference `data.id` or the webhook
+   * `data.id`), NOT our tx_ref. Amount is optional; omitting it refunds the
+   * full collected amount.
+   */
+  async refundPayment(request: {
+    transactionId?: string | number;
+    providerReference?: string;
+    reference?: string;
+    amount?: number;
+    currency?: string;
+    reason?: string;
+  }) {
+    const flwId = request.transactionId ?? request.providerReference;
+    if (FLW_MOCK) {
+      return {
+        success: true,
+        message: "Refund queued successfully (mock)",
+        data: { id: flwId, mock: true },
+      };
+    }
+    if (!flwId) {
+      return { success: false, message: "Refund skipped: Flutterwave transaction id missing" };
+    }
+    try {
+      const payload: Record<string, unknown> = {};
+      if (request.reason) payload.comments = String(request.reason).substring(0, 180);
+      const response = await flwClient.post(
+        `/v3/charges/${encodeURIComponent(String(flwId))}/refund`,
+        payload,
+      );
+      const body = response.data;
+      return {
+        success: body?.status === "success",
+        message: body?.message || (body?.status === "success" ? "Refund initiated" : "Refund failed"),
+        data: body?.data,
+      };
+    } catch (error: any) {
+      // 409 "Transaction already refunded" / "exceeds amount" — surface as a
+      // soft failure so the caller records it for manual follow-up.
+      console.error(
+        "Flutterwave Refund Error:",
+        error.response?.data || error.message,
+      );
+      return {
+        success: false,
+        message: error.response?.data?.message || "Refund request failed",
+        data: error.response?.data,
+      };
+    }
+  },
+
   async cancelRecurring(token: string) {
     console.log(`[Flutterwave] Cancel recurring for token: ${token}`);
     return { success: true, message: "Recurring subscription cancelled locally" };

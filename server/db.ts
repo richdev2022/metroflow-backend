@@ -585,6 +585,11 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_days INTEGER DEFAULT 7`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS duration VARCHAR(20) DEFAULT 'monthly'`);
+    // PER-CURRENCY PRICING: explicit price per supported charge currency
+    // ({ "USD": 29, "NGN": 49000, "GBP": 25, "EUR": 27 }). Admin-managed;
+    // the charge endpoint prefers it over FX conversion so the customer is
+    // ALWAYS charged the price displayed for their currency.
+    await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS prices_by_currency JSONB`);
     await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS discount DECIMAL(10, 2) DEFAULT 0`);
 
     await ensureBaseSchemaTables();

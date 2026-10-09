@@ -1,4 +1,5 @@
 import { RequestHandler } from "express";
+import crypto from "crypto";
 import { query } from "../db";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
@@ -2171,5 +2172,351 @@ export const aiSummarizeConversation: RequestHandler = async (req: Authenticated
   } catch (error) {
     console.error("Chat AI summarize error:", error);
     res.status(502).json({ success: false, error: "Could not summarize the conversation." });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// GROUP MEMBERSHIP + INVITE LINKS (WhatsApp-style)
+// - any member can add other business users to a group
+// - any member can copy a shareable invite link; other users join by code
+// ---------------------------------------------------------------------------
+
+const CHAT_INVITE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
+function generateChatInviteCode(length = 10): string {
+  const bytes = crypto.randomBytes(length);
+  let code = "";
+  for (let i = 0; i < length; i++) code += CHAT_INVITE_ALPHABET[bytes[i] % CHAT_INVITE_ALPHABET.length];
+  return code;
+}
+
+async function ensureConversationInviteCode(conversationId: string): Promise<string> {
+  const existing = await query(`SELECT invite_code as "inviteCode" FROM chat_conversations WHERE id = $1`, [conversationId]);
+  const current = existing.rows[0]?.inviteCode;
+  if (current) return current;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateChatInviteCode();
+    const inserted = await query(
+      `UPDATE chat_conversations SET invite_code = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND invite_code IS NULL RETURNING invite_code as "inviteCode"`,
+      [code, conversationId],
+    );
+    if (inserted.rows[0]?.inviteCode) return inserted.rows[0].inviteCode as string;
+    const recheck = await query(`SELECT invite_code as "inviteCode" FROM chat_conversations WHERE id = $1`, [conversationId]);
+    if (recheck.rows[0]?.inviteCode) return recheck.rows[0].inviteCode as string;
+  }
+  throw new Error("Could not allocate an invite code");
+}
+
+/** Fully-hydrated conversation row — same shape clients already consume. */
+async function hydrateChatConversation(conversationId: string, unreadForUserId?: string) {
+  const hydrated = await query(
+    `SELECT
+      cc.id, cc.business_id as "businessId", cc.name, cc.type,
+      cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
+      cc.invite_code as "inviteCode",
+      (
+        SELECT json_agg(json_build_object(
+          'id', cp.id,
+          'userId', cp.user_id,
+          'role', COALESCE(cp.role, 'member'),
+          'lastReadAt', cp.last_read_at,
+          'presenceStatus', COALESCE(u.presence_status, 'offline'),
+          'lastSeenAt', u.last_seen_at,
+          'name', u.name,
+          'email', u.email,
+          'avatarUrl', u.avatar_url
+        ))
+        FROM chat_participants cp
+        LEFT JOIN users u ON cp.user_id = u.id
+        WHERE cp.conversation_id = cc.id
+      ) as participants,
+      (SELECT CASE
+         WHEN cm.deleted_for_everyone THEN 'This message was deleted'
+         WHEN cm.content IS NOT NULL AND btrim(cm.content) <> '' THEN cm.content
+         WHEN cm.attachment_type = 'image' THEN '📷 Photo'
+         WHEN cm.attachment_type = 'video' THEN '🎬 Video'
+         WHEN cm.attachment_type = 'audio' THEN '🎤 Voice note'
+         WHEN cm.attachment_type = 'gif' THEN 'GIF'
+         WHEN cm.attachment_type = 'sticker' THEN 'Sticker'
+         WHEN cm.attachment_name IS NOT NULL AND btrim(cm.attachment_name) <> ''
+           THEN ('📎 ' || cm.attachment_name)
+         WHEN cm.attachment_url IS NOT NULL THEN '📎 Attachment'
+         ELSE 'Message'
+       END
+       FROM chat_messages cm
+       WHERE cm.conversation_id = cc.id
+       ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
+      (SELECT cm.created_at FROM chat_messages cm
+       WHERE cm.conversation_id = cc.id
+       ORDER BY cm.created_at DESC LIMIT 1) as "lastMessageAt",
+      (
+        SELECT COUNT(*)::int FROM chat_messages cm
+        WHERE cm.conversation_id = cc.id
+          AND cm.sender_id <> $2::uuid
+          AND cm.created_at > COALESCE(
+            (SELECT cp2.last_read_at FROM chat_participants cp2
+             WHERE cp2.conversation_id = cc.id AND cp2.user_id = $2::uuid),
+            to_timestamp(0))
+      ) as "unreadCount"
+    FROM chat_conversations cc
+    WHERE cc.id = $1
+    LIMIT 1`,
+    [conversationId, unreadForUserId || "00000000-0000-0000-0000-000000000000"],
+  );
+  const row: any = hydrated.rows[0] || null;
+  if (row) {
+    const pretty = formatCallLogPreview(row?.lastMessage);
+    if (pretty) row.lastMessage = pretty;
+  }
+  return row;
+}
+
+export const chatInviteBaseUrl = () =>
+  (process.env.CLIENT_URL || "https://app.metricorex.com").replace(/\/+$/, "") + "/chat/join";
+
+/**
+ * POST /chat/conversations/:conversationId/participants
+ * body: { userIds: string[] } (also accepts userIds_ids / participantIds)
+ * ANY group member can add other users from the same business. Direct chats
+ * are immutable here (use createConversation for DMs).
+ */
+export const addChatParticipants: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const membership = await query(
+      `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+      [conversationId, userId],
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "You are not a member of this conversation" });
+    }
+
+    const convRes = await query(
+      `SELECT id, business_id as "businessId", name, type, created_by as "createdById" FROM chat_conversations WHERE id = $1`,
+      [conversationId],
+    );
+    const conversation = convRes.rows[0];
+    if (!conversation || conversation.businessId !== businessId) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+    if (conversation.type === "direct") {
+      return res.status(400).json({ success: false, error: "Members can only be added to group chats" });
+    }
+
+    const body: any = req.body || {};
+    const rawIds = body.userIds ?? body.user_ids ?? body.participantIds ?? body.participant_ids;
+    const list = (Array.isArray(rawIds) ? rawIds : rawIds != null ? [rawIds] : [])
+      .filter((pid: unknown): pid is string => typeof pid === "string" && pid.trim().length > 0)
+      .map((pid: string) => pid.trim());
+    if (list.length === 0) {
+      return res.status(400).json({ success: false, error: "userIds is required" });
+    }
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (list.some((pid: string) => !uuidRegex.test(pid))) {
+      return res.status(400).json({ success: false, error: "Invalid chat participants: one or more participant ids are not valid user ids" });
+    }
+
+    const validIds = await getBusinessUserIds(list, businessId);
+    const targets = list.filter((pid: string) => validIds.has(pid));
+    if (targets.length === 0) {
+      return res.status(400).json({ success: false, error: "All chat participants must belong to this business" });
+    }
+
+    const added: any[] = [];
+    for (const pid of targets) {
+      const existing = await query(
+        `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+        [conversationId, pid],
+      );
+      if (existing.rows.length > 0) continue;
+      await query(
+        `INSERT INTO chat_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')
+         ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+        [conversationId, pid],
+      );
+      added.push(pid);
+    }
+
+    const io = getSocketServer();
+    if (added.length > 0) {
+      await query(`UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [conversationId]);
+      if (io) {
+        io.to(`conversation:${conversationId}`).emit("conversation:participants-added", {
+          conversationId,
+          addedBy: userId,
+          addedIds: added,
+        });
+        // Each NEW member gets the fully-hydrated conversation so their chat
+        // list updates instantly (mobile listens for conversation:created).
+        for (const pid of added) {
+          const hydratedRow = await hydrateChatConversation(conversationId, pid);
+          if (hydratedRow) io.to(`user:${pid}`).emit("conversation:created", hydratedRow);
+        }
+      }
+    }
+
+    const hydratedRow = await hydrateChatConversation(conversationId, userId);
+    res.json({ success: true, data: { added: added, conversation: hydratedRow } });
+  } catch (error) {
+    console.error("Add chat participants error:", error);
+    res.status(500).json({ success: false, error: "Failed to add members" });
+  }
+};
+
+/**
+ * GET /chat/conversations/:conversationId/invite
+ * Returns (creating on first use) this group's invite code + share URL.
+ */
+export const getChatInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    const membership = await query(
+      `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+      [conversationId, userId],
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "You are not a member of this conversation" });
+    }
+    const convRes = await query(
+      `SELECT type, business_id FROM chat_conversations WHERE id = $1`,
+      [conversationId],
+    );
+    const conversation = convRes.rows[0];
+    if (!conversation || conversation.business_id !== businessId) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+    if (conversation.type === "direct") {
+      return res.status(400).json({ success: false, error: "Invite links are only available for group chats" });
+    }
+    const inviteCode = await ensureConversationInviteCode(conversationId);
+    res.json({
+      success: true,
+      data: { inviteCode, inviteUrl: `${chatInviteBaseUrl()}/${inviteCode}` },
+    });
+  } catch (error) {
+    console.error("Get chat invite error:", error);
+    res.status(500).json({ success: false, error: "Failed to create invite link" });
+  }
+};
+
+/**
+ * POST /chat/conversations/:conversationId/invite/rotate
+ * Regenerates the code — old links stop working (admin or any member).
+ */
+export const rotateChatInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    const membership = await query(
+      `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+      [conversationId, userId],
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "You are not a member of this conversation" });
+    }
+    const convRes = await query(
+      `SELECT type, business_id FROM chat_conversations WHERE id = $1`,
+      [conversationId],
+    );
+    const conversation = convRes.rows[0];
+    if (!conversation || conversation.business_id !== businessId) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+    if (conversation.type === "direct") {
+      return res.status(400).json({ success: false, error: "Invite links are only available for group chats" });
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = generateChatInviteCode();
+      const updated = await query(
+        `UPDATE chat_conversations SET invite_code = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2 RETURNING invite_code as "inviteCode"`,
+        [code, conversationId],
+      );
+      if (updated.rows[0]?.inviteCode) {
+        return res.json({
+          success: true,
+          data: { inviteCode: updated.rows[0].inviteCode, inviteUrl: `${chatInviteBaseUrl()}/${updated.rows[0].inviteCode}` },
+        });
+      }
+    }
+    res.status(500).json({ success: false, error: "Failed to rotate invite code" });
+  } catch (error) {
+    console.error("Rotate chat invite error:", error);
+    res.status(500).json({ success: false, error: "Failed to rotate invite link" });
+  }
+};
+
+/**
+ * POST /chat/join/:code — self-join a group via its invite code.
+ * Returns the fully-hydrated conversation for the joiner.
+ */
+export const joinChatByInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const { code } = req.params as { code: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    if (!code || code.length < 4) {
+      return res.status(400).json({ success: false, error: "Invalid invite code" });
+    }
+    const convRes = await query(
+      `SELECT id, business_id, type, name FROM chat_conversations WHERE invite_code = $1 LIMIT 1`,
+      [code.trim()],
+    );
+    const conversation = convRes.rows[0];
+    if (!conversation || conversation.type === "direct") {
+      return res.status(404).json({ success: false, error: "This invite link is invalid or has expired" });
+    }
+    // Cross-business join is allowed ONLY when the invite was shared into that
+    // business — same-business invites keep the group private to the business.
+    // (Invites are per-business because chat participants are per-business.)
+    if (conversation.business_id !== businessId) {
+      return res.status(403).json({
+        success: false,
+        error: "This group belongs to a different workspace. Switch to that workspace and try again.",
+      });
+    }
+    const membership = await query(
+      `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
+      [conversation.id, userId],
+    );
+    if (membership.rows.length === 0) {
+      await query(
+        `INSERT INTO chat_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')
+         ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+        [conversation.id, userId],
+      );
+      const io = getSocketServer();
+      if (io) {
+        io.to(`conversation:${conversation.id}`).emit("conversation:participants-added", {
+          conversationId: conversation.id,
+          addedBy: userId,
+          addedIds: [userId],
+        });
+      }
+    }
+    const hydratedRow = await hydrateChatConversation(conversation.id, userId);
+    res.json({ success: true, data: hydratedRow });
+  } catch (error) {
+    console.error("Join chat by invite error:", error);
+    res.status(500).json({ success: false, error: "Failed to join the group" });
   }
 };

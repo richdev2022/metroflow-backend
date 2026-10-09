@@ -3,7 +3,7 @@ import { sendSMS } from "../services/sms";
 import { sendEmail, generateOtpEmailHtml, generateKYCOtpEmailHtml } from "../services/email";
 import { sendWhatsApp } from "../services/whatsapp";
 import { getAvailableSMSProviders, getSMSProvider } from "../services/sms-providers/factory";
-import { isPushConfigured, sendToTokens, PushSendDiagnostic } from "../services/push";
+import { isPushConfigured, sendToTokens, PushSendDiagnostic, getPushServiceAccountDiagnostics } from "../services/push";
 import { query } from "../db";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import crypto from "crypto";
@@ -40,33 +40,37 @@ router.get("/push-status", authenticateToken, async (req: AuthenticatedRequest, 
       `SELECT platform, COUNT(*)::int AS count FROM user_devices WHERE user_id = $1 GROUP BY platform`,
       [userId],
     );
-    const account = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-      ? (() => {
-          try {
-            const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-            const json = JSON.parse(raw.trim().startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
-            return { project_id: json.project_id || null, client_email: json.client_email || null };
-          } catch {
-            return { project_id: null, client_email: null, parse_error: true };
-          }
-        })()
-      : null;
+    // Unified diagnostics: handles raw JSON / base64 / FIREBASE_SERVICE_ACCOUNT_FILE
+    // and returns the actionable parse error when the .env value is damaged.
+    const sa = getPushServiceAccountDiagnostics();
+    const account = sa.account
+      ? { project_id: sa.account.project_id || null, client_email: sa.account.client_email || null }
+      : { project_id: null, client_email: null, parse_error: true as const };
+
+    const mode = sa.account
+      ? sa.source === "file"
+        ? "http-v1 (service account file)"
+        : sa.source === "env-base64"
+          ? "http-v1 (service account, base64)"
+          : "http-v1 (service account)"
+      : process.env.FCM_SERVER_KEY
+        ? "legacy server key"
+        : "NOT CONFIGURED — pushes are dropped silently; set FIREBASE_SERVICE_ACCOUNT_JSON + FIREBASE_PROJECT_ID";
 
     res.json({
       success: true,
       data: {
         fcmConfigured: isPushConfigured(),
-        mode: process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-          ? "http-v1 (service account)"
-          : process.env.FCM_SERVER_KEY
-            ? "legacy server key"
-            : "NOT CONFIGURED — pushes are dropped silently; set FIREBASE_SERVICE_ACCOUNT_JSON + FIREBASE_PROJECT_ID",
+        mode,
         firebaseProjectId: process.env.FIREBASE_PROJECT_ID || account?.project_id || null,
         serviceAccountEmail: account?.client_email || null,
-        // false = GOOD (the JSON parsed cleanly). true = the env var is
-        // malformed and FCM can never authenticate.
-        serviceAccountParseError: !!(account as any)?.parse_error,
-        serviceAccountOk: !!(account?.client_email && !((account as any)?.parse_error)),
+        // false = GOOD (the credentials parsed cleanly). true = the env/file is
+        // malformed and FCM can never authenticate — see serviceAccountError.
+        serviceAccountParseError: !!sa.error || !(account as any)?.client_email,
+        serviceAccountOk: !!sa.account,
+        serviceAccountSource: sa.source,
+        serviceAccountError: sa.error || null,
+        serviceAccountMultilineEnvSuspected: !!sa.multilineEnvSuspected,
         myDevices: countsRes.rows,
         myDeviceDetails: devicesRes.rows,
         hint:
@@ -75,7 +79,8 @@ router.get("/push-status", authenticateToken, async (req: AuthenticatedRequest, 
           "If a device that just opened the app is MISSING, it was pruned after a failed send: check the server log for " +
           "'[push] pruned invalid token'. A fresh token pruned with 404 means the app's Firebase project " +
           "(google-services.json / GoogleService-Info.plist project_id) does not equal firebaseProjectId above — " +
-          "use POST /test-communications/push-send to reproduce and see the exact FCM error per device.",
+          "use POST /test-communications/push-send to reproduce and see the exact FCM error per device. " +
+          "If serviceAccountParseError is true, run `node scripts/fix-firebase-env.mjs` on the server and restart pm2.",
       },
     });
   } catch (error: any) {

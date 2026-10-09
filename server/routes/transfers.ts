@@ -10,6 +10,7 @@ import { getProvider, getActiveProviderName, getActiveTransferProviderName, getA
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
 import { calculateFee, creditRevenueWallet, chargeAncillaryFee, isFeeChargeFailure } from "../services/fees";
 import { getIntlTransferConfig, effectiveMarkupPercent, getIntlPayoutLimits, limitForCurrency, checkPayoutLimit } from "../services/app-config";
+import { enforceTransactionLimits } from "../services/transaction-limits";
 
 /** Quote lock window fallback (seconds) — the live value comes from the
  *  admin-editable `intl_quote_ttl_seconds` system setting (getIntlTransferConfig),
@@ -596,6 +597,21 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         return res.status(400).json({ success: false, error: limitCheck.error, code: limitCheck.code, data: { limits: limitCheck.limit } });
       }
       payoutLimitInfo = limitCheck.limit || null;
+    }
+
+    // BUSINESS CATEGORY LIMITS (NGN): Non-Registered vs Registered Business.
+    // Every business starts non-registered; approving the Business KYC upgrade
+    // unlocks the registered tier. Error data carries upgradeHint for the UI.
+    {
+      const limitCheck = await enforceTransactionLimits(businessId, Number(amount), { currency: String(currency).toUpperCase() });
+      if (!limitCheck.ok) {
+        return res.status(403).json({
+          success: false,
+          error: limitCheck.error,
+          code: limitCheck.code,
+          data: { limits: limitCheck.data },
+        });
+      }
     }
 
     // Fee: charged in the DEBIT currency (it leaves the same wallet as the
@@ -1372,6 +1388,28 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
     }
 
     // 2. Insert into transfer_queue
+    // BUSINESS CATEGORY LIMITS (aggregate, per currency): enforce before queueing.
+    {
+      const byCurrency = new Map<string, number[]>();
+      for (const t of transfersToQueue) {
+        if ((t as any).amount <= 0) continue;
+        const cur = String((t as any).currency || 'NGN').toUpperCase();
+        const list = byCurrency.get(cur) || [];
+        list.push(Number((t as any).amount));
+        byCurrency.set(cur, list);
+      }
+      for (const [cur, amounts] of byCurrency) {
+        const limitCheck = await enforceTransactionLimits(businessId, amounts, { currency: cur });
+        if (!limitCheck.ok) {
+          return res.status(403).json({
+            success: false,
+            error: limitCheck.error,
+            code: limitCheck.code,
+            data: { limits: limitCheck.data },
+          });
+        }
+      }
+    }
     let queuedTransfers: any[] = [];
     const defaultProvider = await getActiveTransferProviderName();
     for (const t of transfersToQueue) {

@@ -5739,4 +5739,249 @@ protectedRouter.post("/locked-accounts/:userId/resolve", requirePermission("mana
     }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * BUSINESS KYC UPGRADE REVIEW (Registered vs Non-Registered businesses)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+// List submissions (filter by status, paginated)
+protectedRouter.get("/business-kyc/submissions", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const status = String(req.query.status || "all");
+        const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "20"), 10) || 20));
+        const offset = (page - 1) * limit;
+        const params: any[] = [];
+        let where = "";
+        if (status !== "all") {
+            params.push(status);
+            where = `WHERE s.status = $${params.length}`;
+        }
+        const rowsRes = await query(
+            `SELECT s.id, s.business_id, s.user_id, s.registration_type, s.registration_type_label,
+                    s.business_description, s.documents, s.status, s.admin_notes, s.reviewed_at, s.created_at,
+                    b.name AS business_name, b.email AS business_email, b.industry AS business_industry,
+                    COALESCE(b.registration_category, 'non_registered') AS registration_category,
+                    b.business_registration_type,
+                    u.name AS submitted_by_name, u.email AS submitted_by_email
+               FROM business_kyc_submissions s
+               JOIN businesses b ON b.id = s.business_id
+               LEFT JOIN users u ON u.id = s.user_id
+               ${where}
+              ORDER BY s.created_at DESC
+              LIMIT ${limit} OFFSET ${offset}`,
+            params,
+        );
+        const countRes = await query(
+            `SELECT COUNT(*)::int AS total FROM business_kyc_submissions s ${where}`,
+            params,
+        );
+        res.json({
+            success: true,
+            data: {
+                submissions: rowsRes.rows,
+                pagination: { page, limit, total: countRes.rows[0]?.total || 0, totalPages: Math.max(1, Math.ceil((countRes.rows[0]?.total || 0) / limit)) },
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load business KYC submissions" });
+    }
+});
+
+// Submission detail
+protectedRouter.get("/business-kyc/submissions/:id", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const rowRes = await query(
+            `SELECT s.*, b.name AS business_name, b.email AS business_email, b.industry AS business_industry,
+                    COALESCE(b.registration_category, 'non_registered') AS registration_category,
+                    b.created_at AS business_created_at,
+                    u.name AS submitted_by_name, u.email AS submitted_by_email
+               FROM business_kyc_submissions s
+               JOIN businesses b ON b.id = s.business_id
+               LEFT JOIN users u ON u.id = s.user_id
+              WHERE s.id = $1 LIMIT 1`,
+            [req.params.id],
+        );
+        if (!rowRes.rows.length) return res.status(404).json({ success: false, error: "Submission not found" });
+        res.json({ success: true, data: { submission: rowRes.rows[0] } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load submission" });
+    }
+});
+
+// Approve → business becomes Registered (Verified)
+protectedRouter.post("/business-kyc/submissions/:id/approve", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const id = req.params.id;
+        const adminId = (req as any).admin?.adminId || null;
+        const rowRes = await query(`SELECT * FROM business_kyc_submissions WHERE id = $1 LIMIT 1`, [id]);
+        const submission = rowRes.rows[0];
+        if (!submission) return res.status(404).json({ success: false, error: "Submission not found" });
+        if (submission.status !== "pending") {
+            return res.status(409).json({ success: false, error: `Submission is already ${submission.status}` });
+        }
+
+        await query(
+            `UPDATE business_kyc_submissions
+                SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(), updated_at = NOW(),
+                    admin_notes = COALESCE(NULLIF($3, ''), admin_notes)
+              WHERE id = $1`,
+            [id, adminId, String((req.body as any)?.notes || "")],
+        );
+        await query(
+            `UPDATE businesses
+                SET registration_category = 'registered',
+                    registration_category_updated_at = NOW()
+              WHERE id = $1`,
+            [submission.business_id],
+        );
+
+        // Notify owner: email + push (best effort).
+        try {
+            const ownerRes = await query(
+                `SELECT u.email, u.name FROM users u WHERE u.id = $1 LIMIT 1`,
+                [submission.user_id],
+            );
+            const owner = ownerRes.rows[0] || null;
+            const bizRes = await query(`SELECT name FROM businesses WHERE id = $1 LIMIT 1`, [submission.business_id]);
+            const bizName = bizRes.rows[0]?.name || "your business";
+            if (owner?.email) {
+                const { sendEmail } = await import("../services/email");
+                const { buildEmailFooterHtml } = await import("../services/email-footer");
+                const html = `
+                  <h2>Your business is now Verified ✅</h2>
+                  <p>Hi ${owner.name || "there"},</p>
+                  <p>Your <b>${submission.registration_type_label || submission.registration_type}</b> registration for
+                  <b>${bizName}</b> has been approved. Your transaction limits have been upgraded to the
+                  <b>Registered Business</b> tier and your account now shows as a <b>Registered Business (Verified)</b>.</p>
+                  ${buildEmailFooterHtml()}`;
+                sendEmail(owner.email, owner.name || "Business owner", "Business KYC approved — Metricorex", html).catch(() => {});
+            }
+            const { sendPushToUsers } = await import("../services/push");
+            if (submission.user_id) {
+                sendPushToUsers(
+                    [{ userId: submission.user_id, businessId: submission.business_id }],
+                    {
+                        title: "Business KYC approved 🎉",
+                        body: `${bizName} is now a Registered Business (Verified). Higher transaction limits are active.`,
+                        data: { type: "business-kyc", eventType: "approved", submissionId: id },
+                    },
+                    { inApp: true, type: "business_kyc", businessId: submission.business_id },
+                ).catch(() => {});
+            }
+        } catch {}
+
+        res.json({ success: true, message: "Business KYC approved — business is now Registered (Verified)" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to approve submission" });
+    }
+});
+
+// Reject with a mandatory reason → owner can resubmit
+protectedRouter.post("/business-kyc/submissions/:id/reject", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const id = req.params.id;
+        const adminId = (req as any).admin?.adminId || null;
+        const reason = String((req.body as any)?.reason || "").trim();
+        if (!reason) return res.status(400).json({ success: false, error: "A rejection reason is required" });
+
+        const rowRes = await query(`SELECT * FROM business_kyc_submissions WHERE id = $1 LIMIT 1`, [id]);
+        const submission = rowRes.rows[0];
+        if (!submission) return res.status(404).json({ success: false, error: "Submission not found" });
+        if (submission.status !== "pending") {
+            return res.status(409).json({ success: false, error: `Submission is already ${submission.status}` });
+        }
+
+        await query(
+            `UPDATE business_kyc_submissions
+                SET status = 'rejected', admin_notes = $2, reviewed_by = $3, reviewed_at = NOW(), updated_at = NOW()
+              WHERE id = $1`,
+            [id, reason, adminId],
+        );
+
+        try {
+            const ownerRes = await query(`SELECT email, name FROM users WHERE id = $1 LIMIT 1`, [submission.user_id]);
+            const owner = ownerRes.rows[0] || null;
+            if (owner?.email) {
+                const { sendEmail } = await import("../services/email");
+                const { buildEmailFooterHtml } = await import("../services/email-footer");
+                const html = `
+                  <h2>Business KYC needs another look</h2>
+                  <p>Hi ${owner.name || "there"},</p>
+                  <p>Your business verification submission was not approved this time.</p>
+                  <p><b>Reason:</b> ${reason}</p>
+                  <p>You can update your documents and resubmit at any time from your dashboard.</p>
+                  ${buildEmailFooterHtml()}`;
+                sendEmail(owner.email, owner.name || "Business owner", "Business KYC update — Metricorex", html).catch(() => {});
+            }
+            const { sendPushToUsers } = await import("../services/push");
+            if (submission.user_id) {
+                sendPushToUsers(
+                    [{ userId: submission.user_id, businessId: submission.business_id }],
+                    {
+                        title: "Business KYC rejected",
+                        body: `Your business verification was rejected: ${reason.slice(0, 120)}`,
+                        data: { type: "business-kyc", eventType: "rejected", submissionId: id },
+                    },
+                    { inApp: true, type: "business_kyc", businessId: submission.business_id },
+                ).catch(() => {});
+            }
+        } catch {}
+
+        res.json({ success: true, message: "Business KYC rejected — the owner has been notified" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to reject submission" });
+    }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * TRANSACTION LIMITS per registration category (admin-editable)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+protectedRouter.get("/transaction-limits", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const rows = await query(
+            `SELECT category, currency, single_transaction_limit, daily_limit, monthly_limit, updated_at
+               FROM transaction_limits ORDER BY category`,
+        );
+        res.json({ success: true, data: { limits: rows.rows } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load transaction limits" });
+    }
+});
+
+protectedRouter.put("/transaction-limits", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const body = (req.body || {}) as Record<string, { singleTransactionLimit?: number; dailyLimit?: number; monthlyLimit?: number; currency?: string }>;
+        const adminId = (req as any).admin?.adminId || null;
+        const validCategories = ["non_registered", "registered"];
+        let updated = 0;
+        for (const [category, vals] of Object.entries(body)) {
+            if (!validCategories.includes(category)) continue;
+            const single = Number((vals as any)?.singleTransactionLimit);
+            const daily = Number((vals as any)?.dailyLimit);
+            const monthly = Number((vals as any)?.monthlyLimit);
+            const currency = String((vals as any)?.currency || "NGN").toUpperCase().slice(0, 3);
+            if (!Number.isFinite(single) || single <= 0 || !Number.isFinite(daily) || daily <= 0 || !Number.isFinite(monthly) || monthly <= 0) {
+                return res.status(400).json({ success: false, error: `Invalid limits for ${category} — all values must be positive numbers` });
+            }
+            if (daily < single || monthly < daily) {
+                return res.status(400).json({ success: false, error: `Limits for ${category} must satisfy: monthly ≥ daily ≥ single` });
+            }
+            await query(
+                `UPDATE transaction_limits
+                    SET single_transaction_limit = $2, daily_limit = $3, monthly_limit = $4,
+                        currency = $5, updated_by = $6, updated_at = NOW()
+                  WHERE category = $1`,
+                [category, single, daily, monthly, currency, adminId],
+            );
+            updated++;
+        }
+        if (!updated) return res.status(400).json({ success: false, error: "No valid categories in payload" });
+        const rows = await query(`SELECT category, currency, single_transaction_limit, daily_limit, monthly_limit, updated_at FROM transaction_limits ORDER BY category`);
+        res.json({ success: true, message: "Transaction limits updated", data: { limits: rows.rows } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to update transaction limits" });
+    }
+});
+
 export default router;

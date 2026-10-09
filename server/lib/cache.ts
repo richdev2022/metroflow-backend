@@ -3,7 +3,12 @@ import logger from "./logger";
 
 let redisClient: Redis | null = null;
 
-const isRedisDisabled = (): boolean =>
+/**
+ * Boolean env parsing done RIGHT: the string "false" must not count as enabled.
+ * (The /health endpoint historically used `!process.env.DISABLE_REDIS`, which
+ * made DISABLE_REDIS=false read as "disabled" — same class of bug.)
+ */
+export const isRedisDisabled = (): boolean =>
   ["true", "1", "yes"].includes((process.env.DISABLE_REDIS || "").toLowerCase());
 
 /**
@@ -49,6 +54,15 @@ export function createRedisClient(context: string): Redis | null {
         `Everything works without Redis — you just lose cross-instance caching.`,
     );
     return null;
+  }
+
+  // Managed Redis providers (Redis Cloud, Upstash) default to TLS-only. A plain
+  // redis:// scheme against them fails the handshake — warn once so the fix is obvious.
+  if (/^redis:\/\//i.test(rawUrl) && /\.db\.redis\.io|\.redis\.cloud\.com|upstash\.io/i.test(rawUrl)) {
+    logger.warn(
+      `${context}: REDIS_URL uses redis:// against a managed TLS provider — if the connection fails, ` +
+        `change the scheme to rediss:// (e.g. REDIS_URL="rediss://default:PASSWORD@host:port")`,
+    );
   }
 
   let loggedConnectionError = false;

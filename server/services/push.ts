@@ -1,4 +1,5 @@
 import axios from "axios";
+import fs from "fs";
 import { query } from "../db";
 import { createNotification } from "./notifications";
 
@@ -23,18 +24,122 @@ interface ServiceAccount {
   project_id?: string;
 }
 
-function loadServiceAccount(): ServiceAccount | null {
+/**
+ * Service-account loading that survives real-world .env damage:
+ *  - FIREBASE_SERVICE_ACCOUNT_JSON as raw JSON (single line or quoted)
+ *  - FIREBASE_SERVICE_ACCOUNT_JSON as base64 (recommended for .env — single line, no escaping)
+ *  - FIREBASE_SERVICE_ACCOUNT_FILE / GOOGLE_APPLICATION_CREDENTIALS pointing at the JSON file
+ *    (RECOMMENDED overall: immune to .env line-splitting entirely)
+ *
+ * A multi-line JSON pasted directly into .env is BROKEN by design (dotenv reads
+ * line-by-line, so only `{` survives). We detect that exact shape and return a
+ * loud, actionable error instead of failing later with a cryptic JSON.parse position.
+ */
+export interface ServiceAccountLoadResult {
+  account: ServiceAccount | null;
+  source: "env-json" | "env-base64" | "file" | null;
+  error: string | null;
+  /** True when the env value looks like a multi-line JSON paste that got line-truncated. */
+  multilineEnvSuspected?: boolean;
+}
+
+const MULTILINE_FIX_HINT =
+  "FIX: on the server run `cd ~/metroflow-backend && node scripts/fix-firebase-env.mjs` " +
+  "(writes firebase-service-account.json + rewrites .env safely), then `pm2 restart metroflow --update-env`. " +
+  "Alternative: put the JSON on ONE line, or base64 it: `base64 -w0 service-account.json` into FIREBASE_SERVICE_ACCOUNT_JSON, " +
+  "or point FIREBASE_SERVICE_ACCOUNT_FILE at the JSON file.";
+
+interface ServiceAccountLoadCache {
+  fingerprint: string;
+  result: ServiceAccountLoadResult;
+}
+let loadCache: ServiceAccountLoadCache | null = null;
+
+function envFingerprint(): string {
+  return [
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "",
+    process.env.FIREBASE_SERVICE_ACCOUNT_FILE || "",
+    process.env.GOOGLE_APPLICATION_CREDENTIALS || "",
+  ].join("|");
+}
+
+function parseServiceAccountJson(json: string): ServiceAccount | null {
+  const parsed = JSON.parse(json);
+  if (parsed && parsed.client_email && parsed.private_key) return parsed as ServiceAccount;
+  throw new Error("JSON is missing client_email or private_key");
+}
+
+function loadServiceAccountUncached(): ServiceAccountLoadResult {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) return null;
-  try {
-    const json = raw.trim().startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8");
-    const parsed = JSON.parse(json);
-    if (parsed.client_email && parsed.private_key) return parsed;
-    return null;
-  } catch (err) {
-    console.error("[push] Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:", err);
-    return null;
+
+  if (raw && raw.trim()) {
+    const trimmed = raw.trim().replace(/^["']|["']$/g, "").trim();
+    // Path 1: inline JSON
+    if (trimmed.startsWith("{")) {
+      try {
+        return { account: parseServiceAccountJson(trimmed), source: "env-json", error: null };
+      } catch (err: any) {
+        // dotenv keeps only the FIRST line of a pasted multi-line JSON — the classic
+        // signature is a value that starts with '{' but fails to parse immediately.
+        const truncated = trimmed === "{" || trimmed.length < 2 || /position 1|Expected property name/i.test(String(err?.message || ""));
+        return {
+          account: null,
+          source: null,
+          error:
+            `FIREBASE_SERVICE_ACCOUNT_JSON failed to parse: ${err?.message || err}. ` +
+            (truncated
+              ? `This looks like a MULTI-LINE JSON pasted into .env (only the first line survived). ${MULTILINE_FIX_HINT}`
+              : MULTILINE_FIX_HINT),
+          multilineEnvSuspected: truncated,
+        };
+      }
+    }
+    // Path 2: base64 (single line, .env-safe)
+    try {
+      const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+      const account = parseServiceAccountJson(decoded);
+      return { account, source: "env-base64", error: null };
+    } catch (err: any) {
+      return {
+        account: null,
+        source: null,
+        error:
+          `FIREBASE_SERVICE_ACCOUNT_JSON is neither valid JSON nor valid base64 of JSON: ${err?.message || err}. ${MULTILINE_FIX_HINT}`,
+      };
+    }
   }
+
+  // Path 3: JSON file on disk (best practice)
+  const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_FILE || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (filePath) {
+    try {
+      const account = parseServiceAccountJson(fs.readFileSync(filePath, "utf8"));
+      return { account, source: "file", error: null };
+    } catch (err: any) {
+      return {
+        account: null,
+        source: null,
+        error: `Failed to load service account file (${filePath}): ${err?.message || err}`,
+      };
+    }
+  }
+
+  return { account: null, source: null, error: null };
+}
+
+function loadServiceAccountDetailed(): ServiceAccountLoadResult {
+  const fingerprint = envFingerprint();
+  if (loadCache && loadCache.fingerprint === fingerprint) return loadCache.result;
+  const result = loadServiceAccountUncached();
+  loadCache = { fingerprint, result };
+  if (result.error) {
+    console.error(`[push] ${result.error}`);
+  }
+  return result;
+}
+
+function loadServiceAccount(): ServiceAccount | null {
+  return loadServiceAccountDetailed().account;
 }
 
 export function isPushConfigured(): boolean {
@@ -46,6 +151,11 @@ export function pushDeliveryMode(): "http-v1" | "legacy" | "none" {
   if (loadServiceAccount()) return "http-v1";
   if (process.env.FCM_SERVER_KEY) return "legacy";
   return "none";
+}
+
+/** Full diagnostics for status endpoints — includes the actionable parse error. */
+export function getPushServiceAccountDiagnostics(): ServiceAccountLoadResult {
+  return loadServiceAccountDetailed();
 }
 
 async function getAccessToken(): Promise<string | null> {

@@ -362,6 +362,8 @@ const EXPECTED_TABLES = [
   "transfer_queue",
   "transaction_disputes",
   "transfer_beneficiaries",
+  "business_kyc_submissions",
+  "transaction_limits",
   "user_sessions",
   "users",
   "virtual_accounts",
@@ -1190,6 +1192,14 @@ export async function initializeDatabase() {
       } catch (e: any) {
         console.warn(`login_attempts union upgrade skipped for ${col}:`, (e?.message || e).toString().substring(0, 150));
       }
+    }
+    // Event-style writers that omit `success` still satisfy the base NOT NULL
+    // (production hit 23502 "null value in column success" on every login).
+    try {
+      await query(`ALTER TABLE login_attempts ALTER COLUMN success SET DEFAULT FALSE`);
+      await query(`UPDATE login_attempts SET success = FALSE WHERE success IS NULL`);
+    } catch (e: any) {
+      console.warn("login_attempts success default heal skipped:", (e?.message || e).toString().substring(0, 150));
     }
 
     await fixUuidIdDefaults(['audit_logs', 'login_attempts']);

@@ -63,7 +63,7 @@ async function ensureChatStatusesSchema(): Promise<void> {
     CREATE TABLE IF NOT EXISTS chat_statuses (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      business_id UUID,
+      business_id VARCHAR(255),
       content TEXT,
       media_url TEXT,
       media_type VARCHAR(10),
@@ -74,6 +74,20 @@ async function ensureChatStatusesSchema(): Promise<void> {
       expires_at TIMESTAMPTZ NOT NULL
     )
   `);
+  // Align business_id with businesses.id (VARCHAR code, e.g. "MW1THY7") —
+  // the first release created it as UUID, which 500s EVERY /statuses read
+  // and write with 22P02 (invalid input syntax for type uuid) because
+  // req.user.businessId is the business CODE, not a UUID.
+  const statusBizCol = await query(
+    `SELECT data_type FROM information_schema.columns
+     WHERE table_name = 'chat_statuses' AND column_name = 'business_id'`,
+  );
+  if (statusBizCol.rows[0]?.data_type === "uuid") {
+    await query(
+      `ALTER TABLE chat_statuses
+       ALTER COLUMN business_id TYPE VARCHAR(255) USING business_id::text`,
+    );
+  }
   await query(
     `CREATE INDEX IF NOT EXISTS idx_chat_statuses_business_active ON chat_statuses(business_id, expires_at)`,
   );

@@ -7,6 +7,8 @@ import { toMinorUnit } from "../services/transfer";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { generateToken } from "../services/auth";
 import { getBankNameByCode } from "../utils/bank-codes";
+import { checkFundingLimit, rejectOverLimitFunding, fundingRejectedHtml } from "../services/funding-limits";
+import { getBusinessLimitInfo } from "../services/transaction-limits";
 
 const router = express.Router();
 
@@ -536,6 +538,31 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
 });
 
 /**
+ * GET /wallet/limits — transaction limits for the CURRENT user (inflow +
+ * outflow) with live usage. Powers the funding UIs (checkout + virtual
+ * account) and the transfer UIs: they display the per-transaction, daily and
+ * monthly tier limits before the user commits an amount.
+ */
+router.get("/limits", authenticateToken, async (req: AuthenticatedRequest, res) => {
+    try {
+        const businessId = req.user!.businessId || req.user!.userId;
+        const info = await getBusinessLimitInfo(businessId);
+        res.json({
+            success: true,
+            data: {
+                ...info,
+                // Explicit direction mapping so clients can label both rails.
+                inflowLimits: info.limits,
+                outflowLimits: info.limits,
+            },
+        });
+    } catch (error: any) {
+        console.error("Wallet limits error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load transaction limits" });
+    }
+});
+
+/**
  * @swagger
  * /wallet/fund/card:
  *   post:
@@ -599,6 +626,24 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
         }
         if (wallet.business_id && wallet.business_id !== businessId) {
             return res.status(403).json({ success: false, error: "You do not have access to this business wallet" });
+        }
+
+        // INFLOW TRANSACTION LIMIT (both directions are governed by the same
+        // registration-category tier): reject BEFORE the payment session is
+        // created so the user can never pay more than their tier allows.
+        const walletCurrency0 = String(wallet.currency || 'NGN').toUpperCase();
+        const fundingLimit = await checkFundingLimit(
+            { businessId: wallet.business_id, userId: wallet.user_id || userId, ownerKey: businessId || userId },
+            Number(amount),
+            { currency: walletCurrency0 },
+        );
+        if (!fundingLimit.ok) {
+            return res.status(403).json({
+                success: false,
+                error: fundingLimit.error,
+                code: fundingLimit.code,
+                data: { limits: fundingLimit.data },
+            });
         }
 
         // Calculate Fee for Funding via Card
@@ -667,7 +712,11 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
                 [wallet.business_id, wallet.user_id, amount, walletCurrency, reference, wallet.id, fee, provider.name]
             );
 
-            res.json({ success: true, payment_url: paymentUrl, reference, fee, total_amount: totalAmount });
+            // Attach the user's live limits so the funding UI can display the
+            // inflow/outflow tiers alongside the payment sheet.
+            const limitInfo = await getBusinessLimitInfo(wallet.business_id || businessId || userId).catch(() => null);
+
+            res.json({ success: true, payment_url: paymentUrl, reference, fee, total_amount: totalAmount, limits: limitInfo });
         } else {
             const errorMessage = provider.name === 'squad' 
                 ? paymentResponse.message 
@@ -1109,7 +1158,46 @@ router.get("/verify", async (req, res) => {
         }
         
         if (isSuccess) {
-            
+            // INFLOW TRANSACTION LIMIT — second gate (the first runs at
+            // /fund/card initiation). Limits can change or be consumed while
+            // the checkout is open, so re-check at credit time. If the
+            // collected amount now exceeds the tier, the wallet is NOT
+            // credited: the transaction is failed and the money is refunded
+            // to the payer (automatic where the provider supports it).
+            {
+                const ownerKey = transaction.business_id || transaction.user_id;
+                const limitCheck = await checkFundingLimit(
+                    {
+                        businessId: transaction.business_id,
+                        userId: transaction.user_id,
+                        ownerKey,
+                    },
+                    Number(transaction.amount),
+                    { currency: String(transaction.currency || 'NGN').toUpperCase() },
+                );
+                if (!limitCheck.ok) {
+                    const providerTxId = provider.name === 'flutterwave'
+                        ? (verifyResponse?.data?.id ?? null)
+                        : (verifyResponse?.data?.id ?? verifyResponse?.data?.transactionReference ?? null);
+                    const rejectRes = await rejectOverLimitFunding({
+                        walletId: String(transaction.wallet_id),
+                        businessId: transaction.business_id,
+                        userId: transaction.user_id,
+                        amount: Number(transaction.amount),
+                        currency: String(transaction.currency || 'NGN').toUpperCase(),
+                        reference,
+                        provider: transaction.payment_provider || provider.name,
+                        source: 'checkout',
+                        providerTransactionId: providerTxId,
+                        gatewayEvent: verifyResponse,
+                        existingTransactionId: transaction.id,
+                        limitResult: limitCheck,
+                    });
+                    const clientUrl = clientAppUrl;
+                    return res.send(fundingRejectedHtml(limitCheck.error || 'Transaction limit exceeded', rejectRes.refund.success, clientUrl));
+                }
+            }
+
             // Create Settlement record if missing (Pending)
             if (!settlement) {
                  const sRes = await query(`

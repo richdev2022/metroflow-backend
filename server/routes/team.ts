@@ -416,6 +416,7 @@ export const inviteTeamMember: RequestHandler = async (req: AuthenticatedRequest
         ON CONFLICT (business_id, email) DO UPDATE SET
           name = $2,
           role = $4,
+          status = 'invited',
           invite_token = $5,
           invite_expires_at = $6,
           role_id = $7,

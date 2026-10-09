@@ -791,42 +791,69 @@ router.post("/initiate-payment", authenticateToken, checkKycStatus, async (req, 
 
     // Generate unique reference
     const reference = `TXN_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-    
-    let finalAmount = Number(plan.price);
-    const discount = Number(plan.discount || 0);
-    
-    if (discount > 0) {
-        finalAmount = Math.max(0, finalAmount - discount);
-    }
-    
-    // Handle currency conversion.
-    // Plans seeded with an explicit NGN price (plan.currency === 'NGN') are
-    // charged as-is; the legacy external FX lookup is only used when the plan
-    // is actually denominated in a different currency than the charge.
-    if (currency === 'NGN' && (plan.currency || 'USD').toUpperCase() !== 'NGN') {
-       try {
-         const rateRes = await axios.get('https://api.exchangerate-api.com/v4/latest/USD');
-         if (rateRes.data && rateRes.data.rates && rateRes.data.rates.NGN) {
-            const rate = rateRes.data.rates.NGN;
-            finalAmount = Math.round(finalAmount * rate);
-         } else {
-            console.error("Failed to fetch exchange rate");
-            return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
-         }
-       } catch (err) {
-         console.error("Exchange rate API error:", err);
-         return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
-       }
+
+    // ---------------------------------------------------------------
+    // PER-CURRENCY CHARGE RESOLUTION
+    // Supported charge currencies: USD, NGN, GBP, EUR. The customer is
+    // charged the price EXACTLY as displayed for the selected currency:
+    //   1. plan.prices_by_currency[currency] — admin-set explicit price
+    //   2. plan.price when the plan is already denominated in `currency`
+    //   3. FX-convert (plan.currency → currency) as the legacy fallback
+    // Before this, ANY non-NGN charge of a USD plan was billed 1:1 — e.g.
+    // a $29 plan charged £29/€29 — and GBP/EUR were outright unsupported.
+    // ---------------------------------------------------------------
+    const SUPPORTED_CURRENCIES = ["USD", "NGN", "GBP", "EUR"];
+    const requestedCurrency = String(currency || "NGN").toUpperCase();
+    if (!SUPPORTED_CURRENCIES.includes(requestedCurrency)) {
+      return res.status(400).json({
+        success: false,
+        error: `Unsupported currency ${requestedCurrency}. Supported: ${SUPPORTED_CURRENCIES.join(", ")}`,
+      });
     }
 
-    // Amount in Minor units (Kobo for NGN, Cents for USD). 
-    const amountInMinor = Math.round(finalAmount * 100); 
+    const basePrice = Math.max(0, Number(plan.price) - Number(plan.discount || 0));
+    const planCurrency = String(plan.currency || "USD").toUpperCase();
+    const pricesByCurrency = (plan.prices_by_currency && typeof plan.prices_by_currency === "object")
+      ? plan.prices_by_currency as Record<string, unknown>
+      : null;
+
+    let finalAmount: number | null = null;
+    let amountSource = "fx";
+
+    const explicit = pricesByCurrency ? Number(pricesByCurrency[requestedCurrency]) : NaN;
+    if (Number.isFinite(explicit) && explicit > 0) {
+      finalAmount = explicit;
+      amountSource = "prices_by_currency";
+    } else if (planCurrency === requestedCurrency) {
+      finalAmount = basePrice;
+      amountSource = "plan_base";
+    } else {
+      // FX fallback: convert base price from the plan's currency into the
+      // requested one (any direction, not just USD→NGN).
+      try {
+        const rateRes = await axios.get("https://api.exchangerate-api.com/v4/latest/USD");
+        const rates = rateRes.data?.rates;
+        const fromRate = planCurrency === "USD" ? 1 : rates?.[planCurrency];
+        const toRate = requestedCurrency === "USD" ? 1 : rates?.[requestedCurrency];
+        if (!fromRate || !toRate) {
+          console.error("FX rate missing for", planCurrency, "->", requestedCurrency);
+          return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
+        }
+        finalAmount = Math.round(basePrice * (toRate / fromRate));
+      } catch (err) {
+        console.error("Exchange rate API error:", err);
+        return res.status(502).json({ success: false, error: "Currency conversion is temporarily unavailable. Please try again shortly." });
+      }
+    }
+
+    // Amount in Minor units (Kobo for NGN, Cents for USD/GBP/EUR).
+    const amountInMinor = Math.round(finalAmount * 100);
 
     // Create pending transaction record
     await query(
       `INSERT INTO transactions (business_id, plan_id, amount, currency, reference, status, transaction_type, payment_provider)
        VALUES ($1, $2, $3, $4, $5, 'pending', 'subscription', $6)`,
-      [businessId, planId, finalAmount, currency, reference, providerName]
+      [businessId, planId, finalAmount, requestedCurrency, reference, providerName]
     );
 
     // Call active payment provider
@@ -837,14 +864,14 @@ router.post("/initiate-payment", authenticateToken, checkKycStatus, async (req, 
     const baseUrl = origin.endsWith('/') ? origin.slice(0, -1) : origin;
     const callbackUrl = `${baseUrl}/payment/callback`;
 
-    console.log(`Initiating payment for ${userEmail}, amount: ${amountInMinor} ${currency}, callback: ${callbackUrl}`);
+    console.log(`Initiating payment for ${userEmail}, amount: ${amountInMinor} ${requestedCurrency} (${amountSource}), callback: ${callbackUrl}`);
 
     const paymentResponse = await provider.initiatePayment({
       email: userEmail,
       amount: amountInMinor,
       reference,
       callbackUrl,
-      currency,
+      currency: requestedCurrency,
       isRecurring: true
     });
 

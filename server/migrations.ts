@@ -34,6 +34,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
   await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
+  await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2181,4 +2182,56 @@ async function ensureLoginSecurityColumns(): Promise<void> {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_blocked ON users (account_blocked) WHERE account_blocked = TRUE`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_locked ON users (locked_until) WHERE locked_until IS NOT NULL`);
+}
+
+/**
+ * Business registration categories + Business KYC upgrade flow.
+ *
+ * Every business starts in the 'non_registered' transaction-limit category
+ * (regardless of the signup choice, which is stored as a preference).
+ * Completing Business KYC and admin approval moves it to 'registered'.
+ */
+async function ensureBusinessRegistrationSchema(): Promise<void> {
+  await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS registration_category VARCHAR(20) NOT NULL DEFAULT 'non_registered'`);
+  await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS requested_registration_category VARCHAR(20)`);
+  await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS business_registration_type VARCHAR(100)`);
+  await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS registration_category_updated_at TIMESTAMPTZ`);
+  // Heal legacy rows that pre-date the default.
+  await query(`UPDATE businesses SET registration_category = 'non_registered' WHERE registration_category IS NULL`);
+
+  await query(`CREATE TABLE IF NOT EXISTS business_kyc_submissions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    business_id VARCHAR(255) NOT NULL,
+    user_id UUID,
+    registration_type VARCHAR(100) NOT NULL,
+    registration_type_label VARCHAR(150),
+    business_description TEXT,
+    documents JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    admin_notes TEXT,
+    reviewed_by UUID,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bkyc_business ON business_kyc_submissions(business_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bkyc_status ON business_kyc_submissions(status, created_at DESC)`);
+
+  await query(`CREATE TABLE IF NOT EXISTS transaction_limits (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category VARCHAR(20) NOT NULL UNIQUE,
+    single_transaction_limit NUMERIC(20,2) NOT NULL,
+    daily_limit NUMERIC(20,2) NOT NULL,
+    monthly_limit NUMERIC(20,2) NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+    updated_by UUID,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await query(`
+    INSERT INTO transaction_limits (category, single_transaction_limit, daily_limit, monthly_limit)
+    VALUES ('non_registered', 50000, 100000, 500000), ('registered', 5000000, 10000000, 50000000)
+    ON CONFLICT (category) DO NOTHING
+  `);
+
+  console.log("[migrations] business registration + KYC upgrade schema applied");
 }

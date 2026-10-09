@@ -253,6 +253,12 @@ export interface RegisterBusinessInput {
   adminName: string;
   adminEmail: string;
   password: string;
+  /**
+   * Business type chosen at signup. NOTE: this is a PREFERENCE only — every
+   * account starts in the 'non_registered' transaction-limit category until
+   * the owner upgrades via the Business KYC flow and an admin approves it.
+   */
+  businessType?: "registered" | "non_registered";
 }
 
 export interface LoginInput {

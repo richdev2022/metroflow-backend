@@ -297,7 +297,9 @@ export const inviteChatContact: RequestHandler = async (req, res) => {
     try {
       emailSent = await sendEmail(
         email,
-        null,
+        // Brevo 400s on a null recipient name — fall back to the email
+        // local-part so the invite always carries a valid display name.
+        req.body?.name?.toString()?.trim() || email.split("@")[0],
         `${inviterName} invited you to Metricorex`,
         generateChatInviteEmailHtml({
           inviterName,

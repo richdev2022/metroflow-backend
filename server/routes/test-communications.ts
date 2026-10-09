@@ -3,7 +3,7 @@ import { sendSMS } from "../services/sms";
 import { sendEmail, generateOtpEmailHtml, generateKYCOtpEmailHtml } from "../services/email";
 import { sendWhatsApp } from "../services/whatsapp";
 import { getAvailableSMSProviders, getSMSProvider } from "../services/sms-providers/factory";
-import { isPushConfigured } from "../services/push";
+import { isPushConfigured, sendToTokens, PushSendDiagnostic } from "../services/push";
 import { query } from "../db";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import crypto from "crypto";
@@ -26,7 +26,17 @@ const router = express.Router();
 router.get("/push-status", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
+    // Full device rows (not just counts): "my android device vanished" needs
+    // creation/last-seen timestamps and a token preview to debug.
     const devicesRes = await query(
+      `SELECT platform, device_name, app_version,
+              LEFT(fcm_token, 18) || '…' AS token_preview,
+              created_at, last_seen_at
+         FROM user_devices WHERE user_id = $1
+        ORDER BY created_at DESC`,
+      [userId],
+    );
+    const countsRes = await query(
       `SELECT platform, COUNT(*)::int AS count FROM user_devices WHERE user_id = $1 GROUP BY platform`,
       [userId],
     );
@@ -53,14 +63,178 @@ router.get("/push-status", authenticateToken, async (req: AuthenticatedRequest, 
             : "NOT CONFIGURED — pushes are dropped silently; set FIREBASE_SERVICE_ACCOUNT_JSON + FIREBASE_PROJECT_ID",
         firebaseProjectId: process.env.FIREBASE_PROJECT_ID || account?.project_id || null,
         serviceAccountEmail: account?.client_email || null,
+        // false = GOOD (the JSON parsed cleanly). true = the env var is
+        // malformed and FCM can never authenticate.
         serviceAccountParseError: !!(account as any)?.parse_error,
-        myDevices: devicesRes.rows,
+        serviceAccountOk: !!(account?.client_email && !((account as any)?.parse_error)),
+        myDevices: countsRes.rows,
+        myDeviceDetails: devicesRes.rows,
         hint:
-          "If fcmConfigured is false, no push will ever reach any device. If firebaseProjectId does not match the apps' Firebase project, every send 404s and tokens get pruned.",
+          "fcmConfigured:true and serviceAccountParseError:false are the healthy state — 'false' here is NOT an error. " +
+          "Devices only appear for the account you are signed in as (both on the phone AND in this request). " +
+          "If a device that just opened the app is MISSING, it was pruned after a failed send: check the server log for " +
+          "'[push] pruned invalid token'. A fresh token pruned with 404 means the app's Firebase project " +
+          "(google-services.json / GoogleService-Info.plist project_id) does not equal firebaseProjectId above — " +
+          "use POST /test-communications/push-send to reproduce and see the exact FCM error per device.",
       },
     });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error?.message || "Failed to read push status" });
+  }
+});
+
+/**
+ * @swagger
+ * /test-communications/push-send:
+ *   post:
+ *     summary: Fire a REAL FCM push at all of the caller's registered devices
+ *     description: >
+ *       Replays the exact production payload shapes (incoming-call data-only ring,
+ *       chat-message alert, or a plain general test) against every device registered
+ *       to the signed-in user and reports the per-device FCM result. Use it to prove
+ *       the pipeline end to end without placing a real call.
+ *     tags: [Test Communications]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               kind:
+ *                 type: string
+ *                 enum: [general, call, chat]
+ *                 description: Payload shape to send. call = data-only ring (wakes the app full-screen), chat = message alert, general = plain test banner. Default general.
+ *               platform:
+ *                 type: string
+ *                 enum: [android, ios]
+ *                 description: Only send to this platform's devices. Default all.
+ *     responses:
+ *       200:
+ *         description: Per-device delivery report
+ */
+router.post("/push-send", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    const kind = ["general", "call", "chat"].includes(req.body?.kind) ? req.body.kind : "general";
+    const platformFilter = ["android", "ios"].includes(req.body?.platform) ? req.body.platform : null;
+
+    const devicesRes = await query(
+      `SELECT fcm_token, platform, device_name FROM user_devices WHERE user_id = $1`,
+      [userId],
+    );
+    const devices = devicesRes.rows
+      .filter((d: any) => d.fcm_token)
+      .filter((d: any) => !platformFilter || String(d.platform || "").toLowerCase() === platformFilter);
+
+    if (devices.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error:
+          `No registered device${platformFilter ? ` on platform "${platformFilter}"` : "s"} for this account. ` +
+          "Open the mobile app signed in as THIS user first — the app registers its FCM token at " +
+          "/notifications/register-device after login.",
+      });
+    }
+
+    const stamp = crypto.randomBytes(4).toString("hex");
+    let payload;
+    if (kind === "call") {
+      // EXACTLY the shape of call-push.ts attempt 1: data-only on Android so
+      // the app renders the full-screen ringing UI even when killed/swiped.
+      payload = {
+        title: "Push Test Caller",
+        body: "Incoming audio call (push pipeline test)",
+        data: {
+          type: "incoming-call",
+          callId: `push-test-${stamp}`,
+          callType: "audio",
+          callerName: "Push Test Caller",
+          callerId: userId,
+          callCode: "",
+        },
+        androidChannelId: "calls",
+        ttlSeconds: 45,
+        collapseKey: `incoming-call-push-test-${stamp}`,
+        androidDataOnly: true,
+      };
+    } else if (kind === "chat") {
+      // EXACTLY the shape of the chat.ts message push.
+      payload = {
+        title: "Push Test",
+        body: "This is a chat push delivery test",
+        data: {
+          type: "chat-message",
+          conversationId: `push-test-${stamp}`,
+          messageId: `push-test-msg-${stamp}`,
+          senderId: userId,
+          senderName: "Push Test",
+          conversationName: "",
+          conversationType: "direct",
+          message: "This is a chat push delivery test",
+          badge: "1",
+        },
+        androidChannelId: "general",
+        ttlSeconds: 3600,
+        collapseKey: `chat-push-test-${stamp}`,
+      };
+    } else {
+      payload = {
+        title: "Metroflow push test",
+        body: `Push pipeline test (${kind}) — if you can read this on the device, FCM delivery works`,
+        data: { type: "test", kind, stamp },
+      };
+    }
+
+    const diagnostics: PushSendDiagnostic[] = [];
+    const result = await sendToTokens(
+      devices.map((d: any) => d.fcm_token),
+      payload,
+      diagnostics,
+    );
+
+    const perDevice = devices.map((d: any, i: number) => ({
+      platform: d.platform || "unknown",
+      deviceName: d.device_name || null,
+      tokenPreview: String(d.fcm_token).slice(0, 18) + "…",
+      ...(diagnostics[i] || { ok: false, httpStatus: null, error: "no diagnostic recorded" }),
+    }));
+
+    const allFailed404 = result.sent === 0 && diagnostics.every((x) => x.httpStatus === 404 || x.httpStatus === 410);
+    res.json({
+      success: true,
+      data: {
+        kind,
+        summary: { devices: devices.length, accepted: result.sent, failed: result.failed },
+        devices: perDevice,
+        diagnosis: allFailed404
+          ? {
+              likelyConfigProblem: true,
+              message:
+                "FCM rejected EVERY token with 404. For freshly-registered devices this is almost never staleness — it is a config mismatch: " +
+                "the app fetched its FCM token from a DIFFERENT Firebase project than the backend sends to. " +
+                "Fix: make the project_id in android/app/google-services.json AND the PROJECT_ID in ios/Runner/GoogleService-Info.plist " +
+                "equal the backend's FIREBASE_PROJECT_ID (either replace the app config files with the current project's, or point the " +
+                "backend service account at the app's project), then rebuild/reinstall the app. iOS additionally needs an APNs auth key " +
+                "uploaded in the Firebase console (Settings > Cloud Messaging > Apple app configuration). " +
+                "Tokens pruned by this test will re-register automatically next time the app opens.",
+            }
+          : {
+              likelyConfigProblem: false,
+              message:
+                result.sent > 0
+                  ? "FCM ACCEPTED the send — if the device still showed nothing, the problem is on-device (notification permission denied, channel disabled, or the app was force-stopped and the OEM suppressed data-only delivery)."
+                  : "FCM rejected the send for reasons reported per device below.",
+            },
+      },
+    });
+  } catch (error: any) {
+    console.error("Test push-send error:", error);
+    res.status(500).json({ success: false, error: error?.message || "Failed to send test push" });
   }
 });
 

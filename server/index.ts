@@ -30,6 +30,8 @@ import {
   setPassword,
   changePassword,
   getMe,
+  listWorkspaces,
+  switchWorkspace,
 } from "./routes/auth";
 import { biometricEnroll, biometricLogin, biometricRevoke, biometricStatus } from "./routes/auth";
 import {
@@ -741,6 +743,9 @@ export async function createServer() {
   mainRouter.post("/auth/set-password", authenticateToken, setPassword);
   mainRouter.post("/auth/change-password", authenticateToken, changePassword);
   mainRouter.get("/auth/me", authenticateToken, getMe);
+  // Multi-workspace switching — same verified email, multiple memberships.
+  mainRouter.get("/auth/workspaces", authenticateToken, listWorkspaces);
+  mainRouter.post("/auth/switch-workspace", authenticateToken, switchWorkspace);
 
   // Biometric unlock endpoints
   mainRouter.post("/auth/biometric/enroll", authenticateToken, biometricEnroll);

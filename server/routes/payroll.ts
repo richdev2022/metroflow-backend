@@ -949,6 +949,8 @@ router.post("/employees/:id/verify", authenticateToken, checkSubscriptionStatus,
                 beneficiaryPostalCode: employee.beneficiary_postal_code,
                 // USD meta[0] contract: the beneficiary's email (employee's own).
                 beneficiaryEmail: employee.email,
+                // USD payout rail (bank_code is NULL for USD employees -> ACH default).
+                bankCode: employee.bank_code,
             });
             if (!intlCheck.valid) {
                 await query(

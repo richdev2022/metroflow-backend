@@ -66,9 +66,18 @@ export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) =
       );
     }
 
-    // First get all task statuses for the business
+    // First get all task statuses for the business. COALESCE the nullable
+    // columns so one NULL (color is nullable in the schema) can never crash
+    // the strict mobile parser into rendering the whole board as "empty".
+    // Keys stay snake_case — the mobile TaskStatus.fromJson contract.
     const statusesResult = await query(
-      `SELECT * FROM task_statuses WHERE business_id = $1 ORDER BY sort_order ASC, created_at ASC`,
+      `SELECT id, business_id, name,
+              COALESCE(color, '#6B7280') as color,
+              COALESCE(is_default, false) as is_default,
+              COALESCE(sort_order, 0) as sort_order,
+              COALESCE(created_at, NOW()) as created_at,
+              COALESCE(updated_at, NOW()) as updated_at
+         FROM task_statuses WHERE business_id = $1 ORDER BY sort_order ASC, created_at ASC`,
       [businessId]
     );
 

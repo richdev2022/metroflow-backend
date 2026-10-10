@@ -595,14 +595,24 @@ export async function createServer() {
 
   // Check DB status for API routes (both / and /api paths)
   const dbCheckMiddleware = (req, res, next) => {
-    if (req.path === '/' || req.path === '/ping' || req.path === '/demo') return next();
-    
+    // This middleware is mounted on the app BEFORE mainRouter, which is
+    // attached at both "/" and "/api" — so a ping probe arrives here with
+    // req.path === "/api/ping". The old exact-match exemption never fired:
+    // /api/ping (and /api/health) returned 503 during the DB-init window,
+    // deploy.sh burned its 60s retry loop on a server that was already up,
+    // and /api/health got misreported as "very old build". Normalize the
+    // /api prefix, then exempt the ops probes: /ping must ALWAYS answer so
+    // deploys stay green, and /health reports its own degraded/db:"down"
+    // state with HTTP 200 while initialization is still running.
+    const p = req.path.replace(/^\/api(?=\/|$)/, "");
+    if (p === '/' || p === '/ping' || p === '/demo' || p === '/health') return next();
+
     if (!isDbReady) {
       // Allow pre-flight requests to pass through
       if (req.method === 'OPTIONS') return next();
 
-      return res.status(503).json({ 
-        error: "Service Unavailable", 
+      return res.status(503).json({
+        error: "Service Unavailable",
         message: "Server is still initializing database connection. Please try again in a few seconds.",
         details: dbInitError ? (dbInitError instanceof Error ? dbInitError.message : String(dbInitError)) : undefined
       });

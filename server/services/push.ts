@@ -385,7 +385,10 @@ async function sendToTokens(
       ? String(Math.floor(Date.now() / 1000) + payload.ttlSeconds)
       : null;
     const isSilent = payload.silent === true;
-    for (const token of tokens) {
+    // PARALLEL per-token sends — the old sequential loop made device #2's ring
+    // wait for device #1's HTTP round-trip (up to 15s timeout each). Promise.all
+    // fires them all at once; per-token failures are contained below.
+    await Promise.all(tokens.map(async (token) => {
       const isIos = iosTokens.has(token);
       try {
         const message: any = isIos
@@ -535,7 +538,7 @@ async function sendToTokens(
           );
         }
       }
-    }
+    }));
     return { sent, failed };
   }
 

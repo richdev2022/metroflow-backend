@@ -302,20 +302,20 @@ export const createCall: RequestHandler = async (
       });
     }
 
-    const planResult = await query(
-      `SELECT pp.max_meeting_duration as "maxMeetingDuration", pp.max_participants as "planMaxParticipants"
-       FROM businesses b 
-       LEFT JOIN pricing_plans pp ON b.plan_id = pp.id 
-       WHERE b.id = $1`,
-      [businessId]
-    );
+    // Plan limits + active provider are INDEPENDENT reads — run them in
+    // parallel instead of stacking two RTTs on the ring path.
+    const [planResult, callingProvider] = await Promise.all([
+      query(
+        `SELECT pp.max_meeting_duration as "maxMeetingDuration", pp.max_participants as "planMaxParticipants"
+         FROM businesses b
+         LEFT JOIN pricing_plans pp ON b.plan_id = pp.id
+         WHERE b.id = $1`,
+        [businessId],
+      ),
+      getActiveProviderName(),
+    ]);
     const planMaxMeetingDuration = planResult.rows[0]?.maxMeetingDuration || null;
     const planMaxParticipants = planResult.rows[0]?.planMaxParticipants || null;
-
-    // The calling provider is resolved ONCE at creation time and stored on the
-    // row, so an admin switching providers later never migrates an in-flight
-    // room (the room keeps its original provider until it ends).
-    const callingProvider = await getActiveProviderName();
 
     const now = new Date();
     const endedAt = null;
@@ -339,10 +339,10 @@ export const createCall: RequestHandler = async (
     }
 
     const result = await query(
-      `INSERT INTO calls 
+      `INSERT INTO calls
         (business_id, type, status, created_by, host_id, call_code, password, is_group_call, waiting_room_enabled, recording_enabled, started_at, ended_at, max_participants, conversation_id, provider)
        VALUES ($1, $2, 'ongoing', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-       RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
+       RETURNING id, business_id as "businessId", type, status, started_at as "startedAt",
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
                  co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
                  waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
@@ -353,102 +353,39 @@ export const createCall: RequestHandler = async (
 
     const call = result.rows[0];
 
-    // Add participants
-    const participants = [];
-    for (const pid of uniqueParticipantIds) {
-      const participantResult = await query(
+    // Add participants in ONE multi-row insert — the old per-participant loop
+    // serialized N round-trips on the ring path (each ~1 RTT to Neon), which
+    // was directly measurable as "call takes seconds to ring".
+    const participantValues = uniqueParticipantIds.map((pid, i) =>
+      `($1, $${2 + i * 2}, $${3 + i * 2})`
+    ).join(", ");
+    const participantParams: unknown[] = [call.id];
+    uniqueParticipantIds.forEach((pid) => {
+      participantParams.push(pid, pid === userId ? "joined" : "invited");
+    });
+    // Caller display name for the ring + the participant rows are
+    // INDEPENDENT — run them in parallel (one fewer RTT before the ring).
+    const [participantResult, currentUserResult] = await Promise.all([
+      query(
         `INSERT INTO call_participants (call_id, user_id, status)
-         VALUES ($1, $2, $3)
+         VALUES ${participantValues}
          RETURNING id, user_id as "userId", status, joined_at as "joinedAt", left_at as "leftAt"`,
-        [call.id, pid, pid === userId ? "joined" : "invited"],
-      );
-      participants.push(participantResult.rows[0]);
-    }
-
-    call.participants = participants;
+        participantParams,
+      ),
+      query(`SELECT name FROM users WHERE id = $1`, [userId]),
+    ]);
+    call.participants = participantResult.rows;
     call.maxMeetingDuration = planMaxMeetingDuration;
     enrichCall(call);
-
-    // Fetch current user name for notifications
-    const currentUserResult = await query(
-      `SELECT name FROM users WHERE id = $1`,
-      [userId]
-    );
     const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
 
-    // Send in-app notifications and emails to invited participants.
-    // These are side effects: the call row is already committed, so a failing
-    // notification/email must NEVER turn the request into a 500 (the caller
-    // would believe the call failed while it is actually live). Best-effort.
-    const invitedParticipantIds = (providedParticipantIds).filter((pid: string) => pid !== userId);
-    if (invitedParticipantIds.length > 0) {
-      try {
-        const usersMap = await getBusinessUserIdsForCalls(invitedParticipantIds, businessId);
-        const callLink = buildCallLink(call.callCode);
+    // -----------------------------------------------------------------------
+    // RING FIRST. The callee's ring must not wait for notifications, activity
+    // logs or (formerly) Brevo emails. Socket emit + FCM dispatch happen NOW;
+    // everything else runs in parallel / after the response.
+    // -----------------------------------------------------------------------
+    const invitedParticipantIds = providedParticipantIds.filter((pid: string) => pid !== userId);
 
-        for (const pid of invitedParticipantIds) {
-          try {
-            await createNotification({
-              businessId: businessId,
-              userId: pid,
-              type: "call",
-              title: `${currentUserName} is calling`,
-              message: `You have an incoming ${type || 'video'} call from ${currentUserName}`,
-              actionUrl: `/calls/${call.callCode}`,
-              actionType: "join_call",
-              metadata: { callId: call.id, callCode: call.callCode },
-              isActionable: true,
-              expiresInHours: 1,
-            });
-          } catch (notifyError) {
-            console.error(`Create call: failed to notify participant ${pid}:`, notifyError);
-          }
-
-          const user = usersMap.get(pid);
-          if (user?.email) {
-            try {
-              const emailHtml = generateCallInvitationEmailHtml(
-                user.name || 'User',
-                (type || 'video') as 'audio' | 'video',
-                new Date(call.startedAt),
-                call.callCode,
-                currentUserName,
-                callLink,
-                password || null,
-                waitingRoomEnabled || false
-              );
-              const emailSent = await sendEmail(user.email, user.name || 'User', `📞 Incoming ${type === 'audio' ? 'Audio' : 'Video'} Call from ${currentUserName}`, emailHtml);
-              if (!emailSent) console.error(`Create call: invite email not sent to ${user.email} - share the call link manually: ${callLink}`);
-            } catch (emailError) {
-              console.error(`Create call: failed to email participant ${pid}:`, emailError);
-            }
-          }
-        }
-      } catch (sideEffectError) {
-        console.error("Create call: participant notification stage failed (call still created):", sideEffectError);
-      }
-    }
-
-    // Log activity (best-effort)
-    try {
-      await logActivity({
-        businessId,
-        userId,
-        action: "create",
-        actionType: "call",
-        description: `Started a ${call.type} call`,
-        metadata: {
-          type: call.type,
-          callCode: call.callCode,
-          isGroupCall: call.isGroupCall,
-          participantIds: uniqueParticipantIds,
-        },
-      });
-    } catch (logError) {
-      console.error("Create call: failed to log activity:", logError);
-    }
-
-    // Emit socket events (best-effort)
     try {
       const io = getSocketServer();
       if (io) {
@@ -486,6 +423,45 @@ export const createCall: RequestHandler = async (
         conversationId: conversationId || null,
       });
     }
+
+    // In-app notifications: parallel + non-blocking (best-effort).
+    if (invitedParticipantIds.length > 0) {
+      void Promise.all(
+        invitedParticipantIds.map((pid: string) =>
+          createNotification({
+            businessId: businessId,
+            userId: pid,
+            type: "call",
+            title: `${currentUserName} is calling`,
+            message: `You have an incoming ${type || 'video'} call from ${currentUserName}`,
+            actionUrl: `/calls/${call.callCode}`,
+            actionType: "join_call",
+            metadata: { callId: call.id, callCode: call.callCode },
+            isActionable: true,
+            expiresInHours: 1,
+          }).catch((notifyError) => {
+            console.error(`Create call: failed to notify participant ${pid}:`, notifyError);
+          }),
+        ),
+      );
+    }
+
+    // Log activity (best-effort, non-blocking)
+    void logActivity({
+      businessId,
+      userId,
+      action: "create",
+      actionType: "call",
+      description: `Started a ${call.type} call`,
+      metadata: {
+        type: call.type,
+        callCode: call.callCode,
+        isGroupCall: call.isGroupCall,
+        participantIds: uniqueParticipantIds,
+      },
+    }).catch((logError) => {
+      console.error("Create call: failed to log activity:", logError);
+    });
 
     const response: ApiResponse<any> = {
       success: true,
@@ -1798,7 +1774,6 @@ export const addCallParticipants: RequestHandler = async (
       [actualCallId]
     );
     const callDetails = fullCallDetails.rows[0];
-    const usersMap = await getBusinessUserIdsForCalls(newParticipantIds, businessId);
     const callLink = buildCallLink(call.call_code);
 
     for (const pid of newParticipantIds) {
@@ -1833,24 +1808,8 @@ export const addCallParticipants: RequestHandler = async (
         console.error(`Add call participants: failed to notify ${pid}:`, notifyError);
       }
 
-      const user = usersMap.get(pid);
-      if (user?.email) {
-        try {
-          const emailHtml = generateCallInvitationEmailHtml(
-            user.name || 'User',
-            (callDetails?.type || 'video') as 'audio' | 'video',
-            new Date(callDetails?.started_at || new Date()),
-            call.call_code,
-            currentUserName,
-            callLink,
-            callDetails?.password || null,
-            !!callDetails?.waiting_room_enabled
-          );
-          await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
-        } catch (emailError) {
-          console.error(`Add call participants: failed to email ${user.email}:`, emailError);
-        }
-      }
+      // NO call emails for registered users (removed per product decision):
+      // they get the real-time ring (socket + FCM push) + in-app notification.
     }
 
     // ===== External email invites (people without accounts) =====
@@ -1907,23 +1866,7 @@ export const addCallParticipants: RequestHandler = async (
                 } catch (notifyError) {
                   console.error(`Add call participants: failed to notify ${email}:`, notifyError);
                 }
-                if (user.email) {
-                  try {
-                    const emailHtml = generateCallInvitationEmailHtml(
-                      user.name || 'User',
-                      (callDetails?.type || 'video') as 'audio' | 'video',
-                      new Date(callDetails?.started_at || new Date()),
-                      call.call_code,
-                      currentUserName,
-                      callLink,
-                      callDetails?.password || null,
-                      !!callDetails?.waiting_room_enabled
-                    );
-                    await sendEmail(user.email, user.name || 'User', `📞 You've been added to a Call by ${currentUserName}`, emailHtml);
-                  } catch (emailError) {
-                    console.error(`Add call participants: failed to email ${email}:`, emailError);
-                  }
-                }
+                // NO call email here either — registered users ring via push.
                 continue;
               }
             } catch (insertError) {

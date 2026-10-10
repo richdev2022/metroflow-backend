@@ -41,16 +41,6 @@ function isValidUUID(str: string): boolean {
   return uuidRegex.test(str);
 }
 
-async function resolveMeetingId(inputId: string): Promise<string | null> {
-  if (isValidUUID(inputId)) {
-    const result = await query(`SELECT id FROM meetings WHERE id = $1`, [inputId]);
-    if (result.rows.length > 0) return result.rows[0].id;
-  }
-  const codeResult = await query(`SELECT id FROM meetings WHERE meeting_code = $1`, [inputId]);
-  if (codeResult.rows.length > 0) return codeResult.rows[0].id;
-  return null;
-}
-
 async function resolveCallId(inputId: string): Promise<string | null> {
   if (isValidUUID(inputId)) {
     const result = await query(`SELECT id FROM calls WHERE id = $1`, [inputId]);
@@ -61,12 +51,52 @@ async function resolveCallId(inputId: string): Promise<string | null> {
   return null;
 }
 
-async function resolveRoomId(inputId: string): Promise<{ id: string; type: 'call' | 'meeting' } | null> {
-  const callId = await resolveCallId(inputId);
-  if (callId) return { id: callId, type: 'call' };
-  const meetingId = await resolveMeetingId(inputId);
-  if (meetingId) return { id: meetingId, type: 'meeting' };
+async function resolveMeetingId(inputId: string): Promise<string | null> {
+  if (isValidUUID(inputId)) {
+    const result = await query(`SELECT id FROM meetings WHERE id = $1`, [inputId]);
+    if (result.rows.length > 0) return result.rows[0].id;
+  }
+  const codeResult = await query(`SELECT id FROM meetings WHERE meeting_code = $1`, [inputId]);
+  if (codeResult.rows.length > 0) return codeResult.rows[0].id;
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Room-resolve cache. High-frequency relay events (caption:segment fires
+// per utterance, call:reaction per tap, meeting-chat per message) each paid
+// 1-2 DB round-trips JUST to map code→uuid — the single biggest source of
+// "captions feel slow". Ids are immutable, so a short TTL cache is safe:
+// codes resolve to the same uuid for the life of the room.
+// ---------------------------------------------------------------------------
+const ROOM_RESOLVE_TTL_MS = 120_000;
+const roomResolveCache = new Map<string, { value: { id: string; type: 'call' | 'meeting' } | null; expiresAt: number }>();
+
+async function resolveRoomId(inputId: string): Promise<{ id: string; type: 'call' | 'meeting' } | null> {
+  if (!inputId) return null;
+  const cached = roomResolveCache.get(inputId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  let value: { id: string; type: 'call' | 'meeting' } | null = null;
+  try {
+    const callId = await resolveCallId(inputId);
+    if (callId) value = { id: callId, type: 'call' };
+    else {
+      const meetingId = await resolveMeetingId(inputId);
+      if (meetingId) value = { id: meetingId, type: 'meeting' };
+    }
+  } catch {
+    // DB blip: fall through with null but DO NOT cache failures — the next
+    // event should retry the lookup rather than lock in the outage.
+    return null;
+  }
+  roomResolveCache.set(inputId, { value, expiresAt: Date.now() + ROOM_RESOLVE_TTL_MS });
+  // Opportunistic GC so the map never grows unbounded across long uptimes.
+  if (roomResolveCache.size > 5000) {
+    const now = Date.now();
+    for (const [k, v] of roomResolveCache) {
+      if (v.expiresAt <= now) roomResolveCache.delete(k);
+    }
+  }
+  return value;
 }
 
 /**
@@ -1424,40 +1454,46 @@ export function initSocketServer(server: http.Server): void {
     // Call events
     socket.on("call:invite", async (data: { callId: string; targetUserId: string; type: string; callerName?: string }) => {
       logger.info(`Call invite: ${data.callId} to user ${data.targetUserId}`);
-      const resolvedCallId = await resolveCallId(data.callId);
-      const finalCallId = resolvedCallId || data.callId;
-      // Resolve the caller's display name so clients (especially mobile) can
-      // render "John is calling" instead of a raw user UUID.
-      let callerName: string | null = null;
-      let callConversationId: string | null = null;
-      try {
-        const callerRes = await query(`SELECT name FROM users WHERE id = $1`, [socket.data.userId]);
-        callerName = callerRes.rows[0]?.name || null;
-      } catch { /* best-effort */ }
-      if (resolvedCallId) {
-        try {
-          const convRes = await query(`SELECT conversation_id FROM calls WHERE id = $1`, [resolvedCallId]);
-          callConversationId = convRes.rows[0]?.conversation_id || null;
-        } catch { /* best-effort */ }
-      }
+      // RING IMMEDIATELY. The DB lookups below (caller name, conversation id)
+      // only enrich the background push — the live socket ring never waits on
+      // them (they used to sit in front of the emit and cost 1-3 DB RTTs).
       socket.to(`user:${data.targetUserId}`).emit("call:incoming", {
-        callId: finalCallId,
+        callId: data.callId,
         callCode: data.callId,
         from: socket.data.userId,
-        callerName: callerName || data.callerName || undefined,
+        callerName: data.callerName || undefined,
         type: data.type,
       });
       // Ring the callee's OTHER devices too (FCM + Web Push). Fire-and-forget:
       // a push failure must never break the live call flow.
       if (data.targetUserId && data.targetUserId !== socket.data.userId) {
-        pushIncomingCall([data.targetUserId], {
-          callId: finalCallId,
-          callType: data.type,
-          callerName: callerName || data.callerName || "Someone",
-          callerId: socket.data.userId || "",
-          callCode: data.callId,
-          conversationId: callConversationId,
-        });
+        void (async () => {
+          let callerName: string | null = null;
+          let callConversationId: string | null = null;
+          try {
+            const callerRes = await query(`SELECT name FROM users WHERE id = $1`, [socket.data.userId]);
+            callerName = callerRes.rows[0]?.name || null;
+          } catch { /* best-effort */ }
+          try {
+            const resolvedCallId = await resolveCallId(data.callId);
+            if (resolvedCallId) {
+              const convRes = await query(`SELECT conversation_id FROM calls WHERE id = $1`, [resolvedCallId]);
+              callConversationId = convRes.rows[0]?.conversation_id || null;
+            }
+          } catch { /* best-effort */ }
+          try {
+            pushIncomingCall([data.targetUserId], {
+              callId: data.callId,
+              callType: data.type,
+              callerName: callerName || data.callerName || "Someone",
+              callerId: socket.data.userId || "",
+              callCode: data.callId,
+              conversationId: callConversationId,
+            });
+          } catch (pushErr) {
+            logger.warn("pushIncomingCall failed (socket ring already sent):", pushErr);
+          }
+        })();
       }
     });
 
@@ -1477,6 +1513,48 @@ export function initSocketServer(server: http.Server): void {
       if (creatorId && creatorId !== socket.data.userId) {
         io.to(`user:${creatorId}`).emit("call:accepted", { callId: resolvedCallId, userId: socket.data.userId });
       }
+
+      // ---------------------------------------------------------------------
+      // STOP THE RING EVERYWHERE. One device answered → every other device of
+      // the acceptor AND every other still-ringing callee must dismiss their
+      // ringing UI + notification immediately (was: they kept ringing until
+      // the call ended, or until the 45s auto-dismiss).
+      // ---------------------------------------------------------------------
+      const stopRingEvent = { callId: resolvedCallId, callCode: data.callId, acceptedBy: socket.data.userId };
+      // Acceptor's other live devices (socket.to excludes the answering socket).
+      socket.to(`user:${socket.data.userId}`).emit("call:ring-stopped", stopRingEvent);
+      try {
+        const othersRes = await query(
+          `SELECT DISTINCT user_id FROM call_participants WHERE call_id = $1 AND user_id <> $2`,
+          [resolvedCallId, socket.data.userId],
+        );
+        const otherIds: string[] = othersRes.rows.map((r: any) => String(r.user_id)).filter(Boolean);
+        for (const pid of otherIds) {
+          // The creator just got call:accepted (their ringback stops off that).
+          // Everyone ELSE is still ringing in-app and must stop NOW.
+          if (pid !== creatorId) {
+            io.to(`user:${pid}`).emit("call:ring-stopped", stopRingEvent);
+          }
+        }
+        // Backgrounded/locked devices stop via the silent data push (their
+        // socket may be dead). pushCallCancelled is data-only + same collapse
+        // key family — it replaces/cancels the ring notification.
+        const pushTargets = otherIds.filter((pid) => pid !== creatorId);
+        if (pushTargets.length) {
+          pushCallCancelled(pushTargets, {
+            callId: resolvedCallId,
+            callerId: socket.data.userId,
+            reason: "answered_elsewhere",
+          });
+        }
+        // The acceptor's own backgrounded devices (different from the socket
+        // that just answered) also need the silent dismissal.
+        pushCallCancelled([socket.data.userId], {
+          callId: resolvedCallId,
+          callerId: socket.data.userId,
+          reason: "answered_elsewhere",
+        });
+      } catch { /* ring-stop is best-effort */ }
     });
 
     socket.on("call:reject", async (data: { callId: string }) => {
@@ -1550,6 +1628,12 @@ export function initSocketServer(server: http.Server): void {
       if (creatorId && creatorId !== socket.data.userId) {
         io.to(`user:${creatorId}`).emit("call:rejected", { callId: resolvedCallId, userId: socket.data.userId });
       }
+      // The rejecting account's OTHER devices must also stop ringing NOW.
+      socket.to(`user:${socket.data.userId}`).emit("call:ring-stopped", {
+        callId: resolvedCallId,
+        callCode: data.callId,
+        rejectedBy: socket.data.userId,
+      });
     });
 
     socket.on("call:end", async (data: { callId: string }) => {
@@ -2272,11 +2356,21 @@ export function initSocketServer(server: http.Server): void {
           meetingId: resolvedType === "meeting" ? resolvedId : undefined,
           callId: resolvedType === "call" ? resolvedId : undefined,
           roomId: resolvedId,
+          // Echo whatever id the client used to address the room (code or
+          // uuid). Mobile guards incoming messages against ITS OWN room key,
+          // which may be a meeting CODE while `meetingId` here is the
+          // canonical UUID — without this echo those messages were dropped.
+          requestedRoom: String(data.meetingId || data.callId || data.roomId || ""),
           message: data.message,
           timestamp: new Date(),
         };
-        // Broadcast to everyone in the room (including sender for consistency)
+        // Broadcast to everyone in the room (including sender for consistency).
+        // Both room keys: clients that joined via meeting:join are members of
+        // room:{id} AND meeting:{id}; relaying on both covers every client.
         io.to(`room:${resolvedId}`).emit("meeting-chat:message", payload);
+        if (resolvedType === "meeting") {
+          io.to(`meeting:${resolvedId}`).emit("meeting-chat:message", payload);
+        }
       } catch (error) {
         logger.error("Error handling meeting chat:", error);
       }

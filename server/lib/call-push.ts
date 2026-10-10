@@ -16,6 +16,8 @@ export interface IncomingCallPushInfo {
   callerId: string;
   callCode?: string | null;
   conversationId?: string | null;
+  /** GROUP-CALL TEARDOWN FIX: mobile computes shouldEndForAll from this. */
+  isGroupCall?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,7 @@ export async function pushIncomingCall(
         callerName: info.callerName,
         callerId: info.callerId,
         callCode: info.callCode || "",
+        isGroupCall: info.isGroupCall ? "1" : "0",
         ...(info.conversationId ? { conversationId: info.conversationId } : {}),
       },
       androidChannelId: "calls-v3",
@@ -144,6 +147,7 @@ export async function pushIncomingCall(
         callType: callTypeLabel,
         callerName: info.callerName,
         callCode: info.callCode || null,
+        isGroupCall: !!info.isGroupCall,
       },
       { TTL: 60, urgency: "high" },
     );

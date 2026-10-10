@@ -23,7 +23,7 @@ import {
   registrationTypesConfig,
 } from "../lib/registration-types";
 import { getBusinessLimitInfo } from "../services/transaction-limits";
-import { r2Storage } from "../lib/storage";
+import { uploadWithFallback } from "../lib/storage";
 
 const router = express.Router();
 
@@ -257,18 +257,21 @@ router.post(
           ? file.originalname.split(".").pop()!.toLowerCase()
           : (file.mimetype.split("/")[1] || "bin");
         const key = `kyc/${businessId}/${Date.now()}-${crypto.randomBytes(5).toString("hex")}-${kind}.${ext}`;
+        // Resilient upload: R2 first; on R2 failure (revoked token, blip) small
+        // docs degrade to data URIs so the submission still lands instead of a
+        // raw 500 — only oversized docs 503 when storage is down.
         let url: string;
-        if (r2Storage.isAvailable()) {
-          url = await r2Storage.uploadFile(key, file.buffer, file.mimetype);
-        } else if (file.size <= 4 * 1024 * 1024) {
-          // R2 unavailable — fall back to a data URI so the submission still lands.
-          url = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-        } else {
-          return res.status(503).json({
-            success: false,
-            error: "Document storage is temporarily unavailable — try smaller files or retry shortly",
-            code: "STORAGE_UNAVAILABLE",
-          });
+        try {
+          url = await uploadWithFallback(key, file.buffer, file.mimetype);
+        } catch (storageErr: any) {
+          if (storageErr?.code === "STORAGE_UNAVAILABLE") {
+            return res.status(503).json({
+              success: false,
+              error: storageErr.message,
+              code: "STORAGE_UNAVAILABLE",
+            });
+          }
+          throw storageErr;
         }
         documents.push({
           kind,
@@ -351,8 +354,21 @@ router.post(
         data: { submissionId, status: "pending" },
       });
     } catch (err: any) {
-      console.error("[business-kyc] submit error:", err?.message);
-      res.status(500).json({ success: false, error: "Failed to submit Business KYC" });
+      // Full forensic line — pm2 error.log must show WHY, not just that it
+      // failed (pg code + constraint + stack make support triage one-shot).
+      console.error(
+        "[business-kyc] submit error:",
+        err?.code ? `${err.code} ` : "",
+        err?.message,
+        "\n",
+        err?.stack || "(no stack)",
+      );
+      res.status(500).json({
+        success: false,
+        error: "Failed to submit Business KYC",
+        // Safe, non-leaking hint so clients can retry intelligently.
+        ...(err?.code ? { code: `SUBMIT_FAILED_${String(err.code).replace(/[^A-Z0-9_]/gi, "")}` } : {}),
+      });
     }
   },
 );

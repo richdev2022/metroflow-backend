@@ -916,7 +916,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 // Mark failed without crediting
                 if (transaction.status !== 'failed') {
                     await query(
-                        `UPDATE transactions SET status = 'failed', gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                        `UPDATE transactions SET status = 'failed', gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
                         [JSON.stringify(event), transaction.id]
                     );
                 }
@@ -928,7 +928,7 @@ const handleFlutterwaveWebhook = async (event: any) => {
             if (!verified) {
                 console.warn(`Flutterwave webhook charge ${reference}: verification failed - wallet NOT credited. Will be re-verified on callback.`);
                 await query(
-                    `UPDATE transactions SET gateway_response = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+                    `UPDATE transactions SET gateway_response = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
                     [JSON.stringify({ ...event, verification: 'pending_webhook_verify_failed' }), transaction.id]
                 );
                 return;

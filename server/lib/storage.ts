@@ -323,3 +323,36 @@ export function getCloudStorage(): { uploadFile(key: string, body: Buffer | stri
   if (cloudinaryStorage.isAvailable()) return cloudinaryStorage;
   return null;
 }
+
+/**
+ * Normalize a recording storage reference into a directly playable URL.
+ *
+ * Recording rows can hold three shapes of storage_url:
+ *  - an absolute http(s)/data URL (R2 public URL, base64 fallback) → pass through
+ *  - a root-served local path "/uploads/<file>" (client-mode uploads on the
+ *    droplet disk — served by express.static at the ROOT, not under /api)
+ *  - a bare R2 object key "recordings/<businessId>/<id>.mp4" (written by the
+ *    LiveKit egress webhook) → presign when possible, otherwise fall back to
+ *    the public /files/<key> streaming route.
+ *
+ * Every endpoint that returns a recording (list, detail, call detail, meeting
+ * report) MUST run its storage_url through this helper before responding —
+ * a bare key is not a playable URL.
+ */
+export async function resolveRecordingMediaUrl(storageUrl?: string | null): Promise<string> {
+  const raw = String(storageUrl || "").trim();
+  if (!raw) return raw;
+  if (/^(https?:|data:|blob:)/i.test(raw)) return raw;
+  if (raw.startsWith("/uploads/")) return raw;
+  if (raw.startsWith("/files/")) return raw;
+
+  const key = raw.replace(/^\/+/, "");
+  if (r2Storage.isAvailable()) {
+    try {
+      return await r2Storage.getPresignedUrl(key, 86400); // 24 hours
+    } catch (err) {
+      console.error("Failed to presign recording key, falling back to /files route:", key, err);
+    }
+  }
+  return `/files/${key}`;
+}

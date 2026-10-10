@@ -1215,7 +1215,7 @@ export const sendMessage: RequestHandler = async (
                   message: preview,
                   badge: String(unreadByUser.size > 0 ? Math.max(...unreadByUser.values()) : 1),
                 },
-                androidChannelId: "general",
+                androidChannelId: "messages",
                 // iOS alerts are automatic (push.ts detects iOS tokens and
                 // sends a real APNs alert with the data badge).
                 // A message notification older than an hour is noise.

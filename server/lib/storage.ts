@@ -356,3 +356,35 @@ export async function resolveRecordingMediaUrl(storageUrl?: string | null): Prom
   }
   return `/files/${key}`;
 }
+
+/**
+ * Resilient upload used by user-facing flows (KYC documents, avatars, logos):
+ * try R2 first; if R2 fails for ANY reason (Access Denied from a revoked
+ * token, network blip, bucket misconfig) fall back to an inline data URI for
+ * small files so the user's submission still LANDS instead of a raw 500.
+ * Files above the data-URI budget rethrow a structured error the route can
+ * map to a 503 with an actionable message.
+ */
+export const DATA_URI_MAX_BYTES = 4 * 1024 * 1024; // 4MB
+
+export async function uploadWithFallback(
+  key: string,
+  body: Buffer,
+  contentType?: string,
+): Promise<string> {
+  if (r2Storage.isAvailable()) {
+    try {
+      return await r2Storage.uploadFile(key, body, contentType);
+    } catch (err: any) {
+      console.error(
+        `[storage] R2 upload failed for ${key} [${err?.name || "Error"}: ${err?.message}] — falling back to data URI if small enough`,
+      );
+    }
+  }
+  if (Buffer.byteLength(body) <= DATA_URI_MAX_BYTES) {
+    return `data:${contentType || "application/octet-stream"};base64,${body.toString("base64")}`;
+  }
+  const err: any = new Error("Document storage is temporarily unavailable — try smaller files or retry shortly");
+  err.code = "STORAGE_UNAVAILABLE";
+  throw err;
+}

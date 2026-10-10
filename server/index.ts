@@ -104,7 +104,7 @@ import { getConversations, getConversationMessages, createConversation, sendMess
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest } from "./routes/calls";
-import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording } from "./routes/recordings";
+import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording, getRecordingById } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
 import { isPushConfigured, pushDeliveryMode } from "./services/push";
@@ -1033,6 +1033,7 @@ export async function createServer() {
 
   // Recordings API routes
   mainRouter.get("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordings);
+  mainRouter.get("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), getRecordingById);
   mainRouter.post("/recordings", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), createRecording);
   mainRouter.put("/recordings/:id", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("rtc.recording"), updateRecording);
   // PATCH alias: the web client patches recording status on failure

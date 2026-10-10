@@ -144,7 +144,8 @@ export const getCalls: RequestHandler = async (
     const countResult = await query(
       `SELECT COUNT(*) as total
        FROM calls c
-       WHERE (
+       WHERE c.business_id = $1
+       AND (
          c.created_by = $2
          OR c.host_id = $2
          OR c.co_host_id = $2

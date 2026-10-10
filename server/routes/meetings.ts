@@ -274,7 +274,9 @@ export const getMeetings: RequestHandler = async (
     const toParam = req.query.to as string | undefined;
     let fromFilter = "";
     let toFilter = "";
-    const filterParams: any[] = [businessId, userId];
+    // userId is $1 — businessId is NOT passed (involvement-based visibility is
+    // platform-wide now, and an unused $1 makes Postgres throw 42P18).
+    const filterParams: any[] = [userId];
     if (fromParam && !isNaN(new Date(fromParam).getTime())) {
       filterParams.push(new Date(fromParam).toISOString());
       fromFilter = ` AND m.start_time >= $${filterParams.length}`;
@@ -288,12 +290,12 @@ export const getMeetings: RequestHandler = async (
       `SELECT COUNT(*) as total
        FROM meetings m
        WHERE (
-         m.created_by = $2
-         OR m.host_id = $2
-         OR m.co_host_id = $2
+         m.created_by = $1
+         OR m.host_id = $1
+         OR m.co_host_id = $1
          OR EXISTS (
            SELECT 1 FROM meeting_attendees ma
-           WHERE ma.meeting_id = m.id AND ma.user_id = $2
+           WHERE ma.meeting_id = m.id AND ma.user_id = $1
          )
        )${fromFilter}${toFilter}`,
       filterParams,
@@ -326,12 +328,12 @@ export const getMeetings: RequestHandler = async (
       FROM meetings m
       LEFT JOIN meeting_attendees ma ON m.id = ma.meeting_id
       WHERE (
-        m.created_by = $2
-        OR m.host_id = $2
-        OR m.co_host_id = $2
+        m.created_by = $1
+        OR m.host_id = $1
+        OR m.co_host_id = $1
         OR EXISTS (
           SELECT 1 FROM meeting_attendees current_ma
-          WHERE current_ma.meeting_id = m.id AND current_ma.user_id = $2
+          WHERE current_ma.meeting_id = m.id AND current_ma.user_id = $1
         )
       )${fromFilter}${toFilter}
       GROUP BY m.id

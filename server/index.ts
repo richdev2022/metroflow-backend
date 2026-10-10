@@ -388,8 +388,14 @@ export async function createServer() {
       const duration = Date.now() - start;
       const status = res.statusCode;
       const log = `${method} ${url} ${status} - ${duration}ms`;
-      
-      if (status >= 400) {
+
+      // Only genuine SERVER faults (5xx) belong in stderr/pm2-error.
+      // 4xx are client outcomes — internet scanners constantly probe public
+      // APIs (/.git/config, /webui/, unknown admin paths...) and every one of
+      // those correctly-rejected probes was flooding the error log and
+      // masking real errors. They stay fully visible in the out log and in
+      // the api_request_logs audit table.
+      if (status >= 500) {
         console.error(log);
       } else {
         console.log(log);

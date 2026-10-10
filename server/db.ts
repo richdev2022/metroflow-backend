@@ -1423,6 +1423,31 @@ export async function initializeDatabase() {
       await query(`INSERT INTO platform_wallet (balance, currency) VALUES (0, 'NGN')`);
     }
 
+    // Ledger adjustments audit trail: every admin credit/debit correction on
+    // the Platform (operational) or Revenue ledger — who, when, narration,
+    // before/after balances — surfaced on the admin "Ledger Adjustments" page.
+    await query(`
+      CREATE TABLE IF NOT EXISTS ledger_adjustments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        ledger_type VARCHAR(20) NOT NULL,
+        direction VARCHAR(10) NOT NULL,
+        currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+        amount NUMERIC(20, 2) NOT NULL,
+        balance_before NUMERIC(20, 2),
+        balance_after NUMERIC(20, 2),
+        narration TEXT NOT NULL,
+        reference VARCHAR(160),
+        admin_id UUID,
+        admin_email VARCHAR(255),
+        admin_name VARCHAR(255),
+        ip VARCHAR(64),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_ledger_adjustments_created ON ledger_adjustments(created_at DESC)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_ledger_adjustments_type ON ledger_adjustments(ledger_type)`);
+
     const defaultFees = [
       {
         name: 'Standard Transfer Fee',

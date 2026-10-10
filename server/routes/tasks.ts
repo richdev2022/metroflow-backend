@@ -106,11 +106,29 @@ export const getBoard: RequestHandler = async (req: AuthenticatedRequest, res) =
       isOverdue: task.status !== 'completed' ? isOverdue(task.endDate, task.dueDate) : false
     }));
 
-    // group tasks by status
-    const board = statusesResult.rows.map(status => ({
+    // Group tasks by status. Matching is CASE-INSENSITIVE: legacy clients
+    // wrote display labels ("In Progress", "Pending") while columns are
+    // named in_progress/pending — an exact `===` used to ORPHAN such tasks
+    // (visible in the tasks LIST, invisible on the BOARD, click-from-list
+    // still opened them — the "board not displaying tasks" bug). Any task
+    // whose status matches NO column is appended to the first column so a
+    // task can NEVER vanish from the board.
+    const statusRows = statusesResult.rows;
+    const columnByLowerName = new Map(statusRows.map(s => [String(s.name).toLowerCase(), s]));
+    const orphanTasks: any[] = [];
+    for (const task of tasksWithOverdueStatus) {
+      const key = String(task.status ?? '').toLowerCase();
+      if (!columnByLowerName.has(key)) orphanTasks.push(task);
+    }
+    const board = statusRows.map(status => ({
       ...status,
-      tasks: tasksWithOverdueStatus.filter(task => task.status === status.name)
+      tasks: tasksWithOverdueStatus.filter(
+        task => String(task.status ?? '').toLowerCase() === String(status.name).toLowerCase()
+      )
     }));
+    if (orphanTasks.length && board.length) {
+      board[0].tasks.push(...orphanTasks);
+    }
 
     const response: ApiResponse<any> = {
       success: true,

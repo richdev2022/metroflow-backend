@@ -179,7 +179,7 @@ export async function pushMissedCall(
           callCode: info.callCode || "",
           status: info.status || "missed",
         },
-        androidChannelId: "general",
+        androidChannelId: "general-v2",
         ttlSeconds: 300,
         // Deliberately tagged like the INCOMING-CALL push: on Android the
         // tag makes the missed-call notice REPLACE the still-ringing tray

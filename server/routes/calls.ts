@@ -10,6 +10,7 @@ import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
 import { pushIncomingCall, pushMissedCall, acknowledgeCallPush } from "../lib/call-push";
 import { roomManager } from "../lib/roomManager";
+import { resolveRecordingMediaUrl } from "../lib/storage";
 import crypto from "crypto";
 import {
   buildCallingCredentials,
@@ -1032,9 +1033,12 @@ export const joinCall: RequestHandler = async (
     // Best-effort: a transient DB hiccup here must not 500 the whole join —
     // the socket join handler admits the user to the room regardless.
     try {
+      // NOTE: $3 must be cast to varchar — "$3 = 'joined'" deduces text while
+      // the column insert deduces character varying → PG 42P08 ("inconsistent
+      // types deduced for parameter $3"). Same fix as joinMeeting.
       await query(
         `INSERT INTO call_participants (call_id, user_id, status, joined_at)
-         VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
+         VALUES ($1, $2, $3::varchar, CASE WHEN $3::varchar = 'joined' THEN CURRENT_TIMESTAMP END)
          ON CONFLICT (call_id, user_id) DO UPDATE SET
            status = EXCLUDED.status,
            joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE call_participants.joined_at END,
@@ -2577,6 +2581,14 @@ export const getCallDetail: RequestHandler = async (req: AuthenticatedRequest, r
         [call.id],
       );
       recording = recordingResult.rows[0] || null;
+      // Bare R2 keys (LiveKit egress) are not playable URLs — presign/normalize
+      if (recording?.storageUrl) {
+        try {
+          recording.storageUrl = await resolveRecordingMediaUrl(recording.storageUrl);
+        } catch (err) {
+          console.error("Failed to resolve call recording URL:", recording.id, err);
+        }
+      }
     } catch { /* recordings table issue must not break the detail view */ }
 
     const conversationId = await findSharedDirectConversation(

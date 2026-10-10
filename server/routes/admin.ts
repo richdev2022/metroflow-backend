@@ -3743,7 +3743,7 @@ protectedRouter.put("/maintenance-mode", requirePermission('manage_settings'), a
                         body: enabled
                             ? 'Metricorex is undergoing maintenance. Some features may be unavailable.'
                             : 'Maintenance complete - Metricorex is fully back up. Thank you for your patience!',
-                        androidChannelId: 'general',
+                        androidChannelId: 'general-v2',
                     }, 'maintenance');
                 } catch (pushErr: any) {
                     console.warn('Maintenance push fan-out failed:', pushErr?.message);
@@ -4306,7 +4306,7 @@ protectedRouter.post("/broadcast", requirePermission('manage_settings'), async (
         let pushesSent = 0;
         if (wantsPush) {
             try {
-                const pushResult = await sendPushToAll({ title: subject, body: message, androidChannelId: 'general' }, 'broadcast');
+                const pushResult = await sendPushToAll({ title: subject, body: message, androidChannelId: 'general-v2' }, 'broadcast');
                 pushesSent = pushResult.sent;
             } catch (pushErr: any) {
                 console.warn('Broadcast push failed:', pushErr?.message);

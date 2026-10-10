@@ -162,7 +162,7 @@ router.post("/push-send", authenticateToken, async (req: AuthenticatedRequest, r
           callerId: userId,
           callCode: "",
         },
-        androidChannelId: "calls",
+        androidChannelId: "calls-v3",
         ttlSeconds: 45,
         collapseKey: `incoming-call-push-test-${stamp}`,
         androidDataOnly: true,

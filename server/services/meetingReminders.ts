@@ -232,7 +232,7 @@ export async function processDueMeetingReminders(): Promise<{ processed: number 
               meetingId: String(reminder.meeting_id),
               meetingCode: String(reminder.meetingCode || ""),
             },
-            androidChannelId: "general-v2",
+            androidChannelId: "general-v3",
           },
           { inApp: true, type: "meeting-reminder", businessId: reminder.businessId },
         );

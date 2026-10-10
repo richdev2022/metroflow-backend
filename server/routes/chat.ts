@@ -78,6 +78,21 @@ async function getBusinessUserIds(userIds: string[], businessId: string) {
   return new Set(result.rows.map((row) => row.id));
 }
 
+/// Platform-wide user-id validation: chat participants may come from ANY
+/// Metricorex workspace — the ONLY requirement is that they exist on the
+/// platform. Guests (chat_guest_contacts) are reserved for emails that do
+/// not resolve to a registered user at all.
+async function getPlatformUserIds(userIds: string[]) {
+  if (userIds.length === 0) return new Set<string>();
+
+  const result = await query(
+    `SELECT id FROM users WHERE id = ANY($1::uuid[])`,
+    [userIds],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
+}
+
 // ---------------------------------------------------------------------------
 // Block enforcement (WhatsApp-style contact blocking, direct chats only)
 // ---------------------------------------------------------------------------
@@ -153,13 +168,16 @@ async function getBlockDirection(
   blockerCandidate: string,
   otherCandidate: string,
 ): Promise<"i-blocked-them" | "they-blocked-me" | null> {
+  // Block checks are USER-PAIR scoped, not business scoped: with cross-
+  // workspace chats, the block row may carry the OTHER user's business id,
+  // and filtering by the caller's business would silently miss it.
+  void businessId;
   const result = await query(
     `SELECT blocker_id as "blockerId"
      FROM user_blocks
-     WHERE business_id = $1
-       AND ((blocker_id = $2 AND blocked_id = $3) OR (blocker_id = $3 AND blocked_id = $2))
+     WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)
      LIMIT 1`,
-    [businessId, blockerCandidate, otherCandidate],
+    [blockerCandidate, otherCandidate],
   );
   const row = result.rows[0];
   if (!row) return null;
@@ -191,13 +209,17 @@ async function ensureConversationParticipant(
   businessId: string,
   userId: string,
 ) {
+  // businessId is intentionally unused: conversations are cross-workspace
+  // (platform-wide lookup), so membership alone grants access. The parameter
+  // stays to keep every call site signature-stable.
+  void businessId;
   const result = await query(
     `SELECT cc.id
      FROM chat_conversations cc
      JOIN chat_participants cp_current ON cc.id = cp_current.conversation_id
-     WHERE cc.id = $1 AND cc.business_id = $2 AND cp_current.user_id = $3
+     WHERE cc.id = $1 AND cp_current.user_id = $2
      LIMIT 1`,
-    [conversationId, businessId, userId],
+    [conversationId, userId],
   );
 
   return result.rows.length > 0;
@@ -252,14 +274,30 @@ export const lookupChatContact: RequestHandler = async (req, res) => {
       return res.status(400).json({ success: false, error: "Enter a valid email address" });
     }
 
-    const member = await query(
-      `SELECT id, name FROM users WHERE business_id = $1 AND LOWER(email) = $2 LIMIT 1`,
-      [businessId, email],
+    // PLATFORM-WIDE lookup: the email resolves against EVERY registered
+    // Metricorex user, not just this workspace. Any registered user is
+    // chattable + status-visible cross-workspace; a GUEST contact is only
+    // for emails that do not exist on the platform at all. Same-business
+    // matches win when the email exists under multiple workspaces.
+    const platformUser = await query(
+      `SELECT id, name, business_id as "businessId"
+         FROM users
+        WHERE LOWER(email) = $1
+        ORDER BY (business_id = $2) DESC
+        LIMIT 1`,
+      [email, businessId],
     );
-    if (member.rows.length > 0) {
+    if (platformUser.rows.length > 0) {
+      const u = platformUser.rows[0];
       return res.json({
         success: true,
-        data: { registered: true, name: member.rows[0].name, userId: member.rows[0].id },
+        data: {
+          registered: true,
+          platform: true,
+          sameBusiness: u.businessId === businessId,
+          name: u.name,
+          userId: u.id,
+        },
       });
     }
 
@@ -305,15 +343,16 @@ export const inviteChatContact: RequestHandler = async (req, res) => {
       return res.status(400).json({ success: false, error: "Enter a valid email address" });
     }
 
-    // Workspace members don't need invites — they are already chattable.
+    // Registered Metricorex users (this workspace or any other) don't need
+    // invites — they are already chattable via a normal direct chat.
     const member = await query(
-      `SELECT id FROM users WHERE business_id = $1 AND LOWER(email) = $2 LIMIT 1`,
-      [businessId, email],
+      `SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1`,
+      [email],
     );
     if (member.rows.length > 0) {
       return res.status(400).json({
         success: false,
-        error: "This person is already on your workspace — start a chat with them directly",
+        error: "This person is already on Metricorex — start a chat with them directly",
       });
     }
 
@@ -374,9 +413,13 @@ export const getChatGuestContacts: RequestHandler = async (req, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    // Guests whose email has SINCE become a registered Metricorex user are no
+    // longer "waiting to join" — the client should start a normal direct chat
+    // with them instead, so they are filtered out here.
     const rows = await query(
-      `SELECT id, email, invited_at as "invitedAt" FROM chat_guest_contacts
-       WHERE owner_user_id = $1
+      `SELECT id, email, invited_at as "invitedAt" FROM chat_guest_contacts g
+       WHERE g.owner_user_id = $1
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE LOWER(u.email) = g.email)
        ORDER BY invited_at DESC LIMIT 100`,
       [userId],
     );
@@ -489,7 +532,12 @@ export const getConversations: RequestHandler = async (
             AND cm.created_at > COALESCE(cp_me.last_read_at, cp_me.created_at, to_timestamp(0))
         ) as "unreadCount"
       FROM chat_conversations cc
-      WHERE cc.business_id = $1 AND EXISTS (
+      -- Participant membership IS the visibility predicate: conversations
+      -- are cross-workspace now (platform-wide lookup), so an explicit
+      -- business_id filter would HIDE a cross-business direct chat from the
+      -- other participant. Members are only ever added through validated
+      -- APIs, so membership alone is safe.
+      WHERE EXISTS (
         SELECT 1 FROM chat_participants cp_current
         WHERE cp_current.conversation_id = cc.id AND cp_current.user_id = $2
       )
@@ -808,11 +856,14 @@ export const createConversation: RequestHandler = async (
     }
 
     const uniqueParticipantIds = [...new Set([userId, ...providedIds])];
-    const validParticipantIds = await getBusinessUserIds(uniqueParticipantIds, businessId);
+    // Platform-wide: participants may be ANY registered Metricorex user
+    // (cross-workspace direct chats and groups are allowed). Guests are not
+    // valid here — they must register first.
+    const validParticipantIds = await getPlatformUserIds(uniqueParticipantIds);
     if (validParticipantIds.size !== uniqueParticipantIds.length) {
       return res.status(400).json({
         success: false,
-        error: "All chat participants must belong to this business",
+        error: "All chat participants must be registered Metricorex users",
       });
     }
 
@@ -1215,7 +1266,7 @@ export const sendMessage: RequestHandler = async (
                   message: preview,
                   badge: String(unreadByUser.size > 0 ? Math.max(...unreadByUser.values()) : 1),
                 },
-                androidChannelId: "messages",
+                androidChannelId: "messages-v3",
                 // iOS alerts are automatic (push.ts detects iOS tokens and
                 // sends a real APNs alert with the data badge).
                 // A message notification older than an hour is noise.
@@ -2323,10 +2374,11 @@ export const addChatParticipants: RequestHandler = async (req: AuthenticatedRequ
       return res.status(400).json({ success: false, error: "Invalid chat participants: one or more participant ids are not valid user ids" });
     }
 
-    const validIds = await getBusinessUserIds(list, businessId);
+    // Platform-wide: group members may be ANY registered Metricorex user.
+    const validIds = await getPlatformUserIds(list);
     const targets = list.filter((pid: string) => validIds.has(pid));
     if (targets.length === 0) {
-      return res.status(400).json({ success: false, error: "All chat participants must belong to this business" });
+      return res.status(400).json({ success: false, error: "All chat participants must be registered Metricorex users" });
     }
 
     const added: any[] = [];

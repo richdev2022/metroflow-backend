@@ -26,12 +26,16 @@ interface CallUserFromDb {
 }
 
 async function getBusinessUserIdsForCalls(userIds: string[], businessId: string): Promise<Map<string, CallUserFromDb>> {
+  // Platform-wide: chat (and therefore calls started from a chat) is cross-
+  // workspace — resolve ANY registered Metricorex user. businessId kept in
+  // the signature for call-site stability.
+  void businessId;
   if (userIds.length === 0) return new Map<string, CallUserFromDb>();
 
   const placeholders = userIds.map((_, i) => `$${i + 1}`).join(',');
   const result = await query(
-    `SELECT id, name, email FROM users WHERE business_id = $1 AND id IN (${placeholders})`,
-    [businessId, ...userIds],
+    `SELECT id, name, email FROM users WHERE id IN (${placeholders})`,
+    [...userIds],
   );
 
   return new Map<string, CallUserFromDb>(result.rows.map((row: CallUserFromDb) => [row.id, row]));
@@ -81,11 +85,15 @@ async function resolveUserName(userId: string | null | undefined): Promise<strin
 }
 
 async function getBusinessUserIds(userIds: string[], businessId: string) {
+  // Platform-wide: call participants may be ANY registered Metricorex user
+  // (cross-workspace direct chats start calls too). businessId kept for
+  // call-site stability.
+  void businessId;
   if (userIds.length === 0) return new Set<string>();
 
   const result = await query(
-    `SELECT id FROM users WHERE business_id = $1 AND id = ANY($2::uuid[])`,
-    [businessId, userIds],
+    `SELECT id FROM users WHERE id = ANY($1::uuid[])`,
+    [userIds],
   );
 
   return new Set(result.rows.map((row) => row.id));
@@ -136,8 +144,7 @@ export const getCalls: RequestHandler = async (
     const countResult = await query(
       `SELECT COUNT(*) as total
        FROM calls c
-       WHERE c.business_id = $1
-       AND (
+       WHERE (
          c.created_by = $2
          OR c.host_id = $2
          OR c.co_host_id = $2
@@ -290,7 +297,7 @@ export const createCall: RequestHandler = async (
     if (validParticipantIds.size !== uniqueParticipantIds.length) {
       return res.status(400).json({
         success: false,
-        error: "All call participants must belong to this business",
+        error: "All call participants must be registered Metricorex users",
       });
     }
 
@@ -706,7 +713,7 @@ export const updateCall: RequestHandler = async (
       if (!validCoHostIds.has(coHostId)) {
         return res.status(400).json({
           success: false,
-          error: "Call co-host must belong to this business",
+          error: "Call co-host must be a registered Metricorex user",
         });
       }
     }
@@ -1761,7 +1768,7 @@ export const addCallParticipants: RequestHandler = async (
       if (validUserIds.size !== uniqueParticipantIds.length) {
         return res.status(400).json({
           success: false,
-          error: "All participants must belong to this business",
+          error: "All participants must be registered Metricorex users",
         });
       }
     }

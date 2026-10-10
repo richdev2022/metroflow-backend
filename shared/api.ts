@@ -259,6 +259,8 @@ export interface RegisterBusinessInput {
    * the owner upgrades via the Business KYC flow and an admin approves it.
    */
   businessType?: "registered" | "non_registered";
+  /** Optional Refer & Earn referral code — attributes this signup to a referrer. */
+  referralCode?: string;
 }
 
 export interface LoginInput {
@@ -320,6 +322,8 @@ export interface GoogleAuthInput {
   credential: string;
   businessName?: string;
   businessIndustry?: string;
+  /** Optional Refer & Earn referral code — attributes this signup to a referrer. */
+  referralCode?: string;
 }
 
 export interface GoogleAuthUser {
@@ -360,6 +364,10 @@ export interface MeResponse {
   emailVerified: boolean;
   kycStatus: string;
   phoneNumber?: string | null;
+  /** Refer & Earn — this user's own referral code (lazily minted). */
+  referralCode?: string | null;
+  /** True when this account was referred by another user. */
+  hasReferrer?: boolean;
 }
 
 // Task Creation with new fields

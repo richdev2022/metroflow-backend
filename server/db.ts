@@ -415,6 +415,8 @@ const EXPECTED_TABLES = [
   "meeting_transcripts",
   "meeting_notes",
   "user_blocks",
+  // ---- Refer & Earn ----
+  "referral_bonuses",
 ];
 
 /**
@@ -446,6 +448,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "locked_until",
     // Team Roles & Permissions (ensureTeamRolesSchema)
     "role_id",
+    // Refer & Earn (ensureReferralSchema)
+    "referral_code",
+    "referred_by",
   ],
   businesses: ["id", "name", "email", "plan_id", "owner_id", "trial_ends_at"],
   login_attempts: ["id", "email", "success"],

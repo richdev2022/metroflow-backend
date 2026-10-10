@@ -4,6 +4,7 @@ import { query, pool } from "../db";
 import { getProvider } from "../services/providers/factory";
 import { processSubscriptionRenewals } from "../services/subscription";
 import { creditRevenueWallet } from "../services/fees";
+import { maybePayReferralBonus } from "../services/referral";
 import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail, generateSubscriptionActivatedEmail } from "../services/email";
 import crypto from "crypto";
 import axios from "axios";
@@ -1180,6 +1181,11 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
             undefined,
             { revenueType: 'subscription' },
         );
+
+        // Refer & Earn: on the referred business's FIRST successful
+        // subscription, credit the referrer's wallet from platform revenue.
+        // Idempotent + never throws into the payment flow.
+        maybePayReferralBonus(transaction.business_id, transaction.plan_id);
 
         try {
             const businessRes = await query(`SELECT name, email FROM businesses WHERE id = $1`, [transaction.business_id]);

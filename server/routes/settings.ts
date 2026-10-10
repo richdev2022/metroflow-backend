@@ -81,7 +81,8 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
                     job_title as "jobTitle", department,
                     bank_code as "bankCode", bank_name as "bankName", account_number as "accountNumber",
                     account_name as "accountName", verification_status as "verificationStatus",
-                    verified_account_name as "verifiedAccountName"
+                    verified_account_name as "verifiedAccountName",
+                    referral_code as "referralCode"
              FROM users WHERE id = $1`,
             [userId]
         );

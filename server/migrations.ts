@@ -36,6 +36,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
   await ensureChatInviteSchema(); // group chat invite links (join by code)
+  await ensureReferralSchema(); // Refer & Earn: referral codes + bonus ledger
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2239,6 +2240,47 @@ async function ensureBusinessRegistrationSchema(): Promise<void> {
   `);
 
   console.log("[migrations] business registration + KYC upgrade schema applied");
+}
+
+/**
+ * Refer & Earn: per-user referral codes + the referral bonus ledger.
+ * - users.referral_code — unique per user (partial unique index, NULL-safe)
+ * - users.referred_by   — the referrer for signup attribution
+ * - referral_bonuses    — one row per referred user, UNIQUE(referred_user_id)
+ *   doubles as the payout idempotency anchor (ON CONFLICT DO NOTHING).
+ * - system_settings defaults are seeded so the admin UI always has values.
+ */
+async function ensureReferralSchema(): Promise<void> {
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(20)`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id) ON DELETE SET NULL`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS referral_bonuses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      referrer_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      referred_user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      referred_business_id VARCHAR(255) REFERENCES businesses(id) ON DELETE SET NULL,
+      plan_id UUID,
+      amount DECIMAL(15, 2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      status VARCHAR(20) NOT NULL DEFAULT 'paid',
+      reference VARCHAR(255) UNIQUE,
+      transaction_id UUID,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_referral_bonuses_referrer ON referral_bonuses(referrer_user_id, created_at DESC)`);
+
+  // Admin-configurable bonus defaults (seeded once — admin edits win).
+  await query(`
+    INSERT INTO system_settings (key, value, description) VALUES
+      ('referral_bonus_enabled', 'true', 'Refer & Earn master switch (true/false)'),
+      ('referral_bonus_amount', '5000', 'Referral bonus credited to the referrer wallet when a referred business subscribes'),
+      ('referral_bonus_currency', 'NGN', 'Currency of the referral bonus')
+    ON CONFLICT (key) DO NOTHING
+  `);
 }
 
 /**

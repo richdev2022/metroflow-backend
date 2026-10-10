@@ -18,6 +18,12 @@ import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
 import { verifyPayment } from "../services/squad";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
+import {
+  creditPlatformWallet,
+  debitPlatformWallet,
+  creditRevenueWallet,
+  debitRevenueWallet,
+} from "../services/fees";
 
 import * as XLSX from "xlsx";
 import { generateBusinessId } from "../utils/idGenerator";
@@ -5982,6 +5988,219 @@ protectedRouter.put("/transaction-limits", requirePermission("manage_businesses"
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to update transaction limits" });
     }
+});
+
+// ===========================================================================
+// LEDGER ADJUSTMENTS — admin credit/debit corrections on the Platform
+// (operational) and Revenue ledgers, for when a transaction doesn't balance.
+//
+// Every adjustment:
+//   1. moves the balance through the SAME helpers the product code uses
+//      (creditPlatformWallet / debitPlatformWallet / creditRevenueWallet /
+//      debitRevenueWallet), so the ledger HISTORY rows are written exactly
+//      like organic movements (balance + transactions row with the
+//      adjustment reference), and
+//   2. writes an immutable audit row into `ledger_adjustments` (who, when,
+//      narration, before/after balances, reference) — surfaced on the admin
+//      "Ledger Adjustments" page with filters + per-ledger summaries.
+// Gated by `manage_finance`; overdraft debits are rejected unless
+// `allowNegative` is explicitly true.
+// ===========================================================================
+
+type LedgerType = "platform" | "revenue";
+
+/** Current balance of a ledger for one currency (0 + row created lazily). */
+async function readLedgerBalance(ledgerType: LedgerType, currency: string): Promise<number> {
+  if (ledgerType === "revenue") {
+    const res = await query(`SELECT balance FROM platform_wallet WHERE currency = $1 LIMIT 1`, [currency]);
+    return Number(res.rows[0]?.balance ?? 0);
+  }
+  // Platform operational wallet: the internal wallets row with no owner.
+  const res = await query(
+    `SELECT balance FROM wallets WHERE business_id IS NULL AND user_id IS NULL AND currency = $1 LIMIT 1`,
+    [currency]
+  );
+  return Number(res.rows[0]?.balance ?? 0);
+}
+
+protectedRouter.get("/ledger-adjustments/balances", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const data: Record<string, any> = { platform: [], revenue: [] };
+    const platform = await query(
+      `SELECT currency, balance FROM wallets
+        WHERE business_id IS NULL AND user_id IS NULL
+        ORDER BY (currency = 'NGN') DESC, currency ASC`
+    );
+    data.platform = platform.rows.map((r: any) => ({ currency: r.currency, balance: Number(r.balance) }));
+    const revenue = await query(`SELECT currency, balance FROM platform_wallet ORDER BY (currency = 'NGN') DESC, currency ASC`);
+    data.revenue = revenue.rows.map((r: any) => ({ currency: r.currency, balance: Number(r.balance) }));
+    res.json({ success: true, data });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message || "Failed to read ledger balances" });
+  }
+});
+
+protectedRouter.post("/ledger-adjustments", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const admin = req.admin;
+    if (!admin?.adminId) {
+      return res.status(401).json({ success: false, error: "Admin authentication required" });
+    }
+
+    const ledgerType = String(req.body?.ledgerType ?? "").toLowerCase() as LedgerType;
+    const direction = String(req.body?.direction ?? "").toLowerCase();
+    const currency = String(req.body?.currency ?? "NGN").toUpperCase().trim();
+    const amount = Number(req.body?.amount);
+    const narration = String(req.body?.narration ?? "").trim();
+    const allowNegative = req.body?.allowNegative === true;
+
+    if (ledgerType !== "platform" && ledgerType !== "revenue") {
+      return res.status(400).json({ success: false, error: "ledgerType must be 'platform' or 'revenue'" });
+    }
+    if (direction !== "credit" && direction !== "debit") {
+      return res.status(400).json({ success: false, error: "direction must be 'credit' or 'debit'" });
+    }
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({ success: false, error: "currency must be a 3-letter code (e.g. NGN)" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "amount must be a positive number" });
+    }
+    if (narration.length < 3) {
+      return res.status(400).json({ success: false, error: "narration is required (min 3 chars) — explain WHY the ledger is being adjusted" });
+    }
+
+    const balanceBefore = await readLedgerBalance(ledgerType, currency);
+    if (direction === "debit" && !allowNegative && balanceBefore < amount) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient ${ledgerType} ledger balance: ${balanceBefore.toFixed(2)} ${currency} available, ${amount.toFixed(2)} ${currency} requested. Credit the ledger first or pass allowNegative to force an overdraw.`,
+      });
+    }
+
+    // Deterministic adjustment reference so the ledger history row and the
+    // audit row cross-reference each other (helpers append -REVENUE-* suffixes
+    // for the revenue ledger).
+    const reference = `ADJ-${ledgerType.toUpperCase()}-${direction.toUpperCase()}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    const description = `Ledger adjustment (${direction}) — ${narration} [by admin ${admin.adminId}]`;
+
+    if (ledgerType === "platform") {
+      if (direction === "credit") {
+        await creditPlatformWallet(amount, currency, reference, description);
+      } else {
+        await debitPlatformWallet(amount, currency, reference, description);
+      }
+    } else {
+      if (direction === "credit") {
+        await creditRevenueWallet(amount, currency, reference, description, null);
+      } else {
+        await debitRevenueWallet(amount, currency, reference, description);
+      }
+    }
+
+    const balanceAfter = await readLedgerBalance(ledgerType, currency);
+
+    // Audit snapshot of WHO adjusted (admin table is the source of truth for
+    // email/name — role changes later must not rewrite history).
+    const adminRow = await query(`SELECT email, name FROM platform_admins WHERE id = $1 LIMIT 1`, [admin.adminId]);
+
+    const insert = await query(
+      `INSERT INTO ledger_adjustments
+        (ledger_type, direction, currency, amount, balance_before, balance_after,
+         narration, reference, admin_id, admin_email, admin_name, ip, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING *`,
+      [
+        ledgerType,
+        direction,
+        currency,
+        amount.toFixed(2),
+        balanceBefore.toFixed(2),
+        balanceAfter.toFixed(2),
+        narration,
+        reference,
+        admin.adminId,
+        adminRow.rows[0]?.email ?? null,
+        adminRow.rows[0]?.name ?? null,
+        (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || null,
+        (req.headers["user-agent"] as string)?.slice(0, 500) || null,
+      ]
+    );
+
+    console.log(`[admin] LEDGER ADJUSTMENT ${direction} ${amount.toFixed(2)} ${currency} on ${ledgerType} ledger by ${adminRow.rows[0]?.email ?? admin.adminId}: ${narration} (${balanceBefore.toFixed(2)} -> ${balanceAfter.toFixed(2)}) ref=${reference}`);
+
+    res.json({ success: true, message: `${direction === "credit" ? "Credited" : "Debited"} ${amount.toFixed(2)} ${currency} on the ${ledgerType} ledger`, data: insert.rows[0] });
+  } catch (error: any) {
+    console.error("Ledger adjustment error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to adjust ledger" });
+  }
+});
+
+protectedRouter.get("/ledger-adjustments", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const offset = (page - 1) * limit;
+
+    const filters: string[] = [];
+    const params: any[] = [];
+    const addFilter = (clause: string, ...values: any[]) => {
+      for (const value of values) {
+        params.push(value);
+        clause = clause.replace("?", `$${params.length}`);
+      }
+      filters.push(clause);
+    };
+
+    const ledgerType = String(req.query.ledgerType ?? "").toLowerCase();
+    if (ledgerType === "platform" || ledgerType === "revenue") addFilter(`ledger_type = ?`, ledgerType);
+    const direction = String(req.query.direction ?? "").toLowerCase();
+    if (direction === "credit" || direction === "debit") addFilter(`direction = ?`, direction);
+    if (req.query.adminId) addFilter(`admin_id = ?`, String(req.query.adminId));
+    if (req.query.currency) addFilter(`currency = ?`, String(req.query.currency).toUpperCase());
+    if (req.query.from) addFilter(`created_at >= ?`, new Date(String(req.query.from)));
+    if (req.query.to) addFilter(`created_at <= ?`, new Date(String(req.query.to)));
+    if (req.query.q) {
+      const q = `%${String(req.query.q).trim()}%`;
+      addFilter(`(narration ILIKE ? OR reference ILIKE ? OR admin_email ILIKE ?)`, q, q, q);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const countRes = await query(`SELECT COUNT(*)::int AS total FROM ledger_adjustments ${where}`, params);
+    const total = countRes.rows[0]?.total ?? 0;
+
+    const rows = await query(
+      `SELECT * FROM ledger_adjustments ${where}
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params
+    );
+
+    // Per-ledger summary (unfiltered by ledgerType/direction so the page
+    // header always shows the full correction volumes).
+    const summary = await query(
+      `SELECT ledger_type, direction, COUNT(*)::int AS count, COALESCE(SUM(amount), 0) AS total_amount
+         FROM ledger_adjustments
+        GROUP BY ledger_type, direction`
+    );
+
+    res.json({
+      success: true,
+      data: rows.rows,
+      total,
+      page,
+      limit,
+      summary: summary.rows.map((r: any) => ({
+        ledgerType: r.ledger_type,
+        direction: r.direction,
+        count: Number(r.count),
+        totalAmount: Number(r.total_amount),
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch ledger adjustments" });
+  }
 });
 
 export default router;

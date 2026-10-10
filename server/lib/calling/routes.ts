@@ -36,8 +36,16 @@ async function resolveRoom(roomType: "call" | "meeting", idOrCode: string, busin
   const table = roomType === "call" ? "calls" : "meetings";
   const codeCol = roomType === "call" ? "call_code" : "meeting_code";
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrCode);
+  // The two tables model the "room over" deadline on DIFFERENT columns:
+  // calls.ended_at exists but calls has NO end_time, and meetings.end_time
+  // exists but meetings has NO ended_at. Selecting both unconditionally threw
+  // PG 42703 ("column does not exist") on EVERY /rtc/rooms/* route —
+  // recording start/stop, participant mute/remove — for BOTH room types.
+  const deadlineCols = roomType === "call"
+    ? `ended_at, NULL::timestamptz AS end_time`
+    : `NULL::timestamptz AS ended_at, end_time`;
   const res = await query(
-    `SELECT id, provider, ended_at, end_time, status, max_participants, password, host_id, co_host_id, created_by
+    `SELECT id, provider, ${deadlineCols}, status, max_participants, password, host_id, co_host_id, created_by
      FROM ${table} WHERE ${isUuid ? "id" : codeCol} = $1 AND business_id = $2`,
     [idOrCode, businessId],
   );

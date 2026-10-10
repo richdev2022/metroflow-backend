@@ -15,6 +15,7 @@ import {
 } from "../lib/calling/factory";
 import { generateMeetingNotes, hasSummarizableTranscript } from "../lib/meeting-notes";
 import { resolveSpeakerNames } from "../lib/speaker-names";
+import { resolveRecordingMediaUrl } from "../lib/storage";
 import {
   computeOccurrences,
   isRecurrenceInput,
@@ -61,7 +62,7 @@ async function pushMeetingInvite(
           inviterName: info.inviterName,
           ...(info.startTime ? { startTime: info.startTime.toISOString() } : {}),
         },
-        androidChannelId: "general",
+        androidChannelId: "general-v2",
         ttlSeconds: 86400,
         collapseKey: `meeting-invite-${info.meetingId}`,
       },
@@ -1953,9 +1954,13 @@ export const joinMeeting: RequestHandler = async (
     );
     // Atomic upsert below; the SELECT remains only as a cheap pre-check for
     // the waiting-room vs re-join branches.
+    // NOTE: $3 MUST be cast to varchar. Postgres deduces "$3 = 'joined'" as
+    // text but the column insert as character varying → PG error 42P08
+    // ("inconsistent types deduced for parameter $3"), which 500'd EVERY
+    // meeting join. Same class of bug as the ledger backfill 42P08.
     await query(
       `INSERT INTO meeting_attendees (meeting_id, user_id, status, joined_at)
-       VALUES ($1, $2, $3, CASE WHEN $3 = 'joined' THEN CURRENT_TIMESTAMP END)
+       VALUES ($1, $2, $3::varchar, CASE WHEN $3::varchar = 'joined' THEN CURRENT_TIMESTAMP END)
        ON CONFLICT (meeting_id, user_id) DO UPDATE SET
          status = EXCLUDED.status,
          joined_at = CASE WHEN EXCLUDED.status = 'joined' THEN CURRENT_TIMESTAMP ELSE meeting_attendees.joined_at END,
@@ -2950,6 +2955,17 @@ export const getMeetingReport: RequestHandler = async (req: AuthenticatedRequest
         [meeting.id],
       );
       recordings = recordingsResult.rows;
+      // Bare R2 keys (LiveKit egress) are not playable URLs — presign/normalize
+      await Promise.all(recordings.map(async (rec: any) => {
+        if (rec?.storageUrl) {
+          try {
+            rec.storageUrl = await resolveRecordingMediaUrl(rec.storageUrl);
+          } catch (err) {
+            console.error("Failed to resolve meeting recording URL:", rec.id, err);
+          }
+        }
+        return rec;
+      }));
     } catch { /* recordings table may not exist yet */ }
 
     // Duration: completed meetings measure end_time - start_time; ongoing

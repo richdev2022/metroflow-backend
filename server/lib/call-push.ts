@@ -94,7 +94,7 @@ export async function pushIncomingCall(
         callCode: info.callCode || "",
         ...(info.conversationId ? { conversationId: info.conversationId } : {}),
       },
-      androidChannelId: "calls",
+      androidChannelId: "calls-v3",
       // Max-priority heads-up rendering for the VISIBLE fallback (the 4s
       // no-ack escalation): category "call" + PRIORITY_MAX makes FCM's own
       // tray notification banner over anything and use the channel's alarm
@@ -179,7 +179,7 @@ export async function pushMissedCall(
           callCode: info.callCode || "",
           status: info.status || "missed",
         },
-        androidChannelId: "general-v2",
+        androidChannelId: "general-v3",
         ttlSeconds: 300,
         // Deliberately tagged like the INCOMING-CALL push: on Android the
         // tag makes the missed-call notice REPLACE the still-ringing tray
@@ -221,7 +221,7 @@ export async function pushCallCancelled(
           callerName: info.callerName || "",
           reason: info.reason || "caller_hung_up",
         },
-        androidChannelId: "calls",
+        androidChannelId: "calls-v3",
         // SILENT: data-only on both platforms. The iOS branch in push.ts
         // sends a content-available background push (no aps.alert) and the
         // Android branch skips the tray notification — a hung-up call must

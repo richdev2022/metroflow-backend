@@ -24,6 +24,7 @@ import {
   creditRevenueWallet,
   debitRevenueWallet,
 } from "../services/fees";
+import { maybePayReferralBonus, getReferralConfig } from "../services/referral";
 
 import * as XLSX from "xlsx";
 import { generateBusinessId } from "../utils/idGenerator";
@@ -429,7 +430,7 @@ protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), asy
       SELECT COALESCE(SUM(amount), 0) as sum
       FROM transactions
       WHERE status = 'success'
-        AND transaction_type IN ('fee', 'subscription')
+        AND transaction_type IN ('fee', 'subscription', 'referral_bonus')
         AND wallet_id IS NULL
         AND type = 'credit'
     `);
@@ -477,7 +478,7 @@ protectedRouter.get("/dashboard/charts", requirePermission('view_dashboard'), as
       LEFT JOIN transactions t 
         ON date_trunc('month', t.created_at) = d 
         AND t.status = 'success'
-        AND t.transaction_type IN ('fee', 'subscription')
+        AND t.transaction_type IN ('fee', 'subscription', 'referral_bonus')
         AND t.wallet_id IS NULL
         AND t.type = 'credit'
       GROUP BY d
@@ -561,7 +562,7 @@ protectedRouter.get("/revenue", requirePermission('view_dashboard'), async (req,
       ), 0) as balance
       FROM transactions
       WHERE status = 'success'
-      AND transaction_type IN ('subscription', 'fee')
+      AND transaction_type IN ('subscription', 'fee', 'referral_bonus')
       AND wallet_id IS NULL
       GROUP BY currency
     `);
@@ -648,7 +649,7 @@ protectedRouter.get("/revenue/history", requirePermission('view_dashboard'), asy
     // list on production databases that predate the current writer.
     const where = `status = 'success'
          AND (
-           (transaction_type IN ('subscription', 'fee') AND wallet_id IS NULL)
+           (transaction_type IN ('subscription', 'fee', 'referral_bonus') AND wallet_id IS NULL)
            OR transaction_type = 'revenue'
          )`;
     const countRes = await query(
@@ -2574,6 +2575,192 @@ protectedRouter.put("/settings/card-verification-amount", async (req, res) => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// Refer & Earn — admin configuration + referred users ledger
+// ---------------------------------------------------------------------------
+
+/**
+ * @swagger
+ * /admin/referral-config:
+ *   get:
+ *     summary: Get referral bonus configuration
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ */
+protectedRouter.get("/referral-config", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const config = await getReferralConfig();
+        const updated = await query(
+            `SELECT key, value, updated_at FROM system_settings WHERE key LIKE 'referral_bonus_%'`
+        );
+        res.json({ success: true, config, settings: updated.rows });
+    } catch (error) {
+        console.error("Error fetching referral config:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch referral configuration" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referral-config:
+ *   put:
+ *     summary: Update referral bonus configuration
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               enabled:
+ *                 type: boolean
+ *               amount:
+ *                 type: number
+ *               currency:
+ *                 type: string
+ */
+protectedRouter.put("/referral-config", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const { enabled, amount, currency } = req.body || {};
+
+        if (typeof enabled === "boolean") {
+            await setSetting("referral_bonus_enabled", enabled ? "true" : "false", "Refer & Earn master switch (true/false)");
+        }
+        if (amount !== undefined) {
+            const parsed = Number(amount);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                return res.status(400).json({ success: false, error: "Invalid referral bonus amount" });
+            }
+            await setSetting(
+                "referral_bonus_amount",
+                parsed.toString(),
+                "Referral bonus credited to the referrer wallet when a referred business subscribes",
+            );
+        }
+        if (currency !== undefined) {
+            const cur = String(currency).toUpperCase().trim();
+            if (!/^[A-Z]{3}$/.test(cur)) {
+                return res.status(400).json({ success: false, error: "Currency must be a 3-letter ISO code (e.g. NGN, USD)" });
+            }
+            await setSetting("referral_bonus_currency", cur, "Currency of the referral bonus");
+        }
+
+        const config = await getReferralConfig();
+        res.json({ success: true, message: "Referral configuration updated", config });
+    } catch (error) {
+        console.error("Error updating referral config:", error);
+        res.status(500).json({ success: false, error: "Failed to update referral configuration" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referrals:
+ *   get:
+ *     summary: All referred users with referrer, plan and bonus disbursement status
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [all, paid, subscribed, pending] }
+ */
+protectedRouter.get("/referrals", requirePermission('view_businesses'), async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 25));
+        const offset = (page - 1) * limit;
+        const search = ((req.query.search as string) || "").trim();
+        const statusFilter = ((req.query.status as string) || "all").toLowerCase();
+
+        // Base rows: every user that has a referrer, with referrer + business +
+        // bonus + subscription context. Status computed in SQL so pagination
+        // and filtering stay consistent.
+        const conditions: string[] = [`ru.referred_by IS NOT NULL`];
+        const params: any[] = [];
+        if (search) {
+            params.push(`%${search}%`);
+            const idx = params.length;
+            conditions.push(`(ru.name ILIKE $${idx} OR ru.email ILIKE $${idx} OR rr.name ILIKE $${idx} OR rr.email ILIKE $${idx} OR bz.name ILIKE $${idx})`);
+        }
+        if (statusFilter === "paid") {
+            conditions.push(`rb.id IS NOT NULL`);
+        } else if (statusFilter === "subscribed") {
+            conditions.push(`rb.id IS NULL AND (SELECT COUNT(*) FROM transactions t WHERE t.business_id = bz.id AND t.transaction_type = 'subscription' AND t.status = 'success') > 0`);
+        } else if (statusFilter === "pending") {
+            conditions.push(`rb.id IS NULL AND (SELECT COUNT(*) FROM transactions t WHERE t.business_id = bz.id AND t.transaction_type = 'subscription' AND t.status = 'success') = 0`);
+        }
+        const where = conditions.join(" AND ");
+
+        const countRes = await query(
+            `SELECT COUNT(*)::int AS total
+             FROM users ru
+             JOIN users rr ON rr.id = ru.referred_by
+             LEFT JOIN LATERAL (
+               SELECT id, name FROM businesses WHERE owner_id = ru.id ORDER BY created_at LIMIT 1
+             ) bz ON TRUE
+             LEFT JOIN referral_bonuses rb ON rb.referred_user_id = ru.id
+             WHERE ${where}`,
+            params,
+        );
+        const total = countRes.rows[0]?.total ?? 0;
+
+        params.push(limit, offset);
+        const rows = await query(
+            `SELECT ru.id as "referredUserId", ru.name as "referredUserName", ru.email as "referredUserEmail",
+                    ru.created_at as "joinedAt",
+                    rr.id as "referrerUserId", rr.name as "referrerUserName", rr.email as "referrerUserEmail",
+                    rr.referral_code as "referrerCode",
+                    bz.id as "businessId", bz.name as "businessName", bz.plan_id as "planId",
+                    (SELECT COUNT(*)::int FROM transactions t
+                      WHERE t.business_id = bz.id AND t.transaction_type = 'subscription' AND t.status = 'success'
+                    ) as "subscriptionCount",
+                    rb.id as "bonusId", rb.amount as "bonusAmount", rb.currency as "bonusCurrency",
+                    rb.status as "bonusStatus", rb.created_at as "bonusPaidAt", rb.reference as "bonusReference"
+             FROM users ru
+             JOIN users rr ON rr.id = ru.referred_by
+             LEFT JOIN LATERAL (
+               SELECT id, name, plan_id FROM businesses WHERE owner_id = ru.id ORDER BY created_at LIMIT 1
+             ) bz ON TRUE
+             LEFT JOIN referral_bonuses rb ON rb.referred_user_id = ru.id
+             WHERE ${where}
+             ORDER BY ru.created_at DESC
+             LIMIT $${params.length - 1} OFFSET $${params.length}`,
+            params,
+        );
+
+        const referrals = rows.rows.map((r: any) => {
+            const hasBonus = r.bonusId != null;
+            const hasSub = Number(r.subscriptionCount || 0) > 0;
+            return {
+                ...r,
+                subscriptionCount: Number(r.subscriptionCount || 0),
+                bonusAmount: r.bonusAmount != null ? Number(r.bonusAmount) : null,
+                status: hasBonus ? "paid" : hasSub ? "subscribed" : "pending",
+            };
+        });
+
+        res.json({ success: true, referrals, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+    } catch (error) {
+        console.error("Error listing referrals:", error);
+        res.status(500).json({ success: false, error: "Failed to load referrals" });
+    }
+});
+
 // Helper for CSV download
 const sendCSV = (res: any, data: any[], filename: string) => {
     const ws = XLSX.utils.json_to_sheet(data);
@@ -2966,6 +3153,10 @@ protectedRouter.post("/subscription/manual-upgrade", requirePermission('manage_p
              WHERE id = $2`,
             [planId, businessId]
         );
+
+        // Refer & Earn: manual upgrades count as the referred business's
+        // subscription activation (idempotent — first payment only).
+        maybePayReferralBonus(businessId, planCheck.rows[0].id);
 
         res.json({ success: true, message: `Business upgraded to ${planCheck.rows[0].name} (Manual)` });
     } catch (error) {

@@ -11,6 +11,20 @@ export interface AuthenticatedRequest extends Request {
   };
 }
 
+/**
+ * Global augmentation: `authenticateToken` attaches `req.user` at runtime on
+ * EVERY route it guards, but several route files (chat, statuses) type their
+ * handlers as plain RequestHandler and read `req.user`. Declaring the shape
+ * on the core Request interface keeps those files typecheck-clean without
+ * importing AuthenticatedRequest everywhere. Optional — unguarded routes see
+ * `undefined` exactly as at runtime.
+ */
+declare module "express-serve-static-core" {
+  interface Request {
+    user?: AuthenticatedRequest["user"];
+  }
+}
+
 export const authenticateToken = async (
   req: AuthenticatedRequest,
   res: Response,

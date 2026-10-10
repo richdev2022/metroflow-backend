@@ -53,6 +53,9 @@ export const getStatuses: RequestHandler = async (req, res) => {
     const userId = req.user?.userId;
     if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
+    // Visibility = own business + platform-wide CHAT CONTACTS. Chat is
+    // cross-workspace now (platform-wide lookup), so anyone who shares a
+    // conversation with the caller sees their status too — WhatsApp-style.
     const rows = await query(
       `SELECT s.id, s.user_id as "userId", u.name as "authorName", u.avatar_url as "authorAvatar",
               s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
@@ -66,9 +69,19 @@ export const getStatuses: RequestHandler = async (req, res) => {
               EXISTS (SELECT 1 FROM chat_status_likes l WHERE l.status_id = s.id AND l.user_id = $2) as "liked"
          FROM chat_statuses s
          JOIN users u ON u.id = s.user_id
-        WHERE s.business_id = $1 AND s.expires_at > NOW()
+        WHERE s.expires_at > NOW()
+          AND (
+            s.business_id = $1
+            OR s.user_id IN (
+              SELECT DISTINCT cp2.user_id
+                FROM chat_participants cp1
+                JOIN chat_participants cp2
+                  ON cp2.conversation_id = cp1.conversation_id AND cp2.user_id <> cp1.user_id
+               WHERE cp1.user_id = $2
+            )
+          )
         ORDER BY (s.user_id = $2) DESC, s.created_at DESC
-        LIMIT 100`,
+        LIMIT 200`,
       [businessId, userId],
     );
 
@@ -296,8 +309,18 @@ export const repostStatus: RequestHandler = async (req, res) => {
       `SELECT s.id, s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
               s.background_color as "backgroundColor", s.user_id, u.name as "authorName"
          FROM chat_statuses s JOIN users u ON u.id = s.user_id
-        WHERE s.id = $1 AND s.business_id = $2 AND s.expires_at > NOW()`,
-      [id, businessId],
+        WHERE s.id = $1 AND s.expires_at > NOW()
+          AND (
+            s.business_id = $2
+            OR s.user_id IN (
+              SELECT DISTINCT cp2.user_id
+                FROM chat_participants cp1
+                JOIN chat_participants cp2
+                  ON cp2.conversation_id = cp1.conversation_id AND cp2.user_id <> cp1.user_id
+               WHERE cp1.user_id = $3
+            )
+          )`,
+      [id, businessId, userId],
     );
     if (!original.rows.length) return res.status(404).json({ success: false, error: "Status not found" });
     const o = original.rows[0];

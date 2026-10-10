@@ -137,6 +137,18 @@ STALE=0
 HEALTH_JSON="$(curl -sf -m 10 "$BASE/api/health" 2>/dev/null || true)"
 if [ -n "$HEALTH_JSON" ]; then
   ok "/api/health: $(echo "$HEALTH_JSON" | head -c 220)..."
+  # /health now answers 200 with db:"down" while the DB is still initializing
+  # (cold Neon connect + first-run migrations). Wait for it to flip up before
+  # declaring the deploy failed — it is a timing signal, not a broken build.
+  if ! echo "$HEALTH_JSON" | grep -q '"db":"up"'; then
+    echo "  Database still initializing — waiting for db:\"up\" (up to 60s)..."
+    DBWAIT=0
+    while [ $DBWAIT -lt 30 ]; do
+      sleep 2; DBWAIT=$((DBWAIT+1))
+      HEALTH_JSON="$(curl -sf -m 10 "$BASE/api/health" 2>/dev/null || true)"
+      [ -n "$HEALTH_JSON" ] && echo "$HEALTH_JSON" | grep -q '"db":"up"' && break
+    done
+  fi
   echo "$HEALTH_JSON" | grep -q '"metricAi":{"configured":true' \
     && ok "MetricAi: GLM key configured — AI replies live" \
     || warn "MetricAi: GLM_API_KEY missing -> /api/public/metric-ai/ask will 503."
@@ -147,7 +159,7 @@ if [ -n "$HEALTH_JSON" ]; then
     || warn "GIF picker: TENOR_API_KEY not set (chat GIF tab stays hidden — optional)"
   echo "$HEALTH_JSON" | grep -q '"db":"up"' \
     && ok "Database: up" \
-    || { fail "Database: DOWN — check DATABASE_URL"; STALE=1; }
+    || { fail "Database: DOWN after 60s wait — check DATABASE_URL + pm2 logs"; STALE=1; }
 else
   warn "/api/health not available (very old build?) — falling back to route probes"
   CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "$BASE/api/public/app-config")

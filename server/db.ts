@@ -167,8 +167,18 @@ const isTransientDatabaseError = (error: any) => {
     error.code === 'ETIMEDOUT' ||
     error.code === 'ECONNRESET' ||
     error.code === 'ECONNREFUSED' ||
+    error.code === 'EPIPE' ||
+    // Neon/pgbouncer occasionally reaps pooled connections mid-query —
+    // 57P01 "terminating connection due to administrator command",
+    // 57P02/57P03 connection exceptions. Safe to retry: a SELECT re-runs on
+    // a fresh pooled connection and writes are only retried when
+    // DB_RETRY_WRITES=true.
+    error.code === '57P01' ||
+    error.code === '57P02' ||
+    error.code === '57P03' ||
     error.message?.includes('timeout') ||
     error.message?.includes('Connection terminated') ||
+    error.message?.includes('terminating connection') ||
     error.message?.includes('Client has encountered a connection error');
 };
 

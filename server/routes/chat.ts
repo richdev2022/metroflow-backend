@@ -536,10 +536,15 @@ export const getConversations: RequestHandler = async (
       -- are cross-workspace now (platform-wide lookup), so an explicit
       -- business_id filter would HIDE a cross-business direct chat from the
       -- other participant. Members are only ever added through validated
-      -- APIs, so membership alone is safe.
+      -- APIs, so membership alone is safe. hidden_at = "deleted chat"
+      -- (WhatsApp-style delete-for-me; a new incoming message clears it).
       WHERE EXISTS (
         SELECT 1 FROM chat_participants cp_current
-        WHERE cp_current.conversation_id = cc.id AND cp_current.user_id = $2
+        WHERE cp_current.conversation_id = cc.id
+          AND cp_current.user_id = $2
+          -- hidden_at = "deleted chat" (WhatsApp-style delete-for-me; a new
+          -- incoming message clears the flag and the chat reappears).
+          AND cp_current.hidden_at IS NULL
       )
       ORDER BY cc.updated_at DESC`,
       [businessId, userId],
@@ -1159,6 +1164,14 @@ export const sendMessage: RequestHandler = async (
       userId,
     ]);
     message.senderName = userResult.rows[0]?.name;
+
+    // "Deleted" chats come back when a new message arrives (WhatsApp
+    // behaviour): clear the per-participant hide flag for everyone ELSE.
+    await query(
+      `UPDATE chat_participants SET hidden_at = NULL
+        WHERE conversation_id = $1 AND user_id <> $2 AND hidden_at IS NOT NULL`,
+      [conversationId, userId],
+    );
 
     // Update conversation updated_at and mark sender as read
     await query(
@@ -1900,6 +1913,54 @@ export const leaveConversation: RequestHandler = async (req: AuthenticatedReques
   } catch (error) {
     console.error("Leave conversation error:", error);
     res.status(500).json({ success: false, error: "Failed to leave conversation" });
+  }
+};
+
+/**
+ * DELETE /chat/conversations/:conversationId
+ * WhatsApp-style "delete chat" — removes the conversation from the CALLER's
+ * chat list only. Direct chats: the caller's participant row is hidden
+ * (hidden_at); the other participant keeps everything, and a new incoming
+ * message un-hides the chat. Groups: not allowed — leave the group instead
+ * (a hidden group would silently keep its member in).
+ */
+export const deleteConversation: RequestHandler = async (req, res) => {
+  try {
+    const { conversationId } = req.params as { conversationId: string };
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+
+    const typeRow = await query(
+      `SELECT cc.type
+         FROM chat_conversations cc
+         JOIN chat_participants cp_me ON cp_me.conversation_id = cc.id AND cp_me.user_id = $2
+        WHERE cc.id = $1
+        LIMIT 1`,
+      [conversationId, userId],
+    );
+    if (typeRow.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Conversation not found" });
+    }
+    if (typeRow.rows[0].type !== "direct") {
+      return res.status(400).json({
+        success: false,
+        error: "Groups can't be deleted from the list — leave the group instead",
+      });
+    }
+
+    await query(
+      `UPDATE chat_participants SET hidden_at = NOW()
+        WHERE conversation_id = $1 AND user_id = $2`,
+      [conversationId, userId],
+    );
+
+    res.json({ success: true, data: { conversationId, deletedFor: userId } });
+  } catch (error) {
+    console.error("Delete conversation error:", error);
+    res.status(500).json({ success: false, error: "Failed to delete the chat" });
   }
 };
 

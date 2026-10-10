@@ -1136,6 +1136,10 @@ async function ensureChatCallUxSchema(): Promise<void> {
 
   // --- chat_participants: role ('admin' | 'member') ---
   await query(`ALTER TABLE chat_participants ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'member'`);
+  // "Delete chat" for direct conversations: a per-participant HIDE flag.
+  // Hiding is per-viewer — the other participant keeps the chat; a new
+  // incoming message un-hides it (WhatsApp behaviour).
+  await query(`ALTER TABLE chat_participants ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ`);
   // One-time backfill (idempotent by construction): the creator of a GROUP
   // conversation is its admin. Direct conversations keep everyone as 'member'.
   await query(

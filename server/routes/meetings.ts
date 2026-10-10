@@ -62,7 +62,7 @@ async function pushMeetingInvite(
           inviterName: info.inviterName,
           ...(info.startTime ? { startTime: info.startTime.toISOString() } : {}),
         },
-        androidChannelId: "general-v2",
+        androidChannelId: "general-v3",
         ttlSeconds: 86400,
         collapseKey: `meeting-invite-${info.meetingId}`,
       },
@@ -99,6 +99,20 @@ async function getBusinessUserIds(userIds: string[], businessId: string) {
   const result = await query(
     `SELECT id FROM users WHERE business_id = $1 AND id = ANY($2::uuid[])`,
     [businessId, userIds],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
+}
+
+/// Platform-wide attendee validation: ANY registered Metricorex user can be
+/// added to a meeting (mirrors the chat platform-wide lookup). Guests are
+/// reserved for emails that do not exist on the platform at all.
+async function getPlatformUserIds(userIds: string[]) {
+  if (userIds.length === 0) return new Set<string>();
+
+  const result = await query(
+    `SELECT id FROM users WHERE id = ANY($1::uuid[])`,
+    [userIds],
   );
 
   return new Set(result.rows.map((row) => row.id));
@@ -273,8 +287,7 @@ export const getMeetings: RequestHandler = async (
     const countResult = await query(
       `SELECT COUNT(*) as total
        FROM meetings m
-       WHERE m.business_id = $1
-       AND (
+       WHERE (
          m.created_by = $2
          OR m.host_id = $2
          OR m.co_host_id = $2
@@ -312,8 +325,7 @@ export const getMeetings: RequestHandler = async (
         )) FROM meeting_guests g WHERE g.meeting_id = m.id) as guests
       FROM meetings m
       LEFT JOIN meeting_attendees ma ON m.id = ma.meeting_id
-      WHERE m.business_id = $1
-      AND (
+      WHERE (
         m.created_by = $2
         OR m.host_id = $2
         OR m.co_host_id = $2
@@ -443,11 +455,12 @@ export const createMeeting: RequestHandler = async (
     }
 
     const uniqueAttendeeIds = Array.from(new Set<string>(attendeeIds || []));
-    const validAttendeeIds = await getBusinessUserIds(uniqueAttendeeIds, businessId);
+    // Platform-wide: attendees may be ANY registered Metricorex user.
+    const validAttendeeIds = await getPlatformUserIds(uniqueAttendeeIds);
     if (validAttendeeIds.size !== uniqueAttendeeIds.length) {
       return res.status(400).json({
         success: false,
-        error: "All meeting attendees must belong to this business",
+        error: "All meeting attendees must be registered Metricorex users",
       });
     }
 

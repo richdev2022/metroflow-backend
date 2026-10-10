@@ -211,7 +211,7 @@ async function createGoogleJwt(account: ServiceAccount): Promise<string> {
  * The named files are bundled in the app (ios/Runner/*.caf) — an unknown or
  * missing file would make iOS fall back to silence, so the default is a file
  * we ship. Android does NOT use this: its sound comes from the app-owned
- * notification channels ("calls" / "messages" / "general-v2").
+ * notification channels ("calls-v3" / "messages-v3" / "general-v3").
  */
 function iosSoundForType(type?: string): string {
   const t = String(type || "")
@@ -446,6 +446,11 @@ async function sendToTokens(
                       notification: {
                         title: payload.title,
                         body: payload.body,
+                        // White Metricorex silhouette bundled in the app
+                        // (res/drawable-*/ic_notification.png) — without this
+                        // AND the manifest default_notification_icon meta,
+                        // Android shows the system robot icon.
+                        icon: "ic_notification",
                         channel_id: payload.androidChannelId || "general",
                         ...(payload.collapseKey ? { tag: payload.collapseKey } : {}),
                         ...(payload.androidCallStyle === true

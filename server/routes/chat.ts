@@ -526,9 +526,9 @@ export const getConversations: RequestHandler = async (
           SELECT COUNT(*)::int
           FROM chat_messages cm
           JOIN chat_participants cp_me
-            ON cp_me.conversation_id = cm.conversation_id AND cp_me.user_id = $2
+            ON cp_me.conversation_id = cm.conversation_id AND cp_me.user_id = $1
           WHERE cm.conversation_id = cc.id
-            AND cm.sender_id <> $2
+            AND cm.sender_id <> $1
             AND cm.created_at > COALESCE(cp_me.last_read_at, cp_me.created_at, to_timestamp(0))
         ) as "unreadCount"
       FROM chat_conversations cc
@@ -541,13 +541,15 @@ export const getConversations: RequestHandler = async (
       WHERE EXISTS (
         SELECT 1 FROM chat_participants cp_current
         WHERE cp_current.conversation_id = cc.id
-          AND cp_current.user_id = $2
+          AND cp_current.user_id = $1
           -- hidden_at = "deleted chat" (WhatsApp-style delete-for-me; a new
           -- incoming message clears the flag and the chat reappears).
           AND cp_current.hidden_at IS NULL
       )
       ORDER BY cc.updated_at DESC`,
-      [businessId, userId],
+      // Participant-based visibility: businessId is intentionally NOT passed —
+      // an unused $1 makes Postgres throw 42P18 (could not determine data type).
+      [userId],
     );
 
     // Call-log blobs store JSON in content — swap in the human preview so

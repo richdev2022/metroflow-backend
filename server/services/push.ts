@@ -206,6 +206,25 @@ async function createGoogleJwt(account: ServiceAccount): Promise<string> {
   return `${unsigned}.${signature}`;
 }
 
+/**
+ * iOS notification sound for a push, by the payload's `type` discriminator.
+ * The named files are bundled in the app (ios/Runner/*.caf) — an unknown or
+ * missing file would make iOS fall back to silence, so the default is a file
+ * we ship. Android does NOT use this: its sound comes from the app-owned
+ * notification channels ("calls" / "messages" / "general-v2").
+ */
+function iosSoundForType(type?: string): string {
+  const t = String(type || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, "-");
+  if (t === "incoming-call") return "call_ringtone.caf";
+  if (t === "chat" || t === "chat-message" || t === "chat-message-notification") {
+    return "chat_receive_alert.caf";
+  }
+  return "push_notification.caf";
+}
+
 export interface PushPayload {
   title: string;
   body: string;
@@ -348,6 +367,7 @@ async function sendToTokens(
       body: payload.body,
     };
     const badgeRaw = dataPayload.badge ? parseInt(String(dataPayload.badge), 10) : NaN;
+    const iosSound = iosSoundForType(dataPayload.type);
 
     // Split tokens by platform so each OS gets the strategy it needs
     // (reuses the single platform lookup from above).
@@ -396,7 +416,11 @@ async function sendToTokens(
                     payload: {
                       aps: {
                         alert: { title: payload.title, body: payload.body },
-                        sound: "default",
+                        // Custom sound bundled in the app (ios/Runner/*.caf);
+                        // picked per push type — incoming calls ring with the
+                        // call ringtone, chats play the receive alert, and
+                        // everything else uses the generic push sound.
+                        sound: iosSound,
                         "interruption-level": "time-sensitive",
                         ...(Number.isFinite(badgeRaw) && badgeRaw > 0 ? { badge: badgeRaw } : {}),
                         "thread-id": String(dataPayload.type || "general"),

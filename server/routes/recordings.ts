@@ -5,7 +5,7 @@ import { ApiResponse } from "@shared/api";
 import { logActivity } from "../services/activity";
 import { getSocketServer } from "../lib/socket";
 import { upload } from "../middleware/upload";
-import { r2Storage } from "../lib/storage";
+import { r2Storage, resolveRecordingMediaUrl } from "../lib/storage";
 import fs from "fs";
 import path from "path";
 
@@ -238,15 +238,14 @@ export const getRecordings: RequestHandler = async (
       [businessId, userId, limit, offset],
     );
 
-    // Generate presigned URLs for recordings if needed
+    // Resolve playable URLs for recordings (presign bare R2 keys, pass through
+    // http/data and root-served /uploads/ paths)
     const recordings = await Promise.all(
       result.rows.map(async (recording) => {
-        if (recording.storageUrl && !recording.storageUrl.startsWith('http') && !recording.storageUrl.startsWith('/uploads/') && !recording.storageUrl.startsWith('data:') && r2Storage.isAvailable()) {
-          try {
-            recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
-          } catch (err) {
-            console.error("Failed to generate presigned URL for recording:", recording.id, err);
-          }
+        try {
+          recording.storageUrl = await resolveRecordingMediaUrl(recording.storageUrl);
+        } catch (err) {
+          console.error("Failed to resolve recording media URL:", recording.id, err);
         }
         return recording;
       })
@@ -262,6 +261,101 @@ export const getRecordings: RequestHandler = async (
     const response: ApiResponse<null> = {
       success: false,
       error: "Failed to fetch recordings",
+    };
+    res.status(500).json(response);
+  }
+};
+
+/**
+ * @swagger
+ * /recordings/{id}:
+ *   get:
+ *     summary: Get a single recording (with a playable URL)
+ *     tags: [Recordings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Recording fetched successfully
+ */
+export const getRecordingById: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res,
+) => {
+  try {
+    const { id } = req.params;
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!businessId || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "User authentication required",
+      });
+    }
+
+    const result = await query(
+      `SELECT
+        r.id, r.business_id as "businessId", r.meeting_id as "meetingId", r.call_id as "callId",
+        r.recorded_by as "recordedById", r.storage_url as "storageUrl", r.duration, r.status,
+        r.size, r.created_at as "createdAt", r.updated_at as "updatedAt",
+        u.name as "recordedByName"
+      FROM recordings r
+      LEFT JOIN meetings m ON r.meeting_id = m.id
+      LEFT JOIN calls c ON r.call_id = c.id
+      JOIN users u ON r.recorded_by = u.id
+      WHERE r.id = $1 AND r.business_id = $2
+      AND (
+        r.recorded_by = $3
+        OR m.created_by = $3
+        OR m.host_id = $3
+        OR m.co_host_id = $3
+        OR c.created_by = $3
+        OR c.host_id = $3
+        OR c.co_host_id = $3
+        OR EXISTS (
+          SELECT 1 FROM meeting_attendees ma
+          WHERE ma.meeting_id = r.meeting_id AND ma.user_id = $3
+        )
+        OR EXISTS (
+          SELECT 1 FROM call_participants cp
+          WHERE cp.call_id = r.call_id AND cp.user_id = $3
+        )
+      )
+      LIMIT 1`,
+      [id, businessId, userId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Recording not found",
+      });
+    }
+
+    const recording = result.rows[0];
+    try {
+      recording.storageUrl = await resolveRecordingMediaUrl(recording.storageUrl);
+    } catch (err) {
+      console.error("Failed to resolve recording media URL:", recording.id, err);
+    }
+
+    const response: ApiResponse<any> = {
+      success: true,
+      data: recording,
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("Get recording error:", error);
+    const response: ApiResponse<null> = {
+      success: false,
+      error: "Failed to fetch recording",
     };
     res.status(500).json(response);
   }
@@ -717,9 +811,11 @@ export const uploadRecording: RequestHandler[] = [
 
       const recording = updateResult.rows[0];
 
-      // Generate presigned URL if needed
-      if (recording.storageUrl && !recording.storageUrl.startsWith('http') && !recording.storageUrl.startsWith('/uploads/') && !recording.storageUrl.startsWith('data:') && r2Storage.isAvailable()) {
-        recording.storageUrl = await r2Storage.getPresignedUrl(recording.storageUrl, 86400); // 24 hours
+      // Resolve a playable URL (presign bare R2 keys)
+      try {
+        recording.storageUrl = await resolveRecordingMediaUrl(recording.storageUrl);
+      } catch (err) {
+        console.error("Failed to resolve recording media URL:", recording.id, err);
       }
 
       const response: ApiResponse<any> = {

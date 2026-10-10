@@ -100,7 +100,7 @@ import { getStatuses, createStatus, deleteStatus, viewStatus, likeStatus, getSta
 import testCommunicationsRouter from "./routes/test-communications";
 import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
-import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact, addChatParticipants, getChatInvite, rotateChatInvite, joinChatByInvite } from "./routes/chat";
+import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, deleteConversation, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact, addChatParticipants, getChatInvite, rotateChatInvite, joinChatByInvite } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest } from "./routes/calls";
@@ -975,6 +975,8 @@ export async function createServer() {
   // Chat participants: roster / leave / roles / remove (WhatsApp-style)
   mainRouter.get("/chat/conversations/:conversationId/participants", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), getParticipants);
   mainRouter.post("/chat/conversations/:conversationId/leave", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), leaveConversation);
+  // WhatsApp-style "delete chat" — hides the direct conversation for the CALLER only
+  mainRouter.delete("/chat/conversations/:conversationId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), deleteConversation);
   mainRouter.patch("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), updateParticipantRole);
   mainRouter.delete("/chat/conversations/:conversationId/participants/:userId", authenticateToken, checkSubscriptionStatus, checkFeaturePermission("use_chat"), requireTeamPermission("use_chat"), removeParticipant);
 

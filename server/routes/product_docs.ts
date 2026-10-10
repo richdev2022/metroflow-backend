@@ -136,7 +136,11 @@ router.get("/ideas/:ideaId/documentation", authenticateToken, checkSubscriptionS
     const businessId = req.user?.businessId;
 
     const result = await query(
-      `SELECT * FROM product_documentation WHERE idea_id = $1 AND business_id = $2 ORDER BY created_at DESC`,
+      `SELECT id, business_id as "businessId", idea_id as "ideaId",
+              title, content, version, status, logo_url as "logoUrl",
+              created_by as "createdBy", updated_by as "updatedBy",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM product_documentation WHERE idea_id = $1 AND business_id = $2 ORDER BY created_at DESC`,
       [ideaId, businessId]
     );
 

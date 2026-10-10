@@ -404,6 +404,10 @@ export const createCall: RequestHandler = async (
             callLink: buildCallLink(call.callCode),
             hasPassword: !!password,
             waitingRoomEnabled: waitingRoomEnabled || false,
+            // GROUP-CALL TEARDOWN FIX: mobile defaults this to false when
+            // absent, which made any callee's hangup end the group call for
+            // EVERYONE (shouldEndForAll computes from it).
+            isGroupCall: !!call.isGroupCall,
           });
         });
       }
@@ -421,6 +425,7 @@ export const createCall: RequestHandler = async (
         callerId: userId,
         callCode: call.callCode,
         conversationId: conversationId || null,
+        isGroupCall: !!call.isGroupCall,
       });
     }
 
@@ -1770,7 +1775,7 @@ export const addCallParticipants: RequestHandler = async (
     );
     const currentUserName = currentUserResult.rows[0]?.name || 'Someone';
     const fullCallDetails = await query(
-      `SELECT type, started_at, password, waiting_room_enabled FROM calls WHERE id = $1`,
+      `SELECT type, started_at, password, waiting_room_enabled, is_group_call FROM calls WHERE id = $1`,
       [actualCallId]
     );
     const callDetails = fullCallDetails.rows[0];
@@ -1951,6 +1956,8 @@ export const addCallParticipants: RequestHandler = async (
           callLink: callLink,
           hasPassword: !!callDetails?.password,
           waitingRoomEnabled: !!callDetails?.waiting_room_enabled,
+          // GROUP-CALL TEARDOWN FIX — see the create-call emit above.
+          isGroupCall: !!updatedCall?.isGroupCall,
         });
       });
     }
@@ -1964,6 +1971,7 @@ export const addCallParticipants: RequestHandler = async (
         callerId: userId,
         callCode: call.call_code,
         conversationId: null,
+        isGroupCall: !!callDetails?.is_group_call,
       });
     }
 

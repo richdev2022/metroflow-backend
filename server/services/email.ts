@@ -178,6 +178,51 @@ export function generateAccountCreationEmailHtml(name: string, loginLink: string
 }
 
 /**
+ * Refer & Earn — bonus payout notification for the referrer.
+ */
+export function generateReferralBonusEmailHtml(
+  name: string,
+  amount: number,
+  currency: string,
+  referredBusiness: string,
+): string {
+  const logoUrl = EMAIL_LOGO_URL;
+  const walletLink = `${process.env.CLIENT_URL || process.env.APP_BASE_URL || 'https://app.metricorex.com'}/wallet`;
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
+          <h2 style="color: #1d4ed8; margin-bottom: 20px; text-align: center;">Referral bonus earned 🎉</h2>
+          <p style="color: #333;">Hi ${name},</p>
+          <p style="color: #666; line-height: 1.6;">
+            Great news! <strong style="color:#111;">${referredBusiness}</strong> — a business you referred — just subscribed to a
+            Metricorex plan. Your referral bonus has been credited to your Metricorex wallet.
+          </p>
+          <div style="text-align: center; margin: 24px 0;">
+            <div style="font-size: 30px; font-weight: 800; color: #16a34a;">+${currency} ${Number(amount).toLocaleString()}</div>
+            <div style="color: #6b7280; font-size: 13px; margin-top: 4px;">Referral bonus — credited to your wallet</div>
+          </div>
+          <div style="text-align: center; margin: 24px 0;">
+            <a href="${walletLink}" style="background-color: #2563eb; color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold;">Open your wallet</a>
+          </div>
+          <div style="background-color: #f0f9ff; padding: 15px; border-left: 4px solid #2563eb; margin: 20px 0;">
+            <p style="margin: 0; color: #1e40af; font-weight: bold;">Keep earning:</p>
+            <ul style="margin: 10px 0 0 20px; color: #374151; padding: 0;">
+              <li>Share your referral code from the Referrals page</li>
+              <li>You earn a bonus every time a business you referred subscribes</li>
+            </ul>
+          </div>
+          ${buildEmailFooterHtml()}
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
  * Maintenance-mode notification emails (toggle ON) and back-up emails (toggle OFF).
  */
 export function generateMaintenanceModeEmailHtml(name: string, isDown: boolean, maintenanceTime: Date): string {

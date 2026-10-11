@@ -2,6 +2,7 @@ import express from "express";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
+import { maybePayReferralBonus } from "../services/referral";
 import { settlePaymentLinkPayment } from "./payment_links";
 import { settleInvoicePayment } from "./invoices";
 import { settleStoreOrderPayment } from "./store";
@@ -232,6 +233,8 @@ const handleSquadWebhook = async (event: any) => {
                         // 'subscription') — subscriptions must NEVER touch the
                         // platform operational ledger (owner invariant).
                         await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'squad', undefined, { revenueType: 'subscription' });
+                        // Refer & Earn: first-subscription referral bonus (idempotent, best effort)
+                        maybePayReferralBonus(businessId, transaction.plan_id);
                     }
                 }
             }
@@ -506,6 +509,8 @@ const handleMonnifyWebhook = async (event: any) => {
                         // Revenue-LEDGER row only — subscriptions never touch the
                         // platform operational ledger (owner invariant).
                         await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'monnify', undefined, { revenueType: 'subscription' });
+                        // Refer & Earn: first-subscription referral bonus (idempotent, best effort)
+                        maybePayReferralBonus(businessId, transaction.plan_id);
                     }
                 }
             }
@@ -1056,6 +1061,8 @@ const handleFlutterwaveWebhook = async (event: any) => {
 
                 const subAmount = parseFloat(transaction.amount);
                 await creditRevenueWallet(subAmount, transaction.currency || 'NGN', reference, 'Subscription Payment', 'flutterwave', undefined, { revenueType: 'subscription' });
+                // Refer & Earn: first-subscription referral bonus (idempotent, best effort)
+                maybePayReferralBonus(businessId, transaction.plan_id);
             }
 
             return;

@@ -1,5 +1,6 @@
 import { sendPushToUsers } from "../services/push";
 import { sendWebPushToUsers } from "../services/webPush";
+import { isApnsVoipConfigured, sendVoipToUsers } from "../services/apns";
 
 /**
  * Incoming / missed call push notifications.
@@ -115,6 +116,25 @@ export async function pushIncomingCall(
       { ...fcmPayload, androidDataOnly: true },
       { inApp: false },
     ).catch(() => ({ sent: 0, failed: 0, users: 0 }));
+
+    // --- Attempt 1b: iOS VoIP push (PushKit -> CallKit native ring UI).
+    // FCM banners cannot show a full-screen call UI on iOS — the ONLY way an
+    // incoming call rings with Answer/Decline while the app is backgrounded
+    // or terminated is a VoIP push delivered straight to APNs. Degrades to
+    // the FCM alert (below) when APNs keys are not configured on the server.
+    if (isApnsVoipConfigured()) {
+      void sendVoipToUsers(targets, {
+        alert: { title: info.callerName, body: `Incoming ${callTypeLabel} call` },
+        type: "incoming-call",
+        callId: info.callId,
+        callType: callTypeLabel,
+        callerName: info.callerName,
+        callerId: info.callerId,
+        callCode: info.callCode || "",
+        isGroupCall: !!info.isGroupCall,
+        ...(info.conversationId ? { conversationId: info.conversationId } : {}),
+      }).catch(() => {});
+    }
 
     // --- Attempt 2 (delivery-ack fallback): even when FCM ACCEPTED the
     // send, the device may never render a data-only message (OEM drop while

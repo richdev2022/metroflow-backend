@@ -27,6 +27,7 @@ import {
 } from "../services/login-security";
 import { verifyGoogleIdToken } from "../services/googleAuth";
 import { isMaintenanceMode } from "../services/app-config";
+import { attributeReferrer, ensureUserReferralCode } from "../services/referral";
 import { AuthenticatedRequest } from "../middleware/auth";
 
 /**
@@ -238,6 +239,18 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       `UPDATE businesses SET owner_id = $1 WHERE id = $2`,
       [user.id, business.id]
     );
+
+    // Refer & Earn: attribute the signup to a referrer (optional referralCode)
+    // and mint this user's own referral code. Best effort — signup must never
+    // fail because of the referral feature.
+    try {
+      if (input.referralCode) {
+        await attributeReferrer(user.id, input.referralCode);
+      }
+      await ensureUserReferralCode(user.id);
+    } catch (refErr: any) {
+      console.warn("Referral attribution skipped:", refErr?.message);
+    }
 
     // Seed default task statuses for the new business
     const defaultStatuses = [
@@ -1218,7 +1231,7 @@ export const login: RequestHandler = async (req, res) => {
  */
 export const googleAuth: RequestHandler = async (req, res) => {
   try {
-    const { credential, businessName, businessIndustry } = req.body || {};
+    const { credential, businessName, businessIndustry, referralCode } = req.body || {};
 
     // MAINTENANCE GATE: Google SSO must not bypass the maintenance window.
     if (await rejectIfUnderMaintenance(res)) return;
@@ -1343,6 +1356,17 @@ export const googleAuth: RequestHandler = async (req, res) => {
         [business.id, googleUser.email, googleUser.name, googleUser.googleId, googleUser.picture || null],
       );
       const newUser = userResult.rows[0];
+
+      // Refer & Earn: attribute the Google signup to a referrer (optional
+      // referralCode — also claimable later via /referrals/claim). Best effort.
+      try {
+        if (referralCode) {
+          await attributeReferrer(newUser.id, referralCode);
+        }
+        await ensureUserReferralCode(newUser.id);
+      } catch (refErr: any) {
+        console.warn("Referral attribution skipped (google):", refErr?.message);
+      }
 
       // Welcome email on Google account creation (best effort)
       try {
@@ -1708,7 +1732,9 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
               phone_number as "phoneNumber",
               COALESCE(phone_verified, FALSE) as "phoneVerified",
               COALESCE(profile_completed, FALSE) as "profileCompleted",
-              COALESCE(profile_prompt_dismissed, FALSE) as "profilePromptDismissed"
+              COALESCE(profile_prompt_dismissed, FALSE) as "profilePromptDismissed",
+              referral_code as "referralCode",
+              (referred_by IS NOT NULL) as "hasReferrer"
        FROM users WHERE id = $1`,
       [userId],
     );
@@ -1718,6 +1744,15 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
     }
 
     const data = { ...result.rows[0] };
+
+    // Refer & Earn: mint the caller's referral code lazily if missing (best
+    // effort — the profile response must never break on this).
+    try {
+      const minted = await ensureUserReferralCode(userId);
+      if (minted && !data.referralCode) data.referralCode = minted;
+    } catch (refErr) {
+      console.error("Get me referral code mint failed:", refErr);
+    }
 
     // Business identity (logo + name) — SSO LOGO PARITY FIX: clients can
     // render the workspace logo straight from /auth/me without an extra

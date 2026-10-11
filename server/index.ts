@@ -122,6 +122,7 @@ import { getMediasoupDiagnostics } from "./lib/mediasoup";
 import { getCloudStorage, r2Storage } from "./lib/storage";
 import publicRouter from "./routes/public";
 import supportRouter from "./routes/support";
+import referralRouter from "./routes/referral";
 import { authenticateToken, checkTeamLimit, checkSubscriptionStatus, checkFeaturePermission } from "./middleware/auth";
 import { rateLimiter, secureHeaders, sanitizeMiddleware } from "./middleware/security";
 import { processSubscriptionRenewals } from "./services/subscription";
@@ -1061,6 +1062,7 @@ export async function createServer() {
 
   // Public app configuration (maintenance mode, announcements) - no auth
   mainRouter.use("/public", publicRouter);
+  mainRouter.use("/referrals", referralRouter);
 
   // Customer Support desk (MetricAi handoff, guest widget chat, agent inbox)
   mainRouter.use("/support", supportRouter);

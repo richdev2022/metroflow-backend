@@ -1,6 +1,6 @@
 import express, { RequestHandler } from "express";
 import { query } from "../db";
-import { AuthenticatedRequest } from "../middleware/auth";
+import { AuthenticatedRequest, authenticateToken } from "../middleware/auth";
 import { upload } from "../middleware/upload";
 import { uploadMediaBuffer } from "../services/media-upload";
 import { sendDisputeAdminAlert, sendDisputeCustomerUpdate } from "../services/email";
@@ -376,8 +376,8 @@ const getMyDispute: RequestHandler = async (req, res) => {
   }
 };
 
-router.post("/", upload.single("attachment"), fileDispute);
-router.get("/mine", listMyDisputes);
-router.get("/:id", getMyDispute);
+router.post("/", authenticateToken, upload.single("attachment"), fileDispute);
+router.get("/mine", authenticateToken, listMyDisputes);
+router.get("/:id", authenticateToken, getMyDispute);
 
 export default router;

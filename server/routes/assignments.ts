@@ -1,6 +1,20 @@
-import { RequestHandler } from "express";
+import { Request, RequestHandler } from "express";
 import { query } from "../db";
 import { ApiResponse, AssignTaskInput } from "@shared/api";
+import { AuthenticatedRequest } from "../middleware/auth";
+
+/**
+ * Business/user context: the mobile and web clients do NOT send the legacy
+ * x-business-id / x-user-id headers, so derive them from the authenticated
+ * token (set by authenticateToken at mount time) with header fallback.
+ */
+function businessContext(req: Request): { businessId: string | undefined; userId: string | undefined } {
+  const authReq = req as AuthenticatedRequest;
+  return {
+    businessId: (authReq.user?.businessId || req.headers["x-business-id"]) as string | undefined,
+    userId: (authReq.user?.userId || req.headers["x-user-id"]) as string | undefined,
+  };
+}
 
 // Assign task(s) to user(s)
 export const assignTasks: RequestHandler = async (req, res) => {
@@ -54,8 +68,7 @@ export const assignTasks: RequestHandler = async (req, res) => {
  *         description: Server error
  */
   try {
-    const businessId = req.headers["x-business-id"] as string;
-    const userId = req.headers["x-user-id"] as string;
+    const { businessId, userId } = businessContext(req);
     const input: AssignTaskInput = req.body;
 
     if (!businessId || !userId) {
@@ -168,7 +181,7 @@ export const getAssignments: RequestHandler = async (req, res) => {
  *         description: Server error
  */
   try {
-    const businessId = req.headers["x-business-id"] as string;
+    const { businessId } = businessContext(req);
     const { taskId } = req.params;
 
     if (!businessId) {
@@ -235,7 +248,7 @@ export const removeAssignment: RequestHandler = async (req, res) => {
  *         description: Server error
  */
   try {
-    const businessId = req.headers["x-business-id"] as string;
+    const { businessId } = businessContext(req);
     const { assignmentId } = req.params;
 
     if (!businessId) {

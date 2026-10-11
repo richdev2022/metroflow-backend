@@ -12,9 +12,10 @@
 #          `git pull`s fail with "local changes would be overwritten")
 #        • any OTHER local edits are stashed (recoverable via `git stash pop`)
 #   2. git pull (fast-forward only)
-#   3. npm ci (fallback: npm install)
+#   3. npm ci ONLY when package-lock.json changed (fallback: npm install);
+#      skipped entirely on deploys that touch no dependencies (zero downtime)
 #   4. npm run build
-#   5. pm2 restart metroflow
+#   5. pm2 restart metroflow (logs flushed first: pm2 flush metroflow)
 #   6. Verifies the NEW build is serving via /api/health (+ route probes)
 #      and prints actionable warnings when GLM_API_KEY / TENOR_API_KEY are
 #      missing.
@@ -96,23 +97,60 @@ else
   ok "Updated: ${OLD_REV:0:8} -> ${NEW_REV:0:8}"
 fi
 
+# ---------------------------------------------------------------------
+# npm ci DELETES node_modules before reinstalling. If the live pm2
+# process dies for ANY reason during that window (OOM during install,
+# crash, manual action), pm2's auto-restart boots into a HALF-INSTALLED
+# tree and crash-loops with:
+#   "Cannot find module '/root/metroflow-backend/node_modules/dotenv/config.js'"
+# followed by a storm of 503s (db gate) and one-off login 500s.
+# Seen in production logs 2026-10-10. Two guards fix it:
+#   a) skip npm ci entirely when the lockfile did not change (most
+#      deploys — also removes 1-2 min from every deploy),
+#   b) when we DO reinstall, stop pm2 first and restore it on failure
+#      so no request ever hits a broken boot.
+# ---------------------------------------------------------------------
+PM2_STOPPED=0
+INSTALL_NEEDED=0
+if [ ! -f node_modules/dotenv/package.json ]; then
+  INSTALL_NEEDED=1   # node_modules missing/incomplete — must install
+elif ! git diff --quiet "$OLD_REV" HEAD -- package-lock.json 2>/dev/null; then
+  INSTALL_NEEDED=1   # lockfile changed in this pull
+fi
+
 step "2/6  Installing dependencies"
-if npm ci --no-audit --no-fund; then
-  ok "npm ci done"
+if [ "$INSTALL_NEEDED" = "0" ]; then
+  ok "package-lock.json unchanged — skipping npm ci (zero-downtime deploy)"
 else
-  warn "npm ci failed — falling back to npm install"
-  npm install --no-audit --no-fund || { fail "dependency install failed"; [ "$STASHED" = "1" ] && git stash pop; exit 1; }
+  echo "  Stopping pm2 process for a safe install (no half-installed boots possible)"
+  if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
+    pm2 stop "$APP_NAME" >/dev/null 2>&1 || true
+    PM2_STOPPED=1
+  fi
+  if npm ci --no-audit --no-fund; then
+    ok "npm ci done"
+  else
+    warn "npm ci failed — falling back to npm install"
+    npm install --no-audit --no-fund || { fail "dependency install failed"; [ "$STASHED" = "1" ] && git stash pop; [ "$PM2_STOPPED" = "1" ] && { warn "restoring old pm2 process"; pm2 start "$APP_NAME" --update-env >/dev/null 2>&1; }; exit 1; }
+  fi
 fi
 
 step "3/6  Building (swagger + server bundle)"
-npm run build || { fail "build failed — old process left untouched"; [ "$STASHED" = "1" ] && git stash pop; exit 1; }
+npm run build || { fail "build failed"; [ "$PM2_STOPPED" = "1" ] && { warn "restoring old pm2 process (previous dist/ still on disk)"; pm2 start "$APP_NAME" --update-env >/dev/null 2>&1; }; [ "$STASHED" = "1" ] && git stash pop; exit 1; }
 ok "build complete (dist/server/node-build.mjs)"
 
 step "4/6  Restarting pm2 process '$APP_NAME'"
 if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
-  pm2 restart "$APP_NAME" --update-env
+  # Fresh logs per deploy: old-process errors must never be mistaken for
+  # new-build errors when triaging pm2 logs after a deploy.
+  pm2 flush "$APP_NAME" >/dev/null 2>&1 || true
+  if [ "$PM2_STOPPED" = "1" ]; then
+    pm2 start "$APP_NAME" --update-env
+  else
+    pm2 restart "$APP_NAME" --update-env
+  fi
   pm2 save
-  ok "pm2 restart done"
+  ok "pm2 restart done (logs flushed)"
 else
   fail "pm2 process '$APP_NAME' not found. Start it once with:"
   echo "       pm2 start dist/server/node-build.mjs --name $APP_NAME --time"

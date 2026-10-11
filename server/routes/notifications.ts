@@ -340,24 +340,43 @@ export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, 
   try {
     const userId = req.user?.userId;
     const businessId = req.user?.businessId;
-    const { fcm_token, platform, device_name, app_version } = req.body || {};
+    const { fcm_token, voip_token, platform, device_name, app_version } = req.body || {};
 
-    if (!userId || !fcm_token) {
-      return res.status(400).json({ success: false, error: "fcm_token is required" });
+    if (!userId || (!fcm_token && !voip_token)) {
+      return res.status(400).json({ success: false, error: "fcm_token or voip_token is required" });
     }
 
-    await query(
-      `INSERT INTO user_devices (user_id, business_id, fcm_token, platform, device_name, app_version, last_seen_at)
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
-       ON CONFLICT (fcm_token) DO UPDATE SET
-         user_id = EXCLUDED.user_id,
-         business_id = EXCLUDED.business_id,
-         platform = EXCLUDED.platform,
-         device_name = EXCLUDED.device_name,
-         app_version = EXCLUDED.app_version,
-         last_seen_at = CURRENT_TIMESTAMP`,
-      [userId, businessId || null, fcm_token, platform || null, device_name || null, app_version || null],
-    );
+    if (fcm_token) {
+      await query(
+        `INSERT INTO user_devices (user_id, business_id, fcm_token, platform, device_name, app_version, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+         ON CONFLICT (fcm_token) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           business_id = EXCLUDED.business_id,
+           platform = EXCLUDED.platform,
+           device_name = EXCLUDED.device_name,
+           app_version = EXCLUDED.app_version,
+           -- attach/refresh the VoIP token onto the same row when provided
+           voip_token = COALESCE(EXCLUDED.voip_token, user_devices.voip_token),
+           last_seen_at = CURRENT_TIMESTAMP`,
+        [userId, businessId || null, fcm_token, platform || null, device_name || null, app_version || null, voip_token || null],
+      );
+    }
+
+    if (voip_token) {
+      // PushKit tokens rotate (new install / token refresh) — upsert keyed on
+      // the voip token itself so a refreshed token re-binds to the user.
+      await query(
+        `INSERT INTO user_devices (user_id, business_id, voip_token, platform, device_name, app_version, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+         ON CONFLICT (voip_token) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           business_id = EXCLUDED.business_id,
+           platform = EXCLUDED.platform,
+           last_seen_at = CURRENT_TIMESTAMP`,
+        [userId, businessId || null, voip_token, platform || "ios", device_name || null, app_version || null],
+      );
+    }
 
     // Diagnostic counters so "notifications don't arrive" is diagnosable from
     // the client: how many devices this account can be pushed to right now.

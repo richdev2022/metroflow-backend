@@ -1,6 +1,5 @@
-import { sendPushToUsers } from "../services/push";
+import { sendPushToUsers, sendVoipPushToUsers } from "../services/push";
 import { sendWebPushToUsers } from "../services/webPush";
-import { isApnsVoipConfigured, sendVoipToUsers } from "../services/apns";
 
 /**
  * Incoming / missed call push notifications.
@@ -117,25 +116,6 @@ export async function pushIncomingCall(
       { inApp: false },
     ).catch(() => ({ sent: 0, failed: 0, users: 0 }));
 
-    // --- Attempt 1b: iOS VoIP push (PushKit -> CallKit native ring UI).
-    // FCM banners cannot show a full-screen call UI on iOS — the ONLY way an
-    // incoming call rings with Answer/Decline while the app is backgrounded
-    // or terminated is a VoIP push delivered straight to APNs. Degrades to
-    // the FCM alert (below) when APNs keys are not configured on the server.
-    if (isApnsVoipConfigured()) {
-      void sendVoipToUsers(targets, {
-        alert: { title: info.callerName, body: `Incoming ${callTypeLabel} call` },
-        type: "incoming-call",
-        callId: info.callId,
-        callType: callTypeLabel,
-        callerName: info.callerName,
-        callerId: info.callerId,
-        callCode: info.callCode || "",
-        isGroupCall: !!info.isGroupCall,
-        ...(info.conversationId ? { conversationId: info.conversationId } : {}),
-      }).catch(() => {});
-    }
-
     // --- Attempt 2 (delivery-ack fallback): even when FCM ACCEPTED the
     // send, the device may never render a data-only message (OEM drop while
     // the app is killed/swiped). The app acks on receipt; no ack within the
@@ -156,6 +136,24 @@ export async function pushIncomingCall(
         ).catch(() => {});
       }, 1500);
     }
+
+    // --- iOS native ring: direct APNs VoIP push. FCM cannot carry
+    // `apns-push-type: voip`, so without THIS send the iOS callee only ever
+    // sees the notification-panel banner and never the CallKit full-screen
+    // ring (Answer/Decline) when backgrounded or killed. The payload keys
+    // match PKPushPayload.dictionaryPayload readers in AppDelegate
+    // (callId / callerName / callType, with call_id / caller_name / call_type
+    // fallbacks) and the Dart CallKitService handlers.
+    sendVoipPushToUsers(targets, {
+      type: "incoming-call",
+      callId: info.callId,
+      callType: callTypeLabel,
+      callerName: info.callerName,
+      callerId: info.callerId,
+      callCode: info.callCode || "",
+      isGroupCall: String(!!info.isGroupCall),
+      ...(info.conversationId ? { conversationId: info.conversationId } : {}),
+    }).catch(() => {});
 
     // --- Web Push (browsers): short TTL — a ring that arrives a minute late
     // is worse than no ring at all.

@@ -310,7 +310,12 @@ export const takeNotificationAction: RequestHandler = async (
  * POST /notifications/register-device
  * Registers/refreshes an FCM token for the authenticated user so the backend
  * can deliver push notifications (calls, chats, broadcasts).
- * Body: { fcm_token, platform: 'android'|'ios'|'web', device_name?, app_version? }
+ * Body: { fcm_token, platform: 'android'|'ios'|'web', device_name?, app_version?, voip_token? }
+ *
+ * fcm_token OR voip_token (iOS PushKit) is required — the iOS app registers
+ * its VoIP token with fcm_token:'' as a voip-only registration. FCM cannot
+ * carry apns-push-type voip, so the backend delivers iOS incoming-call rings
+ * via direct APNs using this token (see services/apns.ts).
  */
 /**
  * @swagger
@@ -326,9 +331,9 @@ export const takeNotificationAction: RequestHandler = async (
  *         application/json:
  *           schema:
  *             type: object
- *             required: [fcm_token]
  *             properties:
- *               fcm_token: { type: string }
+ *               fcm_token: { type: string, description: "FCM token (required unless voip_token given)" }
+ *               voip_token: { type: string, description: "iOS PushKit VoIP token (direct APNs delivery)" }
  *               platform: { type: string, enum: [android, ios, web] }
  *               device_name: { type: string }
  *               app_version: { type: string }
@@ -340,41 +345,53 @@ export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, 
   try {
     const userId = req.user?.userId;
     const businessId = req.user?.businessId;
-    const { fcm_token, voip_token, platform, device_name, app_version } = req.body || {};
+    const { platform, device_name, app_version } = req.body || {};
+    const fcm = typeof req.body?.fcm_token === "string" ? req.body.fcm_token.trim() : "";
+    const voip = typeof req.body?.voip_token === "string" ? req.body.voip_token.trim() : "";
 
-    if (!userId || (!fcm_token && !voip_token)) {
+    if (!userId || (!fcm && !voip)) {
       return res.status(400).json({ success: false, error: "fcm_token or voip_token is required" });
     }
 
-    if (fcm_token) {
+    if (fcm) {
       await query(
-        `INSERT INTO user_devices (user_id, business_id, fcm_token, platform, device_name, app_version, last_seen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+        `INSERT INTO user_devices (user_id, business_id, fcm_token, voip_token, platform, device_name, app_version, last_seen_at)
+         VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, CURRENT_TIMESTAMP)
          ON CONFLICT (fcm_token) DO UPDATE SET
            user_id = EXCLUDED.user_id,
            business_id = EXCLUDED.business_id,
+           voip_token = COALESCE(NULLIF(EXCLUDED.voip_token, ''), user_devices.voip_token),
            platform = EXCLUDED.platform,
            device_name = EXCLUDED.device_name,
            app_version = EXCLUDED.app_version,
-           -- attach/refresh the VoIP token onto the same row when provided
-           voip_token = COALESCE(EXCLUDED.voip_token, user_devices.voip_token),
            last_seen_at = CURRENT_TIMESTAMP`,
-        [userId, businessId || null, fcm_token, platform || null, device_name || null, app_version || null, voip_token || null],
+        [userId, businessId || null, fcm, voip, platform || null, device_name || null, app_version || null],
       );
     }
 
-    if (voip_token) {
-      // PushKit tokens rotate (new install / token refresh) — upsert keyed on
-      // the voip token itself so a refreshed token re-binds to the user.
+    if (voip) {
+      // VoIP upsert by token (the iOS voip-only registration has fcm_token:'').
+      // When the app also sent an fcm_token this lands on the same row created
+      // above (conflict on the voip_token unique index), keeping them merged.
       await query(
-        `INSERT INTO user_devices (user_id, business_id, voip_token, platform, device_name, app_version, last_seen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+        `INSERT INTO user_devices (user_id, business_id, fcm_token, voip_token, platform, device_name, app_version, last_seen_at)
+         VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, CURRENT_TIMESTAMP)
          ON CONFLICT (voip_token) DO UPDATE SET
            user_id = EXCLUDED.user_id,
            business_id = EXCLUDED.business_id,
+           fcm_token = COALESCE(NULLIF(EXCLUDED.fcm_token, ''), user_devices.fcm_token),
            platform = EXCLUDED.platform,
+           device_name = EXCLUDED.device_name,
+           app_version = EXCLUDED.app_version,
            last_seen_at = CURRENT_TIMESTAMP`,
-        [userId, businessId || null, voip_token, platform || "ios", device_name || null, app_version || null],
+        [userId, businessId || null, fcm, voip, platform || "ios", device_name || null, app_version || null],
+      );
+      // PushKit tokens rotate on reinstall: drop this user's stale voip rows
+      // so dead tokens never delay future rings (APNs would 410 them anyway,
+      // but proactive cleanup keeps the registry honest).
+      await query(
+        `DELETE FROM user_devices WHERE user_id = $1 AND voip_token IS NOT NULL AND voip_token <> $2`,
+        [userId, voip],
       );
     }
 
@@ -389,7 +406,7 @@ export const registerDevice: RequestHandler = async (req: AuthenticatedRequest, 
     res.json({
       success: true,
       message: "Device registered for push notifications",
-      data: { devices: deviceCount, platform: platform || null },
+      data: { devices: deviceCount, platform: platform || null, voipRegistered: Boolean(voip) },
     });
   } catch (error: any) {
     console.error("Register device error:", error);

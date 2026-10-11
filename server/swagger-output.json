@@ -5987,12 +5987,14 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": [
-                  "fcm_token"
-                ],
                 "properties": {
                   "fcm_token": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "FCM token (required unless voip_token given)"
+                  },
+                  "voip_token": {
+                    "type": "string",
+                    "description": "iOS PushKit VoIP token (direct APNs delivery)"
                   },
                   "platform": {
                     "type": "string",

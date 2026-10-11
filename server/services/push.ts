@@ -2,6 +2,7 @@ import axios from "axios";
 import fs from "fs";
 import { query } from "../db";
 import { createNotification } from "./notifications";
+import { isApnsConfigured, sendVoipPush } from "./apns";
 
 /**
  * Push notifications (FCM).
@@ -677,6 +678,56 @@ export async function sendPushToAll(payload: PushPayload, type: string = "broadc
   const usersRes = await query(`SELECT DISTINCT user_id FROM user_devices`);
   const targets: PushTarget[] = usersRes.rows.map((r: any) => ({ userId: r.user_id }));
   return sendPushToUsers(targets, payload, { inApp: false, type });
+}
+
+/**
+ * iOS VoIP (PushKit) delivery — direct APNs, bypassing FCM entirely.
+ * FCM cannot carry `apns-push-type: voip`, so the native CallKit ring
+ * (full-screen Answer/Decline while backgrounded/killed) only fires when
+ * THIS path delivers. Best-effort; never throws. A 410 (Unregistered)
+ * response deletes the stale token row — PushKit rotates tokens on
+ * reinstall and uninstalls, and dead tokens otherwise poison every ring.
+ */
+export async function sendVoipPushToUsers(
+  users: PushTarget[],
+  data: Record<string, string>,
+): Promise<{ sent: number; failed: number; devices: number }> {
+  const ids = Array.from(new Set((users || []).map((u) => u.userId).filter(Boolean)));
+  if (ids.length === 0 || !isApnsConfigured()) {
+    return { sent: 0, failed: 0, devices: 0 };
+  }
+  let sent = 0;
+  let failed = 0;
+  let devices = 0;
+  try {
+    const res = await query(
+      `SELECT id, voip_token FROM user_devices WHERE user_id = ANY($1::uuid[]) AND voip_token IS NOT NULL`,
+      [ids],
+    );
+    for (const row of res.rows as { id: string; voip_token: string }[]) {
+      devices++;
+      try {
+        const result = await sendVoipPush(row.voip_token, data);
+        if (result.ok) {
+          sent++;
+        } else if (result.status === 410) {
+          // Token dead (reinstall/uninstall/rotation) — remove the row so it
+          // never delays future rings again.
+          await query(`DELETE FROM user_devices WHERE id = $1 AND voip_token = $2`, [row.id, row.voip_token]).catch(() => {});
+          failed++;
+        } else {
+          console.warn(`[apns] voip push to device ${row.id} failed: status=${result.status} reason=${result.reason || "?"}`);
+          failed++;
+        }
+      } catch (err: any) {
+        failed++;
+        console.error("[apns] voip push error:", err?.message || err);
+      }
+    }
+  } catch (err: any) {
+    console.error("[apns] sendVoipPushToUsers error:", err?.message || err);
+  }
+  return { sent, failed, devices };
 }
 
 export { sendToTokens };

@@ -1,4 +1,5 @@
 import { query } from "./db";
+import { backfillReferralCodes } from "./services/referral";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -37,6 +38,12 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
   await ensureChatInviteSchema(); // group chat invite links (join by code)
   await ensureReferralSchema(); // Refer & Earn: referral codes + bonus ledger
+  // Refer & Earn backfill: mint codes for every pre-existing user so their
+  // code/link is shareable without waiting for a lazy read. Idempotent.
+  const referralBackfill = await backfillReferralCodes();
+  if (referralBackfill > 0) {
+    console.log(`[migrations] backfilled referral codes for ${referralBackfill} existing user(s)`);
+  }
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();

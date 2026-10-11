@@ -689,6 +689,10 @@ async function ensureAppTables(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id)`);
+  // iOS VoIP (PushKit) token — FCM cannot deliver VoIP pushes; incoming-call
+  // CallKit rings go DIRECTLY through APNs against this token.
+  await query(`ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS voip_token TEXT`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_voip_token ON user_devices(voip_token) WHERE voip_token IS NOT NULL`);
 
   // Login attempt audit (feeds the always-on login attempt emails).
   // NOTE: this table also has an audit-style variant created by

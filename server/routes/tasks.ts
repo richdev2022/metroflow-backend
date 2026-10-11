@@ -671,6 +671,24 @@ export const updateTask: RequestHandler = async (req: AuthenticatedRequest, res)
 
     const taskBefore = taskBeforeResult.rows[0];
 
+    // Status normalization: tasks.status stores the task_status column NAME
+    // (createTask uses the DB default "pending"; getBoard groups by
+    // case-insensitive name). The web board sends the COLUMN ID when a task
+    // is dragged to another column — writing that UUID verbatim orphaned the
+    // task (status no longer matching any column name -> it silently jumped
+    // back to the first column). Resolve id -> canonical name here so both
+    // the web (id) and mobile (name) land the task in the right column.
+    let statusValue = status;
+    if (status !== undefined && status !== null && String(status).trim() !== "") {
+      const statusRes = await query(
+        `SELECT name FROM task_statuses
+          WHERE business_id = $1 AND (id = $2 OR LOWER(name) = LOWER($2))
+          LIMIT 1`,
+        [businessId, String(status).trim()],
+      );
+      if (statusRes.rows[0]?.name) statusValue = statusRes.rows[0].name;
+    }
+
     const result = await query(
       `UPDATE tasks
         SET title = COALESCE($1, title),
@@ -690,7 +708,7 @@ export const updateTask: RequestHandler = async (req: AuthenticatedRequest, res)
                   start_date as "startDate", end_date as "endDate",
                   due_date as "dueDate", status, is_overdue as "isOverdue",
                   created_at as "createdAt", updated_at as "updatedAt"`,
-      [title, description, epic, epicId, sprint, startDate, endDate, dueDate, accomplished_value, status, id, businessId],
+      [title, description, epic, epicId, sprint, startDate, endDate, dueDate, accomplished_value, statusValue, id, businessId],
     );
 
     if (result.rows.length === 0) {

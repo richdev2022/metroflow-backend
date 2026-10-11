@@ -67,6 +67,57 @@ export async function ensureUserReferralCode(userId: string): Promise<string | n
 }
 
 /**
+ * Backfill referral codes for every existing user that doesn't have one
+ * (users created before Refer & Earn shipped — they only got codes lazily
+ * on their next /referrals/me, getMe or /settings read otherwise).
+ *
+ * Single bulk-statement mint, looped to absorb the astronomically unlikely
+ * unique-code collisions (31^8 ≈ 852 billion space): each pass mints every
+ * still-missing user a collision-free code, until no rows are left. Runs
+ * at boot right after ensureReferralSchema, and is idempotent by design.
+ */
+export async function backfillReferralCodes(): Promise<number> {
+  let minted = 0;
+  for (let pass = 0; pass < 10; pass += 1) {
+    try {
+      const res = await query(
+        `WITH missing AS (
+           SELECT id FROM users WHERE referral_code IS NULL
+         ), gen AS (
+           -- LATERAL (correlated) so random() is re-evaluated PER ROW — an
+           -- uncorrelated scalar subquery becomes a Postgres InitPlan and
+           -- every user would get the SAME code → unique-violation abort.
+           SELECT m.id, g.code
+             FROM missing m
+            CROSS JOIN LATERAL (
+              SELECT string_agg(substr('23456789ABCDEFGHJKMNPQRSTUVWXYZ',
+                                       (floor(random() * 31))::int + 1, 1), '') AS code
+                FROM generate_series(1, 8)
+            ) g
+         ), dedup AS (
+           -- DISTINCT ON (code): intra-pass collision insurance — losing a row
+           -- here is fine, it stays NULL and the next pass mints it again.
+           SELECT DISTINCT ON (code) id, code FROM gen
+           WHERE code IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM users u WHERE u.referral_code = gen.code)
+         )
+         UPDATE users u
+            SET referral_code = dedup.code
+           FROM dedup
+          WHERE u.id = dedup.id AND u.referral_code IS NULL`,
+      );
+      const n = res.rowCount || 0;
+      minted += n;
+      if (n === 0) break;
+    } catch (err: any) {
+      console.warn("backfillReferralCodes failed:", err?.message);
+      break;
+    }
+  }
+  return minted;
+}
+
+/**
  * Resolve a referral code to a referrer user id. Codes are compared
  * case-insensitively (clients may lowercase them when sharing links).
  */
@@ -340,7 +391,7 @@ export async function getReferralInfo(userId: string): Promise<{
             rb.status as "bonusStatus", rb.created_at as "bonusPaidAt"
      FROM users u
      LEFT JOIN LATERAL (
-       SELECT name, plan_id FROM businesses WHERE owner_id = u.id ORDER BY created_at LIMIT 1
+       SELECT id, name, plan_id FROM businesses WHERE owner_id = u.id ORDER BY created_at LIMIT 1
      ) biz ON TRUE
      LEFT JOIN referral_bonuses rb ON rb.referred_user_id = u.id
      WHERE u.referred_by = $1

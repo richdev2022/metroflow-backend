@@ -374,4 +374,79 @@ router.get("/subscribe/categories", (_req, res) => {
   res.json({ success: true, data: SUBSCRIBER_CATEGORIES });
 });
 
+// ---------------------------------------------------------------------------
+// Account deletion requests (GDPR erasure flow) — used by the marketing site
+// at metricorex.com/delete-account. Unauthenticated by design; the flow is
+// protected by email confirmation + rate limiting instead. The response is
+// deliberately generic (anti-enumeration): it never reveals whether the
+// address has an account.
+// ---------------------------------------------------------------------------
+import {
+  createDeletionRequest,
+  confirmDeletionRequest,
+  isRateLimited,
+} from "../lib/account-deletion";
+
+const clientIp = (req: express.Request): string =>
+  (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+  req.socket.remoteAddress ||
+  "unknown";
+
+router.post("/account-deletion/request", async (req, res) => {
+  try {
+    const ip = clientIp(req);
+    if (isRateLimited(`adr:${ip}`, 5, 10 * 60 * 1000)) {
+      return res.status(429).json({ success: false, error: "Too many requests — try again later." });
+    }
+    const email = typeof req.body?.email === "string" ? req.body.email : "";
+    const reason = typeof req.body?.reason === "string" ? req.body.reason : null;
+    if (!email) {
+      return res.status(400).json({ success: false, error: "email is required" });
+    }
+    const result = await createDeletionRequest(email, reason, ip);
+    if (!result.ok) {
+      return res.status(400).json({ success: false, error: "Please provide a valid email address." });
+    }
+    // Same message for known and unknown addresses (no account enumeration).
+    res.json({
+      success: true,
+      message: "If an account exists for this address, a confirmation email has been sent.",
+    });
+  } catch (error: any) {
+    console.error("Account deletion request error:", error?.message || error);
+    res.status(500).json({ success: false, error: "Could not process the request" });
+  }
+});
+
+router.post("/account-deletion/confirm", async (req, res) => {
+  try {
+    const ip = clientIp(req);
+    if (isRateLimited(`adc:${ip}`, 20, 10 * 60 * 1000)) {
+      return res.status(429).json({ success: false, error: "Too many requests — try again later." });
+    }
+    const token = typeof req.body?.token === "string" ? req.body.token : "";
+    const result = await confirmDeletionRequest(token);
+    if (!result.ok) {
+      const friendly: Record<string, string> = {
+        invalid_token: "This confirmation link is invalid.",
+        expired: "This confirmation link has expired — please submit the request again.",
+      };
+      const generic = result.error?.startsWith("already_")
+        ? "This request was already confirmed."
+        : undefined;
+      return res.status(400).json({
+        success: false,
+        error: friendly[result.error || ""] || generic || "This confirmation link is invalid or the request was already processed.",
+      });
+    }
+    res.json({
+      success: true,
+      message: "Request confirmed. Our team will process your account deletion.",
+    });
+  } catch (error: any) {
+    console.error("Account deletion confirm error:", error?.message || error);
+    res.status(500).json({ success: false, error: "Could not confirm the request" });
+  }
+});
+
 export default router;

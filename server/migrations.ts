@@ -36,6 +36,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
   await ensureChatInviteSchema(); // group chat invite links (join by code)
+  await ensureAccountDeletionSchema(); // GDPR account deletion request queue
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2258,4 +2259,25 @@ async function ensureBusinessRegistrationSchema(): Promise<void> {
 async function ensureChatInviteSchema(): Promise<void> {
   await query(`ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS invite_code VARCHAR(16)`);
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_conversations_invite_code ON chat_conversations (invite_code) WHERE invite_code IS NOT NULL`);
+}
+
+async function ensureAccountDeletionSchema(): Promise<void> {
+  await query(`CREATE TABLE IF NOT EXISTS account_delete_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) NOT NULL,
+    reason TEXT,
+    token_hash VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    requested_ip VARCHAR(64),
+    confirm_expires_at TIMESTAMP,
+    confirmed_at TIMESTAMP,
+    processed_at TIMESTAMP,
+    processed_by UUID,
+    note TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_email ON account_delete_requests (email)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_status ON account_delete_requests (status)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_delete_requests_token ON account_delete_requests (token_hash) WHERE token_hash IS NOT NULL`);
 }

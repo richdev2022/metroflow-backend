@@ -5937,6 +5937,83 @@ protectedRouter.post("/locked-accounts/:userId/resolve", requirePermission("mana
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * ACCOUNT DELETION REQUESTS (GDPR erasure queue)
+ * Requests are filed from the public site, CONFIRMED by the email owner,
+ * then reviewed here. Completing a request runs the standard deletion:
+ * PII anonymized in place, status='deleted' (login blocked), sessions and
+ * push devices revoked, financial records retained (legal retention) with
+ * referential integrity. See server/lib/account-deletion.ts for the contract.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+import {
+  executeAccountDeletion,
+  rejectDeletionRequest,
+} from "../lib/account-deletion";
+
+protectedRouter.get("/account-deletion/requests", requirePermission("view_dashboard"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const status = typeof req.query.status === "string" ? req.query.status : "";
+        const allowed = ["pending", "confirmed", "completed", "rejected", "cancelled"];
+        const params: unknown[] = [];
+        let where = "";
+        if (allowed.includes(status)) {
+            params.push(status);
+            where = `WHERE r.status = $${params.length}`;
+        }
+        const result = await query(
+            `SELECT r.id, r.email, r.reason, r.status, r.requested_ip,
+                    r.confirmed_at, r.processed_at, r.note,
+                    r.created_at AS requested_at,
+                    u.id AS user_id, u.name AS user_name, u.role AS user_role,
+                    u.status AS user_status,
+                    b.name AS business_name, b.id AS business_id,
+                    (SELECT COUNT(*)::int FROM users m
+                      WHERE m.business_id = u.business_id AND m.id <> u.id AND m.status = 'active')
+                      AS active_teammates
+               FROM account_delete_requests r
+          LEFT JOIN users u ON LOWER(u.email) = LOWER(r.email)
+          LEFT JOIN businesses b ON b.id = u.business_id
+               ${where}
+           ORDER BY CASE r.status WHEN 'confirmed' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                    r.created_at DESC
+              LIMIT 200`,
+            params,
+        );
+        res.json({ success: true, data: { requests: result.rows } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load deletion requests" });
+    }
+});
+
+protectedRouter.post("/account-deletion/requests/:id/complete", requirePermission("manage_admins"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const adminId = req.admin?.adminId;
+        if (!adminId) return res.status(401).json({ success: false, error: "Unauthorized" });
+        const result = await executeAccountDeletion(req.params.id, adminId);
+        if (!result.ok) {
+            return res.status(409).json({ success: false, error: result.error || "Could not complete deletion" });
+        }
+        res.json({ success: true, message: result.message, data: result.summary });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to delete account" });
+    }
+});
+
+protectedRouter.post("/account-deletion/requests/:id/reject", requirePermission("manage_admins"), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const adminId = req.admin?.adminId;
+        if (!adminId) return res.status(401).json({ success: false, error: "Unauthorized" });
+        const note = typeof req.body?.note === "string" ? req.body.note : null;
+        const result = await rejectDeletionRequest(req.params.id, adminId, note);
+        if (!result.ok) {
+            return res.status(404).json({ success: false, error: "Request not found or already processed" });
+        }
+        res.json({ success: true, message: "Request rejected and user notified" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to reject request" });
+    }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * BUSINESS KYC UPGRADE REVIEW (Registered vs Non-Registered businesses)
  * ═══════════════════════════════════════════════════════════════════════════ */
 

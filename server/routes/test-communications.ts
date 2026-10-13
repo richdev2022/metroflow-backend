@@ -493,14 +493,25 @@ router.post(
  *       200:
  *         description: List of available categories
  */
-router.get("/categories", (req, res) => {
-  res.json({
-    success: true,
-    sms_categories: Object.keys(SMS_CATEGORIES),
-    whatsapp_categories: Object.keys(SMS_CATEGORIES),
-    email_categories: Object.keys(EMAIL_CATEGORIES),
-    available_sms_providers: getAvailableSMSProviders()
-  });
-});
+router.get(
+  "/categories",
+  // VAPT MF-001 follow-up: same platform-admin gate as /send — this endpoint
+  // also enumerates configured SMS providers to anonymous callers.
+  (req, res, next) => {
+    if (process.env.DISABLE_TEST_ENDPOINTS === "true") {
+      return res.status(404).json({ success: false, error: "Not found" });
+    }
+    return authenticateAdmin(req as any, res, next);
+  },
+  (req, res) => {
+    res.json({
+      success: true,
+      sms_categories: Object.keys(SMS_CATEGORIES),
+      whatsapp_categories: Object.keys(SMS_CATEGORIES),
+      email_categories: Object.keys(EMAIL_CATEGORIES),
+      available_sms_providers: getAvailableSMSProviders()
+    });
+  },
+);
 
 export default router;

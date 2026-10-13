@@ -6,6 +6,8 @@ import { getAvailableSMSProviders, getSMSProvider } from "../services/sms-provid
 import { isPushConfigured, sendToTokens, PushSendDiagnostic, getPushServiceAccountDiagnostics } from "../services/push";
 import { query } from "../db";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateAdmin } from "../middleware/adminAuth";
+import { generateOTP } from "../services/auth";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -273,8 +275,9 @@ const EMAIL_CATEGORIES = {
   }
 };
 
-// Helper to generate OTP
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+// Helper to generate OTP — VAPT fix: delegates to the CSPRNG-based service
+// helper (was Math.random).
+const generateTestOTP = generateOTP;
 
 /**
  * @swagger
@@ -324,7 +327,22 @@ const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString()
  *       400:
  *         description: Invalid input
  */
-router.post("/send", async (req, res) => {
+// VAPT MF-001 fix (HIGH): this endpoint fired REAL SMS / email / WhatsApp
+// messages at ARBITRARY recipients with NO authentication — an open relay
+// for SMS pumping, phishing and sender-reputation abuse (live-confirmed:
+// unauthenticated POST returned 400 validation, not 401). No client in any
+// repo (web/admin/mobile) uses it — it is a server-side debug tool, so it is
+// now platform-admin-only. Set DISABLE_TEST_ENDPOINTS=true to hard-disable.
+router.post(
+  "/send",
+  // kill-switch + platform-admin gate
+  (req, res, next) => {
+    if (process.env.DISABLE_TEST_ENDPOINTS === "true") {
+      return res.status(404).json({ success: false, error: "Not found" });
+    }
+    return authenticateAdmin(req as any, res, next);
+  },
+  async (req, res) => {
   try {
     const { type, category, recipient, otp: customOtp, name, purpose, provider } = req.body;
 
@@ -344,7 +362,7 @@ router.post("/send", async (req, res) => {
       });
     }
 
-    const otp = customOtp || generateOTP();
+    const otp = customOtp || generateTestOTP();
 
     if (type === 'sms') {
       // Validate SMS category

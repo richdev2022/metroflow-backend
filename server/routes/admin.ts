@@ -2623,7 +2623,29 @@ protectedRouter.get("/referral-config", requirePermission('manage_settings'), as
         const updated = await query(
             `SELECT key, value, updated_at FROM system_settings WHERE key LIKE 'referral_bonus_%'`
         );
-        res.json({ success: true, config, settings: updated.rows });
+        let userBonuses: any[] = [];
+        try {
+            const rows = await query(
+                `SELECT rb.user_id as "userId", rb.amount, rb.currency, rb.updated_at as "updatedAt",
+                        u.name, u.email, u.referral_code as "referralCode"
+                 FROM referral_user_bonuses rb
+                 JOIN users u ON u.id = rb.user_id
+                 ORDER BY rb.updated_at DESC`
+            );
+            userBonuses = rows.rows.map((r: any) => ({
+                userId: r.userId,
+                name: r.name,
+                email: r.email,
+                referralCode: r.referralCode,
+                amount: Number(r.amount),
+                currency: r.currency,
+                updatedAt: r.updatedAt,
+            }));
+        } catch (tblErr: any) {
+            // Pre-migration DBs may not have the table yet — boot migration creates it.
+            console.warn("referral_user_bonuses read skipped:", tblErr?.message);
+        }
+        res.json({ success: true, config, settings: updated.rows, userBonuses });
     } catch (error) {
         console.error("Error fetching referral config:", error);
         res.status(500).json({ success: false, error: "Failed to fetch referral configuration" });
@@ -2683,6 +2705,191 @@ protectedRouter.put("/referral-config", requirePermission('manage_settings'), as
     } catch (error) {
         console.error("Error updating referral config:", error);
         res.status(500).json({ success: false, error: "Failed to update referral configuration" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referral-user-bonuses/search:
+ *   get:
+ *     summary: Search users (name/email/referral code) for the per-user bonus picker
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ */
+protectedRouter.get("/referral-user-bonuses/search", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const q = String((req.query.q as string) || "").trim();
+        if (q.length < 2) {
+            return res.json({ success: true, users: [] });
+        }
+        const like = `%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`;
+        const rows = await query(
+            `SELECT id, name, email, referral_code as "referralCode", status
+             FROM users
+             WHERE (name ILIKE $1 OR email ILIKE $1 OR UPPER(referral_code) = UPPER($2))
+               AND status != 'banned'
+             ORDER BY created_at DESC
+             LIMIT 10`,
+            [like, q.trim()],
+        );
+        res.json({ success: true, users: rows.rows });
+    } catch (error) {
+        console.error("Error searching users for referral bonus:", error);
+        res.status(500).json({ success: false, error: "Failed to search users" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referral-user-bonuses:
+ *   get:
+ *     summary: List per-user referral bonus overrides
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ */
+protectedRouter.get("/referral-user-bonuses", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const rows = await query(
+            `SELECT rb.user_id as "userId", rb.amount, rb.currency, rb.updated_at as "updatedAt",
+                    u.name, u.email, u.referral_code as "referralCode"
+             FROM referral_user_bonuses rb
+             JOIN users u ON u.id = rb.user_id
+             ORDER BY rb.updated_at DESC`
+        );
+        const userBonuses = rows.rows.map((r: any) => ({
+            userId: r.userId,
+            name: r.name,
+            email: r.email,
+            referralCode: r.referralCode,
+            amount: Number(r.amount),
+            currency: r.currency,
+            updatedAt: r.updatedAt,
+        }));
+        res.json({ success: true, userBonuses });
+    } catch (error) {
+        console.error("Error listing referral user bonuses:", error);
+        res.status(500).json({ success: false, error: "Failed to load referral user bonuses" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referral-user-bonuses/{userId}:
+ *   put:
+ *     summary: Set (or update) a per-user referral bonus override
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [amount]
+ *             properties:
+ *               amount:
+ *                 type: number
+ *               currency:
+ *                 type: string
+ */
+protectedRouter.put("/referral-user-bonuses/:userId", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { amount, currency } = req.body || {};
+
+        if (!userId || !/^[0-9a-fA-F-]{36}$/.test(userId)) {
+            return res.status(400).json({ success: false, error: "Invalid user id" });
+        }
+        const parsed = Number(amount);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return res.status(400).json({ success: false, error: "Bonus amount must be a positive number" });
+        }
+        const userRes = await query(`SELECT id, name, email FROM users WHERE id = $1 LIMIT 1`, [userId]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "User not found" });
+        }
+
+        let cur: string;
+        if (currency !== undefined) {
+            cur = String(currency).toUpperCase().trim();
+            if (!/^[A-Z]{3}$/.test(cur)) {
+                return res.status(400).json({ success: false, error: "Currency must be a 3-letter ISO code (e.g. NGN, USD)" });
+            }
+        } else {
+            const globalCfg = await getReferralConfig();
+            cur = globalCfg.currency;
+        }
+
+        await query(
+            `INSERT INTO referral_user_bonuses (user_id, amount, currency, updated_by, updated_at)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id) DO UPDATE
+               SET amount = EXCLUDED.amount,
+                   currency = EXCLUDED.currency,
+                   updated_by = EXCLUDED.updated_by,
+                   updated_at = CURRENT_TIMESTAMP`,
+            [userId, parsed.toFixed(2), cur, (req as any).user?.userId || null],
+        );
+
+        console.log(`Referral per-user bonus set: ${cur} ${parsed.toFixed(2)} for user ${userId} by admin ${(req as any).user?.userId}`);
+        res.json({
+            success: true,
+            message: `Per-user referral bonus set to ${cur} ${parsed.toLocaleString()}`,
+            user: { userId, name: userRes.rows[0].name, email: userRes.rows[0].email },
+            bonus: { amount: parsed, currency: cur },
+        });
+    } catch (error) {
+        console.error("Error setting referral user bonus:", error);
+        res.status(500).json({ success: false, error: "Failed to set referral user bonus" });
+    }
+});
+
+/**
+ * @swagger
+ * /admin/referral-user-bonuses/{userId}:
+ *   delete:
+ *     summary: Remove a per-user referral bonus override (falls back to the global bonus)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ */
+protectedRouter.delete("/referral-user-bonuses/:userId", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!userId || !/^[0-9a-fA-F-]{36}$/.test(userId)) {
+            return res.status(400).json({ success: false, error: "Invalid user id" });
+        }
+        const del = await query(`DELETE FROM referral_user_bonuses WHERE user_id = $1`, [userId]);
+        res.json({
+            success: true,
+            message: (del.rowCount || 0) > 0
+                ? "Per-user bonus removed — global bonus applies again"
+                : "No override existed for this user",
+        });
+    } catch (error) {
+        console.error("Error removing referral user bonus:", error);
+        res.status(500).json({ success: false, error: "Failed to remove referral user bonus" });
     }
 });
 

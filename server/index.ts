@@ -412,6 +412,9 @@ export async function createServer() {
   app.use(secureHeaders);
   app.use(rateLimiter);
 
+  // VAPT MF-010 fix: stop advertising the framework version.
+  app.disable("x-powered-by");
+
   app.use(express.json({
     // Capture the raw body for signature-validated webhooks (LiveKit egress events).
     verify: (req: any, _res, buf) => {
@@ -433,14 +436,25 @@ export async function createServer() {
   });
 
   // Swagger Documentation
-  const CSS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui.min.css";
-  const JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-bundle.min.js";
-  const JS_PRESET_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-standalone-preset.min.js";
+  // VAPT MF-007 fix: /api-docs previously exposed the FULL API surface
+  // (every route, parameter shape and business rule) to anonymous internet
+  // scanners. In production it now requires an explicit opt-in so real
+  // deployments are dark by default:
+  //   - SWAGGER_ENABLED=true  -> serve as before (explicit operator choice)
+  //   - otherwise (prod)      -> 404
+  // Non-production (local dev, previews) keeps docs open.
+  const isProd = process.env.NODE_ENV === "production" || !!process.env.NETLIFY;
+  const swaggerAllowed = !isProd || process.env.SWAGGER_ENABLED === "true";
+  if (swaggerAllowed) {
+    const CSS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui.min.css";
+    const JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-bundle.min.js";
+    const JS_PRESET_URL = "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.0.0/swagger-ui-standalone-preset.min.js";
 
-  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, {
-    customCssUrl: CSS_URL,
-    customJs: [JS_URL, JS_PRESET_URL]
-  }));
+    app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, {
+      customCssUrl: CSS_URL,
+      customJs: [JS_URL, JS_PRESET_URL]
+    }));
+  }
 
 
   // Serve static files
@@ -579,6 +593,72 @@ export async function createServer() {
   // envelopes, wrap res.json so every JSON response leaves as ciphertext.
   // Installed after body parsing/recovery so no stream surgery is needed.
   app.use(payloadEncryptionMiddleware);
+  // VAPT MF-004 fix: 5xx response sanitizer. 100+ handlers answer
+  // res.status(500).json({ error: error.message }) — when the underlying
+  // failure is a database/parser/network error, RAW internals (SQL text,
+  // column names, file paths, stack frames, provider payloads) reached
+  // clients. This wrapper (mounted AFTER payload-encryption so it wraps
+  // OUTERMOST and sees plaintext first) rewrites any leak-shaped string in
+  // 5xx bodies to a generic message. Full detail stays in pm2 logs.
+  const LEAK_PATTERNS: RegExp[] = [
+    /relation\s+"?[a-z0-9_.]+"?\s+does not exist/i,
+    /column\s+"?[a-z0-9_.]+"?\s+does not exist/i,
+    /syntax error at or near/i,
+    /invalid input syntax for type/i,
+    /duplicate key value violates unique constraint/i,
+    /violates (foreign key|unique|not-null|check) constraint/i,
+    /insert or update on table .+ violates/i,
+    /password authentication failed/i,
+    /role\s+"?[a-z0-9_]+"?\s+does not exist/i,
+    /permission denied for (table|relation|function|schema)/i,
+    /connect ECONNREFUSED/i,
+    /getaddrinfo ENOTFOUND/i,
+    /ETIMEDOUT|ECONNRESET|EHOSTUNREACH/i,
+    /aggregate function|pg_types| PreparedStmt/i,
+    /\bat\s+[\w$.]+\s+\(?.*:\d+:\d+\)?/,
+    /\/(home|root|var|srv|app|Users)\/[\w./-]+\.(ts|js|mjs|cjs)/,
+    /node_modules[\\/][\w@./-]+/,
+    /from\s+environment variable|expected\s+\w+,\s+got/i,
+    /postgres(ql)?\s+error/i,
+    /error:\s/i,
+    /stack\s*trace|traceback/i,
+    /\bPROCESSING|\bSSL(?:_)?SYSCALL|sslwr_|libpq/i,
+  ];
+  type SanitizableBody = Record<string, unknown> | null | undefined;
+  function containsLeakDetail(value: unknown, depth = 0): boolean {
+    if (depth > 4) return false;
+    if (typeof value === "string") return LEAK_PATTERNS.some((re) => re.test(value));
+    if (Array.isArray(value)) return value.some((v) => containsLeakDetail(v, depth + 1));
+    if (value && typeof value === "object") {
+      return Object.values(value as Record<string, unknown>).some((v) => containsLeakDetail(v, depth + 1));
+    }
+    return false;
+  }
+  app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const originalJson = res.json.bind(res);
+    res.json = ((body: SanitizableBody) => {
+      try {
+        if (res.statusCode >= 500 && body && typeof body === "object") {
+          const scrubbed: any = { ...(body as Record<string, unknown>) };
+          if (typeof scrubbed.error === "string" && containsLeakDetail(scrubbed.error)) {
+            scrubbed.error = "Internal Server Error";
+          }
+          if (typeof scrubbed.message === "string" && containsLeakDetail(scrubbed.message)) {
+            scrubbed.message = "Internal Server Error";
+          }
+          // 5xx must never carry internals regardless of shape.
+          delete scrubbed.stack;
+          delete scrubbed.providerResponse;
+          if (containsLeakDetail(scrubbed)) scrubbed.error = "Internal Server Error";
+          return originalJson(scrubbed);
+        }
+      } catch {
+        // Sanitizer must never break the response path.
+      }
+      return originalJson(body);
+    }) as typeof res.json;
+    next();
+  });
   // Encrypted-at-rest audit trail of every API call (admin Activity Logs).
   app.use(requestLoggerMiddleware);
 
@@ -1120,6 +1200,9 @@ export async function createServer() {
 
 
   // Global Error Handler
+  // VAPT MF-004 fix: the response no longer echoes err.message (raw
+  // PostgreSQL/parser text leaked to clients here). Full detail is logged
+  // and reported to Sentry; clients get a generic body.
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     logger.error("❌ Unhandled Error:", err);
     if (sentryInitialized) {
@@ -1128,9 +1211,9 @@ export async function createServer() {
     if (res.headersSent) {
       return next(err);
     }
-    res.status(500).json({ 
-      error: "Internal Server Error", 
-      message: err.message,
+    res.status(500).json({
+      error: "Internal Server Error",
+      message: "Internal Server Error",
       path: req.path
     });
   });

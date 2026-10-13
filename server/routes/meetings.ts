@@ -29,9 +29,13 @@ function isValidUUID(str: string): boolean {
   return uuidRegex.test(str);
 }
 
-// Helper to generate random meeting code
+// Helper to generate random meeting code — VAPT MF-011 fix: CSPRNG
+// (join-by-code rooms are protected solely by this secret).
 function generateMeetingCode() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+  const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += ALPHABET[crypto.randomInt(ALPHABET.length)];
+  return code;
 }
 
 /**

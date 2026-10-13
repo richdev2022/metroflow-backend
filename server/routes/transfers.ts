@@ -17,7 +17,7 @@ import { enforceTransactionLimits } from "../services/transaction-limits";
  *  with INTL_QUOTE_TTL_SECONDS env as the legacy override. Clients show a
  *  countdown and must re-quote when it lapses; the initiation path re-quotes
  *  server-side regardless. */
-import { generateOTP, getOTPExpiry, verifyPassword } from "../services/auth";
+import { generateOTP, getOTPExpiry, verifyPassword, hashOtp, otpMatches } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
 import { sendWhatsApp } from "../services/whatsapp";
@@ -252,7 +252,7 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, requireT
 
         await query(
             `UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`,
-            [otpCode, otpExpiresAt, userId]
+            [hashOtp(otpCode), otpExpiresAt, userId] // VAPT MF-012: hashed at rest
         );
 
         let feeCharged = 0;
@@ -568,11 +568,11 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
         return res.status(400).json({ success: false, error: "OTP is required" });
       }
 
-      // Verify OTP
+      // Verify OTP (VAPT MF-012: hashed-OTP compare)
       const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
       const user = uRes.rows[0];
 
-      if (!user.otp_code || user.otp_code !== otp) {
+      if (!user.otp_code || !otpMatches(otp, user.otp_code)) {
         return res.status(400).json({ success: false, error: "Invalid OTP" });
       }
       if (new Date(user.otp_expires_at) < new Date()) {

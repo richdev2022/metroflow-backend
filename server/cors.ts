@@ -39,18 +39,32 @@ function getAllowedOrigins() {
   ].filter(Boolean) as string[];
 }
 
+// VAPT MF-003 fix: local development origins are matched with an EXACT
+// host:port pattern, never a substring check. The old `origin.includes(
+// "localhost")` reflected hostile origins like `https://localhost.evil.com`
+// (live-confirmed exploitable) because they merely CONTAIN the substring.
+// `Origin: null` (sandboxed iframes, some cross-site form posts, and the
+// classic `document.origin = null` tricks) is likewise no longer trusted.
+const LOCAL_ORIGIN_PATTERN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
 export function isCorsOriginAllowed(origin?: string | null) {
-  if (!origin || origin === "null") {
+  if (!origin) {
+    // No Origin header (server-to-server, mobile apps, curl) — CORS is a
+    // browser concept; these requests were never blocked and must not start
+    // being blocked now.
+    return true;
+  }
+
+  if (origin === "null") {
+    return false;
+  }
+
+  if (LOCAL_ORIGIN_PATTERN.test(origin)) {
     return true;
   }
 
   const allowedOrigins = getAllowedOrigins();
-  return (
-    allowedOrigins.includes("*") ||
-    allowedOrigins.includes(origin) ||
-    origin.includes("localhost") ||
-    origin.includes("127.0.0.1")
-  );
+  return allowedOrigins.includes("*") || allowedOrigins.includes(origin);
 }
 
 export function getCorsHeaders(origin?: string | null, requestedHeaders?: string | null) {
@@ -75,7 +89,12 @@ export const corsOptions: CorsOptions = {
       return callback(null, true);
     }
 
-    return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    // VAPT MF-003 fix: a disallowed origin must NOT error the request.
+    // callback(Error) turned every blocked cross-site probe into a 500 and
+    // (worse) some error paths still carried CORS headers. callback(null,
+    // false) simply omits Access-Control-Allow-Origin so the BROWSER rejects
+    // the response — the request itself answers normally (200/4xx).
+    return callback(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],

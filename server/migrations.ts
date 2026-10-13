@@ -37,6 +37,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
   await ensureChatInviteSchema(); // group chat invite links (join by code)
   await ensureAccountDeletionSchema(); // GDPR account deletion request queue
+  await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2280,4 +2281,19 @@ async function ensureAccountDeletionSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_email ON account_delete_requests (email)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_status ON account_delete_requests (status)`);
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_delete_requests_token ON account_delete_requests (token_hash) WHERE token_hash IS NOT NULL`);
+}
+
+/**
+ * Free-forever trial tier: pricing_plans.trial_permissions holds the EXTRA
+ * permission slugs granted while a business is inside its initial trial
+ * window (trial_ends_at > now). Semantics consumed by
+ * checkFeaturePermission (server/middleware/auth.ts):
+ *   - NULL / empty / ["*"]  -> trial grants ALL plan-gated features
+ *     (premium preview — "enjoy all premium features free for 7 days")
+ *   - explicit array        -> trial grants base permissions + these slugs
+ * After the trial expires, free-plan businesses fall back to the plan's
+ * base `permissions` set (free forever) — never a hard block.
+ */
+async function ensureFreeForeverTrialSchema(): Promise<void> {
+  await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_permissions JSONB`);
 }

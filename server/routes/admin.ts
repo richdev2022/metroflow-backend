@@ -849,7 +849,8 @@ protectedRouter.get("/pricing", requirePermission('manage_plans', 'manage_busine
 protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_businesses'), async (req, res) => {
     try {
         const { 
-            name, price, currency, duration, discount, features, permissions,
+            name, description, price, currency, duration, discount, features, permissions,
+            trialDays, trialPermissions,
             maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
             breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
@@ -877,16 +878,19 @@ protectedRouter.post("/pricing", requirePermission('manage_plans', 'manage_busin
 
         const result = await query(
             `INSERT INTO pricing_plans 
-            (name, price, currency, duration, discount, features, permissions, is_active,
+            (name, description, price, currency, duration, discount, features, permissions, is_active,
+            trial_days, trial_permissions,
             max_meeting_duration, max_participants, max_recording_duration, max_recording_storage,
             waiting_room_enabled, recording_enabled, screen_sharing_enabled,
             breakout_rooms_enabled, virtual_backgrounds, live_captions,
             payment_links_enabled, max_payment_links, payment_link_fee_discount_percent,
             ai_credit_discount_percent, prices_by_currency)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, true, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb)
              RETURNING *`,
             [
-                name, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions),
+                name, description ?? null, price, currency, duration, discount || 0, toJsonbParam(features), toJsonbParam(permissions),
+                (() => { const d = parseInt(trialDays, 10); return Number.isFinite(d) && d >= 0 ? d : 7; })(),
+                trialPermissions === undefined || trialPermissions === null ? null : toJsonbParam(trialPermissions),
                 maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
                 waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
                 breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
@@ -943,7 +947,8 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
     try {
         const { id } = req.params;
         const { 
-            name, price, discount, features, permissions, is_active,
+            name, description, price, discount, features, permissions, is_active,
+            trialDays, trialPermissions,
             maxMeetingDuration, maxParticipants, maxRecordingDuration, maxRecordingStorage,
             waitingRoomEnabled, recordingEnabled, screenSharingEnabled,
             breakoutRoomsEnabled, virtualBackgrounds, liveCaptions,
@@ -976,6 +981,11 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
             params.push(discount);
             paramCount++;
         }
+        if (description !== undefined) {
+            queryStr += `, description = $${paramCount}`;
+            params.push(description);
+            paramCount++;
+        }
         if (features !== undefined) {
             queryStr += `, features = $${paramCount}::jsonb`;
             params.push(toJsonbParam(features));
@@ -989,6 +999,20 @@ protectedRouter.put("/pricing/:id", requirePermission('manage_plans', 'manage_bu
         if (is_active !== undefined) {
             queryStr += `, is_active = $${paramCount}`;
             params.push(is_active);
+            paramCount++;
+        }
+        if (trialDays !== undefined) {
+            // Trial window length for the free-forever tier (days, 0 disables)
+            const days = parseInt(trialDays, 10);
+            queryStr += `, trial_days = $${paramCount}`;
+            params.push(Number.isFinite(days) && days >= 0 ? days : 7);
+            paramCount++;
+        }
+        if (trialPermissions !== undefined) {
+            // FREE-FOREVER TRIAL: null (or []) = ALL plan-gated features during
+            // the trial window; an array = explicit extra permission slugs.
+            queryStr += `, trial_permissions = $${paramCount}::jsonb`;
+            params.push(trialPermissions === null ? null : toJsonbParam(trialPermissions));
             paramCount++;
         }
         if (pricesByCurrency !== undefined) {

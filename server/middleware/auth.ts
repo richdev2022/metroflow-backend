@@ -199,41 +199,25 @@ export const checkSubscriptionStatus = async (
     const trialEndsAt = business.trial_ends_at ? new Date(business.trial_ends_at) : null;
     const isFreePlan = parseFloat(business.price) === 0;
 
-    // Check if subscription is explicitly inactive/cancelled
-    if (business.subscription_status === 'inactive' || business.subscription_status === 'cancelled') {
-         // Allow if trial is still valid? 
-         // Usually inactive means manually cancelled or payment failed.
-         // If it's a free plan, 'inactive' might mean trial expired.
-         
-         // If trial date exists and is in future, maybe allow? 
-         // But prompt says "After expiration for Free Plan".
-         
-         if (isFreePlan && trialEndsAt && trialEndsAt < now) {
-             return res.status(403).json({
-                 success: false,
-                 error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
-             });
-         }
-         
-         // For paid plans that are inactive/cancelled
-         if (!isFreePlan && business.subscription_status !== 'active') {
-             // Maybe they have a grace period or trial?
-             // Simplification: if not active and trial expired (or no trial), block.
-             if (!trialEndsAt || trialEndsAt < now) {
-                return res.status(403).json({
-                    success: false,
-                    error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
-                });
-             }
-         }
+    // FREE-FOREVER: the free plan is never hard-blocked at the subscription
+    // level. During the trial window the business enjoys ALL plan-gated
+    // features (see checkFeaturePermission); after the trial it falls back to
+    // the plan's base permission set (free forever). Feature-level permission
+    // checks do the restricting — not this gate.
+    if (isFreePlan) {
+        return next();
     }
-    
-    // Check if Active but Trial Expired (specifically for Free Plan which might stay 'active' until we check dates)
-    if (isFreePlan && trialEndsAt && trialEndsAt < now) {
-        return res.status(403).json({
-            success: false,
-            error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
-        });
+
+    // Check if subscription is explicitly inactive/cancelled (paid plans)
+    if (business.subscription_status === 'inactive' || business.subscription_status === 'cancelled') {
+         // Maybe they have a grace period or trial?
+         // Simplification: if not active and trial expired (or no trial), block.
+         if (!trialEndsAt || trialEndsAt < now) {
+            return res.status(403).json({
+                success: false,
+                error: "Your subscription has expired. Please upgrade your plan to continue accessing these features."
+            });
+         }
     }
 
     next();
@@ -260,8 +244,10 @@ export const checkFeaturePermission = (requiredPermission: string | string[]) =>
 
       // Get plan permissions. Some admin flows store selectable feature IDs in
       // `features`, so both columns are treated as plan-level access grants.
+      // Trial columns: free plans grant trial_permissions on top of the base
+      // set while the business is inside its initial trial window.
       const result = await query(
-        `SELECT p.permissions, p.features 
+        `SELECT p.permissions, p.features, p.price, p.trial_permissions, b.trial_ends_at
          FROM businesses b
          JOIN pricing_plans p ON b.plan_id = p.id
          WHERE b.id = $1`,
@@ -273,7 +259,27 @@ export const checkFeaturePermission = (requiredPermission: string | string[]) =>
       }
 
       const permissions = normalizePlanPermissions(result.rows[0].permissions, result.rows[0].features);
-      
+
+      // FREE-FOREVER TRIAL: while a free plan is inside its trial window
+      // (trial_ends_at > now) the business gets the plan's trial permissions
+      // on top of its base set. An unset/empty trial_permissions (or ["*"])
+      // means "everything" — ALL plan-gated features are permitted during the
+      // trial ("enjoy all premium features free for 7 days"). After the trial
+      // the business falls back to the plan's base permission set.
+      const isFreePlan = parseFloat(result.rows[0].price) === 0;
+      const trialEndsAt = result.rows[0].trial_ends_at ? new Date(result.rows[0].trial_ends_at) : null;
+      if (isFreePlan && trialEndsAt && trialEndsAt > new Date()) {
+        const tp = result.rows[0].trial_permissions;
+        const trialList = Array.isArray(tp) ? tp.map((v) => String(v)) : null;
+        if (!trialList || trialList.length === 0 || trialList.includes("*") || trialList.includes("all")) {
+          return next(); // trial unlocks every plan-gated feature
+        }
+        const trialPerms = normalizePlanPermissions(trialList);
+        if (requiredList.some((perm) => trialPerms.has(perm))) {
+          return next();
+        }
+      }
+
       if (permissions.has("*") || permissions.has("all") || requiredList.some((perm) => permissions.has(perm))) {
         return next();
       }

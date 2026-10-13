@@ -36,10 +36,10 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
   await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
   await ensureChatInviteSchema(); // group chat invite links (join by code)
+  await ensureReferralUserBonusSchema(); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
   await ensureAccountDeletionSchema(); // GDPR account deletion request queue
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
-  await ensureReferralUserBonusSchema(); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2264,6 +2264,64 @@ async function ensureChatInviteSchema(): Promise<void> {
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_conversations_invite_code ON chat_conversations (invite_code) WHERE invite_code IS NOT NULL`);
 }
 
+/**
+ * Refer & Earn — per-user bonus overrides.
+ *
+ * - referral_bonuses: DDL kept here (idempotent) because the original
+ *   ensureReferralSchema() was lost in a refactor while production already
+ *   had the table — a fresh database would otherwise never create it.
+ * - referral_user_bonuses: admin-configured PER-USER bonus override. When a
+ *   referrer has a row here, they earn THIS amount/currency instead of the
+ *   global referral_bonus_amount. Master switch (referral_bonus_enabled)
+ *   still governs whether any bonus pays at all.
+ */
+async function ensureReferralUserBonusSchema(): Promise<void> {
+  // users.referral_code / referred_by (originally ensureReferralSchema)
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(20)`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id) ON DELETE SET NULL`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS referral_bonuses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      referrer_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      referred_user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      referred_business_id VARCHAR(255) REFERENCES businesses(id) ON DELETE SET NULL,
+      plan_id UUID,
+      amount DECIMAL(15, 2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      status VARCHAR(20) NOT NULL DEFAULT 'paid',
+      reference VARCHAR(255) UNIQUE,
+      transaction_id UUID,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_referral_bonuses_referrer ON referral_bonuses(referrer_user_id, created_at DESC)`);
+
+  // Admin-configurable bonus defaults (seeded once — admin edits win).
+  await query(`
+    INSERT INTO system_settings (key, value, description) VALUES
+      ('referral_bonus_enabled', 'true', 'Refer & Earn master switch (true/false)'),
+      ('referral_bonus_amount', '5000', 'Referral bonus credited to the referrer wallet when a referred business subscribes'),
+      ('referral_bonus_currency', 'NGN', 'Currency of the referral bonus')
+    ON CONFLICT (key) DO NOTHING
+  `);
+
+  // Per-user bonus overrides (the new bit).
+  await query(`
+    CREATE TABLE IF NOT EXISTS referral_user_bonuses (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      amount DECIMAL(15, 2) NOT NULL CHECK (amount > 0),
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      updated_by UUID,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_referral_user_bonuses_updated ON referral_user_bonuses(updated_at DESC)`);
+}
+
 async function ensureAccountDeletionSchema(): Promise<void> {
   await query(`CREATE TABLE IF NOT EXISTS account_delete_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2324,61 +2382,4 @@ async function ensureVaptHardeningSchema(): Promise<void> {
 
   await query(`ALTER TABLE users ALTER COLUMN otp_code TYPE VARCHAR(255)`);
   await query(`ALTER TABLE businesses ALTER COLUMN otp_code TYPE VARCHAR(255)`);
-
-/**
- * Refer & Earn — per-user bonus overrides.
- *
- * - referral_bonuses: DDL kept here (idempotent) because the original
- *   ensureReferralSchema() was lost in a refactor while production already
- *   had the table — a fresh database would otherwise never create it.
- * - referral_user_bonuses: admin-configured PER-USER bonus override. When a
- *   referrer has a row here, they earn THIS amount/currency instead of the
- *   global referral_bonus_amount. Master switch (referral_bonus_enabled)
- *   still governs whether any bonus pays at all.
- */
-async function ensureReferralUserBonusSchema(): Promise<void> {
-  // users.referral_code / referred_by (originally ensureReferralSchema)
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(20)`);
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id) ON DELETE SET NULL`);
-  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS referral_bonuses (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      referrer_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      referred_user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-      referred_business_id VARCHAR(255) REFERENCES businesses(id) ON DELETE SET NULL,
-      plan_id UUID,
-      amount DECIMAL(15, 2) NOT NULL,
-      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-      status VARCHAR(20) NOT NULL DEFAULT 'paid',
-      reference VARCHAR(255) UNIQUE,
-      transaction_id UUID,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_referral_bonuses_referrer ON referral_bonuses(referrer_user_id, created_at DESC)`);
-
-  // Admin-configurable bonus defaults (seeded once — admin edits win).
-  await query(`
-    INSERT INTO system_settings (key, value, description) VALUES
-      ('referral_bonus_enabled', 'true', 'Refer & Earn master switch (true/false)'),
-      ('referral_bonus_amount', '5000', 'Referral bonus credited to the referrer wallet when a referred business subscribes'),
-      ('referral_bonus_currency', 'NGN', 'Currency of the referral bonus')
-    ON CONFLICT (key) DO NOTHING
-  `);
-
-  // Per-user bonus overrides (the new bit).
-  await query(`
-    CREATE TABLE IF NOT EXISTS referral_user_bonuses (
-      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      amount DECIMAL(15, 2) NOT NULL CHECK (amount > 0),
-      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-      updated_by UUID,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_referral_user_bonuses_updated ON referral_user_bonuses(updated_at DESC)`);
 }

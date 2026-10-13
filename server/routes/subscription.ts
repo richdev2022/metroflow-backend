@@ -8,13 +8,14 @@ import { maybePayReferralBonus } from "../services/referral";
 import { sendEmail, generateSubscriptionCancelledEmail, generateSubscriptionDowngradedEmail, generateSubscriptionActivatedEmail } from "../services/email";
 import crypto from "crypto";
 import axios from "axios";
-import * as XLSX from "xlsx";
+// VAPT MF-008: `xlsx` (SheetJS) removed — abandoned upstream, unfixable
+// advisories; CSV export now served by server/utils/csv.ts (toCsv).
+import { toCsv } from "../utils/csv";
 
 const router = express.Router();
 
 const sendCSV = (res: any, data: any[], filename: string) => {
-    const ws = XLSX.utils.json_to_sheet(data);
-    const csv = XLSX.utils.sheet_to_csv(ws);
+    const csv = toCsv(data);
     res.header('Content-Type', 'text/csv');
     res.header('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
@@ -1685,8 +1686,7 @@ router.get("/transactions/export", authenticateToken, async (req, res) => {
         queryStr += ` ORDER BY t.created_at DESC`;
         const result = await query(queryStr, params);
 
-        const ws = XLSX.utils.json_to_sheet(result.rows);
-        const csv = XLSX.utils.sheet_to_csv(ws);
+        const csv = toCsv(result.rows);
         res.header('Content-Type', 'text/csv');
         res.header('Content-Disposition', `attachment; filename="transactions_${Date.now()}.csv"`);
         res.send(csv);

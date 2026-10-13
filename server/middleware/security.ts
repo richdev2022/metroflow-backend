@@ -64,7 +64,10 @@ export function secureHeaders(req: Request, res: Response, next: NextFunction) {
   
   // Permissions Policy
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
-  
+
+  // VAPT MF-009 fix: deny legacy Adobe cross-domain policy files.
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+
   next();
 }
 

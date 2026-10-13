@@ -38,6 +38,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureChatInviteSchema(); // group chat invite links (join by code)
   await ensureAccountDeletionSchema(); // GDPR account deletion request queue
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
+  await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2296,4 +2297,30 @@ async function ensureAccountDeletionSchema(): Promise<void> {
  */
 async function ensureFreeForeverTrialSchema(): Promise<void> {
   await query(`ALTER TABLE pricing_plans ADD COLUMN IF NOT EXISTS trial_permissions JSONB`);
+}
+
+/**
+ * VAPT remediation schema (findings MF-002 + MF-012):
+ *  1. platform_admins gains the SAME login-governance columns users already
+ *     has (failed_login_attempts / locked_until / lock_count) so admin
+ *     logins can be locked out after repeated failures.
+ *  2. platform_admins gains reset_token / reset_expires — the admin
+ *     forgot-password flow (POST /admin/auth/forgot-password, called by the
+ *     admin UI) has always written these columns but they never existed, so
+ *     the endpoint 500ed. The columns make the flow real; reset tokens are
+ *     stored HASHED (sha256, 64 hex chars).
+ *  3. users.otp_code / businesses.otp_code widen varchar(6) -> varchar(255)
+ *     so OTP flows can store SHA-256 digests instead of plaintext codes.
+ * All idempotent — safe on every boot.
+ */
+async function ensureVaptHardeningSchema(): Promise<void> {
+  await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`);
+  await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS lock_count INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS reset_token VARCHAR(255)`);
+  await query(`ALTER TABLE platform_admins ADD COLUMN IF NOT EXISTS reset_expires TIMESTAMPTZ`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_platform_admins_locked ON platform_admins (locked_until) WHERE locked_until IS NOT NULL`);
+
+  await query(`ALTER TABLE users ALTER COLUMN otp_code TYPE VARCHAR(255)`);
+  await query(`ALTER TABLE businesses ALTER COLUMN otp_code TYPE VARCHAR(255)`);
 }

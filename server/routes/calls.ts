@@ -48,8 +48,14 @@ function isValidUUID(str: string): boolean {
 }
 
 // Helper to generate random call code
+// VAPT MF-011 fix: room codes are the SOLE secret protecting a call join
+// (join-by-code). Math.random() is a predictable PRNG — codes are now drawn
+// from the OS CSPRNG (crypto.randomInt is unbiased).
 function generateCallCode() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+  const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += ALPHABET[crypto.randomInt(ALPHABET.length)];
+  return code;
 }
 
 // Helper to build a call link (for responses + emails).

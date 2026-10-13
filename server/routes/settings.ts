@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../middleware/auth";
-import { generateOTP, getOTPExpiry, hashPassword, verifyPassword } from "../services/auth";
+import { generateOTP, getOTPExpiry, hashPassword, verifyPassword, hashOtp, otpMatches } from "../services/auth";
 import { sendEmail, generateOtpEmailHtml } from "../services/email";
 import { sendSMS } from "../services/sms";
 import { validateBody } from "../middleware/validation";
@@ -413,12 +413,12 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
         }
 
         if (type === 'email') {
-            // Update DB with temp email and OTP
+            // Update DB with temp email and OTP (VAPT MF-012: OTP stored hashed)
             await query(
                 `UPDATE businesses 
                  SET temp_email = $1, otp_code = $2, otp_expires_at = $3, temp_phone = NULL
                  WHERE id = $4`,
-                [value, otpCode, otpExpiresAt, businessId]
+                [value, hashOtp(otpCode), otpExpiresAt, businessId]
             );
 
             // Send Email
@@ -426,12 +426,12 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
             await sendEmail(value, "Business Admin", "Verify New Business Email", emailHtml);
 
         } else if (type === 'phone') {
-            // Update DB with temp phone and OTP
+            // Update DB with temp phone and OTP (VAPT MF-012: OTP stored hashed)
             await query(
                 `UPDATE businesses 
                  SET temp_phone = $1, otp_code = $2, otp_expires_at = $3, temp_email = NULL
                  WHERE id = $4`,
-                [value, otpCode, otpExpiresAt, businessId]
+                [value, hashOtp(otpCode), otpExpiresAt, businessId]
             );
 
             // Send SMS
@@ -492,7 +492,8 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
 
         const { temp_email, temp_phone, otp_code, otp_expires_at } = result.rows[0];
 
-        if (!otp_code || otp_code !== otp) {
+        // VAPT MF-012: hashed-OTP compare
+        if (!otp_code || !otpMatches(otp, otp_code)) {
             return res.status(400).json({ success: false, error: "Invalid OTP" });
         }
 
@@ -725,10 +726,10 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
     const otpCode = generateOTP();
     const otpExpiresAt = getOTPExpiry();
 
-    // Store OTP
+    // Store OTP (VAPT MF-012: hashed at rest)
     await query(
       `UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_type = 'pin_update' WHERE id = $3`,
-      [otpCode, otpExpiresAt, userId]
+      [hashOtp(otpCode), otpExpiresAt, userId]
     );
 
     // Deliver the OTP over every available channel; only fail when NO
@@ -835,7 +836,8 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
       return res.status(400).json({ success: false, error: "PIN not set. Create one first." });
     }
 
-    if (!storedOtp || storedOtp !== otp) {
+    // VAPT MF-012: hashed-OTP compare
+    if (!storedOtp || !otpMatches(otp, storedOtp)) {
       return res.status(400).json({ success: false, error: "Invalid OTP" });
     }
 
@@ -912,7 +914,7 @@ router.post("/otp-enabled/send-otp", authenticateToken, checkSubscriptionStatus,
 
     await query(
       `UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_type = 'otp_toggle' WHERE id = $3`,
-      [otpCode, otpExpiresAt, userId]
+      [hashOtp(otpCode), otpExpiresAt, userId] // VAPT MF-012: hashed at rest
     );
 
     let emailSent = false;
@@ -991,7 +993,8 @@ router.put("/otp-enabled", authenticateToken, checkSubscriptionStatus, validateB
         error: "OTP verification required. Please request an OTP first."
       });
     }
-    if (user.otp_code !== otp) {
+    // VAPT MF-012: hashed-OTP compare
+    if (!otpMatches(otp, user.otp_code)) {
       return res.status(400).json({ success: false, error: "Invalid OTP" });
     }
     if (!user.otp_expires_at || new Date(user.otp_expires_at) < new Date()) {

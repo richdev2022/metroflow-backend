@@ -15,6 +15,10 @@ import {
   generateOTP,
   getOTPExpiry,
   generateToken,
+  hashOtp,
+  otpMatches,
+  validatePasswordPolicy,
+  TIMING_EQUALIZER_HASH,
 } from "../services/auth";
 import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, parseDeviceInfo, emailLogoHeader } from "../services/email";
 import { getProfileStatus } from "../services/profile-status";
@@ -132,6 +136,15 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       });
     }
 
+    // VAPT MF-006 fix: password policy. "12345678" used to be accepted.
+    const passwordCheck = validatePasswordPolicy(input.password, { minLength: 8 });
+    if (!passwordCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: passwordCheck.error,
+      });
+    }
+
     // Check if business email already exists
     const existingBusiness = await query(
       "SELECT id FROM businesses WHERE email = $1",
@@ -216,7 +229,7 @@ export const registerBusiness: RequestHandler = async (req, res) => {
         input.adminEmail,
         passwordHash,
         input.adminName,
-        otpCode,
+        hashOtp(otpCode), // VAPT MF-012: store the digest, email the code
         otpExpiresAt,
       ],
     );
@@ -427,7 +440,9 @@ export const verifyOTP: RequestHandler = async (req, res) => {
 
     const user = result.rows[0];
 
-    if (!user.otp_code || user.otp_code !== input.otpCode) {
+    // VAPT MF-012: stored value is now a SHA-256 digest (legacy plaintext
+    // rows still accepted for their remaining lifetime).
+    if (!user.otp_code || !otpMatches(input.otpCode, user.otp_code)) {
       return res.status(400).json({
         success: false,
         message: "Invalid OTP code",
@@ -569,10 +584,14 @@ export const forgotPassword: RequestHandler = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "User not found",
-      });
+      // VAPT MF-005 fix: never reveal whether the account exists and burn a
+      // bcrypt round so the timing matches the known-account path.
+      await verifyPassword(input.email, TIMING_EQUALIZER_HASH);
+      const response: AuthResponse = {
+        success: true,
+        message: "If an account exists for this email, a reset code has been sent",
+      };
+      return res.json(response);
     }
 
     const user = result.rows[0];
@@ -585,7 +604,7 @@ export const forgotPassword: RequestHandler = async (req, res) => {
       `UPDATE users
        SET otp_code = $1, otp_expires_at = $2
        WHERE id = $3`,
-      [otpCode, otpExpiresAt, user.id],
+      [hashOtp(otpCode), otpExpiresAt, user.id], // VAPT MF-012: hashed at rest
     );
 
     // Send password reset OTP email
@@ -690,15 +709,19 @@ export const verifyResetOTP: RequestHandler = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      // VAPT MF-005: same generic answer + timing for unknown emails —
+      // “User not found” was a direct enumeration oracle.
+      await verifyPassword(input.email, TIMING_EQUALIZER_HASH);
       return res.status(400).json({
         success: false,
-        message: "User not found",
+        message: "Invalid or expired OTP code",
       });
     }
 
     const user = result.rows[0];
 
-    if (!user.otp_code || user.otp_code !== input.otpCode) {
+    // VAPT MF-012: hashed-OTP compare
+    if (!user.otp_code || !otpMatches(input.otpCode, user.otp_code)) {
       return res.status(400).json({
         success: false,
         message: "Invalid OTP code",
@@ -771,10 +794,19 @@ export const resetPassword: RequestHandler = async (req, res) => {
       });
     }
 
-    if (input.newPassword.length < 6) {
+    if (input.newPassword.length < 8) {
       return res.status(400).json({
         success: false,
-        message: "Password must be at least 6 characters long",
+        message: "Password must be at least 8 characters long",
+      });
+    }
+
+    // VAPT MF-006: reset-password is a password-set path — full policy.
+    const resetPasswordCheck = validatePasswordPolicy(input.newPassword, { minLength: 8 });
+    if (!resetPasswordCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: resetPasswordCheck.error,
       });
     }
 
@@ -786,15 +818,18 @@ export const resetPassword: RequestHandler = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      // VAPT MF-005: generic answer + timing equalization.
+      await verifyPassword(input.email, TIMING_EQUALIZER_HASH);
       return res.status(400).json({
         success: false,
-        message: "User not found",
+        message: "Invalid or expired OTP code",
       });
     }
 
     const user = result.rows[0];
 
-    if (!user.otp_code || user.otp_code !== input.otpCode) {
+    // VAPT MF-012: hashed-OTP compare
+    if (!user.otp_code || !otpMatches(input.otpCode, user.otp_code)) {
       return res.status(400).json({
         success: false,
         message: "Invalid OTP code",
@@ -876,10 +911,13 @@ export const resendOTP: RequestHandler = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "User not found",
-      });
+      // VAPT MF-005: generic answer + timing equalization (was "User not found").
+      await verifyPassword(email, TIMING_EQUALIZER_HASH);
+      const response: AuthResponse = {
+        success: true,
+        message: "If an account exists for this email, a verification code has been sent",
+      };
+      return res.json(response);
     }
 
     const user = result.rows[0];
@@ -892,7 +930,7 @@ export const resendOTP: RequestHandler = async (req, res) => {
       `UPDATE users
        SET otp_code = $1, otp_expires_at = $2
        WHERE id = $3`,
-      [otpCode, otpExpiresAt, user.id],
+      [hashOtp(otpCode), otpExpiresAt, user.id], // VAPT MF-012: hashed at rest
     );
 
     // Send OTP email
@@ -1056,6 +1094,10 @@ export const login: RequestHandler = async (req, res) => {
 
     if (result.rows.length === 0) {
       console.log("User not found for email:", input.email);
+      // VAPT MF-005 fix: burn one bcrypt round so this path costs the same
+      // as "user exists, wrong password" — timing no longer reveals whether
+      // an email is registered.
+      await verifyPassword(input.password, TIMING_EQUALIZER_HASH);
       // Log failed attempt
       await recordFailedLogin(input.email, ipAddress, userAgent);
       return res.status(400).json({
@@ -1113,7 +1155,7 @@ export const login: RequestHandler = async (req, res) => {
         `UPDATE users 
          SET otp_code = $1, otp_expires_at = $2
          WHERE id = $3`,
-        [otpCode, otpExpiresAt, user.id],
+        [hashOtp(otpCode), otpExpiresAt, user.id], // VAPT MF-012: hashed at rest
       );
 
       return res.json({
@@ -1563,6 +1605,15 @@ export const setPassword: RequestHandler = async (req: AuthenticatedRequest, res
       });
     }
 
+    // VAPT MF-006: set-password is a password-set path — full policy.
+    const setPasswordCheck = validatePasswordPolicy(password, { minLength: 8 });
+    if (!setPasswordCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: setPasswordCheck.error,
+      });
+    }
+
     const result = await query(
       `SELECT id, password_hash as "passwordHash", auth_provider as "authProvider" FROM users WHERE id = $1`,
       [userId],
@@ -1627,6 +1678,15 @@ export const changePassword: RequestHandler = async (req: AuthenticatedRequest, 
       return res.status(400).json({
         success: false,
         message: "New password must be at least 8 characters",
+      });
+    }
+
+    // VAPT MF-006: change-password is a password-set path — full policy.
+    const changePasswordCheck = validatePasswordPolicy(newPassword, { minLength: 8 });
+    if (!changePasswordCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: changePasswordCheck.error,
       });
     }
 

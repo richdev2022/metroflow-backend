@@ -37,6 +37,54 @@ export async function getReferralConfig(): Promise<ReferralConfig> {
   };
 }
 
+export interface ReferralUserBonusOverride {
+  amount: number;
+  currency: string;
+}
+
+/**
+ * Admin-configured PER-USER bonus override for a referrer. When a row exists
+ * in referral_user_bonuses, that user earns this amount/currency INSTEAD of
+ * the global referral_bonus_amount. The master switch
+ * (referral_bonus_enabled) still governs whether any bonus pays at all.
+ */
+export async function getUserBonusOverride(
+  referrerUserId: string,
+): Promise<ReferralUserBonusOverride | null> {
+  try {
+    const res = await query(
+      `SELECT amount, currency FROM referral_user_bonuses WHERE user_id = $1 LIMIT 1`,
+      [referrerUserId],
+    );
+    const row: any = res.rows[0];
+    if (!row) return null;
+    const amount = Number(row.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    return { amount, currency: (row.currency || "NGN").toUpperCase().slice(0, 3) };
+  } catch (err: any) {
+    console.warn("getUserBonusOverride failed:", err?.message);
+    return null;
+  }
+}
+
+/**
+ * Global config with the referrer's per-user override (if any) applied.
+ * Used for the payout path AND for the referrer's own /referrals/me view so
+ * their screen shows the bonus THEY will actually earn.
+ */
+export async function getEffectiveReferralConfigForReferrer(
+  referrerUserId: string,
+): Promise<ReferralConfig> {
+  const config = await getReferralConfig();
+  const override = await getUserBonusOverride(referrerUserId);
+  if (!override) return config;
+  return {
+    enabled: config.enabled,
+    amount: override.amount,
+    currency: override.currency,
+  };
+}
+
 function randomCode(length = 8): string {
   let out = "";
   for (let i = 0; i < length; i += 1) {
@@ -180,7 +228,6 @@ export async function maybePayReferralBonus(
 
     const config = await getReferralConfig();
     if (!config.enabled || config.amount <= 0) return;
-
     const pool = (await import("../db")).pool;
     const client = await pool.connect();
     try {
@@ -195,6 +242,13 @@ export async function maybePayReferralBonus(
       );
       const owner = ownerRes.rows[0];
       if (!owner || !owner.referred_by) {
+        await client.query("ROLLBACK");
+        return;
+      }
+
+      // Per-user override: the referrer may earn a custom amount/currency.
+      const effective = await getEffectiveReferralConfigForReferrer(owner.referred_by);
+      if (effective.amount <= 0) {
         await client.query("ROLLBACK");
         return;
       }
@@ -221,7 +275,7 @@ export async function maybePayReferralBonus(
          ON CONFLICT (referred_user_id) DO NOTHING
          RETURNING id`,
         [owner.referred_by, owner.user_id, businessId, planId || null,
-         config.amount.toFixed(2), config.currency, reference],
+         effective.amount.toFixed(2), effective.currency, reference],
       );
       if (bonusInsert.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -240,7 +294,7 @@ export async function maybePayReferralBonus(
            VALUES ($1, 0, $2, 'active')
            ON CONFLICT (user_id) DO NOTHING
            RETURNING id`,
-          [owner.referred_by, config.currency],
+          [owner.referred_by, effective.currency],
         );
         if (walletRes.rows.length === 0) {
           walletRes = await client.query(
@@ -254,7 +308,7 @@ export async function maybePayReferralBonus(
 
       await client.query(
         `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [config.amount.toFixed(2), walletId],
+        [effective.amount.toFixed(2), walletId],
       );
 
       // 5. Referrer-facing ledger row (their wallet history).
@@ -266,8 +320,8 @@ export async function maybePayReferralBonus(
          RETURNING id`,
         [
           businessId,
-          config.amount.toFixed(2),
-          config.currency,
+          effective.amount.toFixed(2),
+          effective.currency,
           reference,
           `Referral bonus earned`,
           walletId,
@@ -284,25 +338,25 @@ export async function maybePayReferralBonus(
       //    revenue-row convention (wallet_id NULL, debit direction).
       let revWallet = await client.query(
         `SELECT id FROM platform_wallet WHERE currency = $1 LIMIT 1`,
-        [config.currency],
+        [effective.currency],
       );
       if (revWallet.rows.length === 0) {
         revWallet = await client.query(
           `INSERT INTO platform_wallet (balance, currency) VALUES (0, $1) RETURNING id`,
-          [config.currency],
+          [effective.currency],
         );
       }
       await client.query(
         `UPDATE platform_wallet SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [config.amount.toFixed(2), revWallet.rows[0].id],
+        [effective.amount.toFixed(2), revWallet.rows[0].id],
       );
       await client.query(
         `INSERT INTO transactions
            (amount, currency, reference, status, type, description, transaction_type, direction)
          VALUES ($1, $2, $3, 'success', 'debit', $4, 'referral_bonus', 'debit')`,
         [
-          config.amount.toFixed(2),
-          config.currency,
+          effective.amount.toFixed(2),
+          effective.currency,
           `${reference}-REVENUE-DEBIT`,
           "Referral bonus payout (revenue debit)",
         ],
@@ -311,7 +365,7 @@ export async function maybePayReferralBonus(
       await client.query("COMMIT");
 
       console.log(
-        `Referral bonus paid: ${config.amount} ${config.currency} -> user ${owner.referred_by} (referred user ${owner.user_id}, business ${businessId})`,
+        `Referral bonus paid: ${effective.amount} ${effective.currency} -> user ${owner.referred_by} (referred user ${owner.user_id}, business ${businessId})${effective.currency !== config.currency || effective.amount !== config.amount ? " [per-user override]" : ""}`,
       );
 
       // 7. Best-effort notification email to the referrer.
@@ -325,14 +379,14 @@ export async function maybePayReferralBonus(
           const { sendEmail, generateReferralBonusEmailHtml } = await import("../services/email");
           const html = generateReferralBonusEmailHtml(
             referrer.name || "there",
-            config.amount,
-            config.currency,
+            effective.amount,
+            effective.currency,
             owner.user_name || "A business you referred",
           );
           sendEmail(
             referrer.email,
             referrer.name || "there",
-            `You earned a referral bonus of ${config.currency} ${config.amount.toLocaleString()}`,
+            `You earned a referral bonus of ${effective.currency} ${effective.amount.toLocaleString()}`,
             html,
           ).catch((e: any) => console.warn("Referral bonus email failed:", e?.message));
         }
@@ -379,7 +433,10 @@ export async function getReferralInfo(userId: string): Promise<{
   referred: ReferredUserRow[];
 }> {
   const referralCode = await ensureUserReferralCode(userId);
-  const config = await getReferralConfig();
+  // The requesting user is the REFERRER here — show their effective bonus
+  // (per-user override applied) so their Refer & Earn screen matches what
+  // they will actually be paid.
+  const config = await getEffectiveReferralConfigForReferrer(userId);
 
   const rows = await query(
     `SELECT u.id, u.name, u.email, u.created_at as "joinedAt",

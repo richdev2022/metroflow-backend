@@ -1,8 +1,9 @@
 import express from "express";
-import { loginAdmin } from "../services/admin-auth";
+import crypto from "crypto";
+import { loginAdmin, AdminAccountLockedError } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
-import { generateOTP, getOTPExpiry, hashPassword } from "../services/auth";
+import { generateOTP, getOTPExpiry, hashPassword, hashOtp, otpMatches, validatePasswordPolicy } from "../services/auth";
 import { sendEmail, generateAdminInviteEmailHtml, generateMaintenanceModeEmailHtml, generateBroadcastEmailHtml, sendDisputeAdminAlert, emailLogoHeader, getEmailConfigWithMeta, saveEmailConfig, EMAIL_CONFIG_KEYS } from "../services/email";
 import {
   getDisputeAdminEmails,
@@ -26,7 +27,10 @@ import {
 } from "../services/fees";
 import { maybePayReferralBonus, getReferralConfig } from "../services/referral";
 
-import * as XLSX from "xlsx";
+// VAPT MF-008: `xlsx` (SheetJS) package removed — abandoned upstream with
+// unfixable advisories; only CSV export was ever used, now served by
+// server/utils/csv.ts (toCsv).
+import { toCsv } from "../utils/csv";
 import { generateBusinessId } from "../utils/idGenerator";
 
 const router = express.Router();
@@ -52,31 +56,62 @@ const toJsonbParam = (value: unknown, fallback: unknown = []) => {
 };
 
 // Backward-compatible public aliases (no token required)
-router.post("/login", async (req, res) => {
+// VAPT MF-002 fix: BOTH public admin login endpoints share ONE hardened
+// handler — per-IP throttle, 423 mapping for locked accounts, and a GENERIC
+// error body (the old handlers echoed error.message, which leaked the
+// "Account is inactive" state and would have leaked raw DB errors).
+const ADMIN_LOGIN_IP_WINDOW_MS = 15 * 60 * 1000;
+const ADMIN_LOGIN_IP_MAX = 20; // throttle is per-IP; the per-ACCOUNT lockout is the real control
+const adminLoginIpHits = new Map<string, { count: number; resetTime: number }>();
+
+function adminLoginIpThrottled(ip: string): boolean {
+  const now = Date.now();
+  const entry = adminLoginIpHits.get(ip);
+  if (!entry || entry.resetTime < now) {
+    adminLoginIpHits.set(ip, { count: 1, resetTime: now + ADMIN_LOGIN_IP_WINDOW_MS });
+    // Opportunistic cleanup so the map cannot grow unbounded.
+    if (adminLoginIpHits.size > 5000) {
+      for (const [k, v] of adminLoginIpHits) if (v.resetTime < now) adminLoginIpHits.delete(k);
+    }
+    return false;
+  }
+  entry.count++;
+  return entry.count > ADMIN_LOGIN_IP_MAX;
+}
+
+async function adminLoginHandler(req: express.Request, res: express.Response) {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (adminLoginIpThrottled(ip)) {
+    return res.status(429).json({ success: false, error: "Too many login attempts. Please try again later." });
+  }
   try {
-    const { email, password } = req.body;
-    const result = await loginAdmin(email, password);
+    const { email, password } = req.body || {};
+    const result = await loginAdmin(email, password, {
+      ipAddress: ip,
+      userAgent: req.headers["user-agent"] as string | undefined,
+    });
     res.json({ success: true, ...result });
   } catch (error: any) {
-    res.status(401).json({ success: false, error: error.message });
-  }
-});
-
-router.post("/verify-login", async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
-
-    if (adminCheck.rows.length > 0) {
-      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
-      res.json({ success: true, message: "Admin verified successfully" });
-    } else {
-      res.status(401).json({ success: false, error: "Invalid OTP" });
+    if (error instanceof AdminAccountLockedError) {
+      return res.status(423).json({
+        success: false,
+        code: "ACCOUNT_LOCKED",
+        error: "Account temporarily locked due to repeated failed sign-in attempts",
+        retryAfterSeconds: error.retryAfterSeconds,
+      });
     }
-  } catch (error: any) {
-    res.status(401).json({ success: false, error: error.message });
+    // Generic ONLY — never echo error.message (DB internals, state oracles).
+    res.status(401).json({ success: false, error: "Invalid email or password" });
   }
-});
+}
+
+router.post("/login", adminLoginHandler);
+
+// VAPT MF-002 fix: the legacy /verify-login two-step flow was DEAD CODE — it
+// queried the reset_token column that did not exist in platform_admins
+// (every call 500ed) and no client ever called it. Removed. The real
+// self-service reset flow is /auth/forgot-password ->
+// /auth/reset-password below.
 
 /**
  * @swagger
@@ -127,77 +162,7 @@ router.post("/verify-login", async (req, res) => {
  *                   type: string
  */
 // Admin Login
-authRouter.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await loginAdmin(email, password);
-    res.json({ success: true, ...result });
-  } catch (error: any) {
-    res.status(401).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * @swagger
- * /admin/auth/verify-login:
- *   post:
- *     summary: Verify admin login with OTP
- *     tags: [Admin]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - email
- *               - otp
- *             properties:
- *               email:
- *                 type: string
- *                 format: email
- *               otp:
- *                 type: string
- *     responses:
- *       200:
- *         description: OTP verified successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 message:
- *                   type: string
- *       401:
- *         description: Invalid OTP
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 error:
- *                   type: string
- */
-// Admin Verify Login
-authRouter.post("/verify-login", async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
-
-    if (adminCheck.rows.length > 0) {
-      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
-      res.json({ success: true, message: "Admin verified successfully" });
-    } else {
-      res.status(401).json({ success: false, error: "Invalid OTP" });
-    }
-  } catch (error: any) {
-    res.status(401).json({ success: false, error: error.message });
-  }
-});
+authRouter.post("/login", adminLoginHandler);
 
 /**
  * @swagger
@@ -244,20 +209,35 @@ authRouter.post("/verify-login", async (req, res) => {
  *                 error:
  *                   type: string
  */
-// Admin Verify Forgot Password OTP
+// Admin Verify Forgot Password OTP — functional now that reset_token /
+// reset_expires exist (migration ensureVaptHardeningSchema). The OTP is
+// stored HASHED by forgot-password, so compare via otpMatches (VAPT MF-012).
 authRouter.post("/verify-forgot-password-otp", async (req, res) => {
   try {
     const { email, otp } = req.body;
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+    if (typeof email !== "string" || !email.trim() || typeof otp !== "string" || !otp) {
+      return res.status(400).json({ success: false, error: "Email and OTP are required" });
+    }
+    const adminCheck = await query(
+      `SELECT id, reset_token, reset_expires FROM platform_admins WHERE email = $1`,
+      [email.trim()],
+    );
+    const admin = adminCheck.rows[0];
+    const valid =
+      admin &&
+      admin.reset_expires &&
+      new Date(admin.reset_expires) > new Date() &&
+      otpMatches(otp, admin.reset_token);
 
-    if (adminCheck.rows.length > 0) {
-      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE email = $1`, [email]);
+    if (valid) {
+      await query(`UPDATE platform_admins SET reset_token = NULL, reset_expires = NULL WHERE id = $1`, [admin.id]);
       res.json({ success: true, message: "OTP verified successfully" });
     } else {
-      res.status(401).json({ success: false, error: "Invalid OTP" });
+      res.status(401).json({ success: false, error: "Invalid or expired OTP" });
     }
   } catch (error: any) {
-    res.status(401).json({ success: false, error: error.message });
+    console.error("admin verify-forgot-password-otp error:", error?.message || error);
+    res.status(500).json({ success: false, error: "Failed to verify OTP" });
   }
 });
 
@@ -309,26 +289,45 @@ authRouter.post("/verify-forgot-password-otp", async (req, res) => {
  *                 error:
  *                   type: string
  */
-// Admin Reset Password
+// Admin Reset Password — real flow now: hashed OTP compare + admin-grade
+// password policy (12 chars). Old version stored plaintext OTP comparison
+// against a non-existent column and allowed 6-character passwords.
 authRouter.post("/reset-password", async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
 
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ success: false, error: "Password must be at least 6 characters" });
+    if (typeof email !== "string" || !email.trim() || typeof otp !== "string" || !otp) {
+      return res.status(400).json({ success: false, error: "Email and OTP are required" });
+    }
+    const policy = validatePasswordPolicy(newPassword, { minLength: 12 });
+    if (!policy.ok) {
+      return res.status(400).json({ success: false, error: policy.error });
     }
 
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1 AND reset_token = $2 AND reset_expires > NOW()`, [email, otp]);
+    const adminCheck = await query(
+      `SELECT id, reset_token, reset_expires FROM platform_admins WHERE email = $1`,
+      [email.trim()],
+    );
+    const admin = adminCheck.rows[0];
+    const valid =
+      admin &&
+      admin.reset_expires &&
+      new Date(admin.reset_expires) > new Date() &&
+      otpMatches(otp, admin.reset_token);
 
-    if (adminCheck.rows.length > 0) {
+    if (valid) {
       const passwordHash = await hashPassword(newPassword);
-      await query(`UPDATE platform_admins SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE email = $2`, [passwordHash, email]);
+      await query(
+        `UPDATE platform_admins SET password_hash = $1, reset_token = NULL, reset_expires = NULL, failed_login_attempts = 0, locked_until = NULL WHERE id = $2`,
+        [passwordHash, admin.id],
+      );
       res.json({ success: true, message: "Password reset successfully" });
     } else {
-      res.status(401).json({ success: false, error: "Invalid OTP" });
+      res.status(401).json({ success: false, error: "Invalid or expired OTP" });
     }
   } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error("admin reset-password error:", error?.message || error);
+    res.status(500).json({ success: false, error: "Failed to reset password" });
   }
 });
 
@@ -374,17 +373,20 @@ authRouter.post("/reset-password", async (req, res) => {
  *                 error:
  *                   type: string
  */
-// Admin Forgot Password
+// Admin Forgot Password — stores a HASHED reset OTP (VAPT MF-012) in the
+// reset_token column (which now exists — see ensureVaptHardeningSchema) and
+// always answers generically (no account-existence oracle).
 authRouter.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
-    const adminCheck = await query(`SELECT * FROM platform_admins WHERE email = $1`, [email]);
-    
-    if (adminCheck.rows.length > 0) {
-      const otp = generateOTP();
-      await query(`UPDATE platform_admins SET reset_token = $1, reset_expires = $2 WHERE email = $3`, 
-        [otp, getOTPExpiry(), email]);
-      await sendEmail(email, "Platform Admin", "Reset Your Metricorex Admin Password", `
+    if (typeof email === "string" && email.trim()) {
+      const adminCheck = await query(`SELECT id, name FROM platform_admins WHERE email = $1`, [email.trim()]);
+
+      if (adminCheck.rows.length > 0) {
+        const otp = generateOTP();
+        await query(`UPDATE platform_admins SET reset_token = $1, reset_expires = $2 WHERE email = $3`, 
+          [hashOtp(otp), getOTPExpiry(), email.trim()]);
+        await sendEmail(email.trim(), adminCheck.rows[0].name || "Platform Admin", "Reset Your Metricorex Admin Password", `
         <html>
           <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
             <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
@@ -400,11 +402,13 @@ authRouter.post("/forgot-password", async (req, res) => {
           </body>
         </html>
       `);
+      }
     }
     
     // Always return success to prevent email enumeration
     res.json({ success: true, message: "If account exists, reset instructions sent." });
   } catch (error) {
+    console.error("admin forgot-password error:", (error as any)?.message || error);
     res.status(500).json({ success: false, error: "Failed to process request" });
   }
 });
@@ -2316,8 +2320,9 @@ protectedRouter.post("/users/invite", requirePermission('manage_admins'), async 
       return res.status(400).json({ success: false, error: "Admin with this email already exists" });
     }
 
-    // Create temp password
-    const tempPassword = Math.random().toString(36).slice(-8);
+    // Create temp password — CSPRNG, 12 chars (VAPT MF-011/006: the old
+    // Math.random 8-char password was both predictable and weak).
+    const tempPassword = crypto.randomBytes(16).toString("base64url").slice(0, 12) + "7A";
     // hashPassword is async — the missing `await` previously persisted "{}"
     // as password_hash, making the generated temp password unusable.
     const hashed = await hashPassword(tempPassword);
@@ -2786,9 +2791,10 @@ protectedRouter.get("/referrals", requirePermission('view_businesses'), async (r
 });
 
 // Helper for CSV download
+// VAPT MF-008: XLSX (SheetJS) replaced by the dependency-free CSV util —
+// the package is abandoned on npm with unfixable advisories.
 const sendCSV = (res: any, data: any[], filename: string) => {
-    const ws = XLSX.utils.json_to_sheet(data);
-    const csv = XLSX.utils.sheet_to_csv(ws);
+    const csv = toCsv(data);
     res.header('Content-Type', 'text/csv');
     res.header('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);

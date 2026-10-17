@@ -38,6 +38,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureChatInviteSchema(); // group chat invite links (join by code)
   await ensureReferralUserBonusSchema(); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
   await ensureAccountDeletionSchema(); // GDPR account deletion request queue
+  await ensureUserEmailChangeSchema(); // users.temp_email — personal email change staging
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
 
@@ -57,6 +58,16 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
   await ensurePlanPricingLadder();
+}
+
+/**
+ * Personal email change — staging column on users. The new address sits in
+ * temp_email while the OTP (hashed in otp_hash, otp_type='email_verify') is
+ * pending; /settings/profile/email/verify-otp commits it into users.email.
+ * Idempotent — safe on every boot.
+ */
+async function ensureUserEmailChangeSchema(): Promise<void> {
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temp_email TEXT`);
 }
 
 /**

@@ -7,10 +7,13 @@ const router = express.Router();
  * WhatsApp-style STATUS (24h stories) for Metricorex chat.
  *
  * A status is a text card (with a background colour) and/or an image posted
- * by a workspace member. It is visible to the SAME business for 24 hours;
- * members can view, LIKE and REPOST it, reply to it in the poster's DM, and
- * the POSTER sees the like count + who liked. Rows are purged lazily on
- * every read (expires_at < NOW()), so nothing outlives the 24h window.
+ * by a member. VISIBILITY IS PLATFORM-WIDE: every active Metricorex user can
+ * see every live status (chat itself is already cross-workspace), with one
+ * exception — users who blocked each other never see each other's stories.
+ * Members can view, LIKE and REPOST a status, reply to it in the poster's
+ * DM, and the POSTER sees the like count + who liked. Rows are purged
+ * lazily on every read (expires_at < NOW()), so nothing outlives the 24h
+ * window.
  */
 
 const STATUS_TTL_HOURS = 24;
@@ -49,40 +52,38 @@ function purgeExpired(): void {
 export const getStatuses: RequestHandler = async (req, res) => {
   purgeExpired();
   try {
-    const businessId = req.user?.businessId;
     const userId = req.user?.userId;
-    if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-    // Visibility = own business + platform-wide CHAT CONTACTS. Chat is
-    // cross-workspace now (platform-wide lookup), so anyone who shares a
-    // conversation with the caller sees their status too — WhatsApp-style.
+    // Visibility = PLATFORM-WIDE (fixes "users cannot view each other's
+    // status posts"): the old same-business + shared-chat-conversation
+    // scoping hid stories from colleagues in other workspaces and from
+    // same-business users whose token carried a different workspace. The
+    // only suppression is the block list — either direction hides the pair
+    // from each other's rail.
     const rows = await query(
       `SELECT s.id, s.user_id as "userId", u.name as "authorName", u.avatar_url as "authorAvatar",
               s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
               s.background_color as "backgroundColor",
               s.reposted_from as "repostedFrom", s.repost_author as "repostAuthor",
               s.created_at as "createdAt", s.expires_at as "expiresAt",
-              (s.user_id = $2) as "isMine",
+              (s.user_id = $1) as "isMine",
               (SELECT COUNT(*)::int FROM chat_status_views v WHERE v.status_id = s.id) as "viewsCount",
-              EXISTS (SELECT 1 FROM chat_status_views v WHERE v.status_id = s.id AND v.viewer_id = $2) as "viewed",
+              EXISTS (SELECT 1 FROM chat_status_views v WHERE v.status_id = s.id AND v.viewer_id = $1) as "viewed",
               (SELECT COUNT(*)::int FROM chat_status_likes l WHERE l.status_id = s.id) as "likesCount",
-              EXISTS (SELECT 1 FROM chat_status_likes l WHERE l.status_id = s.id AND l.user_id = $2) as "liked"
+              EXISTS (SELECT 1 FROM chat_status_likes l WHERE l.status_id = s.id AND l.user_id = $1) as "liked"
          FROM chat_statuses s
          JOIN users u ON u.id = s.user_id
         WHERE s.expires_at > NOW()
-          AND (
-            s.business_id = $1
-            OR s.user_id IN (
-              SELECT DISTINCT cp2.user_id
-                FROM chat_participants cp1
-                JOIN chat_participants cp2
-                  ON cp2.conversation_id = cp1.conversation_id AND cp2.user_id <> cp1.user_id
-               WHERE cp1.user_id = $2
-            )
+          AND u.status = 'active'
+          AND NOT EXISTS (
+            SELECT 1 FROM user_blocks b
+             WHERE (b.blocker_id = $1 AND b.blocked_id = s.user_id)
+                OR (b.blocker_id = s.user_id AND b.blocked_id = $1)
           )
-        ORDER BY (s.user_id = $2) DESC, s.created_at DESC
+        ORDER BY (s.user_id = $1) DESC, s.created_at DESC
         LIMIT 200`,
-      [businessId, userId],
+      [userId],
     );
 
     res.json({ success: true, data: { statuses: rows.rows } });
@@ -298,29 +299,24 @@ export const getStatusLikes: RequestHandler = async (req, res) => {
  */
 export const repostStatus: RequestHandler = async (req, res) => {
   try {
-    const businessId = req.user?.businessId;
     const userId = req.user?.userId;
-    if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
     const { id } = req.params;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
       return res.status(404).json({ success: false, error: "Status not found" });
     }
+    // Same platform-wide visibility predicate as the list endpoint.
     const original = await query(
       `SELECT s.id, s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
               s.background_color as "backgroundColor", s.user_id, u.name as "authorName"
          FROM chat_statuses s JOIN users u ON u.id = s.user_id
         WHERE s.id = $1 AND s.expires_at > NOW()
-          AND (
-            s.business_id = $2
-            OR s.user_id IN (
-              SELECT DISTINCT cp2.user_id
-                FROM chat_participants cp1
-                JOIN chat_participants cp2
-                  ON cp2.conversation_id = cp1.conversation_id AND cp2.user_id <> cp1.user_id
-               WHERE cp1.user_id = $3
-            )
+          AND NOT EXISTS (
+            SELECT 1 FROM user_blocks b
+             WHERE (b.blocker_id = $2 AND b.blocked_id = s.user_id)
+                OR (b.blocker_id = s.user_id AND b.blocked_id = $2)
           )`,
-      [id, businessId, userId],
+      [id, userId],
     );
     if (!original.rows.length) return res.status(404).json({ success: false, error: "Status not found" });
     const o = original.rows[0];
@@ -334,7 +330,7 @@ export const repostStatus: RequestHandler = async (req, res) => {
           reposted_from, repost_author, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '${STATUS_TTL_HOURS} hours')
        RETURNING id, created_at as "createdAt", expires_at as "expiresAt"`,
-      [userId, businessId, o.content, o.mediaUrl, o.mediaType, o.backgroundColor, o.id, o.authorName],
+      [userId, req.user?.businessId || null, o.content, o.mediaUrl, o.mediaType, o.backgroundColor, o.id, o.authorName],
     );
 
     res.status(201).json({

@@ -195,6 +195,9 @@ export async function createServer() {
   const DB_INIT_RETRY_DELAY_MS = 5_000;
   let isDbReady = false;
   let dbInitError: any = null;
+  // One-shot hooks for work that must start as soon as the DB becomes ready —
+  // fired on the normal boot path AND on a late background-retry recovery.
+  const onDatabaseReady: Array<() => void> = [];
 
   const dbInitPromise = (async () => {
     for (let attempt = 1; attempt <= DB_INIT_MAX_ATTEMPTS; attempt++) {
@@ -226,6 +229,53 @@ export async function createServer() {
       logger.error("     The name between the last '/' and '?' must EXACTLY match the database created at your provider (Neon console → project → Dashboard → database name).");
       logger.error("     After fixing:   pm2 restart metroflow --update-env");
     }
+    // Self-healing: a failed init used to leave every data route on 503 until
+    // a manual `pm2 restart`. Seen 2026-10-18/19: the boot ran while the Neon
+    // project had exceeded a plan quota ("Your account or project has
+    // exceeded the quota. Upgrade your plan to increase limits."); by the
+    // time the plan upgrade took effect, the process was long past its 5 boot
+    // attempts and kept 503-ing for ~36h even though SELECT 1 (/health db:up)
+    // already worked. Because the init is fully idempotent, a background
+    // retry finishes it as soon as the database starts accepting connections
+    // — no restart, no deploy. Skipped on serverless (timers freeze) and for
+    // 3D000 (a .env typo can only be fixed together with a restart, so
+    // retrying would just spam the logs without ever succeeding).
+    if (!isServerlessEnv && dbInitError?.code !== "3D000") {
+      const DB_INIT_BACKGROUND_RETRY_MS = 2 * 60 * 1000;
+      logger.warn(`Background DB-init retry armed — re-attempting every ${DB_INIT_BACKGROUND_RETRY_MS / 1000}s until the database accepts connections (data routes recover automatically, no restart needed).`);
+      void (async () => {
+        let round = 0;
+        while (!isDbReady) {
+          await new Promise((resolve) => setTimeout(resolve, DB_INIT_BACKGROUND_RETRY_MS));
+          if (isDbReady) break;
+          round += 1;
+          try {
+            logger.info(`Database init background retry #${round}...`);
+            await initializeDatabase();
+            await runPostInitializeMigrations();
+            await verifySchema();
+            isDbReady = true;
+            dbInitError = null;
+            logger.info("✅ Database initialized successfully (background retry) — data routes recovered");
+            for (const cb of onDatabaseReady.splice(0)) {
+              try {
+                cb();
+              } catch (cbError) {
+                logger.error("onDatabaseReady callback failed:", cbError);
+              }
+            }
+            try {
+              await updateOverdueTasks();
+            } catch (overdueError) {
+              logger.error("Post-init updateOverdueTasks failed:", overdueError);
+            }
+          } catch (retryError: any) {
+            dbInitError = retryError;
+            logger.error(`Database init background retry #${round} failed [${retryError?.code || "UNKNOWN"}]: ${retryError?.message}`);
+          }
+        }
+      })();
+    }
   })();
 
   // Post-init tasks that need the database. On a persistent server (PM2/VPS)
@@ -247,7 +297,7 @@ export async function createServer() {
       // Stay up: /api/ping keeps answering (deploys stay green), the DB check
       // middleware returns 503 for data routes, and the next restart re-runs
       // the fully idempotent initialization.
-      logger.error("Server is up, but the database is unavailable — data routes return 503 until initialization succeeds.");
+      logger.error("Server is up, but the database is unavailable — data routes return 503 until initialization succeeds (a background retry re-attempts every 2 min, so recovery is automatic once the database accepts connections).");
     }
   })();
 
@@ -317,9 +367,13 @@ export async function createServer() {
   // bounded batch, self-scheduling loop, exponential backoff on DB errors).
   // Started only after the DB is ready so its first probe never fails.
   if (!isServerlessEnv) {
-    void dbReadyPromise.then(() => {
+    const startTransferMonitorWhenReady = () => {
       if (isDbReady) startTransferMonitor();
-    });
+    };
+    // Normal boot: dbReadyPromise settles right after init (success or fail).
+    void dbReadyPromise.then(startTransferMonitorWhenReady);
+    // Late recovery: fired once if the background retry rescues a failed boot.
+    onDatabaseReady.push(startTransferMonitorWhenReady);
   }
 
   // api_request_logs retention purge (daily, keeps the audit trail bounded).

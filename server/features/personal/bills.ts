@@ -5,6 +5,7 @@ import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../se
 import { createNotification } from "../../services/notifications";
 import { verifyPassword } from "../../services/auth";
 import { fulfilBill, isBillsProviderConfigured } from "./bills-provider";
+import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
 
 const router = express.Router();
 
@@ -562,3 +563,297 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
 });
 
 export default router;
+
+// ---------------------------------------------------------------------------
+// LIVE FLUTTERWAVE BILL PAYMENTS (v2 endpoints)
+// Categories + billers are ALWAYS fetched live (never hardcoded); the site
+// and apps render whatever the provider returns. Wallet debit, convenience
+// fee, ledger double-entry and the fraud gate match the v1 /pay flow.
+// ---------------------------------------------------------------------------
+
+import {
+    getBillCategories,
+    getBillers,
+    validateCustomer,
+    payBill,
+    isFlutterwaveBillsConfigured,
+    invalidateBillsCaches,
+    categoryLabel,
+    getBillerProducts,
+} from "./flutterwave-bills";
+
+/** GET /bills/categories — live Flutterwave categories (falls back to the
+ * static v1 catalog label set when FLW is unconfigured). */
+router.get("/categories", async (_req, res) => {
+    try {
+        if (isFlutterwaveBillsConfigured()) {
+            const categories = await getBillCategories();
+            return res.json({ success: true, provider: "flutterwave", categories });
+        }
+        return res.json({
+            success: true,
+            provider: "simulator",
+            categories: PROVIDERS.reduce((acc: any[], p) => {
+                const found = acc.find((c) => c.code === p.category);
+                if (found) return acc;
+                acc.push({ code: p.category, label: p.category.replace(/(^|\s)\S/g, (t) => t.toUpperCase()) });
+                return acc;
+            }, []),
+        });
+    } catch (error: any) {
+        console.error("Bill categories error:", error?.message);
+        return res.status(502).json({ success: false, error: "Failed to load bill categories: " + (error?.message || "") });
+    }
+});
+
+/** POST /bills/categories/refresh — force-refresh the category cache. */
+router.post("/categories/refresh", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        invalidateBillsCaches();
+        const categories = await getBillCategories(true);
+        return res.json({ success: true, count: categories.length, categories });
+    } catch (error: any) {
+        return res.status(502).json({ success: false, error: error?.message || "Refresh failed" });
+    }
+});
+
+/** GET /bills/billers?category=CABLEBILLS — billers under a live category. */
+router.get("/billers", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const category = String((req.query.category as string) || "").toUpperCase();
+        if (!category) return res.status(400).json({ success: false, error: "category query param is required" });
+        const billers = await getBillers(category);
+        return res.json({ success: true, category, label: categoryLabel(category), billers });
+    } catch (error: any) {
+        console.error("Billers error:", error?.message);
+        return res.status(502).json({ success: false, error: error?.message || "Failed to load billers" });
+    }
+});
+
+/** GET /bills/billers/:id/products — packages sold by a biller. */
+router.get("/billers/:id/products", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const products = await getBillerProducts(String(req.params.id));
+        return res.json({ success: true, products });
+    } catch (error: any) {
+        return res.status(502).json({ success: false, error: error?.message || "Failed to load products" });
+    }
+});
+
+/** POST /bills/validate — customer identifier validation for a biller. */
+router.post("/validate", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const { biller_code, customer, code } = req.body || {};
+        if (!biller_code || !customer) {
+            return res.status(400).json({ success: false, error: "biller_code and customer are required" });
+        }
+        const result = await validateCustomer(String(biller_code), String(customer), code || null);
+        return res.json({ success: true, ...result });
+    } catch (error: any) {
+        return res.status(502).json({ success: false, validated: false, error: error?.message || "Validation failed" });
+    }
+});
+
+/**
+ * POST /bills/pay-live — pay ANY live Flutterwave category/biller from any
+ * wallet. Body: { category, biller_code?, customer, amount, wallet_id, pin,
+ * narration? }. Convenience fee + plan gates + ledger semantics are identical
+ * to /pay; fulfilment goes to Flutterwave (auto-refund on failure).
+ */
+router.post("/pay-live", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const { userId, businessId } = req.user!;
+        const { category, biller_code, customer, amount, wallet_id, pin, narration } = req.body || {};
+
+        if (!isFlutterwaveBillsConfigured()) {
+            return res.status(503).json({ success: false, error: "Live bill payments are not configured yet", code: "BILLS_PROVIDER_UNCONFIGURED" });
+        }
+        const categoryCode = String(category || "").toUpperCase();
+        if (!categoryCode) return res.status(400).json({ success: false, error: "category is required" });
+        const customerRef = String(customer || "").trim();
+        if (!customerRef) return res.status(400).json({ success: false, error: "customer identifier is required" });
+
+        const billAmount = Math.round(Number(amount) * 100) / 100;
+        if (!billAmount || billAmount < BILL_MIN_AMOUNT || billAmount > BILL_MAX_AMOUNT) {
+            return res.status(400).json({
+                success: false,
+                error: `Amount must be between ₦${BILL_MIN_AMOUNT.toLocaleString()} and ₦${BILL_MAX_AMOUNT.toLocaleString()}`,
+            });
+        }
+
+        // FRAUD GATE (outflow): bills can absolutely be a laundering rail.
+        const fraudResult = await evaluateOutflow({
+            flow: "bill",
+            userId,
+            businessId,
+            walletId: wallet_id || null,
+            amount: billAmount,
+            currency: "NGN",
+            ip: (String(req.headers["x-forwarded-for"] || "")).split(",")[0]?.trim() || req.ip || null,
+            userAgent: (req.headers["user-agent"] as string) || null,
+            deviceId: (req.headers["x-device-id"] as string) || null,
+            beneficiary: { accountNumber: customerRef, accountName: biller_code || categoryCode },
+            channel: `bills:${categoryCode}`,
+        });
+        if (fraudResult.decision === "reject") {
+            return res.status(403).json({
+                success: false,
+                error: fraudRejectReason(fraudResult),
+                code: "FRAUD_REJECTED",
+            });
+        }
+        if (fraudResult.decision === "hold") {
+            return res.status(202).json({
+                success: true,
+                message: "Bill payment received but held for a quick security review. Complete verification in the app to release it.",
+                code: "FRAUD_HOLD",
+                fraud: { decision: "hold", score: fraudResult.score, dueDiligenceId: fraudResult.dueDiligenceId },
+            });
+        }
+
+        // Transaction PIN (same gate as /pay)
+        if (!pin) return res.status(400).json({ success: false, error: "Transaction PIN is required" });
+        const pinRes = await query(`SELECT transaction_pin_hash FROM businesses WHERE id = $1`, [businessId]);
+        const business = pinRes.rows[0];
+        if (!business?.transaction_pin_hash) {
+            return res.status(400).json({ success: false, error: "Transaction PIN not set. Please create one first.", code: "PIN_NOT_SET" });
+        }
+        if (!(await verifyPassword(String(pin), business.transaction_pin_hash))) {
+            return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
+        }
+
+        // Plan gates (shared with /pay)
+        const plan = await getPlanConfig(businessId);
+        if (plan && plan.bills_enabled === false) {
+            return res.status(403).json({ success: false, error: "Bill payments are not available on your current plan. Kindly upgrade your plan.", code: "PLAN_UPGRADE_REQUIRED" });
+        }
+        if (plan?.max_bills_per_day != null && plan.max_bills_per_day < 999999) {
+            const countRes = await query(
+                `SELECT COUNT(*)::int AS c FROM bill_payments
+                 WHERE (business_id = $1 OR user_id = $2) AND created_at >= date_trunc('day', CURRENT_DATE)`,
+                [businessId, userId],
+            );
+            if (countRes.rows[0].c >= plan.max_bills_per_day) {
+                return res.status(403).json({ success: false, error: `Your plan allows up to ${plan.max_bills_per_day} bill payment(s) per day.`, code: "PLAN_UPGRADE_REQUIRED" });
+            }
+        }
+
+        // Wallet
+        const walletRes = await query(
+            `SELECT * FROM wallets WHERE id = $1 AND (business_id = $2 OR user_id = $3)`,
+            [wallet_id, businessId || null, userId],
+        );
+        const wallet = walletRes.rows[0];
+        if (!wallet) return res.status(404).json({ success: false, error: "Wallet not found" });
+        if (wallet.status !== "active") return res.status(400).json({ success: false, error: "Wallet is not active" });
+        if (String(wallet.currency || "NGN").toUpperCase() !== "NGN") {
+            return res.status(400).json({ success: false, error: "Bill payments are charged in NGN. Select your NGN wallet." });
+        }
+
+        // Fee + total (identical fee ladder as /pay)
+        const baseFee = await calculateFee(billAmount, "bill");
+        const fee = effectiveFee(baseFee, Number(plan?.bill_fee_discount_percent) || 0);
+        const total = Math.round((billAmount + fee) * 100) / 100;
+
+        const debit = await query(
+            `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND balance >= $1 AND status = 'active' RETURNING balance`,
+            [total, wallet.id],
+        );
+        if (debit.rows.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: `Insufficient balance. This bill needs ₦${total.toLocaleString()} (₦${billAmount.toLocaleString()} + ₦${fee.toLocaleString()} fee).`,
+                code: "INSUFFICIENT_BALANCE",
+            });
+        }
+
+        const reference = randomReference();
+        const owningBusinessId: string | null = (wallet.business_id as string) || null;
+        const insertRes = await query(
+            `INSERT INTO bill_payments
+             (business_id, user_id, wallet_id, reference, category, provider_code, provider_name,
+              customer_ref, amount, fee, total, currency, status, fulfilment_mode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'NGN', 'pending', 'provider')
+             RETURNING *`,
+            [
+                owningBusinessId, userId, wallet.id, reference, categoryCode,
+                biller_code || categoryCode, categoryLabel(categoryCode),
+                customerRef, billAmount, fee, total,
+            ],
+        );
+        const bill = insertRes.rows[0];
+
+        await query(
+            `INSERT INTO transactions
+             (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction, fee)
+             VALUES ($1, $2, $3, $4, $5, 'success', 'debit', $6, 'bill', $7, 'debit', $8)`,
+            [owningBusinessId, userId, total, "NGN", reference,
+             `${categoryLabel(categoryCode)} — ${customerRef}`, wallet.id, fee],
+        );
+        await debitPlatformWallet(billAmount, "NGN", `${reference}-VENDOR`, "Platform Wallet Debit for Bill Settlement", "bills");
+        if (fee > 0) {
+            await creditRevenueWallet(fee, "NGN", reference, "Bill Payment Convenience Fee", "bills");
+        }
+
+        // Fulfil via Flutterwave
+        const fulfilment = await payBill({
+            reference,
+            category: categoryCode,
+            billerCode: biller_code || null,
+            customer: customerRef,
+            amount: billAmount,
+            narration: narration || `${categoryLabel(categoryCode)} top-up`,
+            meta: { wallet_id: wallet.id, business_id: owningBusinessId, user_id: userId },
+        });
+
+        const finalStatus = fulfilment.ok ? "success" : "failed";
+        await query(
+            `UPDATE bill_payments
+             SET status = $2, provider_reference = $3, provider_response = $4::jsonb, failure_reason = $5, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [bill.id, finalStatus, fulfilment.providerReference || null, JSON.stringify(fulfilment.raw || fulfilment), fulfilment.ok ? null : fulfilment.message || "Fulfilment failed"],
+        );
+
+        // Auto-refund on failure (same as /pay)
+        if (!fulfilment.ok) {
+            await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [total, wallet.id]);
+            await query(
+                `INSERT INTO transactions
+                 (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
+                 VALUES ($1, $2, $3, $4, $5, 'success', 'credit', $6, 'bill_refund', $7, 'credit')`,
+                [owningBusinessId, userId, total, "NGN", `${reference}-REFUND`,
+                 `Bill payment refund — ${categoryLabel(categoryCode)} (${customerRef})`, wallet.id],
+            );
+        }
+
+        try {
+            await createNotification({
+                businessId: owningBusinessId || businessId,
+                userId,
+                type: finalStatus === "success" ? "debit" : "system",
+                title: finalStatus === "success" ? "Bill Payment Successful" : "Bill Payment Failed",
+                message: finalStatus === "success"
+                    ? `${categoryLabel(categoryCode)} for ${customerRef}: -₦${total.toLocaleString()} (fee: ₦${fee.toLocaleString()})`
+                    : `${categoryLabel(categoryCode)} payment failed and was refunded: ${fulfilment.message || "contact support"}`,
+                actionUrl: "/bills",
+                actionType: "view_bill",
+                metadata: { reference, category: categoryCode, amount: billAmount, fee, total },
+                isActionable: false,
+                expiresInHours: 72,
+            });
+        } catch { /* best effort */ }
+
+        const updated = await query(`SELECT * FROM bill_payments WHERE id = $1`, [bill.id]);
+        res.json({
+            success: finalStatus === "success",
+            bill: updated.rows[0],
+            message: finalStatus === "success"
+                ? `${categoryLabel(categoryCode)} payment successful`
+                : `Payment failed and refunded: ${fulfilment.message || "please try again"}`,
+        });
+    } catch (error) {
+        console.error("Pay live bill error:", error);
+        res.status(500).json({ success: false, error: "Failed to process bill payment" });
+    }
+});

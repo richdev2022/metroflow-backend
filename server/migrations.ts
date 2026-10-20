@@ -1,4 +1,5 @@
 import { query } from "./db";
+import { ensureFraudSchema } from "./features/fraud/schema";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -41,6 +42,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureUserEmailChangeSchema(); // users.temp_email — personal email change staging
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
+  await ensureFraudSchema(); // fraud rules/evaluations/cases/blacklists + due diligence
   await repairFreeForeverStatuses(); // reactivate free-plan businesses wrongly deactivated by the old trial cron
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------

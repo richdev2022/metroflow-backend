@@ -2190,3 +2190,58 @@ export const switchWorkspace: RequestHandler = async (req: AuthenticatedRequest,
     res.status(500).json({ success: false, message: "Failed to switch workspace" });
   }
 };
+
+/**
+ * GET /auth/app-context (authenticateToken)
+ * One call that tells EITHER app (Personal or Business) how to treat the
+ * logged-in account: which product the account prefers, whether the business
+ * profile is KYC-ready, and which apps the admin has switched on.
+ *   { success, data: {
+ *       account_type, has_business_kyc, business_kyc_status, business_ready,
+ *       app_flags: { business_app_enabled, personal_app_enabled },
+ *       businesses: [{ id, name, role }] } }
+ */
+export const getAppContext: RequestHandler = async (req, res) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const businessId = authReq.user?.businessId;
+    if (!userId || !businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const [userRes, kycRes, settingsRes] = await Promise.all([
+      query(`SELECT account_type FROM users WHERE id = $1`, [userId]),
+      query(
+        `SELECT status FROM business_kyc_submissions WHERE business_id = $1
+          ORDER BY created_at DESC LIMIT 1`,
+        [businessId],
+      ),
+      query(
+        `SELECT key, value FROM system_settings WHERE key IN ('business_app_enabled','personal_app_enabled')`,
+      ),
+    ]);
+
+    const accountType = userRes.rows[0]?.account_type || null;
+    const kycStatus = kycRes.rows[0]?.status || null;   // approved|pending|rejected|null
+    const hasBusinessKyc = kycStatus === "approved";
+    const flags = { business_app_enabled: true, personal_app_enabled: false };
+    for (const row of settingsRes.rows || []) {
+      if (row.key === "business_app_enabled") flags.business_app_enabled = String(row.value).toLowerCase() !== "false";
+      if (row.key === "personal_app_enabled") flags.personal_app_enabled = String(row.value).toLowerCase() === "true";
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        account_type: accountType,
+        has_business_kyc: hasBusinessKyc,
+        business_kyc_status: kycStatus,
+        business_ready: hasBusinessKyc,
+        app_flags: flags,
+        business: { id: businessId },
+      },
+    });
+  } catch (error: any) {
+    console.error("app-context error:", error?.message);
+    return res.status(500).json({ success: false, error: "Failed to load app context" });
+  }
+};

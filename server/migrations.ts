@@ -1,5 +1,8 @@
 import { query } from "./db";
 import { ensureFraudSchema } from "./features/fraud/schema";
+import { ensurePersonalSchema } from "./features/personal/schema";
+import { ensureGiftcardSchema } from "./features/personal/giftcards";
+import { ensureEsimSchema } from "./features/personal/esim";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -44,6 +47,14 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
   await ensureFraudSchema(); // fraud rules/evaluations/cases/blacklists + due diligence
   await repairFreeForeverStatuses(); // reactivate free-plan businesses wrongly deactivated by the old trial cron
+  await ensurePersonalSchema(); // dormant personal features: bills hub + savings vaults
+  await ensureGiftcardSchema(); // gift card trading (Prestmit)
+  await ensureEsimSchema(); // eSIM top-ups (pluggable provider, simulator first)
+  // Cross-app accounts: Personal <-> Business with one set of credentials.
+  // account_type records the product the user SIGNED UP on (personal |
+  // business); NULL = unset/legacy. Either app accepts any account.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -1965,6 +1976,11 @@ async function ensureAppVersionsSchema(): Promise<void> {
       ('ios', '1.0.0', 13, 'Initial tracked release.', TRUE)
     ON CONFLICT (platform, version_code) DO NOTHING
   `);
+  // Direct APK distribution (site "Download APK" fallback when the Play
+  // Store is unavailable for a user). Binary lives in object storage.
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_url TEXT`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_size_bytes BIGINT`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_sha256 VARCHAR(64)`);
 }
 
 /**

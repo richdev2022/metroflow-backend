@@ -41,6 +41,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureUserEmailChangeSchema(); // users.temp_email — personal email change staging
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
+  await repairFreeForeverStatuses(); // reactivate free-plan businesses wrongly deactivated by the old trial cron
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -2352,6 +2353,33 @@ async function ensureAccountDeletionSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_email ON account_delete_requests (email)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_status ON account_delete_requests (status)`);
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_delete_requests_token ON account_delete_requests (token_hash) WHERE token_hash IS NOT NULL`);
+}
+
+/**
+ * FREE-FOREVER self-heal: the OLD hourly trial cron treated price=0 plans as
+ * trials ("price = 0 OR trial_days > 0") and flipped every Free Forever
+ * business to 'inactive' once trial_ends_at passed, hard-blocking them behind
+ * the "Subscription Required" wall. The cron is fixed (paid trials only) but
+ * any business it already flipped must be healed ON BOOT so a deploy alone
+ * restores service — no manual SQL required. Guards:
+ *   - only status 'inactive' -> 'active' (explicit 'cancelled' stays)
+ *   - only businesses whose CURRENT plan is price = 0 (downgrades to a paid
+ *     plan, admin-set inactive rows, etc. are never touched)
+ * Idempotent — safe on every boot (no-ops once healed).
+ */
+async function repairFreeForeverStatuses(): Promise<void> {
+  const healed = await query(`
+    UPDATE businesses b
+    SET subscription_status = 'active', updated_at = CURRENT_TIMESTAMP
+    FROM pricing_plans p
+    WHERE b.plan_id = p.id
+      AND p.price = 0
+      AND b.subscription_status = 'inactive'
+    RETURNING b.id, b.name
+  `);
+  if (healed.rowCount > 0) {
+    console.log(`[migration] Re-activated ${healed.rowCount} Free Forever business(es) wrongly deactivated by the expired-trial cron:`, healed.rows.map((r: any) => r.id).join(", "));
+  }
 }
 
 /**

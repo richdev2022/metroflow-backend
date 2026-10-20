@@ -86,6 +86,7 @@ import { rtcRouter } from "./lib/calling/routes";
 import { livekitWebhookRouter } from "./lib/calling/webhook";
 import kycRouter from "./routes/kyc";
 import businessKycRouter from "./routes/business-kyc";
+import fraudRouter from "./routes/fraud";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
@@ -423,6 +424,18 @@ export async function createServer() {
         }
       } catch (error) {
         logger.error("Recurring billing cron error:", error);
+      }
+    });
+
+    // Fraud compliance cron — hourly: DD reminders (72h) + expiry auto-reject
+    // (14 days). Best-effort; a failed tick retries on the next one.
+    cron.schedule("15 * * * *", async () => {
+      if (!isDbReady) return;
+      try {
+        const { processDueDiligenceCron } = await import("./services/fraud");
+        await processDueDiligenceCron();
+      } catch (error) {
+        logger.error("Fraud DD cron error:", error);
       }
     });
   }
@@ -1046,6 +1059,9 @@ export async function createServer() {
 
   // Business KYC upgrade (Registered vs Non-Registered business) + transaction limits
   mainRouter.use("/business-kyc", businessKycRouter);
+
+  // Fraud & compliance (user side: holds banner data + due-diligence form)
+  mainRouter.use("/fraud", fraudRouter);
 
     // Wallet API routes
     mainRouter.use("/wallet", walletRouter);

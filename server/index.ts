@@ -324,18 +324,26 @@ export async function createServer() {
 
       logger.info(`Cleaned up ${result.rowCount} old activity logs`);
 
-      // Check for expired trials
+      // Check for expired trials — PAID trials only.
+      // FREE-FOREVER plans (price = 0) must NEVER be deactivated: their trial
+      // only gates premium features (see checkFeaturePermission in
+      // middleware/auth.ts — after the trial the business falls back to the
+      // plan's base permission set, essentials stay free forever). The old
+      // filter (price = 0 OR trial_days > 0) wrongly treated the Free Forever
+      // plan itself as a trial and flipped every free business to 'inactive'
+      // on day 7, which blocked them behind the "Subscription Required" wall.
+      // A 'cancelled' status (explicit user cancellation) is never touched here.
       logger.info("Checking for expired trials...");
       const expiredResult = await query(`
-        UPDATE businesses 
-        SET subscription_status = 'inactive' 
-        WHERE trial_ends_at < NOW() 
+        UPDATE businesses
+        SET subscription_status = 'inactive'
+        WHERE trial_ends_at < NOW()
           AND subscription_status = 'active'
-          AND plan_id IN (SELECT id FROM pricing_plans WHERE price = 0 OR trial_days > 0)
+          AND plan_id IN (SELECT id FROM pricing_plans WHERE price > 0 AND trial_days > 0)
         RETURNING id, email
       `);
-      
-      logger.info(`Deactivated ${expiredResult.rowCount} expired trials`);
+
+      logger.info(`Deactivated ${expiredResult.rowCount} expired paid trials`);
       
       // Send expiration warning emails (for trials expiring tomorrow)
       const warningResult = await query(`

@@ -35,6 +35,7 @@ import {
   getMe,
   listWorkspaces,
   switchWorkspace,
+  getAppContext,
 } from "./routes/auth";
 import { biometricEnroll, biometricLogin, biometricRevoke, biometricStatus } from "./routes/auth";
 import {
@@ -87,6 +88,10 @@ import { livekitWebhookRouter } from "./lib/calling/webhook";
 import kycRouter from "./routes/kyc";
 import businessKycRouter from "./routes/business-kyc";
 import fraudRouter from "./routes/fraud";
+import personalBillsRouter from "./features/personal/bills";
+import personalSavingsRouter from "./features/personal/savings";
+import giftcardsRouter, { ensureGiftcardSchema, processGiftcardSyncCron } from "./features/personal/giftcards";
+import esimRouter, { ensureEsimSchema } from "./features/personal/esim";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
@@ -421,6 +426,18 @@ export async function createServer() {
         const result = await processDueSubscriptionCharges();
         if (result.processed > 0) {
           logger.info(`[Recurring] charges processed ${result.processed}: ${result.succeeded} ok, ${result.failed} failed`);
+        }
+        try {
+          const { processDueAutoSaves } = await import("./features/personal/savings");
+          const saved = await processDueAutoSaves();
+          if (saved.processed > 0) logger.info(`[Savings] auto-saves processed ${saved.processed}`);
+        } catch (savErr) {
+          logger.warn("Savings auto-save cron skipped:", savErr?.message || savErr);
+        }
+        try {
+          await processGiftcardSyncCron(); // poll Prestmit: settle sells, fetch codes
+        } catch (gcErr) {
+          logger.warn("Giftcard sync cron skipped:", gcErr?.message || gcErr);
         }
       } catch (error) {
         logger.error("Recurring billing cron error:", error);
@@ -926,6 +943,7 @@ export async function createServer() {
   mainRouter.post("/auth/set-password", authenticateToken, setPassword);
   mainRouter.post("/auth/change-password", authenticateToken, changePassword);
   mainRouter.get("/auth/me", authenticateToken, getMe);
+  mainRouter.get("/auth/app-context", authenticateToken, getAppContext);
   // Multi-workspace switching — same verified email, multiple memberships.
   mainRouter.get("/auth/workspaces", authenticateToken, listWorkspaces);
   mainRouter.post("/auth/switch-workspace", authenticateToken, switchWorkspace);
@@ -1062,6 +1080,12 @@ export async function createServer() {
 
   // Fraud & compliance (user side: holds banner data + due-diligence form)
   mainRouter.use("/fraud", fraudRouter);
+
+  // Personal Metricorex — Bills Hub (live Flutterwave categories) + Savings Vaults
+  mainRouter.use("/bills", personalBillsRouter);
+  mainRouter.use("/savings", personalSavingsRouter);
+  mainRouter.use("/giftcards", giftcardsRouter);
+  mainRouter.use("/esim", esimRouter);
 
     // Wallet API routes
     mainRouter.use("/wallet", walletRouter);

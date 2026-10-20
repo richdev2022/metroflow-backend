@@ -2,6 +2,7 @@ import express from "express";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider } from "../services/providers/factory";
 import { calculateFee, creditRevenueWallet, creditPlatformWallet, debitPlatformWallet } from "../services/fees";
+import { gateFundingInflow, evaluateInflow } from "../services/fraud";
 import { maybePayReferralBonus } from "../services/referral";
 import { settlePaymentLinkPayment } from "./payment_links";
 import { settleInvoicePayment } from "./invoices";
@@ -188,6 +189,12 @@ const handleSquadWebhook = async (event: any) => {
                                 });
                                 return;
                             }
+
+                            // FRAUD GATE (inflow): hold/reject parks the
+                            // transaction as 'held' WITHOUT crediting; a
+                            // compliance reviewer releases (audited credit)
+                            // or rejects it.
+                            if (!(await gateFundingInflow({ transaction, provider: 'squad', source: 'checkout' }))) return;
 
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
 
@@ -474,6 +481,9 @@ const handleMonnifyWebhook = async (event: any) => {
                                 });
                                 return;
                             }
+
+                            // FRAUD GATE (inflow): see Squad checkout note.
+                            if (!(await gateFundingInflow({ transaction, provider: 'monnify', source: 'checkout' }))) return;
 
                             await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [amount, walletId]);
                             // Owner invariant: funding -> platform ledger DEBITED,
@@ -815,6 +825,15 @@ async function verifyFlutterwaveCharge(reference: string): Promise<any | null> {
 // Runs transaction + wallet credit + platform fee inside a single DB transaction.
 async function creditWalletFundingTransaction(transaction: any, providerName: string) {
     const reference = transaction.reference;
+
+    // FRAUD GATE (inflow): evaluate BEFORE crediting. hold/reject parks the
+    // transaction as 'held' (no credit); a compliance reviewer later releases
+    // it (audited credit via releaseHeldFunding) or rejects it. Fail-open on
+    // engine errors — availability beats false positives.
+    if (!(await gateFundingInflow({ transaction, provider: providerName, source: 'charge.completed' }))) {
+        return false;
+    }
+
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -1173,18 +1192,42 @@ const handleFlutterwaveWebhook = async (event: any) => {
             }
         }
 
+        // FRAUD GATE (inflow, Flutterwave virtual account): decide BEFORE the
+        // credit. hold/reject inserts the transaction row as 'held' WITHOUT
+        // crediting; a compliance reviewer releases (audited credit via
+        // releaseHeldFunding) or rejects it later.
+        let vaFraudDecision: string = 'allow';
+        try {
+            const vaFraud = await evaluateInflow({
+                flow: 'funding',
+                userId: wallet.user_id || null,
+                businessId: wallet.business_id || null,
+                walletId: wallet.id,
+                amount: creditAmount,
+                currency: 'NGN',
+                reference: creditReference,
+                channel: 'flutterwave:virtual_account',
+            });
+            vaFraudDecision = vaFraud.decision;
+        } catch (e: any) {
+            console.error('[fraud] VA inflow gate crashed (fail-open):', e?.message);
+        }
+        const vaInitialStatus = (vaFraudDecision === 'hold' || vaFraudDecision === 'reject') ? 'held' : 'success';
+
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
+            if (vaInitialStatus === 'success') {
+                await client.query(
+                    `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
+                    [creditAmount, wallet.id]
+                );
+            }
             await client.query(
-                `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
-                [creditAmount, wallet.id]
-            );
-            await client.query(
-                `INSERT INTO transactions 
+                `INSERT INTO transactions
                  (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider, gateway_response)
-                 VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', 'Wallet Funding via Flutterwave Virtual Account', 'wallet_funding', $5, 'credit', $6, 'flutterwave', $7)`,
-                [wallet.business_id, wallet.user_id, creditAmount, creditReference, wallet.id, fee, JSON.stringify(event)]
+                 VALUES ($1, $2, $3, 'NGN', $8, $4, 'credit', 'Wallet Funding via Flutterwave Virtual Account', 'wallet_funding', $5, 'credit', $6, 'flutterwave', $7)`,
+                [wallet.business_id, wallet.user_id, creditAmount, creditReference, wallet.id, fee, JSON.stringify(event), vaInitialStatus]
             );
             await client.query('COMMIT');
         } catch (error) {
@@ -1193,6 +1236,11 @@ const handleFlutterwaveWebhook = async (event: any) => {
             return;
         } finally {
             client.release();
+        }
+
+        if (vaInitialStatus !== 'success') {
+            console.log(`[fraud] VA funding ${creditReference} parked as ${vaInitialStatus} (${vaFraudDecision})`);
+            return;
         }
 
         // Platform ledger (owner invariant): ONE debit row for the amount that

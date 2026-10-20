@@ -14,6 +14,7 @@ import {
 import { getSetting, setSetting, getIntlTransferConfig, getIntlPayoutLimits, getIntlPayoutSourceCurrency, DEFAULT_PAYOUT_LIMITS } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
+import adminFraudRouter from "./admin_fraud";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
 import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
@@ -416,6 +417,7 @@ authRouter.post("/forgot-password", async (req, res) => {
 router.use('/auth', authRouter);
 // Dispute lifecycle — own router (brings authenticateAdmin + manage_finance per route)
 router.use('/disputes', adminDisputesRouter);
+router.use('/', adminFraudRouter); // fraud + compliance endpoints (auth inside)
 router.use('/', protectedRouter);
 
 // Dashboard Stats

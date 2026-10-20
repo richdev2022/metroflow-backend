@@ -23,6 +23,7 @@ import { sendSMS } from "../services/sms";
 import { sendWhatsApp } from "../services/whatsapp";
 import { logAuditEvent, generateTransactionHash } from "../services/audit";
 import { transferQueue } from "../lib/queues";
+import { evaluateOutflow, fraudRejectReason } from "../services/fraud";
 
 const router = express.Router();
 
@@ -697,19 +698,48 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     const reference = genRef();
     const defaultProvider = await getActiveTransferProviderName();
 
+    // FRAUD GATE (outflow): every transfer is evaluated before any money
+    // moves. reject → 403 before anything is written; hold → the queue row is
+    // parked as 'held' (processAllPending never touches held rows, so the
+    // wallet is NOT debited until a reviewer releases the case); flag →
+    // normal path with a review case recorded.
+    const fraudResult = await evaluateOutflow({
+      flow: 'transfer',
+      userId,
+      businessId,
+      walletId,
+      amount: Number(finalDebitAmount ?? amount),
+      currency: String(finalDebitCurrency || currency || 'NGN').toUpperCase(),
+      reference,
+      ip: (String(req.headers['x-forwarded-for'] || '')).split(',')[0]?.trim() || req.ip || null,
+      userAgent: (req.headers['user-agent'] as string) || null,
+      deviceId: (req.headers['x-device-id'] as string) || null,
+      beneficiary: { accountNumber: accountNumber, bankCode: bankCode, accountName: accountName },
+      channel: 'bank_transfer',
+    });
+    if (fraudResult.decision === 'reject') {
+      return res.status(403).json({
+        success: false,
+        error: fraudRejectReason(fraudResult),
+        code: 'FRAUD_REJECTED',
+        fraud: { decision: fraudResult.decision, score: fraudResult.score, matched: fraudResult.matched },
+      });
+    }
+
     // Generate transaction hash for integrity
     const transactionHash = generateTransactionHash(reference, amount.toString(), accountNumber, bankCode);
 
-    // Queue Transfer
+    // Queue Transfer — held rows are parked OUTSIDE the payout pipeline
+    const initialTransferStatus = fraudResult.decision === 'hold' ? 'held' : 'pending';
     const insertRes = await query(
       `INSERT INTO transfer_queue
       (business_id, reference, recipient_account, recipient_bank, recipient_name, amount, currency, debit_amount, debit_currency, remark, source_type, source_id, status, wallet_id, payment_provider, fee, transaction_hash, initiated_by,
        recipient_address, recipient_city, recipient_state, recipient_postal_code, recipient_country, recipient_bank_name, recipient_swift_code, recipient_routing_number, recipient_account_type, recipient_email, recipient_street_number, recipient_street_name)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, 'pending', $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, $28, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
       RETURNING *`,
       [businessId, reference, accountNumber, bankCode, accountName, amount, currency, finalDebitAmount, finalDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
        recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, (recipientCountry || '').toUpperCase() || null, bankName || null, swiftCode || null, routingNumber || null,
-       accountType || (req.body as any)?.account_type || null, beneficiaryEmailNorm, streetNumber, streetName]
+       accountType || (req.body as any)?.account_type || null, beneficiaryEmailNorm, streetNumber, streetName, initialTransferStatus]
     );
 
     // Log audit event
@@ -732,6 +762,19 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     });
 
     const queuedTransfer = insertRes.rows[0];
+
+    // HELD by fraud: money never leaves the wallet. The row is parked until a
+    // reviewer releases it (release flips it back to 'pending' and the normal
+    // pipeline takes over) or rejects it (row fails with a clear reason).
+    if (fraudResult.decision === 'hold') {
+      return res.status(202).json({
+        success: true,
+        message: 'Transfer received but held for a quick security review. Complete verification in the app to release it.',
+        transfer: queuedTransfer,
+        code: 'FRAUD_HOLD',
+        fraud: { decision: 'hold', score: fraudResult.score, caseId: fraudResult.caseId, dueDiligenceId: fraudResult.dueDiligenceId },
+      });
+    }
 
     // Trigger processing via BullMQ AND process synchronously for immediate result
     let syncProcessingError: any = null;

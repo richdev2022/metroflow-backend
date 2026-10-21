@@ -146,9 +146,16 @@ function findProvider(code: string): BillProvider | undefined {
 }
 
 function getPlanConfig(businessId: string) {
+    // PERSONAL ACCOUNTS NEVER HIT PLAN GATES: the Personal app is free to use
+    // (no subscription). A personal space is flagged either by the signing-up
+    // user's account_type = 'personal' or by industry = 'personal'; both are
+    // set by /auth/register/personal. For those, is_personal = TRUE and every
+    // plan check below short-circuits.
     return query(
-        `SELECT p.bills_enabled, p.max_bills_per_day, p.bill_fee_discount_percent
-         FROM businesses b JOIN pricing_plans p ON p.id = b.plan_id
+        `SELECT p.bills_enabled, p.max_bills_per_day, p.bill_fee_discount_percent,
+                (COALESCE(b.industry = 'personal', FALSE)
+                 OR EXISTS (SELECT 1 FROM users u WHERE u.business_id = b.id AND u.account_type = 'personal')) AS is_personal
+         FROM businesses b LEFT JOIN pricing_plans p ON p.id = b.plan_id
          WHERE b.id = $1`,
         [businessId]
     ).then((r) => r.rows[0] || null);
@@ -367,16 +374,16 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
         }
 
-        // ---- Plan gating ----
+        // ---- Plan gating (personal accounts are always allowed) ----
         const plan = await getPlanConfig(businessId);
-        if (plan && plan.bills_enabled === false) {
+        if (plan && !plan.is_personal && plan.bills_enabled === false) {
             return res.status(403).json({
                 success: false,
                 error: "Bill payments are not available on your current plan. Kindly upgrade your plan.",
                 code: "PLAN_UPGRADE_REQUIRED",
             });
         }
-        if (plan?.max_bills_per_day != null && plan.max_bills_per_day < 999999) {
+        if (plan && !plan.is_personal && plan?.max_bills_per_day != null && plan.max_bills_per_day < 999999) {
             const countRes = await query(
                 `SELECT COUNT(*)::int AS c FROM bill_payments
                  WHERE (business_id = $1 OR user_id = $2) AND created_at >= date_trunc('day', CURRENT_DATE)`,
@@ -586,6 +593,8 @@ import {
     invalidateBillsCaches,
     categoryLabel,
     getBillerProducts,
+    findBillItem,
+    getBillStatus,
 } from "./flutterwave-bills";
 
 /** GET /bills/categories — live Flutterwave categories (falls back to the
@@ -669,7 +678,7 @@ router.post("/validate", authenticateToken, checkSubscriptionStatus, async (req:
 router.post("/pay-live", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { userId, businessId } = req.user!;
-        const { category, biller_code, customer, amount, wallet_id, pin, narration } = req.body || {};
+        const { category, biller_code, item_code, customer, amount, wallet_id, pin, narration } = req.body || {};
 
         if (!isFlutterwaveBillsConfigured()) {
             return res.status(503).json({ success: false, error: "Live bill payments are not configured yet", code: "BILLS_PROVIDER_UNCONFIGURED" });
@@ -730,10 +739,10 @@ router.post("/pay-live", authenticateToken, checkSubscriptionStatus, async (req:
 
         // Plan gates (shared with /pay)
         const plan = await getPlanConfig(businessId);
-        if (plan && plan.bills_enabled === false) {
+        if (plan && !plan.is_personal && plan.bills_enabled === false) {
             return res.status(403).json({ success: false, error: "Bill payments are not available on your current plan. Kindly upgrade your plan.", code: "PLAN_UPGRADE_REQUIRED" });
         }
-        if (plan?.max_bills_per_day != null && plan.max_bills_per_day < 999999) {
+        if (plan && !plan.is_personal && plan?.max_bills_per_day != null && plan.max_bills_per_day < 999999) {
             const countRes = await query(
                 `SELECT COUNT(*)::int AS c FROM bill_payments
                  WHERE (business_id = $1 OR user_id = $2) AND created_at >= date_trunc('day', CURRENT_DATE)`,
@@ -807,6 +816,7 @@ router.post("/pay-live", authenticateToken, checkSubscriptionStatus, async (req:
             reference,
             category: categoryCode,
             billerCode: biller_code || null,
+            itemCode: item_code || null,
             customer: customerRef,
             amount: billAmount,
             narration: narration || `${categoryLabel(categoryCode)} top-up`,

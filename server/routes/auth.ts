@@ -2,6 +2,7 @@ import { RequestHandler, Response } from "express";
 import { query } from "../db";
 import {
   RegisterBusinessInput,
+  RegisterPersonalInput,
   LoginInput,
   OTPVerificationInput,
   ForgotPasswordInput,
@@ -20,7 +21,7 @@ import {
   validatePasswordPolicy,
   TIMING_EQUALIZER_HASH,
 } from "../services/auth";
-import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, parseDeviceInfo, emailLogoHeader } from "../services/email";
+import { sendEmail, generateBusinessRegistrationEmailHtml, generateLoginAttemptEmailHtml, generateAccountCreationEmailHtml, generatePersonalOtpEmailHtml, parseDeviceInfo, emailLogoHeader } from "../services/email";
 import { getProfileStatus } from "../services/profile-status";
 import { logActivity } from "../services/activity";
 import { generateBusinessId } from "../utils/idGenerator";
@@ -32,6 +33,7 @@ import {
 import { verifyGoogleIdToken } from "../services/googleAuth";
 import { isMaintenanceMode } from "../services/app-config";
 import { attributeReferrer, ensureUserReferralCode } from "../services/referral";
+import { createWallet } from "../services/wallet";
 import { AuthenticatedRequest } from "../middleware/auth";
 
 /**
@@ -367,6 +369,140 @@ export const registerBusiness: RequestHandler = async (req, res) => {
       message: "Failed to register business",
     };
     res.status(500).json(response);
+  }
+};
+
+/**
+ * POST /auth/register/personal — consumer signup with the MINIMAL field set:
+ * email, phone number, password and an optional referral code.
+ *
+ * Mechanism: a personal "space" (businesses row with industry='personal')
+ * backs the account so the shared fintech core — wallets, transaction
+ * limits, ledgers, notifications — keeps working unchanged. The user row is
+ * flagged account_type='personal' (the Personal app reads it for the
+ * personal-only shell) and gets BOTH an NGN and a USD wallet immediately,
+ * so swaps/virtual cards work from minute one.
+ */
+export const registerPersonal: RequestHandler = async (req, res) => {
+  try {
+    const input: RegisterPersonalInput = req.body || {};
+
+    if (await rejectIfUnderMaintenance(res)) return;
+
+    const email = String(input.email || "").trim().toLowerCase();
+    const rawPhone = String(input.phone_number || "").trim();
+    const password = String(input.password || "");
+    const displayName = String(input.name || "").trim() || email.split("@")[0] || "Member";
+
+    if (!email || !rawPhone || !password) {
+      return res.status(400).json({ success: false, message: "Email, phone number and password are required" });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Enter a valid email address" });
+    }
+
+    // Nigerian phone normalization: 0803..., +234803..., 234803... → 0803...
+    const phoneMatch = rawPhone.replace(/[\s-]/g, "").match(/^(?:\+?234|0)([789][01]\d{8})$/);
+    if (!phoneMatch) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid Nigerian phone number (e.g. 08031234567)",
+      });
+    }
+    const phoneNumber = `0${phoneMatch[1]}`;
+
+    const passwordCheck = validatePasswordPolicy(password, { minLength: 8 });
+    if (!passwordCheck.ok) {
+      return res.status(400).json({ success: false, message: passwordCheck.error });
+    }
+
+    // Global uniqueness — email first (logins match users by email globally),
+    // then phone (beneficiary lookups + transaction receipts assume one owner).
+    const existingUser = await query(`SELECT id FROM users WHERE email = $1 LIMIT 1`, [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "An account with this email already exists. Please sign in instead.",
+      });
+    }
+    const existingPhone = await query(`SELECT id FROM users WHERE phone_number = $1 LIMIT 1`, [phoneNumber]);
+    if (existingPhone.rows.length > 0) {
+      return res.status(400).json({ success: false, message: "This phone number is already linked to an account." });
+    }
+
+    // Free-forever plan for the personal space (never subscription-gated).
+    const planResult = await query("SELECT * FROM pricing_plans WHERE price = 0 ORDER BY created_at ASC LIMIT 1");
+    const plan = planResult.rows[0] || null;
+    const trialEndsAt = new Date();
+    trialEndsAt.setDate(trialEndsAt.getDate() + (plan?.trial_days && plan.trial_days > 0 ? plan.trial_days : 7));
+
+    // Personal space backing row.
+    const spaceId = generateBusinessId(displayName);
+    const spaceResult = await query(
+      `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at, requested_registration_category)
+       VALUES ($1, $2, $3, 'personal', $4, $5, 'non_registered')
+       RETURNING id`,
+      [spaceId, `${displayName}'s Space`, email, plan?.id || null, trialEndsAt],
+    );
+    const space = spaceResult.rows[0];
+
+    const otpCode = generateOTP();
+    const passwordHash = await hashPassword(password);
+
+    const userResult = await query(
+      `INSERT INTO users
+        (business_id, email, password_hash, name, role, otp_code, otp_expires_at, account_type, phone_number)
+       VALUES ($1, $2, $3, $4, 'admin', $5, $6, 'personal', $7)
+       RETURNING id, email, name`,
+      [space.id, email, passwordHash, displayName, hashOtp(otpCode), getOTPExpiry(), phoneNumber],
+    );
+    const user = userResult.rows[0];
+
+    await query(`UPDATE businesses SET owner_id = $1 WHERE id = $2`, [user.id, space.id]);
+
+    // Personal wallets: NGN + USD from minute one (swap, virtual cards).
+    try {
+      await createWallet(user.id, "user");
+      await createWallet(user.id, "user", "USD");
+    } catch (wErr: any) {
+      console.warn("Personal wallet provisioning skipped:", wErr?.message);
+    }
+
+    // Best-effort welcome + OTP emails (never block signup on email).
+    try {
+      sendEmail(user.email, user.name, "Your Metricorex verification code", generatePersonalOtpEmailHtml(user.name, otpCode))
+        .catch((e) => console.warn("Personal OTP email failed:", e?.message));
+    } catch (mailErr: any) {
+      console.warn("Personal OTP email build failed:", mailErr?.message);
+    }
+
+    try {
+      if (input.referralCode) await attributeReferrer(user.id, input.referralCode);
+      await ensureUserReferralCode(user.id);
+    } catch (refErr: any) {
+      console.warn("Personal referral attribution skipped:", refErr?.message);
+    }
+
+    await logActivity({
+      businessId: space.id,
+      userId: user.id,
+      action: "register",
+      actionType: "personal",
+      description: `Personal account registered: ${user.name}`,
+      metadata: { email, phone: phoneNumber, accountType: "personal" },
+    }).catch(() => {});
+
+    return res.status(201).json({
+      success: true,
+      userId: user.id,
+      businessId: space.id,
+      requiresOtp: true,
+      accountType: "personal",
+      message: "Personal account created. Please verify your email with the OTP sent.",
+    });
+  } catch (error) {
+    console.error("Register personal error:", error);
+    return res.status(500).json({ success: false, message: "Failed to register account" });
   }
 };
 

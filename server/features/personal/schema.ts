@@ -1,35 +1,89 @@
 import { query } from "../../db";
 
 /**
- * PERSONAL APP — schema for the dormant personal-only revenue features
- * (Bills Hub + Savings Vaults).
+ * PERSONAL APP — schema for all Personal-only features.
  *
- * These features belong to the upcoming Personal Metricorex app, NOT the
- * current business app. They are kept here fully intact so the personal app
- * can be switched on later without rewriting anything. Nothing in this file
- * runs on boot of the business backend.
+ * Sections:
+ *   1. Identity model upgrade   — account_type ('personal'|'business'), nullable
+ *                                 business_id, user-scoped transaction PIN,
+ *                                 per-currency wallets.
+ *   2. Bills Hub + Savings      — original dormant tables (unchanged contract).
+ *   3. Social (Facebook-style)  — posts, media, comments (with replies),
+ *                                 multi-type reactions, robust polls, boosts.
+ *   4. Live (TikTok-style)      — sessions, viewers, chat, reactions,
+ *                                 moderation, co-hosts.
+ *   5. Marketplace              — listings, orders (escrow-lite), saves, boosts.
+ *   6. Commerce providers       — gift card (Prestmit) buy/sell, crypto sales
+ *                                 (Bitnob), virtual cards (Bitnob), eSIM/data.
+ *   7. Boost engine config      — system_settings pricing + global toggles.
  *
- * To activate when the personal app commences:
- *   1. Call ensurePersonalSchema() from runPostInitializeMigrations()
- *      (server/migrations.ts).
- *   2. Mount the routers in server/index.ts:
- *        import billsRouter from "./features/personal/bills";
- *        import savingsRouter from "./features/personal/savings";
- *        mainRouter.use("/bills", billsRouter);
- *        mainRouter.use("/savings", savingsRouter);
- *   3. Re-add the savings auto-save cron (every 5 minutes) that imports
- *      processDueAutoSaves from ./features/personal/savings.
- *   4. Surface the personal plan knobs (bills_enabled, max_bills_per_day,
- *      bill_fee_discount_percent, savings_enabled, max_savings_vaults,
- *      savings_break_fee_discount_percent) in the admin pricing UI.
- *
- * Note: the pricing_plans columns were already added to production databases
- * while these features briefly lived in the business app; they are harmless
- * there and will simply be used again by the personal app.
+ * Everything is idempotent and safe to run on every boot.
  */
 
 export async function ensurePersonalSchema(): Promise<void> {
-  // ---------- Bills Hub ----------
+  // ------------------------------------------------------------------
+  // 1. IDENTITY MODEL UPGRADE (must run before any personal data lands)
+  // ------------------------------------------------------------------
+  // Personal users exist WITHOUT a business: users.business_id becomes
+  // nullable and account_type marks the account kind.
+  await query(`ALTER TABLE users ALTER COLUMN business_id DROP NOT NULL`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) NOT NULL DEFAULT 'business'`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
+  // Personal transaction PIN (business users keep businesses.transaction_pin_hash).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS transaction_pin_hash VARCHAR(255)`);
+  // Sessions may now belong to a personal user (no business context).
+  await query(`ALTER TABLE user_sessions ALTER COLUMN business_id DROP NOT NULL`);
+  // Wallets become per-currency: (user_id, currency) / (business_id, currency).
+  // Old constraints UNIQUE(user_id) / UNIQUE(business_id) are replaced so a
+  // personal user holds NGN + USD wallets. NULLs never conflict in PG uniques,
+  // so business rows keep their uniqueness semantics.
+  await query(`ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_user_id_key`);
+  await query(`ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_business_id_key`);
+  // Clean zero-balance duplicates before adding per-currency uniques (idempotent;
+  // any residual funded duplicates are skipped with a warning instead of breaking boot).
+  await query(`
+    DELETE FROM wallets w
+    USING wallets w2
+    WHERE w.user_id IS NOT NULL AND w.user_id = w2.user_id AND w.currency = w2.currency
+      AND w.balance = 0 AND w2.balance > 0
+  `);
+  await query(`
+    DELETE FROM wallets w
+    USING wallets w2
+    WHERE w.business_id IS NOT NULL AND w.business_id = w2.business_id AND w.currency = w2.currency
+      AND w.balance = 0 AND w2.balance > 0
+  `);
+  await query(`
+    DO $$ BEGIN
+      ALTER TABLE wallets ADD CONSTRAINT wallets_user_currency_key UNIQUE (user_id, currency);
+    EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL; WHEN others THEN RAISE NOTICE 'wallets_user_currency_key skipped: %', SQLERRM; END $$;
+  `);
+  await query(`
+    DO $$ BEGIN
+      ALTER TABLE wallets ADD CONSTRAINT wallets_business_currency_key UNIQUE (business_id, currency);
+    EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL; WHEN others THEN RAISE NOTICE 'wallets_business_currency_key skipped: %', SQLERRM; END $$;
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_wallets_user ON wallets(user_id)`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by VARCHAR(40)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`);
+  // Cross-app SSO tickets (Business <-> Personal switching).
+  await query(`
+    CREATE TABLE IF NOT EXISTS sso_tickets (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ticket VARCHAR(80) UNIQUE NOT NULL,
+      user_id UUID NOT NULL,
+      business_id VARCHAR(255),
+      purpose VARCHAR(20) NOT NULL,
+      next_url TEXT,
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sso_tickets_expiry ON sso_tickets(expires_at)`);
+
+  // ------------------------------------------------------------------
+  // 2. BILLS HUB + SAVINGS VAULTS (original dormant tables)
+  // ------------------------------------------------------------------
   await query(`
     CREATE TABLE IF NOT EXISTS bill_payments (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,7 +126,6 @@ export async function ensurePersonalSchema(): Promise<void> {
     WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'bill')
   `);
 
-  // ---------- Savings Vaults ----------
   await query(`
     CREATE TABLE IF NOT EXISTS savings_vaults (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -130,5 +183,420 @@ export async function ensurePersonalSchema(): Promise<void> {
     WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'savings_break')
   `);
 
-  console.log("[Migrations] Personal (Bills Hub + Savings Vaults) schema applied");
+  // ------------------------------------------------------------------
+  // 3. SOCIAL — Facebook-style feed
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_posts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      image_url TEXT,
+      video_url TEXT,
+      audience VARCHAR(20) NOT NULL DEFAULT 'public', -- public | followers
+      status VARCHAR(20) NOT NULL DEFAULT 'active',   -- active | removed
+      removed_reason TEXT,
+      share_count INTEGER NOT NULL DEFAULT 0,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_user ON social_posts(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_recent ON social_posts(created_at DESC)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_reactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      type VARCHAR(20) NOT NULL DEFAULT 'like', -- like|love|haha|wow|sad|angry
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(post_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_reactions_post ON social_reactions(post_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_comments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      parent_id UUID REFERENCES social_comments(id) ON DELETE CASCADE,
+      body TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      like_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_parent ON social_comments(parent_id)`);
+
+  // Robust polls: up to 10 options, optional media, expiry, single/multi choice,
+  // revocable votes, per-option image, closed/active status.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_polls (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID REFERENCES social_posts(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      question TEXT NOT NULL,
+      options JSONB NOT NULL,            -- [{text, image_url?}] (2..10)
+      allow_multiple BOOLEAN NOT NULL DEFAULT FALSE,
+      hide_results_until_closed BOOLEAN NOT NULL DEFAULT FALSE,
+      ends_at TIMESTAMP,
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | closed | removed
+      removed_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_polls_user ON social_polls(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_polls_post ON social_polls(post_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_poll_votes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      poll_id UUID NOT NULL REFERENCES social_polls(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      option_index INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(poll_id, user_id, option_index)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_poll_votes_poll ON social_poll_votes(poll_id)`);
+
+  // ------------------------------------------------------------------
+  // 4. BOOST ENGINE (posts + marketplace listings share one engine)
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS boost_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      target_type VARCHAR(20) NOT NULL,     -- post | listing
+      target_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      budget DECIMAL(12,2) NOT NULL,
+      duration_days INTEGER NOT NULL,
+      daily_budget DECIMAL(12,2) NOT NULL,
+      audience JSONB,                       -- {locations:[], age_min, age_max, interests:[]}
+      pricing_snapshot JSONB NOT NULL,      -- pricing row used at purchase time
+      estimated_reach INTEGER NOT NULL DEFAULT 0,
+      impressions INTEGER NOT NULL DEFAULT 0,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- pending_payment|active|paused|completed|cancelled|rejected
+      starts_at TIMESTAMP,
+      ends_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_boost_orders_user ON boost_orders(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_boost_orders_target ON boost_orders(target_type, target_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_boost_orders_status ON boost_orders(status)`);
+
+  // ------------------------------------------------------------------
+  // 5. LIVE — TikTok-style streaming
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      host_id UUID NOT NULL,
+      title VARCHAR(160) NOT NULL,
+      description TEXT,
+      category VARCHAR(40) NOT NULL DEFAULT 'general',
+      call_code VARCHAR(20) UNIQUE NOT NULL,   -- rides the proven call-room stack
+      status VARCHAR(20) NOT NULL DEFAULT 'live', -- live | ended | removed
+      cohost_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      pinned_message TEXT,
+      slow_mode_seconds INTEGER NOT NULL DEFAULT 0,
+      current_viewers INTEGER NOT NULL DEFAULT 0,
+      peak_viewers INTEGER NOT NULL DEFAULT 0,
+      total_views INTEGER NOT NULL DEFAULT 0,
+      reaction_count INTEGER NOT NULL DEFAULT 0,
+      gift_count INTEGER NOT NULL DEFAULT 0,
+      started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      ended_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_status ON live_sessions(status, started_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_host ON live_sessions(host_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_viewers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      left_at TIMESTAMP,
+      UNIQUE(session_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_viewers_session ON live_viewers(session_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      body TEXT NOT NULL,
+      is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+      is_removed BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_messages_session ON live_messages(session_id, created_at)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_reactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      emoji VARCHAR(20) NOT NULL DEFAULT 'heart',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_reactions_session ON live_reactions(session_id, created_at)`);
+
+  // ------------------------------------------------------------------
+  // 6a. MARKETPLACE — Facebook-Marketplace-style
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS market_listings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      seller_id UUID NOT NULL,
+      name VARCHAR(160) NOT NULL,
+      description TEXT,
+      category VARCHAR(60) NOT NULL DEFAULT 'other',
+      condition VARCHAR(30) NOT NULL DEFAULT 'used_good', -- new|like_new|used_good|used_fair
+      price DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      negotiable BOOLEAN NOT NULL DEFAULT TRUE,
+      location_text VARCHAR(160),
+      stock INTEGER,
+      images JSONB NOT NULL DEFAULT '[]'::jsonb,   -- ["/files/..", ...]
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | sold | removed | suspended
+      removed_reason TEXT,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      save_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_listings_seller ON market_listings(seller_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_listings_status ON market_listings(status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_listings_category ON market_listings(category)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS market_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      listing_id UUID NOT NULL REFERENCES market_listings(id),
+      buyer_id UUID NOT NULL,
+      seller_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      unit_price DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      delivery_address TEXT,
+      delivery_phone VARCHAR(50),
+      status VARCHAR(24) NOT NULL DEFAULT 'paid',
+      -- paid | shipped | completed | cancelled | refunded | disputed
+      payment_released_at TIMESTAMP,
+      cancelled_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_buyer ON market_orders(buyer_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_seller ON market_orders(seller_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS market_saves (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      listing_id UUID NOT NULL REFERENCES market_listings(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(listing_id, user_id)
+    )
+  `);
+
+  // ------------------------------------------------------------------
+  // 6b. COMMERCE PROVIDERS — gift cards / crypto / virtual cards / eSIM
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS giftcard_sell_trades (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,           -- our reference (MF-GCS-..)
+      provider_reference VARCHAR(120),                  -- Prestmit SGC..
+      giftcard_id VARCHAR(40) NOT NULL,
+      giftcard_name VARCHAR(160),
+      amount DECIMAL(12,2) NOT NULL,
+      rate DECIMAL(12,2),
+      payout_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      payout_method VARCHAR(20) NOT NULL DEFAULT 'NAIRA',
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      -- pending | processing | approved | rejected | settled | failed
+      comments TEXT,
+      attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+      rejection_reason TEXT,
+      provider_response JSONB,
+      credited_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_gc_sell_user ON giftcard_sell_trades(user_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS giftcard_buy_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      provider_reference VARCHAR(160),
+      giftcard_sku VARCHAR(40) NOT NULL,
+      giftcard_name VARCHAR(160),
+      quantity INTEGER NOT NULL DEFAULT 1,
+      card_price DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total_charged DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      payment_method VARCHAR(20) NOT NULL DEFAULT 'NAIRA',
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      -- pending | completed | failed | refunded
+      card_codes JSONB,
+      provider_response JSONB,
+      failure_reason TEXT,
+      refunded_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_gc_buy_user ON giftcard_buy_orders(user_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS crypto_sales (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      provider VARCHAR(20) NOT NULL DEFAULT 'bitnob',
+      provider_reference VARCHAR(160),
+      from_asset VARCHAR(10) NOT NULL,         -- USDT | USDC | BTC
+      usd_debit DECIMAL(15,2) NOT NULL,
+      settlement_amount DECIMAL(15,2) NOT NULL,
+      settlement_currency VARCHAR(5) NOT NULL DEFAULT 'NGN',
+      rate DECIMAL(18,6),
+      bank_code VARCHAR(20),
+      bank_name VARCHAR(120),
+      account_number VARCHAR(30),
+      account_name VARCHAR(160),
+      beneficiary JSONB,
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      -- pending | processing | completed | failed | refunded
+      provider_response JSONB,
+      failure_reason TEXT,
+      completed_at TIMESTAMP,
+      refunded_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_crypto_sales_user ON crypto_sales(user_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS virtual_cards (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      provider VARCHAR(20) NOT NULL DEFAULT 'bitnob',
+      provider_card_id VARCHAR(120),
+      provider_customer_id VARCHAR(120),
+      name VARCHAR(120),
+      currency VARCHAR(5) NOT NULL DEFAULT 'USD',
+      card_brand VARCHAR(20) DEFAULT 'visa',
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      -- pending | active | frozen | terminated | failed
+      masked_pan VARCHAR(30),
+      balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+      meta JSONB,
+      failure_reason TEXT,
+      terminated_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_virtual_cards_user ON virtual_cards(user_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS virtual_card_transactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      card_id UUID NOT NULL REFERENCES virtual_cards(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      type VARCHAR(20) NOT NULL,               -- fund | withdraw | spend | refund
+      amount DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(5) NOT NULL DEFAULT 'USD',
+      status VARCHAR(20) NOT NULL DEFAULT 'success',
+      description TEXT,
+      reference VARCHAR(255),
+      provider_txn_id VARCHAR(160),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_vcard_txn_card ON virtual_card_transactions(card_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS esim_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,
+      reference VARCHAR(255) UNIQUE NOT NULL,
+      provider VARCHAR(20) NOT NULL DEFAULT 'flutterwave',
+      provider_reference VARCHAR(160),
+      package_code VARCHAR(60) NOT NULL,
+      package_name VARCHAR(160),
+      country_code VARCHAR(5) NOT NULL DEFAULT 'NG',
+      country_name VARCHAR(80),
+      data_amount_mb INTEGER,
+      validity_days INTEGER,
+      customer_ref VARCHAR(160) NOT NULL,
+      total DECIMAL(12,2) NOT NULL,
+      fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      activation_details JSONB,
+      provider_response JSONB,
+      failure_reason TEXT,
+      refunded_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_esim_orders_user ON esim_orders(user_id)`);
+
+  // ------------------------------------------------------------------
+  // 7. BOOST ENGINE + PERSONAL SERVICES CONFIG (system_settings defaults)
+  // ------------------------------------------------------------------
+  // Post/listing boost pricing. price_per_1000 = what the user pays per
+  // 1,000 estimated impressions; min/max_budget guard rails in NGN.
+  await query(`
+    INSERT INTO system_settings (key, value, description)
+    SELECT 'personal_boost_pricing', $1::jsonb,
+           'Boost engine pricing for posts + marketplace listings (personal app)'
+    WHERE NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'personal_boost_pricing')
+  `, [
+    JSON.stringify({
+      currency: "NGN",
+      post: { price_per_1000: 250, min_budget: 500, max_budget: 200000, allowed_durations: [1, 3, 7, 14] },
+      listing: { price_per_1000: 200, min_budget: 300, max_budget: 100000, allowed_durations: [1, 3, 7, 14] },
+      audience_multiplier: { national: 1.0, state: 0.65, city: 0.5 },
+      engagement_boost_factor: 1.35, // posts with reactions rank higher per impression
+    }),
+  ]);
+
+  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce) schema applied");
 }

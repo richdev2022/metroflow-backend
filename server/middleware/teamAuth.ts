@@ -61,7 +61,19 @@ export interface TeamAccess {
 export async function loadTeamAccess(req: AuthenticatedRequest): Promise<TeamAccess | null> {
   const userId = req.user?.userId;
   const businessId = req.user?.businessId;
-  if (!userId || !businessId) return null;
+  if (!userId || !businessId) {
+    // PERSONAL USERS (business_id NULL) have no team context. Their app is
+    // free of plan/team gating by design — signal "unrestricted" so
+    // requireTeamPermission passes instead of 401-ing the whole session.
+    if (userId && !businessId) {
+      (req as any).teamAccess = {
+        role: "owner", roleId: null as any, roleName: "personal",
+        permissions: ["*"], isSuper: true, isOwner: true,
+      } as any;
+      return (req as any).teamAccess;
+    }
+    return null;
+  }
 
   const result = await query(
     `SELECT u.role,

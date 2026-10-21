@@ -178,6 +178,41 @@ export function generateAccountCreationEmailHtml(name: string, loginLink: string
 }
 
 /**
+ * Personal (consumer) signup — OTP verification email. Violet/fuchsia accent
+ * palette matches the Personal app identity.
+ */
+export function generatePersonalOtpEmailHtml(name: string, otpCode: string): string {
+  const logoUrl = EMAIL_LOGO_URL;
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <img src="${logoUrl}" alt="Metricorex Logo" style="max-width: 150px; height: auto;" />
+          </div>
+          <h2 style="color: #7c3aed; margin-bottom: 20px; text-align: center;">Verify your email</h2>
+          <p style="color: #333;">Hi ${name},</p>
+          <p style="color: #666; line-height: 1.6;">
+            Welcome to MetriCorex Personal — your money, your people, your whole life.
+            Use the code below to verify your email address and finish creating your account.
+          </p>
+          <div style="text-align: center; margin: 28px 0;">
+            <div style="display: inline-block; background-color: #f5f3ff; border: 1px solid #ddd6fe; color: #6d28d9;
+                        font-size: 32px; font-weight: bold; letter-spacing: 8px; padding: 14px 28px; border-radius: 12px;">
+              ${otpCode}
+            </div>
+          </div>
+          <p style="color: #9ca3af; font-size: 13px; text-align: center;">
+            This code expires shortly. If you did not try to create an account, you can safely ignore this email.
+          </p>
+          ${buildEmailFooterHtml()}
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
  * Refer & Earn — bonus payout notification for the referrer.
  */
 export function generateReferralBonusEmailHtml(

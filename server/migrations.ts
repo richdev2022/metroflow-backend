@@ -1,4 +1,13 @@
 import { query } from "./db";
+import { ensureFraudSchema } from "./features/fraud/schema";
+import { ensurePersonalSchema } from "./features/personal/schema";
+import { ensureGiftcardSchema } from "./features/personal/giftcards";
+import { ensureEsimSchema } from "./features/personal/esim";
+import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
+import { ensureCryptoSchema } from "./features/personal/crypto";
+import { ensureSocialSchema } from "./features/personal/social";
+import { ensureLiveSchema } from "./features/personal/live";
+import { ensureSsoSchema } from "./services/sso";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -38,8 +47,37 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureChatInviteSchema(); // group chat invite links (join by code)
   await ensureReferralUserBonusSchema(); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
   await ensureAccountDeletionSchema(); // GDPR account deletion request queue
+  await ensureUserEmailChangeSchema(); // users.temp_email — personal email change staging
   await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
   await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
+  await ensureFraudSchema(); // fraud rules/evaluations/cases/blacklists + due diligence
+  await repairFreeForeverStatuses(); // reactivate free-plan businesses wrongly deactivated by the old trial cron
+  await ensurePersonalSchema(); // dormant personal features: bills hub + savings vaults
+  await ensureGiftcardSchema(); // gift card trading (Prestmit)
+  await ensureEsimSchema(); // eSIM top-ups (pluggable provider, simulator first)
+  await ensureVirtualCardSchema(); // personal USD virtual cards (Bitnob)
+  await ensureCryptoSchema(); // crypto -> NGN sales (Bitnob payouts)
+  await ensureSocialSchema(); // personal social feed + polls
+  await ensureLiveSchema(); // one-tap live streaming (call-room backed)
+  await ensureSsoSchema(); // cross-app SSO one-time tickets (Business <-> Personal)
+  // eSIM purchase fee row (flat ₦50, mirrors the bill convenience fee) —
+  // admin-editable via the Personal Products console.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'eSIM Purchase Fee', 'esim', 'flat', '{"amount": 50}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'esim')
+  `);
+  // Cross-app accounts: Personal <-> Business with one set of credentials.
+  // account_type records the product the user SIGNED UP on (personal |
+  // business); NULL = unset/legacy. Either app accepts any account.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
+
+  // Personal app: live streams (and personal calls) create call rooms with NO
+  // owning business. calls.business_id started NOT NULL in the business-era
+  // schema, which made every "go live" insert fail with a not-null violation.
+  // DROP NOT NULL is idempotent.
+  await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
@@ -57,6 +95,16 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureBusinessRevenueLadder();
   await ensureBusinessRevenueLadderV2();
   await ensurePlanPricingLadder();
+}
+
+/**
+ * Personal email change — staging column on users. The new address sits in
+ * temp_email while the OTP (hashed in otp_hash, otp_type='email_verify') is
+ * pending; /settings/profile/email/verify-otp commits it into users.email.
+ * Idempotent — safe on every boot.
+ */
+async function ensureUserEmailChangeSchema(): Promise<void> {
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temp_email TEXT`);
 }
 
 /**
@@ -1951,6 +1999,11 @@ async function ensureAppVersionsSchema(): Promise<void> {
       ('ios', '1.0.0', 13, 'Initial tracked release.', TRUE)
     ON CONFLICT (platform, version_code) DO NOTHING
   `);
+  // Direct APK distribution (site "Download APK" fallback when the Play
+  // Store is unavailable for a user). Binary lives in object storage.
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_url TEXT`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_size_bytes BIGINT`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_sha256 VARCHAR(64)`);
 }
 
 /**
@@ -2341,6 +2394,33 @@ async function ensureAccountDeletionSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_email ON account_delete_requests (email)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_account_delete_requests_status ON account_delete_requests (status)`);
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_delete_requests_token ON account_delete_requests (token_hash) WHERE token_hash IS NOT NULL`);
+}
+
+/**
+ * FREE-FOREVER self-heal: the OLD hourly trial cron treated price=0 plans as
+ * trials ("price = 0 OR trial_days > 0") and flipped every Free Forever
+ * business to 'inactive' once trial_ends_at passed, hard-blocking them behind
+ * the "Subscription Required" wall. The cron is fixed (paid trials only) but
+ * any business it already flipped must be healed ON BOOT so a deploy alone
+ * restores service — no manual SQL required. Guards:
+ *   - only status 'inactive' -> 'active' (explicit 'cancelled' stays)
+ *   - only businesses whose CURRENT plan is price = 0 (downgrades to a paid
+ *     plan, admin-set inactive rows, etc. are never touched)
+ * Idempotent — safe on every boot (no-ops once healed).
+ */
+async function repairFreeForeverStatuses(): Promise<void> {
+  const healed = await query(`
+    UPDATE businesses b
+    SET subscription_status = 'active', updated_at = CURRENT_TIMESTAMP
+    FROM pricing_plans p
+    WHERE b.plan_id = p.id
+      AND p.price = 0
+      AND b.subscription_status = 'inactive'
+    RETURNING b.id, b.name
+  `);
+  if (healed.rowCount > 0) {
+    console.log(`[migration] Re-activated ${healed.rowCount} Free Forever business(es) wrongly deactivated by the expired-trial cron:`, healed.rows.map((r: any) => r.id).join(", "));
+  }
 }
 
 /**

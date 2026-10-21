@@ -398,6 +398,86 @@ router.post("/orders/:id/cancel", authenticateToken, checkSubscriptionStatus, re
 
 /**
  * @openapi
+ * /store/marketplace:
+ *   get:
+ *     summary: Personal-app marketplace — active products across ALL enabled storefronts
+ *     tags: [Storefront]
+ *     security: []
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         schema: { type: string }
+ *         description: Case-insensitive search on product/store name
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 60, maximum: 120 }
+ *       - in: query
+ *         name: before
+ *         schema: { type: string, format: date-time }
+ *         description: Cursor pagination (created_at of the last item)
+ *     responses:
+ *       200:
+ *         description: Marketplace feed (newest first, seller info attached)
+ */
+router.get("/marketplace", async (req, res) => {
+    try {
+        const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), 120);
+        const params: unknown[] = [];
+        let where = `sp.status = 'active' AND COALESCE(pp.store_enabled, TRUE) = TRUE AND b.status = 'active'`;
+
+        const q = String(req.query.q || "").trim();
+        if (q) {
+            params.push(`%${q}%`);
+            where += ` AND (sp.name ILIKE $${params.length} OR b.name ILIKE $${params.length})`;
+        }
+        const before = req.query.before ? new Date(String(req.query.before)) : null;
+        if (before && !Number.isNaN(before.getTime())) {
+            params.push(before.toISOString());
+            where += ` AND sp.created_at < $${params.length}`;
+        }
+        params.push(limit);
+        const limitIdx = params.length;
+
+        const rows = await query(
+            `SELECT sp.id, sp.name, sp.description, sp.price, sp.currency, sp.stock, sp.image_url,
+                    sp.created_at,
+                    b.id AS seller_id, b.name AS seller_name, b.logo_url AS seller_logo,
+                    (sp.stock IS NOT NULL AND sp.stock <= 0) AS sold_out
+             FROM store_products sp
+             JOIN businesses b ON b.id = sp.business_id
+             LEFT JOIN pricing_plans pp ON pp.id = b.plan_id
+             WHERE ${where}
+             ORDER BY sp.created_at DESC
+             LIMIT $${limitIdx}`,
+            params,
+        );
+
+        res.json({
+            success: true,
+            data: {
+                products: rows.rows.map((p: any) => ({
+                    id: p.id,
+                    name: p.name,
+                    description: p.description || null,
+                    price: Number(p.price),
+                    currency: p.currency || "NGN",
+                    stock: p.stock,
+                    image_url: p.image_url || null,
+                    sold_out: Boolean(p.sold_out),
+                    created_at: p.created_at,
+                    seller: { id: p.seller_id, name: p.seller_name, logo_url: p.seller_logo || null },
+                })),
+                next_cursor: rows.rows.length === limit ? rows.rows[rows.rows.length - 1].created_at : null,
+            },
+        });
+    } catch (error) {
+        console.error("Marketplace feed error:", error);
+        res.status(500).json({ success: false, error: "Failed to load marketplace" });
+    }
+});
+
+/**
+ * @openapi
  * /store/public/{businessId}:
  *   get:
  *     summary: Public storefront view (business profile + active products)

@@ -67,6 +67,33 @@ export async function ensureVirtualCardSchema(): Promise<void> {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+    // IDEMPOTENT COLUMN LADDER — a database provisioned by an OLDER version of
+    // this function has a virtual_cards table WITHOUT the newer columns, and
+    // CREATE TABLE IF NOT EXISTS is a no-op there. Without this ladder the
+    // bitnob_card_id index below throws 42703 ("column does not exist"),
+    // runPostInitializeMigrations aborts, isDbReady never flips true and the
+    // WHOLE API answers 503 "still initializing" (production incident
+    // 2026-10-21). ADD COLUMN IF NOT EXISTS is a no-op on fresh tables.
+    for (const col of [
+      `ADD COLUMN IF NOT EXISTS business_id VARCHAR(255)`,
+      `ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'bitnob'`,
+      `ADD COLUMN IF NOT EXISTS bitnob_card_id VARCHAR(80)`,
+      `ADD COLUMN IF NOT EXISTS bitnob_customer_id VARCHAR(80)`,
+      `ADD COLUMN IF NOT EXISTS name VARCHAR(120)`,
+      `ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'USD'`,
+      `ADD COLUMN IF NOT EXISTS card_brand VARCHAR(20) DEFAULT 'visa'`,
+      `ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'`,
+      `ADD COLUMN IF NOT EXISTS created_status VARCHAR(20) DEFAULT 'processing'`,
+      `ADD COLUMN IF NOT EXISTS masked_pan VARCHAR(30)`,
+      `ADD COLUMN IF NOT EXISTS balance DECIMAL(15,2) DEFAULT 0`,
+      `ADD COLUMN IF NOT EXISTS wallet_id UUID`,
+      `ADD COLUMN IF NOT EXISTS terminated_reason TEXT`,
+      `ADD COLUMN IF NOT EXISTS provider_response JSONB`,
+      `ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+      `ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+    ]) {
+      await query(`ALTER TABLE virtual_cards ${col}`);
+    }
     await query(`CREATE INDEX IF NOT EXISTS idx_virtual_cards_user ON virtual_cards(user_id, created_at DESC)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_virtual_cards_bitnob ON virtual_cards(bitnob_card_id) WHERE bitnob_card_id IS NOT NULL`);
 
@@ -89,6 +116,18 @@ export async function ensureVirtualCardSchema(): Promise<void> {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+    for (const col of [
+      `ADD COLUMN IF NOT EXISTS fee DECIMAL(15,2) DEFAULT 0`,
+      `ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'USD'`,
+      `ADD COLUMN IF NOT EXISTS provider_reference VARCHAR(120)`,
+      `ADD COLUMN IF NOT EXISTS description TEXT`,
+      `ADD COLUMN IF NOT EXISTS balance_before DECIMAL(15,2)`,
+      `ADD COLUMN IF NOT EXISTS balance_after DECIMAL(15,2)`,
+      `ADD COLUMN IF NOT EXISTS provider_response JSONB`,
+      `ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+    ]) {
+      await query(`ALTER TABLE virtual_card_transactions ${col}`);
+    }
     await query(`CREATE INDEX IF NOT EXISTS idx_vc_tx_card ON virtual_card_transactions(card_id, created_at DESC)`);
 }
 

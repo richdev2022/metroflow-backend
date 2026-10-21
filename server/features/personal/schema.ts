@@ -63,6 +63,59 @@ export async function ensurePersonalSchema(): Promise<void> {
       ALTER TABLE wallets ADD CONSTRAINT wallets_business_currency_key UNIQUE (business_id, currency);
     EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL; WHEN others THEN RAISE NOTICE 'wallets_business_currency_key skipped: %', SQLERRM; END $$;
   `);
+  // STABLECOIN WALLETS (USDT + USDC) replace the legacy USD wallet:
+  //   - widen wallets.currency (VARCHAR(3) cannot hold "USDT"/"USDC")
+  //   - legacy USD wallets migrate 1:1 into USDT (balance preserved) and are
+  //     archived — stablecoins ARE the USD rails from here on
+  //   - every personal user gets USDT + USDC wallets (idempotent)
+  await query(`ALTER TABLE wallets ALTER COLUMN currency TYPE VARCHAR(8)`);
+  // Rename USD -> USDT when the user has no USDT wallet yet (keeps balance in place).
+  await query(`
+    UPDATE wallets w
+    SET currency = 'USDT', updated_at = CURRENT_TIMESTAMP
+    WHERE UPPER(w.currency) = 'USD'
+      AND w.user_id IS NOT NULL
+      AND w.status <> 'archived'
+      AND NOT EXISTS (
+        SELECT 1 FROM wallets u2
+        WHERE u2.user_id = w.user_id AND UPPER(u2.currency) = 'USDT' AND u2.id <> w.id
+      )
+  `);
+  // Merge leftover USD balances into an existing USDT wallet, then archive the USD row.
+  await query(`
+    WITH moved AS (
+      UPDATE wallets usd
+      SET balance = 0, status = 'archived', updated_at = CURRENT_TIMESTAMP
+      WHERE UPPER(usd.currency) = 'USD'
+        AND usd.user_id IS NOT NULL
+        AND usd.status <> 'archived'
+        AND usd.balance > 0
+        AND EXISTS (
+          SELECT 1 FROM wallets u2
+          WHERE u2.user_id = usd.user_id AND UPPER(u2.currency) = 'USDT'
+            AND u2.status = 'active' AND u2.id <> usd.id
+        )
+      RETURNING usd.user_id AS uid, usd.balance AS amt
+    )
+    UPDATE wallets usdt
+    SET balance = usdt.balance + moved.amt, updated_at = CURRENT_TIMESTAMP
+    FROM moved
+    WHERE usdt.user_id = moved.uid AND UPPER(usdt.currency) = 'USDT' AND usdt.status = 'active'
+  `);
+  // Archive any USD row that survived the ladders (zero-balance leftovers).
+  await query(`
+    UPDATE wallets SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+    WHERE UPPER(currency) = 'USD' AND user_id IS NOT NULL AND status <> 'archived'
+  `);
+  // Ensure every personal user owns USDT + USDC wallets going forward.
+  await query(`
+    INSERT INTO wallets (user_id, business_id, balance, currency, status)
+    SELECT DISTINCT u.id, NULL, 0, c.currency, 'active'
+    FROM users u
+    CROSS JOIN (VALUES ('USDT'), ('USDC')) AS c(currency)
+    WHERE u.account_type = 'personal' AND u.business_id IS NULL
+    ON CONFLICT (user_id, currency) DO NOTHING
+  `);
   await query(`CREATE INDEX IF NOT EXISTS idx_wallets_user ON wallets(user_id)`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by VARCHAR(40)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`);

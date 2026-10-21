@@ -300,6 +300,92 @@ export function getSupportedCountries() {
 }
 
 // ---------------------------------------------------------------------------
+// Stablecoins (USDT / USDC)
+// ---------------------------------------------------------------------------
+/** Chains Bitnob supports for stablecoin deposits (GET /api/stablecoins/supported-chains). */
+export function getSupportedStablecoinChains() {
+  return GET("/api/stablecoins/supported-chains");
+}
+
+/**
+ * On-chain stablecoin withdrawal (send USDT/USDC out to an external address).
+ * Amount is a STRING in BASE UNITS in production examples (docs show
+ * "150500000" for 150.5 USDT on 6-decimal chains) — callers decide units and
+ * pass them explicitly via `amount`. `reference` must be unique per withdrawal.
+ */
+export function createWithdrawal(input: {
+  to_address: string;
+  amount: string;
+  currency: "USDT" | "USDC";
+  chain: string;
+  reference: string;
+  description: string;
+}) {
+  return POST("/api/withdrawals", input);
+}
+
+/** Transactions feed — used to server-side verify deposit webhooks (fraud check). */
+export function listTransactions(query: { cursor?: string; limit?: number } = {}) {
+  const qs = new URLSearchParams(
+    Object.entries(query).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]),
+  ).toString();
+  return GET(`/api/transactions${qs ? `?${qs}` : ""}`);
+}
+export function getTransaction(idOrReference: string) {
+  return GET(`/api/transactions/${encodeURIComponent(idOrReference)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Trading (USDT/USDC/BTC <-> NGN conversions, executed on Bitnob's book)
+// ---------------------------------------------------------------------------
+export function listTradingPrices() {
+  return GET("/api/trading/prices");
+}
+export function getTradingPrice(pair: string) {
+  return GET(`/api/trading/prices/${encodeURIComponent(pair.toUpperCase())}`);
+}
+
+/**
+ * Create a trade quote. pair examples:
+ *   USDT→NGN sell: { base_currency: "USDT", quote_currency: "NGN", side: "SELL", quantity: "<USDT units>" }
+ *   NGN→USDT buy:  { base_currency: "NGN",  quote_currency: "USDT", side: "SELL", quantity: "<NGN units>", quantity_in_base_units: false }
+ * Quotes expire (docs: ~15 min for fiat pairs); `exchange` carries send/receive legs.
+ */
+export function createTradingQuote(input: {
+  base_currency: string;
+  quote_currency: string;
+  side: "BUY" | "SELL";
+  quantity: string;
+  quantity_in_base_units?: boolean;
+}) {
+  return POST("/api/trading/quotes", input);
+}
+export function getTradingQuote(quoteId: string) {
+  return GET(`/api/trading/quotes/${encodeURIComponent(quoteId)}`);
+}
+
+/** Submit an order against a quote (see Create Order) — `reference` unique per order. */
+export function createTradingOrder(input: {
+  base_currency: string;
+  quote_currency: string;
+  side: "BUY" | "SELL";
+  quantity: string;
+  price?: string;
+  quote_id: string;
+  quantity_in_base_units?: boolean;
+  reference: string;
+}) {
+  return POST("/api/trading/orders", input);
+}
+/** Get order by id OR reference (docs accept both). */
+export function getTradingOrder(idOrReference: string) {
+  return GET(`/api/trading/orders/${encodeURIComponent(idOrReference)}`);
+}
+export function cancelTradingOrder(idOrReference: string) {
+  return DEL(`/api/trading/orders/${encodeURIComponent(idOrReference)}`);
+}
+
+// ---------------------------------------------------------------------------
 // Beneficiaries
 // ---------------------------------------------------------------------------
 export function listBeneficiaries(limit = 50, offset = 0) {

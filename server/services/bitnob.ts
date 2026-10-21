@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import https from "https";
 import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 
 /**
@@ -11,9 +12,11 @@ import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
  *   headers      = X-Auth-Client, X-Auth-Timestamp (seconds), X-Auth-Nonce (16-byte hex),
  *                  X-Auth-Signature
  *
- * Base URLs: production https://api.bitnob.com/api · sandbox https://sandboxapi.bitnob.co/api
- * (BITNOB_ENV switches; sandbox needs BITNOB_ALLOW_INSECURE_TLS=1 because the
- * sandbox host currently serves a mismatched certificate.)
+ * Base URLs: production https://api.bitnob.com/api (LIVE — confirmed responding
+ * 2026-10; calls before IP whitelisting answer 403 "IP address not whitelisted")
+ * · sandbox https://sandboxapi.bitnob.co/api (BITNOB_ENV=sandbox; the sandbox
+ * host currently serves a mismatched certificate, so also set
+ * BITNOB_ALLOW_INSECURE_TLS=1 — the sandbox routes currently 404 regardless).
  *
  * IP WHITELIST: the Bitnob dashboard must whitelist the calling server's IP
  * (production droplet IP). Otherwise the API answers 403 "IP address not
@@ -27,19 +30,25 @@ import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 
 const BASE =
   process.env.BITNOB_BASE_URL ||
-  (process.env.BITNOB_ENV === "production"
-    ? "https://api.bitnob.com/api"
+  (process.env.BITNOB_ENV === "sandbox"
+    ? "https://sandboxapi.bitnob.co/api"
     : "https://api.bitnob.com/api");
 
 function client(): AxiosInstance {
-  const apiKey = process.env.BITNOB_API_KEY || "";
+  // Unified contract (mirrors services/providers/bitnob.ts):
+  //   X-Auth-Client  = BITNOB_CLIENT_ID
+  //   HMAC secret    = BITNOB_SECRET_KEY (legacy alias: BITNOB_API_KEY)
+  const apiKey = process.env.BITNOB_SECRET_KEY || process.env.BITNOB_API_KEY || "";
   const clientId = process.env.BITNOB_CLIENT_ID || "";
-  if (!apiKey || !clientId) throw new Error("Bitnob is not configured (BITNOB_API_KEY / BITNOB_CLIENT_ID missing)");
+  if (!apiKey || !clientId) throw new Error("Bitnob is not configured (BITNOB_CLIENT_ID / BITNOB_SECRET_KEY missing)");
   const inst = axios.create({
     baseURL: BASE,
     timeout: 45000,
     headers: { "Content-Type": "application/json" },
-    ...(process.env.BITNOB_ALLOW_INSECURE_TLS === "1" ? {} : {}),
+    // BITNOB_ALLOW_INSECURE_TLS=1 tolerates the sandbox host's mismatched cert.
+    ...(process.env.BITNOB_ALLOW_INSECURE_TLS === "1"
+      ? { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
+      : {}),
   });
   inst.interceptors.request.use((config: InternalAxiosRequestConfig) => {
     const ts = Math.floor(Date.now() / 1000).toString();
@@ -56,7 +65,10 @@ function client(): AxiosInstance {
 }
 
 export function isBitnobConfigured(): boolean {
-  return !!(process.env.BITNOB_API_KEY && process.env.BITNOB_CLIENT_ID);
+  return !!(
+    (process.env.BITNOB_SECRET_KEY || process.env.BITNOB_API_KEY) &&
+    process.env.BITNOB_CLIENT_ID
+  );
 }
 
 export class BitnobError extends Error {
@@ -80,7 +92,7 @@ export function bitnobErr(e: any): BitnobError {
       503
     );
   }
-  if (status === 401) return new BitnobError("Bitnob authentication failed — check BITNOB_API_KEY/BITNOB_CLIENT_ID.", "BITNOB_AUTH", 502);
+  if (status === 401) return new BitnobError("Bitnob authentication failed — check BITNOB_CLIENT_ID/BITNOB_SECRET_KEY.", "BITNOB_AUTH", 502);
   return new BitnobError(msg, "BITNOB_ERROR", status ?? 502);
 }
 

@@ -1,24 +1,28 @@
 import type { CorsOptions } from "cors";
+import { configuredClientOrigins } from "./lib/client-urls";
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://metroflow-app.netlify.app",
   "https://metricorex-app.netlify.app",
   "http://localhost:3000",
   "http://localhost:5173",
+  "http://localhost:8080",
+  "http://localhost:8081",
+  "http://localhost:8082",
+  "http://localhost:8085",
   "https://api.metricorex.com",
   "https://metricorex.com",
   "https://www.metricorex.com",
   "https://files.metricorex.com",
   "https://app.metricorex.com",
+  "https://personal.metricorex.com",
   "https://admin.metricorex.com",
   "https://compliance.metricorex.com",
   "https://metricorex-admin.netlify.app",
   "https://metricorex-backend.netlify.app",
   "https://metricorex-site.netlify.app",
-  // Personal app (web) — must be first-class, not an afterthought.
-  "https://personal.metricorex.com",
-  "https://metricorex-personal.netlify.app",
   "https://metricorex-personal-web.netlify.app",
+  "https://metricorex-personal.netlify.app",
 ];
 
 const DEFAULT_ALLOWED_HEADERS = [
@@ -31,15 +35,14 @@ const DEFAULT_ALLOWED_HEADERS = [
 ];
 
 function getAllowedOrigins() {
-  const configuredOrigins = process.env.CORS_ORIGINS
-    ?.split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean) ?? [];
-
+  // configuredClientOrigins() covers CORS_ORIGINS plus every URL env var
+  // (CLIENT_URL / CLIENT_APP_URL / APP_URL / APP_BASE_URL) — comma-separated
+  // lists included. Ops can therefore point both apps at this API by writing
+  // CLIENT_URL="https://app.metricorex.com, https://personal.metricorex.com"
+  // and CORS just works, while the link builders keep using the first entry.
   return [
     ...DEFAULT_ALLOWED_ORIGINS,
-    process.env.APP_BASE_URL,
-    ...configuredOrigins,
+    ...configuredClientOrigins(),
   ].filter(Boolean) as string[];
 }
 

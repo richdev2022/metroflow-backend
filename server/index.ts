@@ -34,6 +34,7 @@ import { handleDemo } from "./routes/demo";
   import savingsPersonalRouter from "./features/personal/savings";
   import { prestmitWebhookHandler, bitnobWebhookHandler } from "./routes/personal-webhooks";
   import adminPersonalRouter from "./routes/admin_personal";
+  import personalProductsAdminRouter from "./features/personal/admin";
 import {
   registerBusiness,
   verifyOTP,
@@ -968,7 +969,11 @@ export async function createServer() {
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);
-  // Personal app management (boosts, moderation, pricing, service flags)
+  // Personal app management — the Personal Products console (flags/routing/
+  // pricing/monitoring, expected by the deployed admin UI) mounts FIRST; the
+  // ops router (boosts, moderation, ledgers, boost pricing) coexists below
+  // with distinct subpaths.
+  mainRouter.use("/admin/personal", personalProductsAdminRouter);
   mainRouter.use("/admin/personal", adminPersonalRouter);
 
   // Dashboard API routes

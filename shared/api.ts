@@ -268,6 +268,22 @@ export interface LoginInput {
   password: string;
 }
 
+/**
+ * Personal (consumer) registration — deliberately MINIMAL: email, phone,
+ * password and an optional referral code. A personal "space" (business row
+ * with industry='personal') backs the account so the shared fintech core
+ * (wallets, limits, ledgers) keeps working unchanged.
+ */
+export interface RegisterPersonalInput {
+  email: string;
+  phone_number: string;
+  password: string;
+  /** Optional display name — defaults to the email local-part. */
+  name?: string;
+  /** Optional Refer & Earn referral code — attributes this signup to a referrer. */
+  referralCode?: string;
+}
+
 export interface OTPVerificationInput {
   email: string;
   otpCode: string;

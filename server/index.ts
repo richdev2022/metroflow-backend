@@ -2,6 +2,9 @@
 // (dotenv alone does not override, so an edited .env silently lost to old pm2 snapshots).
 import "./env-override";
 import "dotenv/config";
+// client-urls normalizes comma-separated CLIENT_URL/APP_URL values to their
+// first entry BEFORE any link builder runs, and feeds the full list to CORS.
+import "./lib/client-urls";
 import * as Sentry from "@sentry/node";
 import express from "express";
 import path from "path";
@@ -36,6 +39,8 @@ import {
   listWorkspaces,
   switchWorkspace,
   getAppContext,
+  createSsoTicket,
+  redeemSsoTicket,
 } from "./routes/auth";
 import { biometricEnroll, biometricLogin, biometricRevoke, biometricStatus } from "./routes/auth";
 import {
@@ -948,6 +953,9 @@ export async function createServer() {
   mainRouter.post("/auth/change-password", authenticateToken, changePassword);
   mainRouter.get("/auth/me", authenticateToken, getMe);
   mainRouter.get("/auth/app-context", authenticateToken, getAppContext);
+  // Cross-app SSO — Business <-> Personal one-time ticket handoff
+  mainRouter.post("/auth/sso/ticket", authenticateToken, createSsoTicket);
+  mainRouter.post("/auth/sso/redeem", redeemSsoTicket);
   // Multi-workspace switching — same verified email, multiple memberships.
   mainRouter.get("/auth/workspaces", authenticateToken, listWorkspaces);
   mainRouter.post("/auth/switch-workspace", authenticateToken, switchWorkspace);
@@ -1040,8 +1048,9 @@ export async function createServer() {
   mainRouter.use("/ai-credits", aiCreditsRouter);
   mainRouter.use("/invoices", invoicesRouter);
   // Business revenue features: Storefront + Recurring Billing (Customer Subscriptions).
-  // (Bills Hub & Savings Vaults live in server/features/personal — dormant until
-  // the Personal app ships; see server/features/personal/README.md.)
+  // Personal products (Bills, Savings, Giftcards, eSIM, Virtual cards, Crypto,
+  // Social, Live) are LIVE below — governed by the Personal Products console
+  // (/api/admin/personal): service flags, provider routing, pricing.
   mainRouter.use("/store", storeRouter);
   mainRouter.use("/recurring", recurringRouter);
 

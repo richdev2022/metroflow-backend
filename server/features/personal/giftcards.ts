@@ -44,7 +44,11 @@ import {
  * Fraud: sell = inflow evaluation (card fraud), buy = outflow evaluation.
  */
 
+import { requirePersonalService } from "./flags";
+
 const router = express.Router();
+// Personal Products console kill-switch for gift card trading.
+router.use(requirePersonalService("giftcards"));
 
 // ---------------------------------------------------------------------------
 // Schema (idempotent)
@@ -96,8 +100,18 @@ function randomReference(prefix: string): string {
     return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`.toUpperCase();
 }
 
-const SELL_FEE_PERCENT = 5;    // our margin on sell payouts
-const BUY_FEE_PERCENT = 5;     // our margin on buy orders
+// Our margin on sell payouts / buy orders — admin-editable via the Personal
+// Products console (settings giftcard_sell_fee_percent / giftcard_buy_fee_percent).
+const SELL_FEE_PERCENT = 5;    // fallback when no admin override exists
+const BUY_FEE_PERCENT = 5;     // fallback when no admin override exists
+async function sellFeePercent(): Promise<number> {
+    const { getPercent } = await import("./flags");
+    return getPercent("giftcard_sell_fee_percent", SELL_FEE_PERCENT);
+}
+async function buyFeePercent(): Promise<number> {
+    const { getPercent } = await import("./flags");
+    return getPercent("giftcard_buy_fee_percent", BUY_FEE_PERCENT);
+}
 
 async function ensureSchema() {
     await ensureGiftcardSchema();
@@ -295,7 +309,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, uploadCardMedia
         }
 
         const reference = randomReference("GCS");
-        const feePercent = SELL_FEE_PERCENT;
+        const feePercent = await sellFeePercent();
         const trade = await createSellTrade({
             giftcardId,
             amount,
@@ -394,7 +408,7 @@ router.get("/buy/config", async (_req, res) => {
     try {
         if (!isPrestmitConfigured()) return res.status(503).json({ success: false, error: "Gift card trading is coming soon", code: "PROVIDER_UNCONFIGURED" });
         const cfg = await buyConfig();
-        return res.json({ success: true, data: cfg, buy_fee_percent: BUY_FEE_PERCENT });
+        return res.json({ success: true, data: cfg, buy_fee_percent: await buyFeePercent() });
     } catch (e: any) {
         return res.status(502).json({ success: false, error: e?.message || "Failed to load buy catalog" });
     }
@@ -406,7 +420,7 @@ router.post("/buy/calculate", authenticateToken, checkSubscriptionStatus, async 
         if (!giftCardSKU || !price || !quantity) return res.status(400).json({ success: false, error: "giftCardSKU, price and quantity are required" });
         const calc = await buyCalculatePayment({ giftCardSKU: String(giftCardSKU), price: Number(price), quantity: parseInt(String(quantity), 10) });
         const partnerTotal = Number(calc?.totalAmount ?? calc?.amount ?? 0);
-        const ourFee = Math.round(partnerTotal * BUY_FEE_PERCENT / 100 * 100) / 100;
+        const ourFee = Math.round(partnerTotal * (await buyFeePercent()) / 100 * 100) / 100;
         return res.json({
             success: true,
             partner_total: partnerTotal,
@@ -441,7 +455,7 @@ router.post("/buy", authenticateToken, checkSubscriptionStatus, async (req: Auth
         const calc = await buyCalculatePayment({ giftCardSKU: String(giftCardSKU), price: Number(price), quantity: qty });
         const partnerTotal = Number(calc?.totalAmount ?? calc?.amount ?? 0);
         if (!(partnerTotal > 0)) return res.status(400).json({ success: false, error: "Could not price this order — check the card and try again" });
-        const fee = Math.round(partnerTotal * BUY_FEE_PERCENT / 100 * 100) / 100;
+        const fee = Math.round(partnerTotal * (await buyFeePercent()) / 100 * 100) / 100;
         const total = Math.round((partnerTotal + fee) * 100) / 100;
 
         // FRAUD GATE (outflow)

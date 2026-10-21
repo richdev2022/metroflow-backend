@@ -7,6 +7,7 @@ import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
 import { ensureCryptoSchema } from "./features/personal/crypto";
 import { ensureSocialSchema } from "./features/personal/social";
 import { ensureLiveSchema } from "./features/personal/live";
+import { ensureSsoSchema } from "./services/sso";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -58,6 +59,14 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensureCryptoSchema(); // crypto -> NGN sales (Bitnob payouts)
   await ensureSocialSchema(); // personal social feed + polls
   await ensureLiveSchema(); // one-tap live streaming (call-room backed)
+  await ensureSsoSchema(); // cross-app SSO one-time tickets (Business <-> Personal)
+  // eSIM purchase fee row (flat ₦50, mirrors the bill convenience fee) —
+  // admin-editable via the Personal Products console.
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'eSIM Purchase Fee', 'esim', 'flat', '{"amount": 50}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'esim')
+  `);
   // Cross-app accounts: Personal <-> Business with one set of credentials.
   // account_type records the product the user SIGNED UP on (personal |
   // business); NULL = unset/legacy. Either app accepts any account.

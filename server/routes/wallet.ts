@@ -1354,6 +1354,11 @@ router.get("/verify", async (req, res) => {
 // ---------------------------------------------------------------------------
 router.post("/swap", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
+        // Personal Products console can pause swaps entirely.
+        const { isPersonalServiceEnabled } = await import("../features/personal/flags");
+        if (!(await isPersonalServiceEnabled("swap"))) {
+            return res.status(403).json({ success: false, error: "Wallet swap is being tuned right now — check back shortly.", code: "SERVICE_DISABLED" });
+        }
         const userId = req.user!.userId;
         const { from_wallet_id, to_wallet_id, amount } = req.body || {};
         const amt = Number(amount);
@@ -1395,11 +1400,17 @@ router.post("/swap", authenticateToken, checkKycStatus, async (req: Authenticate
         const effectiveRate = fromCur === "USD" ? rate : 1 / rate;
 
         // ---- Fee (plan-discounted like other personal features) ----
+        // Reads the canonical fee_configurations row ('swap', percentage_cap
+        // config). The old inline `WHERE type='swap'` query referenced
+        // nonexistent columns and always fell back to 0.5%. Admin-editable
+        // via the Personal Products console.
         let feePercent = 0.5;
         try {
-            const feeRes = await query(`SELECT percentage FROM fee_configurations WHERE type = 'swap' AND is_active = TRUE LIMIT 1`);
-            if (feeRes.rows[0]?.percentage != null) feePercent = Number(feeRes.rows[0].percentage);
-        } catch { /* default */ }
+            const configRes = await query(`SELECT config FROM fee_configurations WHERE fee_type = 'swap' LIMIT 1`);
+            const cfg = typeof configRes.rows[0]?.config === "string" ? JSON.parse(configRes.rows[0].config || "{}") : configRes.rows[0]?.config || {};
+            const pct = Number(cfg.percentage);
+            if (Number.isFinite(pct) && pct >= 0) feePercent = pct;
+        } catch { /* default 0.5% */ }
         const fee = Math.round(amt * feePercent) / 100;
         const totalDebit = Math.round((amt + fee) * 100) / 100;
         const creditAmount = Math.round(amt * effectiveRate * 100) / 100;

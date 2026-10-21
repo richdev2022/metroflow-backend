@@ -2245,3 +2245,89 @@ export const getAppContext: RequestHandler = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to load app context" });
   }
 };
+
+// ---------------------------------------------------------------------------
+// Cross-app SSO — Business <-> Personal one-time ticket handoff (services/sso.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /auth/sso/ticket (authenticated)
+ * Body: { purpose: "personal" | "business" }
+ * Returns { ticket, expires_in, redirect_url } — the caller redirects the
+ * browser to redirect_url; the target app redeems the ticket via
+ * POST /auth/sso/redeem and receives a fresh session token.
+ */
+export const createSsoTicket: RequestHandler = async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, error: "Authentication required" });
+
+    const purpose = String(req.body?.purpose || "").toLowerCase();
+    if (!["personal", "business"].includes(purpose)) {
+      return res.status(400).json({ success: false, error: "purpose must be 'personal' or 'business'" });
+    }
+
+    const { createSsoTicket: mint, ssoTargetBase } = await import("../services/sso");
+    const ip = (String(req.headers["x-forwarded-for"] || "")).split(",")[0]?.trim() || req.ip || null;
+    const { ticket, expires_in } = await mint(userId, purpose as "personal" | "business", ip);
+
+    const nextPath = typeof req.body?.next === "string" && req.body.next.startsWith("/") && !req.body.next.startsWith("//")
+      ? req.body.next
+      : purpose === "personal" ? "/dashboard" : "/dashboard";
+    const redirect_url = `${ssoTargetBase(purpose as "personal" | "business")}/sso?ticket=${encodeURIComponent(ticket)}&next=${encodeURIComponent(nextPath)}`;
+
+    return res.json({ success: true, data: { ticket, expires_in, redirect_url, target: ssoTargetBase(purpose as "personal" | "business") } });
+  } catch (error: any) {
+    console.error("SSO ticket error:", error?.message);
+    return res.status(500).json({ success: false, error: "Failed to start app switch" });
+  }
+};
+
+/**
+ * POST /auth/sso/redeem (public)
+ * Body: { ticket }
+ * Single-use: returns a fresh session token + user profile, identical in
+ * shape to what the apps persist after a normal login.
+ */
+export const redeemSsoTicket: RequestHandler = async (req, res) => {
+  try {
+    if (await rejectIfUnderMaintenance(res)) return;
+    const ticket = String(req.body?.ticket || "");
+    const { redeemSsoTicket: redeem } = await import("../services/sso");
+    const result = await redeem(ticket);
+    if (!result.ok || !result.userId) {
+      return res.status(400).json({ success: false, error: result.error || "Invalid sign-in ticket" });
+    }
+
+    const userRes = await query(
+      `SELECT id, business_id, email, name, first_name, last_name, avatar_url, account_type, kyc_status
+       FROM users WHERE id = $1 LIMIT 1`,
+      [result.userId],
+    );
+    const user = userRes.rows[0];
+    if (!user) return res.status(400).json({ success: false, error: "Account no longer exists" });
+
+    const token = await generateToken(user.id, user.business_id);
+    return res.json({
+      success: true,
+      data: {
+        token,
+        purpose: result.purpose,
+        user: {
+          id: user.id,
+          businessId: user.business_id,
+          email: user.email,
+          name: user.name,
+          firstName: user.first_name,
+          lastName: user.last_name,
+          avatarUrl: user.avatar_url,
+          accountType: user.account_type,
+          kycStatus: user.kyc_status,
+        },
+      },
+    });
+  } catch (error: any) {
+    console.error("SSO redeem error:", error?.message);
+    return res.status(500).json({ success: false, error: "Failed to complete app switch" });
+  }
+};

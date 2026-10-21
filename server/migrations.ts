@@ -5,6 +5,7 @@ import { ensureGiftcardSchema } from "./features/personal/giftcards";
 import { ensureEsimSchema } from "./features/personal/esim";
 import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
 import { ensureCryptoSchema } from "./features/personal/crypto";
+import { ensureStablecoinSchema } from "./features/personal/stablecoin";
 import { ensureSocialSchema } from "./features/personal/social";
 import { ensureLiveSchema } from "./features/personal/live";
 import { ensureSsoSchema } from "./services/sso";
@@ -78,6 +79,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureEsimSchema", ensureEsimSchema); // eSIM top-ups (pluggable provider, simulator first)
   await step("ensureVirtualCardSchema", ensureVirtualCardSchema); // personal USD virtual cards (Bitnob)
   await step("ensureCryptoSchema", ensureCryptoSchema); // crypto -> NGN sales (Bitnob payouts)
+  await step("ensureStablecoinSchema", ensureStablecoinSchema); // USDT/USDC wallets: addresses, deposits, conversions, withdrawals, webhook ledger
   await step("ensureSocialSchema", ensureSocialSchema); // personal social feed + polls
   await step("ensureLiveSchema", ensureLiveSchema); // one-tap live streaming (call-room backed)
   await step("ensureSsoSchema", ensureSsoSchema); // cross-app SSO one-time tickets (Business <-> Personal)

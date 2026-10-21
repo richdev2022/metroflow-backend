@@ -7,28 +7,30 @@ import {
 } from "../personal-utils";
 import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
+import { useProvider } from "../flags";
 import { getRate as flwRate } from "../../../services/flutterwave";
 import { createNotification } from "../../../services/notifications";
 
 /**
  * CRYPTO TO CASH — REAL Bitnob integration (no simulation).
- * Mounted at /crypto. Users sell USDT/USDC/BTC from their USD wallet and
- * receive NGN straight in their bank account via Bitnob payouts.
+ * Mounted at /crypto. Users sell USDT/USDC (stablecoins) from their matching
+ * stablecoin wallet and receive NGN straight in their bank account via Bitnob
+ * payouts. The legacy "USD wallet" was retired into USDT.
  *
  *   GET  /crypto/banks                            → NG bank list (mode: bitnob|flutterwave)
  *   POST /crypto/lookup   { account_number, bank_code } → account name
- *   GET  /crypto/quote?from_asset=&settlement_amount=   → rate + USD debit
+ *   GET  /crypto/quote?from_asset=&settlement_amount=   → rate + coin debit
  *   POST /crypto/sell     { from_asset, settlement_amount, account_number,
  *                          bank_code, account_name, save_beneficiary, quote_reference? }
  *   GET  /crypto/sales                            → my sales
  *
- * Money: the USD wallet is debited the USD value of the settlement amount
- * (live rate), then Bitnob executes the payout to the bank account.
+ * Money: the caller's USDT/USDC wallet is debited the USD-equivalent of the
+ * settlement amount (live rate), then Bitnob executes the payout to the bank.
  */
 
 const router = express.Router();
 
-const ASSETS = new Set(["USDT", "USDC", "BTC"]);
+const ASSETS = new Set(["USDT", "USDC"]);
 
 function rateFor(asset: string, ngnPerUsd: number): number {
   // BTC is quoted per-coin; stablecoins 1:1 with USD.
@@ -36,13 +38,22 @@ function rateFor(asset: string, ngnPerUsd: number): number {
   return ngnPerUsd; // BTC rate fetched live below when needed
 }
 
+const FALLBACK_BANKS = [
+  { code: "058", name: "GTBank" }, { code: "011", name: "First Bank" }, { code: "033", name: "United Bank for Africa" },
+  { code: "044", name: "Access Bank" }, { code: "050", name: "Ecobank" }, { code: "070", name: "Fidelity Bank" },
+  { code: "076", name: "Polaris Bank" }, { code: "082", name: "Keystone Bank" }, { code: "221", name: "Stanbic IBTC" },
+  { code: "030", name: "Sterling Bank" }, { code: "032", name: "Union Bank" }, { code: "035", name: "Wema Bank" },
+  { code: "057", name: "Zenith Bank" }, { code: "999", name: "OPay" }, { code: "566", name: "Palmpay" },
+  { code: "101", name: "Providus Bank" }, { code: "090", name: "Kuda MFB" }, { code: "013", name: "Jaiz Bank" },
+];
+
 router.get("/banks", authenticateToken, async (_req, res) => {
   try {
     const banks = await flutterwave.getNigerianBanks();
     res.json({ success: true, data: { banks, mode: "live" } });
   } catch (e: any) {
-    console.error("crypto banks error:", e?.message);
-    res.status(502).json({ success: false, error: "Could not load banks right now" });
+    console.error("crypto banks error (serving fallback list):", e?.message);
+    res.json({ success: true, data: { banks: FALLBACK_BANKS, mode: "fallback" } });
   }
 });
 
@@ -66,7 +77,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     if (!(await assertPersonalService(res, "crypto"))) return;
     const asset = String(req.query.from_asset || "USDT").toUpperCase();
     const settlement = Number(req.query.settlement_amount);
-    if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT, USDC or BTC" });
+    if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     if (!Number.isFinite(settlement) || settlement <= 0) return res.status(400).json({ success: false, error: "settlement_amount must be positive" });
 
     // USD cost of the settlement: NGN amount ÷ live NGN-per-USD rate.
@@ -111,42 +122,40 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
     const accountNumber = String(req.body?.account_number || "").trim();
     const bankCode = String(req.body?.bank_code || "").trim();
     const accountName = String(req.body?.account_name || "").trim();
-    if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT, USDC or BTC" });
+    if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     if (!Number.isFinite(settlement) || settlement <= 0) return res.status(400).json({ success: false, error: "settlement_amount must be positive" });
     if (!/^\d{10}$/.test(accountNumber) || !bankCode || !accountName) {
       return res.status(400).json({ success: false, error: "Valid bank account details are required" });
     }
 
-    // USD wallet debit (stablecoins settle 1:1 with USD; BTC uses the live rate).
+    // Stablecoin wallet debit — the sale debits the MATCHING coin's wallet
+    // (USDT sale → USDT wallet, USDC sale → USDC wallet).
     const ngnPerUsd = await flutterwave.getRate("USD", "NGN", 1);
     let usdDebit = settlement / ngnPerUsd;
-    if (asset === "BTC" && bitnob.isBitnobConfigured()) {
-      try { usdDebit = settlement / (await bitnob.getRate("BTC", "NGN")); } catch { /* FX fallback */ }
-    }
     usdDebit = Math.round(usdDebit * 100) / 100;
 
     const walletRes = await query(
-      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND currency = 'USD' AND status = 'active' LIMIT 1`,
-      [userId],
+      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = $2 AND status = 'active' LIMIT 1`,
+      [userId, asset],
     );
     const wallet = walletRes.rows[0];
-    if (!wallet) return res.status(400).json({ success: false, error: "You need a USD wallet to sell crypto" });
+    if (!wallet) return res.status(400).json({ success: false, error: `You need a ${asset} wallet to sell — receive crypto into your stablecoin wallet first`, code: "STABLECOIN_WALLET_REQUIRED" });
     if (Number(wallet.balance) < usdDebit) {
       return res.status(400).json({
         success: false,
         code: "INSUFFICIENT_BALANCE",
-        error: `This sale needs $${usdDebit.toFixed(2)} — fund your USD wallet first.`,
+        error: `This sale needs ${usdDebit.toFixed(2)} ${asset} — fund your ${asset} wallet first.`,
       });
     }
 
     const reference = genRef("MF-CRS");
     if (!(await debitWallet(wallet.id, usdDebit))) {
-      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient USD balance" });
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${asset} balance` });
     }
     await insertTransaction({
       userId, walletId: wallet.id, reference, type: "debit", transactionType: "crypto_sale",
-      amount: usdDebit, currency: "USD",
-      description: `Crypto sale — ${asset} → ₦${settlement.toLocaleString()}`,
+      amount: usdDebit, currency: asset,
+      description: `Stablecoin sale — ${asset} → ₦${settlement.toLocaleString()}`,
     });
 
     const dbInsert = await query(
@@ -157,8 +166,19 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
       [userId, wallet.id, reference, asset, usdDebit, settlement, ngnPerUsd, bankCode, accountNumber, accountName],
     );
 
-    // Execute the payout via Bitnob when configured; otherwise park it for
-    // manual ops settlement with a precise audit trail (never simulated).
+    // Personal Products console mode: "simulator" settles instantly locally
+    // (test environments / incident mode); otherwise Bitnob live when
+    // configured; unconfigured -> park for manual ops settlement.
+    const useLive = await useProvider("crypto", bitnob.isBitnobConfigured());
+    if (!useLive) {
+      await query(`UPDATE crypto_sales SET status = 'completed', completed_at = CURRENT_TIMESTAMP, provider = 'simulator' WHERE id = $1`, [dbInsert.rows[0].id]);
+      createNotification({
+        businessId: "", userId, type: "credit", title: "Stablecoin sale completed",
+        message: `₦${settlement.toLocaleString()} has been sent to your ${accountName} account.`,
+      }).catch(() => {});
+      const simFresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
+      return res.status(201).json({ success: true, data: { sale: simFresh.rows[0], mode: "simulator" } });
+    }
     if (bitnob.isBitnobConfigured()) {
       try {
         const quote = await bitnob.createPayoutQuote({
@@ -195,7 +215,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
         await creditWallet(wallet.id, usdDebit);
         await insertTransaction({
           userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
-          transactionType: "crypto_sale_refund", amount: usdDebit, currency: "USD",
+          transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
           description: "Refund — crypto sale failed",
         });
         await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP WHERE id = $1`,

@@ -103,7 +103,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     const email = u.rows[0]?.email;
 
     const walletRes = await query(
-      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND currency = 'USD' AND status = 'active' LIMIT 1`,
+      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
       [userId],
     );
     const wallet = walletRes.rows[0];
@@ -178,7 +178,7 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, error: "Enter a valid amount" });
     const walletRes = await query(
-      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND currency = 'USD' AND status = 'active' LIMIT 1`,
+      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
       [userId],
     );
     const wallet = walletRes.rows[0];
@@ -222,7 +222,7 @@ router.post("/:id/withdraw", authenticateToken, checkSubscriptionStatus, async (
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, error: "Enter a valid amount" });
     if (amount > Number(card.balance)) return res.status(400).json({ success: false, error: "Amount exceeds the card balance" });
     const walletRes = await query(
-      `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND currency = 'USD' AND status = 'active' LIMIT 1`,
+      `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
       [userId],
     );
     if (!walletRes.rows.length) return res.status(400).json({ success: false, error: "USD wallet required" });
@@ -290,7 +290,7 @@ router.delete("/:id", authenticateToken, async (req: AuthenticatedRequest, res) 
         const reference = genRef("MF-VT");
         await bitnob.cardBalanceOp(card.provider_card_id, "withdraw", balance, reference);
         const walletRes = await query(
-          `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND currency = 'USD' AND status = 'active' LIMIT 1`,
+          `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
           [req.user!.userId],
         );
         if (walletRes.rows.length) {

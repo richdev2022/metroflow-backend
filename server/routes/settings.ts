@@ -656,15 +656,30 @@ router.get("/otp-preference", authenticateToken, checkSubscriptionStatus, async 
  */
 router.post("/pin", authenticateToken, checkSubscriptionStatus, validateBody(CreateTransactionPinSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user!.businessId;
+    const businessId = req.user!.businessId || null;
+    const userId = req.user!.userId;
     const { pin } = req.body;
-    
+
+    // PERSONAL users keep their PIN on users.transaction_pin_hash.
+    if (!businessId) {
+      const existingUserPin = await query(
+        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
+        [userId]
+      );
+      if (existingUserPin.rows[0]?.transaction_pin_hash) {
+        return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
+      }
+      const pinHash = await hashPassword(pin);
+      await query(`UPDATE users SET transaction_pin_hash = $1 WHERE id = $2`, [pinHash, userId]);
+      return res.json({ success: true, message: "Transaction PIN created successfully" });
+    }
+
     // Check if PIN already exists
     const existingPin = await query(
       `SELECT transaction_pin_hash FROM businesses WHERE id = $1`,
       [businessId]
     );
-    
+
     if (existingPin.rows[0]?.transaction_pin_hash) {
       return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
     }
@@ -811,10 +826,32 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
  */
 router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(UpdateTransactionPinSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user!.businessId;
+    const businessId = req.user!.businessId || null;
     const userId = req.user!.userId;
     const { newPin, otp } = req.body;
-    
+
+    // PERSONAL users: PIN + OTP both live on the user row.
+    if (!businessId) {
+      const u = await query(
+        `SELECT otp_code, otp_expires_at, otp_type, transaction_pin_hash FROM users WHERE id = $1`,
+        [userId]
+      );
+      const userRow = u.rows[0];
+      if (!userRow) return res.status(404).json({ success: false, error: "User not found" });
+      if (userRow.otp_code) {
+        if (!otp) return res.status(400).json({ success: false, error: "OTP is required to update your PIN" });
+        if (!otpMatches(otp, userRow.otp_code)) return res.status(400).json({ success: false, error: "Invalid OTP" });
+        if (userRow.otp_expires_at && new Date(userRow.otp_expires_at) < new Date()) {
+          return res.status(400).json({ success: false, error: "OTP has expired" });
+        }
+      } else if (otp) {
+        return res.status(400).json({ success: false, error: "No OTP was requested" });
+      }
+      const newHash = await hashPassword(newPin);
+      await query(`UPDATE users SET transaction_pin_hash = $1, otp_code = NULL, otp_expires_at = NULL WHERE id = $2`, [newHash, userId]);
+      return res.json({ success: true, message: "Transaction PIN updated successfully" });
+    }
+
     // Get current PIN hash and OTP
     const [userResult, businessResult] = await Promise.all([
       query(

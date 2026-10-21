@@ -15,6 +15,10 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "https://metricorex-admin.netlify.app",
   "https://metricorex-backend.netlify.app",
   "https://metricorex-site.netlify.app",
+  // Personal app (web) — must be first-class, not an afterthought.
+  "https://personal.metricorex.com",
+  "https://metricorex-personal.netlify.app",
+  "https://metricorex-personal-web.netlify.app",
 ];
 
 const DEFAULT_ALLOWED_HEADERS = [

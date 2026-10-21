@@ -535,15 +535,27 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     const dbDebitAmount = hasDebit ? Number(debitAmount) : null;
     const dbDebitCurrency = hasDebit ? (debitCurrency || 'NGN').toUpperCase() : null;
 
-    // Get business settings
-    const businessRes = await query(
-      `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
-      [businessId]
-    );
-    const business = businessRes.rows[0];
+    // PIN: business users verify against businesses.transaction_pin_hash;
+    // PERSONAL users (business_id NULL) verify against users.transaction_pin_hash.
+    let pinHash: string | null = null;
+    let otpEnabled = false;
+    if (businessId) {
+      const businessRes = await query(
+        `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+        [businessId]
+      );
+      pinHash = businessRes.rows[0]?.transaction_pin_hash || null;
+      otpEnabled = !!businessRes.rows[0]?.otp_enabled;
+    } else {
+      const personalRes = await query(
+        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
+        [userId]
+      );
+      pinHash = personalRes.rows[0]?.transaction_pin_hash || null;
+    }
 
     // Check if PIN is set
-    if (!business?.transaction_pin_hash) {
+    if (!pinHash) {
       return res.status(400).json({ 
         success: false, 
         error: "Transaction PIN not set. Please create one first.",
@@ -556,14 +568,14 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       return res.status(400).json({ success: false, error: "Transaction PIN is required" });
     }
 
-    const pinValid = await verifyPassword(pin, business.transaction_pin_hash);
+    const pinValid = await verifyPassword(pin, pinHash);
     if (!pinValid) {
       return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
     }
 
     // Check OTP requirement
     let isOtpValidated = false;
-    if (business.otp_enabled) {
+    if (otpEnabled) {
       if (!otp) {
         return res.status(400).json({ success: false, error: "OTP is required" });
       }
@@ -1071,15 +1083,27 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       return res.status(400).json({ success: false, error: "Business ID required" });
     }
 
-    // Get business settings
-    const businessRes = await query(
-      `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
-      [businessId]
-    );
-    const business = businessRes.rows[0];
+    // PIN: business users verify against businesses.transaction_pin_hash;
+    // PERSONAL users (business_id NULL) verify against users.transaction_pin_hash.
+    let pinHash: string | null = null;
+    let otpEnabled = false;
+    if (businessId) {
+      const businessRes = await query(
+        `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+        [businessId]
+      );
+      pinHash = businessRes.rows[0]?.transaction_pin_hash || null;
+      otpEnabled = !!businessRes.rows[0]?.otp_enabled;
+    } else {
+      const personalRes = await query(
+        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
+        [(req.user?.userId as string)]
+      );
+      pinHash = personalRes.rows[0]?.transaction_pin_hash || null;
+    }
 
     // Check if PIN is set
-    if (!business?.transaction_pin_hash) {
+    if (!pinHash) {
       return res.status(400).json({ 
         success: false, 
         error: "Transaction PIN not set. Please create one first.",
@@ -1092,14 +1116,14 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       return res.status(400).json({ success: false, error: "Transaction PIN is required" });
     }
 
-    const pinValid = await verifyPassword(pin, business.transaction_pin_hash);
+    const pinValid = await verifyPassword(pin, pinHash);
     if (!pinValid) {
       return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
     }
 
     // Check OTP requirement
     let isOtpValidated = false;
-    if (business.otp_enabled) {
+    if (otpEnabled) {
       if (!otp) {
         return res.status(400).json({ success: false, error: "OTP is required" });
       }
@@ -1133,7 +1157,7 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
         }
     } else {
         // Verify ownership
-        const wCheck = await query(`SELECT id FROM wallets WHERE id = $1 AND (business_id = $2 OR user_id IN (SELECT id FROM users WHERE business_id = $2))`, [walletId, businessId]);
+        const wCheck = await query(`SELECT id FROM wallets WHERE id = $1 AND (business_id = $2 OR user_id = $3)`, [walletId, businessId || null, (req.user?.userId as string)]);
         if (wCheck.rows.length === 0) {
             return res.status(403).json({ success: false, error: "Invalid source wallet" });
         }

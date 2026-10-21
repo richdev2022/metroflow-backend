@@ -1,10 +1,10 @@
 import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
+import { verifyTransactionPin } from "./personal-utils";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
-import { verifyPassword } from "../../services/auth";
-import { fulfilBill, isBillsProviderConfigured } from "./bills-provider";
+import { getBillCategories, payBill as flwPayBill, isFlutterwaveConfigured } from "../../services/flutterwave";
 
 const router = express.Router();
 
@@ -51,97 +51,88 @@ interface BillProvider {
     requiresAmount?: boolean;
 }
 
-const PROVIDERS: BillProvider[] = [
-    // ---- Airtime ----
-    { code: "mtn", name: "MTN Airtime", category: "airtime", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$", refExample: "08031234567" },
-    { code: "airtel", name: "Airtel Airtime", category: "airtime", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$", refExample: "08021234567" },
-    { code: "glo", name: "Glo Airtime", category: "airtime", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$", refExample: "08051234567" },
-    { code: "9mobile", name: "9mobile Airtime", category: "airtime", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$", refExample: "08091234567" },
-    // ---- Data ----
-    {
-        code: "mtn-data", name: "MTN Data", category: "data", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$",
-        plans: [
-            { code: "mtn-1gb", name: "1 GB", amount: 350, validity: "30 days" },
-            { code: "mtn-2gb", name: "2 GB", amount: 650, validity: "30 days" },
-            { code: "mtn-5gb", name: "5 GB", amount: 1500, validity: "30 days" },
-            { code: "mtn-10gb", name: "10 GB", amount: 3000, validity: "30 days" },
-        ],
-    },
-    {
-        code: "airtel-data", name: "Airtel Data", category: "data", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$",
-        plans: [
-            { code: "airtel-1gb", name: "1 GB", amount: 400, validity: "30 days" },
-            { code: "airtel-3gb", name: "3 GB", amount: 1000, validity: "30 days" },
-            { code: "airtel-10gb", name: "10 GB", amount: 3000, validity: "30 days" },
-        ],
-    },
-    {
-        code: "glo-data", name: "Glo Data", category: "data", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$",
-        plans: [
-            { code: "glo-1gb", name: "1 GB", amount: 350, validity: "30 days" },
-            { code: "glo-5gb", name: "5 GB", amount: 1600, validity: "30 days" },
-        ],
-    },
-    {
-        code: "9mobile-data", name: "9mobile Data", category: "data", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$",
-        plans: [
-            { code: "9mobile-1gb", name: "1 GB", amount: 500, validity: "30 days" },
-            { code: "9mobile-3gb", name: "3 GB", amount: 1200, validity: "30 days" },
-        ],
-    },
-    // ---- TV ----
-    {
-        code: "dstv", name: "DStv", category: "tv", refLabel: "Smartcard number", refPattern: "^\\d{10,12}$",
-        plans: [
-            { code: "dstv-padi", name: "Padi", amount: 4400 },
-            { code: "dstv-yanga", name: "Yanga", amount: 6000 },
-            { code: "dstv-confam", name: "Confam", amount: 11000 },
-            { code: "dstv-compact", name: "Compact", amount: 19000 },
-            { code: "dstv-premium", name: "Premium", amount: 44500 },
-        ],
-    },
-    {
-        code: "gotv", name: "GOtv", category: "tv", refLabel: "IUC number", refPattern: "^\\d{10,12}$",
-        plans: [
-            { code: "gotv-smallie", name: "Smallie", amount: 1900 },
-            { code: "gotv-jinja", name: "Jinja", amount: 3900 },
-            { code: "gotv-jolli", name: "Jolli", amount: 5800 },
-            { code: "gotv-max", name: "Max", amount: 8500 },
-        ],
-    },
-    {
-        code: "startimes", name: "StarTimes", category: "tv", refLabel: "Smartcard number", refPattern: "^\\d{10,12}$",
-        plans: [
-            { code: "startimes-nova", name: "Nova", amount: 1900 },
-            { code: "startimes-basic", name: "Basic", amount: 3200 },
-            { code: "startimes-smart", name: "Smart", amount: 4800 },
-            { code: "startimes-classic", name: "Classic", amount: 6000 },
-        ],
-    },
-    // ---- Electricity ----
-    { code: "ikedc", name: "Ikeja Electric (IKEDC)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "ekedc", name: "Eko Electric (EKEDC)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "aedc", name: "Abuja Electric (AEDC)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "phed", name: "Port Harcourt Electric (PHED)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "kedco", name: "Kano Electric (KEDCO)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "jed", name: "Jos Electric (JED)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "kaedco", name: "Kaduna Electric (KAEDCO)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    { code: "eedc", name: "Enugu Electric (EEDC)", category: "electricity", refLabel: "Meter number", refPattern: "^\\d{6,15}$" },
-    // ---- Betting ----
-    { code: "bet9ja", name: "Bet9ja", category: "betting", refLabel: "User ID", refPattern: "^[A-Za-z0-9\\-]{3,40}$" },
-    { code: "sportybet", name: "SportyBet", category: "betting", refLabel: "Phone number", refPattern: "^0[789][01]\\d{8}$" },
-    { code: "betking", name: "BetKing", category: "betting", refLabel: "User ID", refPattern: "^[A-Za-z0-9\\-]{3,40}$" },
-    { code: "1xbet", name: "1xBet", category: "betting", refLabel: "Account ID", refPattern: "^[A-Za-z0-9\\-]{3,40}$" },
-];
+/**
+ * DYNAMIC catalog — fetched live from Flutterwave bill categories (cached).
+ * Nothing is hardcoded: airtime/data/TV/electricity/betting providers and
+ * their plans all come from the provider API on every cold load.
+ */
+const flwCache: { at: number; providers: BillProvider[] } = { at: 0, providers: [] };
+const FLW_CATALOG_TTL = 10 * 60 * 1000;
+
+function classifyBillItem(name: string): string {
+    const n = name.toLowerCase();
+    if (/(bet9ja|sporty|bet\b|betting|nairabet|betway|1xbet|msport)/.test(n)) return "betting";
+    if (/(dstv|gotv|startimes|topstar|tv|cable|dish)/.test(n)) return "tv";
+    if (/(electric|disco|ikedc|ekedc|aedc|jedc|kedco|phed|ibedc|kaedco|tcn|power|prepaid|postpaid|meter)/.test(n)) return "electricity";
+    if (/(airtime|\bat\d+)/.test(n)) return "airtime";
+    if (/(\d+\s*(gb|mb)|data|sme|corporate gsm|gifting)/.test(n)) return "data";
+    return "other";
+}
+
+function refLabelFor(category: string): string {
+    switch (category) {
+        case "airtime": case "data": return "Phone number";
+        case "tv": return "Smartcard / IUC number";
+        case "electricity": return "Meter number";
+        case "betting": return "Customer ID";
+        default: return "Customer reference";
+    }
+}
+
+function refPatternFor(category: string): string | undefined {
+    if (category === "airtime" || category === "data") return "^0[789][01]\\d{8}$";
+    return undefined;
+}
+
+async function loadProviders(): Promise<BillProvider[]> {
+    const now = Date.now();
+    if (flwCache.providers.length && now - flwCache.at < FLW_CATALOG_TTL) return flwCache.providers;
+    const items = await getBillCategories("NG");
+    const byCode = new Map<string, BillProvider & { _fixed: boolean }>();
+    for (const it of items) {
+        const category = classifyBillItem(`${it.biller_name} ${it.short_name}`);
+        if (category === "other") continue;
+        const code = String(it.biller_code || "").toUpperCase();
+        if (!code) continue;
+        let p = byCode.get(code);
+        if (!p) {
+            p = {
+                code, name: (it.biller_name || code).trim(), category,
+                refLabel: refLabelFor(category), refPattern: refPatternFor(category),
+                plans: [], _fixed: false,
+            };
+            byCode.set(code, p);
+        }
+        const fixed = it.is_amount_fixed === true || (it.amount ?? 0) > 0;
+        if (fixed && (category === "data" || category === "tv")) {
+            p.plans = p.plans || [];
+            if (p.plans.length < 40) {
+                p.plans.push({
+                    code: String(it.item_code || it.short_name).slice(0, 40),
+                    name: (it.short_name || it.biller_name || "Bundle").trim(),
+                    amount: Number(it.amount) || 0,
+                });
+            }
+        } else {
+            p.requiresAmount = true;
+        }
+    }
+    const providers = [...byCode.values()];
+    flwCache.providers = providers;
+    flwCache.at = now;
+    return providers;
+}
+
+function findProvider(providers: BillProvider[], code: string): BillProvider | undefined {
+    const c = String(code || "").toUpperCase();
+    return providers.find((p) => p.code.toUpperCase() === c);
+}
 
 const BILL_MIN_AMOUNT = 50;
 const BILL_MAX_AMOUNT = 500_000;
 
-function findProvider(code: string): BillProvider | undefined {
-    return PROVIDERS.find((p) => p.code === String(code).toLowerCase());
-}
-
-function getPlanConfig(businessId: string) {
+function getPlanConfig(businessId: string | null | undefined) {
+    if (!businessId) return Promise.resolve(null); // personal users: no plan gating
     return query(
         `SELECT p.bills_enabled, p.max_bills_per_day, p.bill_fee_discount_percent
          FROM businesses b JOIN pricing_plans p ON p.id = b.plan_id
@@ -176,12 +167,22 @@ function randomReference(): string {
  *         description: Catalog with all providers, plans and configured provider mode
  */
 router.get("/catalog", async (_req, res) => {
-    res.json({
-        success: true,
-        liveProvider: isBillsProviderConfigured(),
-        categories: ["airtime", "data", "tv", "electricity", "betting"],
-        providers: PROVIDERS,
-    });
+    try {
+        const providers = await loadProviders();
+        res.json({
+            success: true,
+            liveProvider: isFlutterwaveConfigured(),
+            categories: ["airtime", "data", "tv", "electricity", "betting"],
+            providers,
+        });
+    } catch (e: any) {
+        console.error("Bills catalog load failed:", e?.message);
+        res.status(503).json({
+            success: false,
+            liveProvider: false,
+            error: "Bill catalog is temporarily unavailable — please retry in a moment.",
+        });
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -309,7 +310,8 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
         } = req.body || {};
 
         // ---- Validate catalog + payload ----
-        const provider = findProvider(String(provider_code || ""));
+        const allProviders = await loadProviders();
+        const provider = findProvider(allProviders, String(provider_code || ""));
         if (!provider || provider.category !== category) {
             return res.status(400).json({ success: false, error: "Unknown service. Pick a valid bill provider." });
         }
@@ -345,22 +347,20 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             });
         }
 
-        // ---- Transaction PIN (same gate as transfers) ----
-        if (!pin) {
-            return res.status(400).json({ success: false, error: "Transaction PIN is required" });
-        }
-        const pinRes = await query(`SELECT transaction_pin_hash FROM businesses WHERE id = $1`, [businessId]);
-        const business = pinRes.rows[0];
-        if (!business?.transaction_pin_hash) {
-            return res.status(400).json({
-                success: false,
-                error: "Transaction PIN not set. Please create one first.",
-                code: "PIN_NOT_SET",
-            });
-        }
-        const pinValid = await verifyPassword(String(pin), business.transaction_pin_hash);
-        if (!pinValid) {
-            return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
+        // ---- Transaction PIN (wallet decides personal vs business hash) ----
+        // NOTE: the wallet must be resolved BEFORE the PIN check now.
+        const walletPre = await query(
+            `SELECT * FROM wallets WHERE id = $1 AND (business_id = $2 OR user_id = $3)`,
+            [wallet_id, businessId || null, userId]
+        );
+        const walletPreRow = walletPre.rows[0];
+        if (!walletPreRow) return res.status(404).json({ success: false, error: "Wallet not found" });
+        const pinCheck = await verifyTransactionPin(
+            typeof pin === "string" ? pin : undefined,
+            { userId, businessId: businessId || null, wallet: walletPreRow }
+        );
+        if (!pinCheck.ok) {
+            return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
         }
 
         // ---- Plan gating ----
@@ -387,13 +387,8 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             }
         }
 
-        // ---- Wallet (must belong to the caller) ----
-        const walletRes = await query(
-            `SELECT * FROM wallets WHERE id = $1 AND (business_id = $2 OR user_id = $3)`,
-            [wallet_id, businessId || null, userId]
-        );
-        const wallet = walletRes.rows[0];
-        if (!wallet) return res.status(404).json({ success: false, error: "Wallet not found" });
+        // ---- Wallet (already resolved for the PIN gate) ----
+        const wallet = walletPreRow;
         if (wallet.status !== "active") return res.status(400).json({ success: false, error: "Wallet is not active" });
 
         // ---- Fee + total ----
@@ -451,16 +446,21 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             await creditRevenueWallet(fee, wallet.currency || "NGN", reference, "Bill Payment Convenience Fee", "bills");
         }
 
-        // ---- Fulfil via the bills provider (simulator when unconfigured) ----
-        const fulfilment = await fulfilBill({
+        // ---- Fulfil via Flutterwave bills (REAL payment — no simulation) ----
+        const flwType = plan_code || provider.code; // fixed-price items use item_code, free-amount use biller_code
+        const fulfilmentRaw = await flwPayBill({
             reference,
-            category: provider.category,
-            providerCode: provider.code,
-            planCode: plan_code || null,
+            customer: customerRef,
             amount: billAmount,
-            customerRef,
-            customerPhone: customer_phone || null,
+            type: flwType,
         });
+        const fulfilment = {
+            ok: fulfilmentRaw.ok,
+            mode: "provider" as const,
+            providerReference: fulfilmentRaw.provider_reference || null,
+            message: fulfilmentRaw.error,
+            raw: fulfilmentRaw.raw,
+        };
 
         const finalStatus = fulfilment.ok ? "success" : "failed";
         await query(

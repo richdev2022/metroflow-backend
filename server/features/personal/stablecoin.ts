@@ -269,21 +269,19 @@ async function receiveAfterSpread(value: number): Promise<number> {
     return n2(value * (1 - spread / 100));
 }
 
-/** Live mid-market rate for 1 <coin> in NGN (Bitnob trading price → convert API → simulator). */
+/** Live mid-market rate for 1 <coin> in NGN (Bitnob exchange-rates → convert API → simulator). */
 async function stableNgnRate(currency: Stablecoin): Promise<{ rate: number; mode: string }> {
     if (await bitnobLive()) {
-        // Preferred: the trading price endpoint (USDTNGN / USDCNGN pairs).
-        for (const pair of [`${currency}NGN`, `NGN${currency}`]) {
-            try {
-                const p = await bitnob.getTradingPrice(pair);
-                const d = p?.data || {};
-                const raw = d.price ?? d.rate ?? d.last ?? d.mid ?? (pair === `NGN${currency}` ? d.inverse_rate : null);
-                let rate = Number(raw);
-                if (pair === `NGN${currency}` && !rate && d.price) rate = 1 / Number(d.price);
-                if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
-            } catch { /* try next */ }
-        }
-        // Fallback: convert endpoint (1 USDT → NGN).
+        // Preferred: GET /api/exchange-rates?from=&to= — returns buy_rate,
+        // sell_rate and mid_rate (docs: Exchange Rates). mid_rate is the fair
+        // display rate; the trading quote prices the actual execution.
+        try {
+            const r = await bitnob.getExchangeRate(currency, "NGN");
+            const d = r?.data || {};
+            const rate = Number(d.mid_rate ?? d.midRate ?? d.sell_rate ?? d.buy_rate);
+            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
+        } catch { /* try next */ }
+        // Fallback: GET /api/exchange-rates/convert (1 USDT → NGN, sell_rate).
         try {
             const c = await bitnob.convertAmount(currency, "NGN", 1);
             const rate = Number(c?.data?.rate_used || c?.data?.to_amount);
@@ -297,9 +295,11 @@ async function stableNgnRate(currency: Stablecoin): Promise<{ rate: number; mode
 async function createConversionQuote(direction: "stable_to_naira" | "naira_to_stable", currency: Stablecoin, amount: number) {
     if (await bitnobLive()) {
         try {
+            // Docs: quote request = exactly 4 fields; side lowercase; quantity
+            // is denominated in the BASE currency.
             const body = direction === "stable_to_naira"
                 ? { base_currency: currency, quote_currency: "NGN", side: "SELL" as const, quantity: String(n8(amount)) }
-                : { base_currency: "NGN", quote_currency: currency, side: "SELL" as const, quantity: String(n2(amount)), quantity_in_base_units: false };
+                : { base_currency: "NGN", quote_currency: currency, side: "SELL" as const, quantity: String(n2(amount)) };
             const q = await bitnob.createTradingQuote(body);
             const quote = q?.data?.quote;
             if (quote?.id) {

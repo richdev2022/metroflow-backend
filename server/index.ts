@@ -964,6 +964,9 @@ export async function createServer() {
   // Business revenue features: Storefront + Recurring Billing (Customer Subscriptions).
   // (Bills Hub & Savings Vaults live in server/features/personal — dormant until
   // the Personal app ships; see server/features/personal/README.md.)
+  // Personal marketplace MUST mount before the business store router —
+  // storeRouter has a legacy GET /marketplace that would shadow the personal wall.
+  mainRouter.use("/store/marketplace", personalMarketplaceRouter);
   mainRouter.use("/store", storeRouter);
   mainRouter.use("/recurring", recurringRouter);
 
@@ -1177,8 +1180,6 @@ export async function createServer() {
   mainRouter.use("/social", personalSocialRouter);
   // TikTok-style live streaming (rides the call-room WebRTC stack)
   mainRouter.use("/live", personalLiveRouter);
-  // Facebook-Marketplace-style listings + escrow-lite orders + boosts
-  mainRouter.use("/store/marketplace", personalMarketplaceRouter);
   // Prestmit gift cards (REAL buy + sell)
   mainRouter.use("/giftcards", personalGiftcardsRouter);
   // Bitnob crypto-to-cash (REAL rates + payouts)

@@ -166,6 +166,10 @@ router.get("/app-links", async (req, res) => {
         apk_version_name: apkVersionName,
         apk_version_code: apkVersionCode,
         apk_size_bytes: apkSizeBytes,
+        // Web-app origins — centrally configurable so the marketing site and
+        // any embed can deep-link to the right product without redeploying.
+        business_web_url: (process.env.BUSINESS_APP_URL || "https://app.metricorex.com").replace(/\/+$/, ""),
+        personal_web_url: (process.env.PERSONAL_APP_URL || "https://personal.metricorex.com").replace(/\/+$/, ""),
       },
     });
   } catch (error: any) {

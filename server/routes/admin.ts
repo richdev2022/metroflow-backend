@@ -18,6 +18,7 @@ import { getSetting, setSetting, getIntlTransferConfig, getIntlPayoutLimits, get
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
 import adminFraudRouter from "./admin_fraud";
+import personalAdminRouter from "../features/personal/admin";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
 import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
@@ -421,6 +422,10 @@ router.use('/auth', authRouter);
 // Dispute lifecycle — own router (brings authenticateAdmin + manage_finance per route)
 router.use('/disputes', adminDisputesRouter);
 router.use('/', adminFraudRouter); // fraud + compliance endpoints (auth inside)
+// Personal Products console (service flags, provider routing, pricing,
+// monitoring) — brings its own authenticateAdmin, so it must mount BEFORE
+// the catch-all protectedRouter.
+router.use('/personal', personalAdminRouter);
 router.use('/', protectedRouter);
 
 // Dashboard Stats

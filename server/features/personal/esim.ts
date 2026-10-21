@@ -2,6 +2,7 @@ import express from "express";
 import crypto from "crypto";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
+import { requirePersonalService, useProvider } from "./flags";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 import { verifyPassword } from "../../services/auth";
@@ -26,12 +27,19 @@ import { evaluateOutflow } from "../../services/fraud";
  */
 
 const router = express.Router();
+// Personal Products console kill-switch for eSIM top-ups.
+router.use(requirePersonalService("esim"));
 
 const ESIM_PROVIDER_URL = process.env.ESIM_PROVIDER_URL || "";
 const ESIM_PROVIDER_API_KEY = process.env.ESIM_PROVIDER_API_KEY || "";
 
 export function isEsimProviderConfigured(): boolean {
   return !!ESIM_PROVIDER_URL;
+}
+
+/** Provider routing (Personal Products console): auto | provider | simulator. */
+async function liveProvider(): Promise<boolean> {
+  return useProvider("esim", isEsimProviderConfigured());
 }
 
 export async function ensureEsimSchema(): Promise<void> {
@@ -93,7 +101,7 @@ const SIMULATED_PACKAGES: EsimPackage[] = [
 ];
 
 async function listPackages(countryCode?: string): Promise<EsimPackage[]> {
-  if (isEsimProviderConfigured()) {
+  if (await liveProvider()) {
     try {
       const res = await fetch(`${ESIM_PROVIDER_URL}/packages${countryCode ? `?country=${encodeURIComponent(countryCode)}` : ""}`, {
         headers: { Authorization: `Bearer ${ESIM_PROVIDER_API_KEY}` },
@@ -112,7 +120,7 @@ async function listPackages(countryCode?: string): Promise<EsimPackage[]> {
 }
 
 async function fulfillOrder(order: { reference: string; packageCode: string; }): Promise<{ ok: boolean; mode: "provider" | "simulated"; activation?: any; providerReference?: string | null; message?: string }> {
-  if (isEsimProviderConfigured()) {
+  if (await liveProvider()) {
     try {
       const res = await fetch(`${ESIM_PROVIDER_URL}/orders`, {
         method: "POST",
@@ -217,7 +225,7 @@ router.post("/purchase", authenticateToken, checkSubscriptionStatus, async (req:
       return res.status(400).json({ success: false, error: "eSIM purchases are charged in NGN. Select your NGN wallet." });
     }
 
-    const baseFee = await calculateFee(pkg.price, "bill");
+    const baseFee = await calculateFee(pkg.price, "esim");
     const fee = Math.round(baseFee * 100) / 100;
     const total = Math.round((pkg.price + fee) * 100) / 100;
 

@@ -31,8 +31,13 @@ export function isBillsProviderConfigured(): boolean {
     return !!process.env.BILLS_PROVIDER_URL;
 }
 
-export async function fulfilBill(request: BillFulfilmentRequest): Promise<BillFulfilmentResult> {
-    if (!isBillsProviderConfigured()) {
+export async function fulfilBill(
+    request: BillFulfilmentRequest,
+    force?: "provider" | "simulator",
+): Promise<BillFulfilmentResult> {
+    // Admin routing override (Personal Products console): force="simulator"
+    // keeps fulfilment in sandbox mode even when a provider is configured.
+    if (force === "simulator" || !isBillsProviderConfigured()) {
         // Simulated fulfilment — instant success, clearly labelled.
         return {
             ok: true,

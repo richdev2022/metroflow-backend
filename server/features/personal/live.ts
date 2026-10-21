@@ -2,8 +2,11 @@ import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
 import { createNotification } from "../../services/notifications";
+import { requirePersonalService } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch for live streaming.
+router.use(requirePersonalService("live"));
 
 /**
  * Live (Personal) — one-tap live streaming for your followers.

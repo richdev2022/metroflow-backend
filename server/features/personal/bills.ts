@@ -6,8 +6,11 @@ import { createNotification } from "../../services/notifications";
 import { verifyPassword } from "../../services/auth";
 import { fulfilBill, isBillsProviderConfigured } from "./bills-provider";
 import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
+import { requirePersonalService, useProvider } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch for the whole Bills Hub.
+router.use(requirePersonalService("bills"));
 
 /**
  * Bills Hub — the fourth REVENUE feature (daily-use).
@@ -453,6 +456,9 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
         }
 
         // ---- Fulfil via the bills provider (simulator when unconfigured) ----
+        // Routing override from the Personal Products console: "simulator"
+        // forces the built-in simulator even when a live provider is set.
+        const liveProvider = await useProvider("bills", isBillsProviderConfigured());
         const fulfilment = await fulfilBill({
             reference,
             category: provider.category,
@@ -461,7 +467,7 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             amount: billAmount,
             customerRef,
             customerPhone: customer_phone || null,
-        });
+        }, liveProvider ? undefined : "simulator");
 
         const finalStatus = fulfilment.ok ? "success" : "failed";
         await query(

@@ -57,7 +57,12 @@ export class BitnobApiError extends Error {
   }
 }
 
-const BASE_URL = (process.env.BITNOB_BASE_URL || "https://api.bitnob.com").replace(/\/+$/, "");
+// BASE_URL is normalized to NEVER end in "/api" — every request path below
+// already starts with "/api/...". Both "https://api.bitnob.com" and the
+// (previously documented, error-prone) "https://api.bitnob.com/api" work.
+const BASE_URL = (process.env.BITNOB_BASE_URL || "https://api.bitnob.com")
+  .replace(/\/+$/, "")
+  .replace(/\/api$/, "");
 // Unified contract: X-Auth-Client = BITNOB_CLIENT_ID, HMAC secret =
 // BITNOB_SECRET_KEY (falls back to the legacy BITNOB_API_KEY alias).
 const CLIENT_ID = process.env.BITNOB_CLIENT_ID || "";
@@ -346,19 +351,19 @@ export function getTradingPrice(pair: string) {
 }
 
 /**
- * Create a trade quote. pair examples:
- *   USDT→NGN sell: { base_currency: "USDT", quote_currency: "NGN", side: "SELL", quantity: "<USDT units>" }
- *   NGN→USDT buy:  { base_currency: "NGN",  quote_currency: "USDT", side: "SELL", quantity: "<NGN units>", quantity_in_base_units: false }
- * Quotes expire (docs: ~15 min for fiat pairs); `exchange` carries send/receive legs.
+ * Create a trade quote (docs: exactly 4 request fields — base_currency,
+ * quote_currency, side 'buy'|'sell' LOWERCASE, quantity = amount of BASE
+ * currency). `exchange` in the response carries send/receive legs.
+ *   USDT→NGN sell: { base_currency: "USDT", quote_currency: "NGN", side: "sell", quantity: "<USDT units>" }
+ *   NGN→USDT buy:  { base_currency: "NGN",  quote_currency: "USDT", side: "sell", quantity: "<NGN units>" }
  */
 export function createTradingQuote(input: {
   base_currency: string;
   quote_currency: string;
-  side: "BUY" | "SELL";
+  side: "BUY" | "SELL" | "buy" | "sell";
   quantity: string;
-  quantity_in_base_units?: boolean;
 }) {
-  return POST("/api/trading/quotes", input);
+  return POST("/api/trading/quotes", { ...input, side: String(input.side).toLowerCase() });
 }
 export function getTradingQuote(quoteId: string) {
   return GET(`/api/trading/quotes/${encodeURIComponent(quoteId)}`);
@@ -368,14 +373,14 @@ export function getTradingQuote(quoteId: string) {
 export function createTradingOrder(input: {
   base_currency: string;
   quote_currency: string;
-  side: "BUY" | "SELL";
+  side: "BUY" | "SELL" | "buy" | "sell";
   quantity: string;
   price?: string;
   quote_id: string;
   quantity_in_base_units?: boolean;
   reference: string;
 }) {
-  return POST("/api/trading/orders", input);
+  return POST("/api/trading/orders", { ...input, side: String(input.side).toLowerCase() });
 }
 /** Get order by id OR reference (docs accept both). */
 export function getTradingOrder(idOrReference: string) {

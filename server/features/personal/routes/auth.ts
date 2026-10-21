@@ -91,7 +91,8 @@ const registerPersonal: RequestHandler = async (req, res) => {
     );
     const user = userResult.rows[0];
 
-    // Personal wallets: NGN (primary) + USD — per-currency uniques allow both.
+    // Personal wallets: NGN (primary) + stablecoin wallets (USDT + USDC).
+    // The legacy USD wallet is retired — stablecoins ARE the USD rails now.
     await query(
       `INSERT INTO wallets (user_id, business_id, balance, currency, status)
        VALUES ($1, NULL, 0, 'NGN', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
@@ -99,7 +100,12 @@ const registerPersonal: RequestHandler = async (req, res) => {
     );
     await query(
       `INSERT INTO wallets (user_id, business_id, balance, currency, status)
-       VALUES ($1, NULL, 0, 'USD', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+       VALUES ($1, NULL, 0, 'USDT', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+      [user.id],
+    );
+    await query(
+      `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+       VALUES ($1, NULL, 0, 'USDC', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
       [user.id],
     );
 

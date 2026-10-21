@@ -60,7 +60,7 @@ router.get("/sell/catalog", authenticateToken, checkSubscriptionStatus, async (_
         id: Number(s.id),
         name: String(s.name || `Gift card ${s.id}`),
         category_name: cats.get(Number(s.category_id ?? s.categoryId ?? -1)) || (s.category?.name ?? undefined),
-        image: s.image || s.logo || null,
+        image: s.image || s.logo || s.logo_url || s.image_url || s.cardImage || s.picture || null,
         rate: s.rate != null ? Number(s.rate) : null,
         minimum: s.minimum != null ? Number(s.minimum) : null,
         currency: s.currency || "USD",
@@ -205,6 +205,7 @@ router.get("/buy/catalog", authenticateToken, checkSubscriptionStatus, async (_r
       giftcards: (cfg?.availableGiftCards || []).map((c: any) => ({
         sku: c.sku,
         title: c.title,
+        image: c.image || c.logo || c.logo_url || c.image_url || c.picture || null,
         min_price: Number(c.minPrice ?? 0),
         max_price: Number(c.maxPrice ?? 0),
         currency: c.currency?.code || null,

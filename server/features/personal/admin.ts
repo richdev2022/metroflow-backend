@@ -229,7 +229,7 @@ router.get("/overview", async (_req, res) => {
         const userIds = [...new Set(recentRes.rows.map((r: any) => r.user_id).filter(Boolean))];
         const userMap = new Map<string, any>();
         if (userIds.length) {
-            const users = await query(`SELECT id, email, first_name, last_name FROM users WHERE id = ANY($1::uuid[])`, [userIds]);
+            const users = await query(`SELECT id, email, name FROM users WHERE id = ANY($1::uuid[])`, [userIds]);
             for (const u of users.rows) userMap.set(u.id, u);
         }
         const recent = recentRes.rows.map((r: any) => {
@@ -238,7 +238,7 @@ router.get("/overview", async (_req, res) => {
                 ...r,
                 amount: Number(r.amount) || 0,
                 user_email: u?.email || null,
-                user_name: u ? `${u.first_name || ""} ${u.last_name || ""}`.trim() || u.email : null,
+                user_name: u ? (u.name || u.email) : null,
             };
         });
 

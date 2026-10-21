@@ -343,12 +343,44 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
         };
         
         let userWallet = null;
-        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
+        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1 ORDER BY created_at ASC`, [userId]);
+
+        // DUAL-CURRENCY LAZY PROVISIONING: personal features (USD <-> NGN swap,
+        // virtual cards) expect the caller to own BOTH an NGN and a USD wallet.
+        // Older accounts only have the NGN row — create the missing USD wallet
+        // on the fly so /wallet/swap works for everyone.
+        const currencies = new Set(userWalletRes.rows.map((w: any) => String(w.currency || "NGN").toUpperCase()));
+        for (const cur of ["NGN", "USD"] as const) {
+            if (!currencies.has(cur)) {
+                try {
+                    const created = await query(
+                        `INSERT INTO wallets (user_id, balance, currency, status) VALUES ($1, 0, $2, 'active') RETURNING *`,
+                        [userId, cur],
+                    );
+                    userWalletRes.rows.push(created.rows[0]);
+                } catch (e: any) {
+                    console.warn(`Lazy ${cur} wallet provisioning skipped:`, e?.message);
+                }
+            }
+        }
+
         if (userWalletRes.rows.length > 0) {
+            const primary = userWalletRes.rows.find((w: any) => String(w.currency || "NGN").toUpperCase() === "NGN") || userWalletRes.rows[0];
             userWallet = {
-                ...cleanWallet(userWalletRes.rows[0]),
-                virtual_accounts: await getWalletWithVAs(userWalletRes.rows[0].id)
+                ...cleanWallet(primary),
+                virtual_accounts: await getWalletWithVAs(primary.id)
             };
+        }
+
+        // `wallets` — ALL of the caller's own wallets (NGN + USD). The Personal
+        // app swap dialog and multi-currency views consume data.wallets; the
+        // legacy user_wallet/business_wallet shape stays for compatibility.
+        const allUserWallets = [];
+        for (const w of userWalletRes.rows) {
+            allUserWallets.push({
+                ...cleanWallet(w),
+                virtual_accounts: await getWalletWithVAs(w.id)
+            });
         }
         
         let businessWallet = null;
@@ -375,7 +407,15 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
             success: true,
             user_wallet: userWallet,
             business_wallet: businessWallet,
-            canManageBusinessWallet
+            canManageBusinessWallet,
+            // Standard data envelope with every wallet the caller owns —
+            // the Personal app swap dialog reads data.wallets.
+            data: {
+                wallets: allUserWallets,
+                user_wallet: userWallet,
+                business_wallet: businessWallet,
+                canManageBusinessWallet,
+            },
         });
 
     } catch (error) {

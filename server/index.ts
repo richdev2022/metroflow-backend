@@ -26,6 +26,7 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
 import { handleDemo } from "./routes/demo";
 import {
   registerBusiness,
+  registerPersonal,
   verifyOTP,
   login,
   resendOTP,
@@ -942,6 +943,8 @@ export async function createServer() {
 
   // Auth API routes
   mainRouter.post("/auth/register", registerBusiness);
+  // Personal (consumer) signup — minimal fields: email, phone, password, optional referral.
+  mainRouter.post("/auth/register/personal", registerPersonal);
   mainRouter.post("/auth/verify-otp", verifyOTP);
   mainRouter.post("/auth/login", login);
   mainRouter.post("/auth/resend-otp", resendOTP);

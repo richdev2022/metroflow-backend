@@ -21,6 +21,19 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
 
 
 import { handleDemo } from "./routes/demo";
+  // PERSONAL APP — routes + routers (mounted below)
+  import personalAuthRouter, { registerPersonal, mintSsoTicket, redeemSsoTicket } from "./features/personal/routes/auth";
+  import personalSocialRouter from "./features/personal/routes/social";
+  import personalLiveRouter from "./features/personal/routes/live";
+  import personalMarketplaceRouter from "./features/personal/routes/marketplace";
+  import personalGiftcardsRouter from "./features/personal/routes/giftcards";
+  import personalCryptoRouter from "./features/personal/routes/crypto";
+  import personalVirtualcardsRouter from "./features/personal/routes/virtualcards";
+  import personalEsimRouter from "./features/personal/routes/esim";
+  import billsPersonalRouter from "./features/personal/bills";
+  import savingsPersonalRouter from "./features/personal/savings";
+  import { prestmitWebhookHandler, bitnobWebhookHandler } from "./routes/personal-webhooks";
+  import adminPersonalRouter from "./routes/admin_personal";
 import {
   registerBusiness,
   verifyOTP,
@@ -841,6 +854,11 @@ export async function createServer() {
 
   // Auth API routes
   mainRouter.post("/auth/register", registerBusiness);
+  // PERSONAL: minimal signup (email + phone + password + optional referral code)
+  mainRouter.post("/auth/register/personal", registerPersonal);
+  // Cross-app SSO (Business <-> Personal)
+  mainRouter.post("/auth/sso/ticket", authenticateToken, checkSubscriptionStatus, mintSsoTicket);
+  mainRouter.post("/auth/sso/redeem", redeemSsoTicket);
   mainRouter.post("/auth/verify-otp", verifyOTP);
   mainRouter.post("/auth/login", login);
   mainRouter.post("/auth/resend-otp", resendOTP);
@@ -950,6 +968,8 @@ export async function createServer() {
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);
+  // Personal app management (boosts, moderation, pricing, service flags)
+  mainRouter.use("/admin/personal", adminPersonalRouter);
 
   // Dashboard API routes
   mainRouter.use("/dashboard", dashboardRouter);
@@ -1146,6 +1166,27 @@ export async function createServer() {
 
   // Customer Support desk (MetricAi handoff, guest widget chat, agent inbox)
   mainRouter.use("/support", supportRouter);
+
+  // ===================== PERSONAL APP SURFACE =====================
+  // Social feed + robust polls + post boost engine
+  mainRouter.use("/social", personalSocialRouter);
+  // TikTok-style live streaming (rides the call-room WebRTC stack)
+  mainRouter.use("/live", personalLiveRouter);
+  // Facebook-Marketplace-style listings + escrow-lite orders + boosts
+  mainRouter.use("/store/marketplace", personalMarketplaceRouter);
+  // Prestmit gift cards (REAL buy + sell)
+  mainRouter.use("/giftcards", personalGiftcardsRouter);
+  // Bitnob crypto-to-cash (REAL rates + payouts)
+  mainRouter.use("/crypto", personalCryptoRouter);
+  // Bitnob USD virtual cards
+  mainRouter.use("/virtualcards", personalVirtualcardsRouter);
+  // eSIM / data bundles (Flutterwave live catalog)
+  mainRouter.use("/esim", personalEsimRouter);
+  // Bills Hub (Flutterwave dynamic catalog + real fulfilment) + Savings Vaults
+  mainRouter.use("/bills", billsPersonalRouter);
+  mainRouter.use("/savings", savingsPersonalRouter);
+
+  // Provider webhooks (public, signature-verified inside)
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);

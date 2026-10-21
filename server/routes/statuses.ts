@@ -105,9 +105,11 @@ export const getStatuses: RequestHandler = async (req, res) => {
 export const createStatus: RequestHandler = async (req, res) => {
   purgeExpired();
   try {
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    // Personal users (business_id NULL) can post statuses too — the column is
+    // nullable and visibility is platform-wide with block-list suppression.
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
     const content = String(req.body?.content || "").trim();
     const mediaUrl = typeof req.body?.mediaUrl === "string" ? req.body.mediaUrl.trim() : "";

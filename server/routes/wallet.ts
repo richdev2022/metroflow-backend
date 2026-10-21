@@ -354,17 +354,19 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
             return cleanedWallet;
         };
         
-        // Personal wallets are per-currency now (NGN + USD). user_wallet is the
-        // NGN primary for compatibility; user_wallets carries every currency.
+        // Personal wallets are per-currency now (NGN + USDT + USDC). user_wallet
+        // is the NGN primary for compatibility; user_wallets carries every currency.
         let userWallet = null;
-        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1 ORDER BY CASE WHEN UPPER(currency) = 'NGN' THEN 0 ELSE 1 END, created_at`, [userId]);
+        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1 AND status = 'active' ORDER BY CASE WHEN UPPER(currency) = 'NGN' THEN 0 ELSE 1 END, created_at`, [userId]);
 
-        // DUAL-CURRENCY LAZY PROVISIONING: personal features (USD <-> NGN swap,
-        // virtual cards) expect the caller to own BOTH an NGN and a USD wallet.
-        // Older accounts only have the NGN row — create the missing USD wallet
-        // on the fly so /wallet/swap works for everyone.
+        // STABLECOIN LAZY PROVISIONING: personal features (stablecoin <-> NGN
+        // conversion, receive-international, virtual cards) expect the caller
+        // to own NGN + USDT + USDC wallets. Older accounts may be missing the
+        // stablecoin rows — create them on the fly so everything works for
+        // everyone. The legacy USD wallet is NOT recreated: it was migrated
+        // into USDT by the schema ladder.
         const currencies = new Set(userWalletRes.rows.map((w: any) => String(w.currency || "NGN").toUpperCase()));
-        for (const cur of ["NGN", "USD"] as const) {
+        for (const cur of ["NGN", "USDT", "USDC"] as const) {
             if (!currencies.has(cur)) {
                 try {
                     const created = await query(
@@ -377,6 +379,10 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
                 }
             }
         }
+        // Every active personal wallet (NGN + stablecoins) — this is the list
+        // data.wallets renders. (Fix: this used to reference an undefined
+        // userWalletsRaw and 500'd the whole endpoint.)
+        const userWalletsRaw = userWalletRes.rows;
 
         if (userWalletRes.rows.length > 0) {
             const primary = userWalletRes.rows.find((w: any) => String(w.currency || "NGN").toUpperCase() === "NGN") || userWalletRes.rows[0];

@@ -32,7 +32,8 @@ import { handleDemo } from "./routes/demo";
   import personalEsimRouter from "./features/personal/routes/esim";
   import billsPersonalRouter from "./features/personal/bills";
   import savingsPersonalRouter from "./features/personal/savings";
-  import { prestmitWebhookHandler, bitnobWebhookHandler } from "./routes/personal-webhooks";
+  import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
+  import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
   import personalProductsAdminRouter from "./features/personal/admin";
 import {
@@ -1182,6 +1183,10 @@ export async function createServer() {
   mainRouter.use("/live", personalLiveRouter);
   // Prestmit gift cards (REAL buy + sell)
   mainRouter.use("/giftcards", personalGiftcardsRouter);
+  // Stablecoin hub (USDT/USDC wallets): receive-international addresses,
+  // stablecoin <-> NGN conversion, on-chain send — mounted BEFORE /crypto so
+  // /crypto/stablecoin/* resolves here instead of the legacy crypto router.
+  mainRouter.use("/crypto/stablecoin", stablecoinRouter);
   // Bitnob crypto-to-cash (REAL rates + payouts)
   mainRouter.use("/crypto", personalCryptoRouter);
   // Bitnob USD virtual cards
@@ -1192,7 +1197,13 @@ export async function createServer() {
   mainRouter.use("/bills", billsPersonalRouter);
   mainRouter.use("/savings", savingsPersonalRouter);
 
-  // Provider webhooks (public, signature-verified inside)
+  // Provider webhooks (public, signature-verified inside). These were
+  // previously imported but never mounted — gift-card + Bitnob callbacks 404'd.
+  mainRouter.post("/webhook/prestmit", prestmitWebhookHandler);
+  mainRouter.post("/webhook/bitnob", bitnobWebhookHandler);
+  // Stablecoin deposits/withdrawals (deposit.success / transfer.*) — stricter
+  // verification: HMAC-SHA512/256 + event de-duplication + address binding.
+  mainRouter.post("/webhook/bitnob/stablecoin", stablecoinWebhookHandler);
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);

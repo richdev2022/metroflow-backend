@@ -130,6 +130,43 @@ function rankFeed(rows: any[], boosts: Map<string, any>): any[] {
 }
 
 // ---------------------------------------------------------------------------
+// Boost pricing — public (authed) read so client dialogs render the CURRENT
+// admin-configured packages (budget presets, durations, per-1000 price)
+// instead of hardcoded values that drift from the admin console.
+// ---------------------------------------------------------------------------
+router.get("/boost-pricing", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const pricing = await getBoostPricing();
+    // Convenience: client-ready budget presets anchored to min/max budget.
+    const presets = (kind: "post" | "listing") => {
+      const cfg = kind === "post" ? pricing.post : pricing.listing;
+      const raw = [500, 1000, 2000, 5000, 10000];
+      return raw
+        .filter((b) => b >= cfg.min_budget && b <= cfg.max_budget)
+        .map((budget) => ({
+          budget,
+          days: cfg.allowed_durations[1] ?? cfg.allowed_durations[0] ?? 3,
+          estimated_reach: estimateReach(pricing, kind, budget, cfg.allowed_durations[1] ?? cfg.allowed_durations[0] ?? 3),
+        }));
+    };
+    res.json({
+      success: true,
+      data: {
+        currency: pricing.currency,
+        post: pricing.post,
+        listing: pricing.listing,
+        audience_multiplier: pricing.audience_multiplier,
+        engagement_boost_factor: pricing.engagement_boost_factor,
+        presets: { post: presets("post"), listing: presets("listing") },
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load boost pricing" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Feed
 // ---------------------------------------------------------------------------
 router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {

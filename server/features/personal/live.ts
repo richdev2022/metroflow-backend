@@ -75,8 +75,8 @@ function generateCallCode(): string {
 router.get("/", authenticateToken, checkSubscriptionStatus, async (_req: AuthenticatedRequest, res) => {
     const rows = await query(
         `SELECT l.*, u.id AS host_id,
-                COALESCE(u.first_name || ' ' || u.last_name, u.full_name, u.username, 'Host') AS host_name,
-                u.profile_photo_url AS host_photo, u.username AS host_username
+                COALESCE(NULLIF(u.name, ''), u.email, 'Host') AS host_name,
+                u.avatar_url AS host_photo, SPLIT_PART(u.email, '@', 1) AS host_username
          FROM live_sessions l JOIN users u ON u.id = l.host_user_id
          WHERE l.status = 'live'
          ORDER BY l.viewer_count DESC, l.started_at DESC LIMIT 50`,

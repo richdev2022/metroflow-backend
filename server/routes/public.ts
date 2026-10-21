@@ -1,6 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { isMaintenanceMode, getSetting } from "../services/app-config";
+import { getPersonalServiceFlags } from "../features/personal/flags";
 import { postPublicMetricAiAsk } from "./ai";
 
 /**
@@ -137,16 +138,75 @@ router.get("/app-links", async (req, res) => {
       } catch { /* app_versions may not exist yet — settings only is fine */ }
     }
 
+    // Direct-APK download (site fallback when the Play Store is unavailable).
+    // Exposed from the newest active android release that carries an APK.
+    let apkUrl: string | null = null;
+    let apkVersionName: string | null = null;
+    let apkVersionCode: number | null = null;
+    let apkSizeBytes: number | null = null;
+    try {
+      const apkRes = await query(
+        `SELECT apk_url, apk_size_bytes, version_name, version_code FROM app_versions
+          WHERE platform = 'android' AND is_active = TRUE AND apk_url IS NOT NULL
+          ORDER BY version_code DESC LIMIT 1`,
+      );
+      if (apkRes.rows.length > 0) {
+        apkUrl = apkRes.rows[0].apk_url;
+        apkSizeBytes = apkRes.rows[0].apk_size_bytes ? parseInt(apkRes.rows[0].apk_size_bytes, 10) : null;
+        apkVersionName = apkRes.rows[0].version_name || null;
+        apkVersionCode = apkRes.rows[0].version_code || null;
+      }
+    } catch { /* apk columns may not exist yet */ }
+
     res.json({
       success: true,
       data: {
         app_store_url: appStoreUrl || null,
         play_store_url: playStoreUrl || null,
+        apk_url: apkUrl,
+        apk_version_name: apkVersionName,
+        apk_version_code: apkVersionCode,
+        apk_size_bytes: apkSizeBytes,
+        // Web-app origins — centrally configurable so the marketing site and
+        // any embed can deep-link to the right product without redeploying.
+        business_web_url: (process.env.BUSINESS_APP_URL || "https://app.metricorex.com").replace(/\/+$/, ""),
+        personal_web_url: (process.env.PERSONAL_APP_URL || "https://personal.metricorex.com").replace(/\/+$/, ""),
       },
     });
   } catch (error: any) {
     console.error("Public app-links error:", error.message);
-    res.json({ success: true, data: { app_store_url: null, play_store_url: null } });
+    res.json({ success: true, data: { app_store_url: null, play_store_url: null, apk_url: null } });
+  }
+});
+
+/**
+ * GET /public/app-flags
+ * Public app-availability toggles (admin-controlled, no PII). The marketing
+ * site swaps the wishlist section for real app CTAs based on these flags;
+ * the apps themselves also gate personal/business-only features on them.
+ */
+router.get("/app-flags", async (_req, res) => {
+  try {
+    const [businessEnabled, personalEnabled, serviceFlags] = await Promise.all([
+      getSetting("business_app_enabled", "true"),
+      getSetting("personal_app_enabled", "false"),
+      getPersonalServiceFlags(),
+    ]);
+    res.set("Cache-Control", "public, max-age=60");
+    res.json({
+      success: true,
+      data: {
+        business_app_enabled: String(businessEnabled || "true").toLowerCase() !== "false",
+        personal_app_enabled: String(personalEnabled || "false").toLowerCase() === "true",
+        // Per-service kill switches (Personal Products console) so the
+        // Personal app can hide nav entries for tuned services instead of
+        // waiting for a 403 on first use. Public, no PII, 60s cache.
+        personal_services: serviceFlags,
+      },
+    });
+  } catch (error: any) {
+    console.error("Public app-flags error:", error.message);
+    res.json({ success: true, data: { business_app_enabled: true, personal_app_enabled: false } });
   }
 });
 

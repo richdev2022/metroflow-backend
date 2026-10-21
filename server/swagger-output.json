@@ -4169,6 +4169,48 @@
         }
       }
     },
+    "/api/store/marketplace": {
+      "get": {
+        "summary": "Personal-app marketplace — active products across ALL enabled storefronts",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive search on product/store name"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 60,
+              "maximum": 120
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Cursor pagination (created_at of the last item)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Marketplace feed (newest first, seller info attached)"
+          }
+        }
+      }
+    },
     "/api/store/public/{businessId}": {
       "get": {
         "summary": "Public storefront view (business profile + active products)",

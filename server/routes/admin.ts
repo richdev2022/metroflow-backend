@@ -1,5 +1,8 @@
 import express from "express";
 import crypto from "crypto";
+import multer from "multer";
+import { uploadMediaBuffer } from "../services/media-upload";
+import { logAuditEvent } from "../services/audit";
 import { loginAdmin, AdminAccountLockedError } from "../services/admin-auth";
 import { authenticateAdmin, requirePermission, AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { query, pool } from "../db";
@@ -14,6 +17,8 @@ import {
 import { getSetting, setSetting, getIntlTransferConfig, getIntlPayoutLimits, getIntlPayoutSourceCurrency, DEFAULT_PAYOUT_LIMITS } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
 import adminDisputesRouter from "./admin_disputes";
+import adminFraudRouter from "./admin_fraud";
+import personalAdminRouter from "../features/personal/admin";
 import { invalidateActiveProviderCache, getActiveTransferProviderName } from "../services/providers/factory";
 import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
@@ -416,6 +421,11 @@ authRouter.post("/forgot-password", async (req, res) => {
 router.use('/auth', authRouter);
 // Dispute lifecycle — own router (brings authenticateAdmin + manage_finance per route)
 router.use('/disputes', adminDisputesRouter);
+router.use('/', adminFraudRouter); // fraud + compliance endpoints (auth inside)
+// Personal Products console (service flags, provider routing, pricing,
+// monitoring) — brings its own authenticateAdmin, so it must mount BEFORE
+// the catch-all protectedRouter.
+router.use('/personal', personalAdminRouter);
 router.use('/', protectedRouter);
 
 // Dashboard Stats
@@ -4299,6 +4309,66 @@ protectedRouter.put("/settings/app-store-urls", requirePermission('manage_settin
 });
 
 /**
+ * GET /admin/app-flags — app availability toggles (Business / Personal).
+ * The marketing site reads the public counterpart (/api/public/app-flags);
+ * the apps themselves gate personal-only / business-only features on them.
+ */
+protectedRouter.get("/app-flags", requirePermission('manage_settings'), async (_req: AuthenticatedAdminRequest, res) => {
+    try {
+        const [businessEnabled, personalEnabled] = await Promise.all([
+            getSetting("business_app_enabled", "true"),
+            getSetting("personal_app_enabled", "false"),
+        ]);
+        res.json({
+            success: true,
+            data: {
+                business_app_enabled: String(businessEnabled || "true").toLowerCase() !== "false",
+                personal_app_enabled: String(personalEnabled || "false").toLowerCase() === "true",
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load app flags" });
+    }
+});
+
+/**
+ * PUT /admin/app-flags
+ * Body: { business_app_enabled?: boolean, personal_app_enabled?: boolean }.
+ * Toggling Personal ON swaps the site wishlist section for real app CTAs and
+ * switches the Personal apps' feature gates; OFF restores the wishlist.
+ */
+protectedRouter.put("/app-flags", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const { business_app_enabled, personal_app_enabled } = req.body || {};
+        if (business_app_enabled === undefined && personal_app_enabled === undefined) {
+            return res.status(400).json({ success: false, error: "Provide business_app_enabled and/or personal_app_enabled" });
+        }
+        if (business_app_enabled !== undefined) {
+            const v = business_app_enabled === true || business_app_enabled === "true";
+            await setSetting("business_app_enabled", v ? "true" : "false", "Business app availability switch (site CTAs + in-app gating)");
+        }
+        if (personal_app_enabled !== undefined) {
+            const v = personal_app_enabled === true || personal_app_enabled === "true";
+            await setSetting("personal_app_enabled", v ? "true" : "false", "Personal app availability switch (site wishlist vs real CTAs + in-app gating)");
+        }
+        try { logAuditEvent({ userId: (req.admin as any)?.adminId, action: 'app_flags_update', entityType: 'system_setting', newValues: { business_app_enabled, personal_app_enabled } }).catch(() => {}); } catch { /* */ }
+        const [businessEnabled, personalEnabled] = await Promise.all([
+            getSetting("business_app_enabled", "true"),
+            getSetting("personal_app_enabled", "false"),
+        ]);
+        res.json({
+            success: true,
+            data: {
+                business_app_enabled: String(businessEnabled || "true").toLowerCase() !== "false",
+                personal_app_enabled: String(personalEnabled || "false").toLowerCase() === "true",
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save app flags" });
+    }
+});
+
+/**
  * GET /admin/email-config — the shared EMAIL footer configuration (app
  * download links + social links) that every outbound email renders. Returns
  * the effective values (stored override or sensible default) plus a
@@ -4519,6 +4589,25 @@ protectedRouter.delete("/announcements/:id", requirePermission('manage_settings'
 
 const APP_VERSION_PLATFORMS = ["ios", "android"];
 
+// APK uploads: memory storage, 500 MB ceiling (matches the global multer cap),
+// .apk extension + APK mime (or generic octet-stream) only.
+const uploadSingleApk = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const name = String(file.originalname || '').toLowerCase();
+    const okExt = name.endsWith('.apk');
+    const okMime = [
+      'application/vnd.android.package-archive',
+      'application/octet-stream',
+      'application/x-zip-compressed',
+      'application/zip',
+    ].includes(String(file.mimetype || ''));
+    if (okExt && okMime) cb(null, true);
+    else cb(new Error('Only .apk files can be uploaded here'));
+  },
+}).single('apk');
+
 const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }) => {
   const errors: string[] = [];
   const out: Record<string, any> = {};
@@ -4698,6 +4787,58 @@ protectedRouter.delete("/app-versions/:id", requirePermission('manage_settings')
         res.json({ success: true, message: "App release deleted" });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message || "Failed to delete app release" });
+    }
+});
+
+/**
+ * POST /admin/app-versions/:id/apk  (multipart field: "apk")
+ * Direct-APK distribution: upload the signed release APK for an android
+ * release row. Stored via the media service (R2 first) with size + SHA-256
+ * recorded; the public app-links endpoint exposes the download URL.
+ * Re-uploading replaces the previous APK.
+ */
+protectedRouter.post("/app-versions/:id/apk", requirePermission('manage_settings'), uploadSingleApk, async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const relRes = await query(`SELECT id, platform FROM app_versions WHERE id = $1`, [req.params.id]);
+        const release = relRes.rows[0];
+        if (!release) return res.status(404).json({ success: false, error: "App release not found" });
+        if (release.platform !== 'android') {
+            return res.status(400).json({ success: false, error: "APK uploads apply to android releases only" });
+        }
+        const file = (req as any).file as any | undefined;
+        if (!file) return res.status(400).json({ success: false, error: "apk file is required (multipart field 'apk')" });
+
+        const up = await uploadMediaBuffer({
+            buffer: file.buffer,
+            originalname: file.originalname,
+            mimeType: file.mimetype || 'application/vnd.android.package-archive',
+            folder: 'app-releases',
+        });
+        const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+        await query(
+            `UPDATE app_versions SET apk_url = $2, apk_size_bytes = $3, apk_sha256 = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [release.id, up.url, file.size, sha256],
+        );
+        try { logAuditEvent({ userId: (req.admin as any)?.adminId, action: 'apk_upload', entityType: 'app_version', entityId: String(release.id), newValues: { size: file.size, sha256, url: up.url } }).catch(() => {}); } catch { /* */ }
+        res.json({ success: true, message: "APK uploaded", data: { apk_url: up.url, apk_size_bytes: file.size, apk_sha256: sha256 } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "APK upload failed" });
+    }
+});
+
+/**
+ * DELETE /admin/app-versions/:id/apk — remove the direct APK download.
+ */
+protectedRouter.delete("/app-versions/:id/apk", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const r = await query(
+            `UPDATE app_versions SET apk_url = NULL, apk_size_bytes = NULL, apk_sha256 = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id`,
+            [req.params.id],
+        );
+        if (r.rows.length === 0) return res.status(404).json({ success: false, error: "App release not found" });
+        res.json({ success: true, message: "APK removed" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "APK removal failed" });
     }
 });
 

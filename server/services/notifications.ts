@@ -2,7 +2,9 @@ import { query } from "../db";
 import { getSocketServer } from "../lib/socket";
 
 interface CreateNotificationOptions {
-  businessId: string;
+  /** Nullable: PERSONAL users have no business — chat messages etc. mirror
+   * in-app notifications without one (column is nullable). */
+  businessId?: string | null;
   userId: string;
   type: string;
   title: string;

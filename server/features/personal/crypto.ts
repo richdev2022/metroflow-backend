@@ -26,17 +26,14 @@ async function applySpread(usdDebit: number): Promise<number> {
 }
 
 /**
- * Crypto → Cash (Personal) — convert crypto assets (BTC / USDT / USDC) into
- * NGN (and other supported fiat) paid straight to a Nigerian bank account,
- * powered by the Bitnob Payouts API:
+ * Crypto → Cash (Personal) — convert stablecoins (USDT / USDC) into NGN paid
+ * straight to a Nigerian bank account, powered by the Bitnob Payouts API:
  *   quote (POST /api/payouts/quotes) → initialize (beneficiary) → finalize.
  *
  * Wallet semantics (end-to-end with the platform ledger):
  *   - `source: offchain` debits Bitnob's own wallet; on OUR side the caller's
- *     USD wallet is debited the USDT-equivalent (USDT ≈ USD) at the payout
- *     quote's rate, so the product works with the shared wallet balances.
- *   - BTC quotes convert through the quote's btc_rate to a USD-equivalent
- *     debit as well (the user's USD wallet is the on-platform crypto proxy).
+ *     MATCHING STABLECOIN wallet is debited (USDT sale → USDT wallet, USDC
+ *     sale → USDC wallet). The legacy "USD wallet" was retired into USDT.
  *
  * When Bitnob is not configured, a built-in SIMULATOR produces instant quotes
  * and instant payouts so the flow remains testable end-to-end.
@@ -174,9 +171,9 @@ router.post("/lookup", authenticateToken, checkSubscriptionStatus, async (req: A
  *     security: [{ bearerAuth: [] }]
  */
 router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
-    const fromAsset = String(req.query.from_asset || "USDT").toUpperCase() as "BTC" | "USDT" | "USDC";
-    if (!["BTC", "USDT", "USDC"].includes(fromAsset)) {
-        return res.status(400).json({ success: false, error: "from_asset must be BTC, USDT or USDC" });
+    const fromAsset = String(req.query.from_asset || "USDT").toUpperCase() as "USDT" | "USDC";
+    if (!"USDT USDC".split(" ").includes(fromAsset)) {
+        return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     }
     const settlementAmount = Number(req.query.settlement_amount);
     if (!settlementAmount || Number.isNaN(settlementAmount)) {
@@ -217,7 +214,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
                         crypto_amount: cryptoAmount,
                         rate: Number(p.exchange_rate?.effective_rate || p.exchange_rate?.rate),
                         fees: Number(p.fees || 0),
-                        usd_debit: fromAsset === "BTC" ? cryptoAmount * Number(p.exchange_rate?.btc_rate || 0) : cryptoAmount,
+                        usd_debit: cryptoAmount,
                         expires_at: p.expires_at,
                         mode: "bitnob",
                     },
@@ -238,7 +235,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
             reference,
             from_asset: fromAsset,
             settlement_amount: settlementAmount,
-            crypto_amount: fromAsset === "BTC" ? usdDebit / 97000 : usdDebit,
+            crypto_amount: usdDebit,
             rate: Math.round(simRate * 100) / 100,
             fees: 0,
             usd_debit: usdDebit,
@@ -252,7 +249,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
  * @swagger
  * /crypto/sell:
  *   post:
- *     summary: Sell crypto for NGN — debits the caller's USD wallet and pays the beneficiary's bank account
+ *     summary: Sell stablecoin (USDT/USDC) for NGN — debits the caller's matching stablecoin wallet and pays the beneficiary's bank account
  *     tags: [CryptoToCash]
  *     security: [{ bearerAuth: [] }]
  */
@@ -262,9 +259,9 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
         from_asset, settlement_amount, account_number, bank_code, account_name, quote_reference, save_beneficiary,
     } = req.body || {};
 
-    const fromAsset = String(from_asset || "USDT").toUpperCase() as "BTC" | "USDT" | "USDC";
-    if (!["BTC", "USDT", "USDC"].includes(fromAsset)) {
-        return res.status(400).json({ success: false, error: "from_asset must be BTC, USDT or USDC" });
+    const fromAsset = String(from_asset || "USDT").toUpperCase() as "USDT" | "USDC";
+    if (!"USDT USDC".split(" ").includes(fromAsset)) {
+        return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     }
     const settlementAmount = Number(settlement_amount);
     if (!settlementAmount || Number.isNaN(settlementAmount) || settlementAmount < MIN_SETTLEMENT_NGN || settlementAmount > MAX_SETTLEMENT_NGN) {
@@ -278,14 +275,14 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
     const user = userRes.rows[0];
     if (!user) return res.status(404).json({ success: false, error: "User not found" });
 
-    // Wallet: USD wallet preferred (crypto proxy balance).
+    // Wallet: the caller's matching stablecoin wallet (USDT sale → USDT wallet).
     const walletRes = await query(
         `SELECT * FROM wallets WHERE user_id = $1 AND status = 'active' AND (business_id IS NULL)
-         ORDER BY (currency = 'USD') DESC, created_at ASC LIMIT 1`,
-        [userId],
+         AND UPPER(currency) = $2 ORDER BY created_at ASC LIMIT 1`,
+        [userId, fromAsset],
     );
     const wallet = walletRes.rows[0];
-    if (!wallet) return res.status(404).json({ success: false, error: "No active wallet found" });
+    if (!wallet) return res.status(404).json({ success: false, error: `No active ${fromAsset} wallet found`, code: "STABLECOIN_WALLET_REQUIRED" });
     const walletCurrency = String(wallet.currency || "NGN").toUpperCase();
 
     // ---- Quote (fresh at sell time; quote_reference is informational) ----
@@ -314,7 +311,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
                                 quote_id: p.quote_id, reference, crypto_amount: cryptoAmount,
                                 rate: Number(p.exchange_rate?.effective_rate || p.exchange_rate?.rate),
                                 fees: Number(p.fees || 0),
-                                usd_debit: fromAsset === "BTC" ? cryptoAmount * Number(p.exchange_rate?.btc_rate || 0) : cryptoAmount,
+                                usd_debit: cryptoAmount,
                             },
                         });
                     }
@@ -328,7 +325,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
                 ok: true,
                 data: {
                     quote_id: `SIMQT_${reference}`, reference,
-                    crypto_amount: fromAsset === "BTC" ? usdDebit / 97000 : usdDebit,
+                    crypto_amount: usdDebit,
                     rate: Math.round(simRate * 100) / 100, fees: 0, usd_debit: usdDebit,
                 },
             });
@@ -366,9 +363,9 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
         });
     }
 
-    // ---- Debit the USD wallet ----
-    if (walletCurrency !== "USD") {
-        return res.status(400).json({ success: false, error: "Crypto sales debit your USD wallet — top it up first.", code: "USD_WALLET_REQUIRED" });
+    // ---- Debit the stablecoin wallet ----
+    if (walletCurrency !== fromAsset) {
+        return res.status(400).json({ success: false, error: `Crypto sales debit your ${fromAsset} stablecoin wallet — top it up first.`, code: "STABLECOIN_WALLET_REQUIRED" });
     }
     const debit = await query(
         `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
@@ -378,7 +375,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
     if (debit.rows.length === 0) {
         return res.status(400).json({
             success: false,
-            error: `Insufficient USD balance — this sale needs $${usdDebit.toFixed(2)}.`,
+            error: `Insufficient ${fromAsset} balance — this sale needs ${usdDebit.toFixed(2)} ${fromAsset}.`,
             code: "INSUFFICIENT_BALANCE",
         });
     }
@@ -406,8 +403,8 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
     await query(
         `INSERT INTO transactions
          (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction, fee)
-         VALUES (NULL, $1, $2, 'USD', $3, 'success', 'debit', $4, 'crypto_sale', $5, 'debit', 0)`,
-        [userId, usdDebit, reference, `Crypto sale — ${fromAsset} → ₦${settlementAmount.toLocaleString()} (rate ₦${quote.rate})`, wallet.id],
+         VALUES (NULL, $1, $2, $3, 'success', 'debit', $4, 'crypto_sale', $5, 'debit', 0)`,
+        [userId, usdDebit, fromAsset, reference, `Crypto sale — ${fromAsset} → ₦${settlementAmount.toLocaleString()} (rate ₦${quote.rate})`, wallet.id],
     );
 
     const finishOk = async () => {
@@ -420,7 +417,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
         }).catch(() => {});
     };
     const finishFail = async (reason: string) => {
-        // Refund the USD wallet.
+        // Refund the stablecoin wallet.
         await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [usdDebit, wallet.id]);
         await query(`UPDATE transactions SET status = 'failed' WHERE reference = $1`, [reference]);
         await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [sale.id, reason]);
@@ -460,14 +457,14 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
             if (finalStatus === "completed") await finishOk();
         } else {
             await finishFail(`Provider status: ${finalStatus}`);
-            return res.status(502).json({ success: false, error: `Payout ${finalStatus} — USD wallet refunded.` });
+            return res.status(502).json({ success: false, error: `Payout ${finalStatus} — ${fromAsset} wallet refunded.` });
         }
         const refreshed = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [sale.id]);
         return res.json({ success: true, data: { sale: publicSale(refreshed.rows[0]), mode } });
     } catch (e: any) {
         console.error("[crypto] payout failed:", e?.message);
         await finishFail(e?.message || "Payout failed");
-        return res.status(502).json({ success: false, error: `${e?.message || "Payout failed"} — USD wallet refunded.` });
+        return res.status(502).json({ success: false, error: `${e?.message || "Payout failed"} — ${fromAsset} wallet refunded.` });
     }
 });
 

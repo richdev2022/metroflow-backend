@@ -445,10 +445,11 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     if (card.status === "terminated") return res.status(400).json({ success: false, error: "Card is terminated" });
     if (card.status === "frozen") return res.status(400).json({ success: false, error: "Card is frozen — unfreeze it first" });
 
-    // Wallet: prefer the user's USD wallet, else first active personal wallet.
+    // Wallet: prefer the user's USDT stablecoin wallet, then USDC, else first
+    // active personal wallet (the legacy USD wallet was retired into USDT).
     const walletRes = await query(
         `SELECT * FROM wallets WHERE user_id = $1 AND status = 'active' AND (business_id IS NULL)
-         ORDER BY (currency = 'USD') DESC, created_at ASC LIMIT 1`,
+         ORDER BY (currency = 'USDT') DESC, (currency = 'USDC') DESC, created_at ASC LIMIT 1`,
         [userId],
     );
     const wallet = walletRes.rows[0];
@@ -458,7 +459,7 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     let debitUsd = amount;               // USD needed on the card
     let debitAmount = amount;            // amount debited from THIS wallet
     let fxRate: number | null = null;
-    if (walletCurrency !== "USD") {
+    if (walletCurrency !== "USDT" && walletCurrency !== "USDC" && walletCurrency !== "USD") {
         // Convert via Bitnob exchange rate (fallback: static 1600 NGN/USD marker is NOT used — we refuse instead).
         if (await bitnobLive()) {
             try {
@@ -590,7 +591,7 @@ router.post("/:id/withdraw", authenticateToken, checkSubscriptionStatus, async (
 
     const walletRes = await query(
         `SELECT * FROM wallets WHERE user_id = $1 AND status = 'active' AND (business_id IS NULL)
-         ORDER BY (currency = 'USD') DESC, created_at ASC LIMIT 1`,
+         ORDER BY (currency = 'USDT') DESC, (currency = 'USDC') DESC, created_at ASC LIMIT 1`,
         [userId],
     );
     const wallet = walletRes.rows[0];

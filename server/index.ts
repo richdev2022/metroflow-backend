@@ -92,6 +92,10 @@ import personalBillsRouter from "./features/personal/bills";
 import personalSavingsRouter from "./features/personal/savings";
 import giftcardsRouter, { ensureGiftcardSchema, processGiftcardSyncCron } from "./features/personal/giftcards";
 import esimRouter, { ensureEsimSchema } from "./features/personal/esim";
+import virtualCardsRouter, { ensureVirtualCardSchema } from "./features/personal/virtualcards";
+import cryptoRouter, { ensureCryptoSchema } from "./features/personal/crypto";
+import socialRouter, { ensureSocialSchema } from "./features/personal/social";
+import liveRouter, { ensureLiveSchema } from "./features/personal/live";
 import walletRouter from "./routes/wallet";
 import adminFeesRouter from "./routes/admin_fees";
 import feesRouter from "./routes/fees";
@@ -1086,6 +1090,10 @@ export async function createServer() {
   mainRouter.use("/savings", personalSavingsRouter);
   mainRouter.use("/giftcards", giftcardsRouter);
   mainRouter.use("/esim", esimRouter);
+  mainRouter.use("/virtualcards", virtualCardsRouter);
+  mainRouter.use("/crypto", cryptoRouter);
+  mainRouter.use("/social", socialRouter);
+  mainRouter.use("/live", liveRouter);
 
     // Wallet API routes
     mainRouter.use("/wallet", walletRouter);

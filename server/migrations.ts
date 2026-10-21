@@ -73,6 +73,12 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
 
+  // Personal app: live streams (and personal calls) create call rooms with NO
+  // owning business. calls.business_id started NOT NULL in the business-era
+  // schema, which made every "go live" insert fail with a not-null violation.
+  // DROP NOT NULL is idempotent.
+  await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
+
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await ensureLedgerAndVirtualAccountFixes();
   await reconcilePlatformLedger();

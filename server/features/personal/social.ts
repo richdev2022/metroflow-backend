@@ -77,11 +77,14 @@ export async function ensureSocialSchema(): Promise<void> {
 }
 
 function authorFields(alias = "u"): string {
+    // users table columns: name, avatar_url (there are no first_name/last_name/
+    // username/profile_photo_url columns — referencing them made every feed
+    // query 500 with "column does not exist").
     return `
     ${alias}.id AS author_id,
-    COALESCE(${alias}.first_name || ' ' || ${alias}.last_name, ${alias}.full_name, ${alias}.username, 'Member') AS author_name,
-    ${alias}.profile_photo_url AS author_photo,
-    ${alias}.username AS author_username`;
+    COALESCE(NULLIF(${alias}.name, ''), ${alias}.email, 'Member') AS author_name,
+    ${alias}.avatar_url AS author_photo,
+    SPLIT_PART(${alias}.email, '@', 1) AS author_username`;
 }
 
 /**

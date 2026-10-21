@@ -36,9 +36,14 @@ const FREQUENCIES = ["daily", "weekly", "monthly"] as const;
 type Frequency = (typeof FREQUENCIES)[number];
 
 function getPlanConfig(businessId: string) {
+    // PERSONAL ACCOUNTS NEVER HIT PLAN GATES (the Personal app is free to use).
+    // See the matching comment in bills.ts — both flags are set by
+    // /auth/register/personal.
     return query(
-        `SELECT p.savings_enabled, p.max_savings_vaults, p.savings_break_fee_discount_percent
-         FROM businesses b JOIN pricing_plans p ON p.id = b.plan_id
+        `SELECT p.savings_enabled, p.max_savings_vaults, p.savings_break_fee_discount_percent,
+                (COALESCE(b.industry = 'personal', FALSE)
+                 OR EXISTS (SELECT 1 FROM users u WHERE u.business_id = b.id AND u.account_type = 'personal')) AS is_personal
+         FROM businesses b LEFT JOIN pricing_plans p ON p.id = b.plan_id
          WHERE b.id = $1`,
         [businessId]
     ).then((r) => r.rows[0] || null);
@@ -193,14 +198,14 @@ router.post("/vaults", authenticateToken, checkSubscriptionStatus, async (req: A
 
         // ---- Plan gating ----
         const plan = await getPlanConfig(businessId);
-        if (plan && plan.savings_enabled === false) {
+        if (plan && !plan.is_personal && plan.savings_enabled === false) {
             return res.status(403).json({
                 success: false,
                 error: "Savings vaults are not available on your current plan. Kindly upgrade your plan.",
                 code: "PLAN_UPGRADE_REQUIRED",
             });
         }
-        if (plan?.max_savings_vaults != null && plan.max_savings_vaults < 999999) {
+        if (plan && !plan.is_personal && plan?.max_savings_vaults != null && plan.max_savings_vaults < 999999) {
             const countRes = await query(
                 `SELECT COUNT(*)::int AS c FROM savings_vaults
                  WHERE business_id = $1 AND status IN ('active', 'paused')`,

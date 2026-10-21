@@ -147,9 +147,9 @@ async function getDirectOtherParticipant(
     `SELECT cc.type, cp.user_id as "userId"
      FROM chat_conversations cc
      JOIN chat_participants cp ON cp.conversation_id = cc.id
-     WHERE cc.id = $1 AND cc.business_id = $2 AND cp.user_id <> $3
+     WHERE cc.id = $1 AND cp.user_id <> $2
      LIMIT 1`,
-    [conversationId, businessId, userId],
+    [conversationId, userId],
   );
   const row = result.rows[0];
   if (!row) return null;
@@ -267,8 +267,8 @@ const EMAIL_MAX = 254;
  */
 export const lookupChatContact: RequestHandler = async (req, res) => {
   try {
-    const businessId = req.user?.businessId;
-    if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const businessId = req.user?.businessId || null;
+    if (!req.user?.userId) return res.status(401).json({ success: false, error: "Unauthorized" });
     const email = String(req.query.email || "").trim().toLowerCase();
     if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
       return res.status(400).json({ success: false, error: "Enter a valid email address" });
@@ -283,7 +283,7 @@ export const lookupChatContact: RequestHandler = async (req, res) => {
       `SELECT id, name, business_id as "businessId"
          FROM users
         WHERE LOWER(email) = $1
-        ORDER BY (business_id = $2) DESC
+        ORDER BY (business_id IS NOT DISTINCT FROM $2) DESC
         LIMIT 1`,
       [email, businessId],
     );
@@ -333,10 +333,10 @@ export const lookupChatContact: RequestHandler = async (req, res) => {
  */
 export const inviteChatContact: RequestHandler = async (req, res) => {
   try {
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
     const inviterName = req.user?.name || "A Metricorex user";
-    if (!businessId || !userId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
 
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
@@ -466,10 +466,12 @@ export const getConversations: RequestHandler = async (
   res,
 ) => {
   try {
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users —
+    // participant membership is the access check, not business context.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -561,11 +563,13 @@ export const getConversations: RequestHandler = async (
 
     // Blocks involving the requester (both directions) — one query for the
     // whole list; direct conversations surface blockedByMe/blockedMe flags.
+    // Blocks are USER-PAIR scoped (mirrors getBlockDirection): with personal
+    // + cross-workspace chats, block rows may carry any business id or NULL.
     const blocksResult = await query(
       `SELECT blocker_id as "blockerId", blocked_id as "blockedId"
        FROM user_blocks
-       WHERE business_id = $1 AND (blocker_id = $2 OR blocked_id = $2)`,
-      [businessId, userId],
+       WHERE blocker_id = $1 OR blocked_id = $1`,
+      [userId],
     );
     const blockedByMeIds = new Set(
       blocksResult.rows.filter((r: any) => r.blockerId === userId).map((r: any) => r.blockedId),
@@ -656,10 +660,12 @@ export const getConversationMessages: RequestHandler = async (
 ) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users —
+    // participant membership is the access check, not business context.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -833,10 +839,12 @@ export const createConversation: RequestHandler = async (
     const body = req.body || {};
     const { name, type } = body;
     const participantIds = body.participantIds ?? body.participant_ids;
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users —
+    // participant membership is the access check, not business context.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -892,7 +900,7 @@ export const createConversation: RequestHandler = async (
         `SELECT cc.id FROM chat_conversations cc
          JOIN chat_participants cp1 ON cc.id = cp1.conversation_id
          JOIN chat_participants cp2 ON cc.id = cp2.conversation_id
-         WHERE cc.business_id = $1 AND cc.type = 'direct'
+         WHERE cc.business_id IS NOT DISTINCT FROM $1 AND cc.type = 'direct'
          AND cp1.user_id = $2 AND cp2.user_id = $3
          AND (
            SELECT COUNT(*) FROM chat_participants cp_count
@@ -1064,10 +1072,12 @@ export const sendMessage: RequestHandler = async (
   try {
     const { conversationId } = req.params as { conversationId: string };
     const { content, attachmentUrl, attachmentType, attachmentName, attachmentSize, messageType } = req.body;
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users —
+    // participant membership is the access check, not business context.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -1389,10 +1399,12 @@ export const markConversationAsRead: RequestHandler = async (
 ) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users —
+    // participant membership is the access check, not business context.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -1568,9 +1580,10 @@ export const uploadChatMedia: RequestHandler = async (req: AuthenticatedRequest,
       });
     }
     try {
-      const businessId = req.user?.businessId;
+      const businessId = req.user?.businessId || null;
       const userId = req.user?.userId;
-      if (!businessId || !userId) {
+      // Personal users (business_id NULL) are first-class chat users.
+      if (!userId) {
         return res.status(400).json({ success: false, error: "User authentication required" });
       }
 
@@ -1638,10 +1651,11 @@ async function getConversationMessage(conversationId: string, messageId: string)
 export const editMessage: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId, messageId } = req.params as { conversationId: string; messageId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -1727,10 +1741,11 @@ export const deleteMessage: RequestHandler = async (req: AuthenticatedRequest, r
   try {
     const { conversationId, messageId } = req.params as { conversationId: string; messageId: string };
     const scope = req.query.scope === "everyone" ? "everyone" : "me";
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -1819,10 +1834,11 @@ export const deleteMessage: RequestHandler = async (req: AuthenticatedRequest, r
 export const getParticipants: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -1873,10 +1889,11 @@ export const getParticipants: RequestHandler = async (req: AuthenticatedRequest,
 export const leaveConversation: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -1929,9 +1946,10 @@ export const leaveConversation: RequestHandler = async (req: AuthenticatedReques
 export const deleteConversation: RequestHandler = async (req, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -1996,10 +2014,11 @@ export const updateParticipantRole: RequestHandler = async (req: AuthenticatedRe
       conversationId: string;
       userId: string;
     };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -2047,10 +2066,11 @@ export const removeParticipant: RequestHandler = async (req: AuthenticatedReques
       conversationId: string;
       userId: string;
     };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -2172,9 +2192,10 @@ export const aiTranslateMessage: RequestHandler = async (req: AuthenticatedReque
 
 export const aiSmartReplies: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (!isGlmConfigured()) {
@@ -2235,9 +2256,10 @@ export const aiSmartReplies: RequestHandler = async (req: AuthenticatedRequest, 
 
 export const aiSummarizeConversation: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (!isGlmConfigured()) {
@@ -2398,9 +2420,10 @@ export const chatInviteBaseUrl = () =>
 export const addChatParticipants: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -2417,11 +2440,9 @@ export const addChatParticipants: RequestHandler = async (req: AuthenticatedRequ
       [conversationId],
     );
     const conversation = convRes.rows[0];
-    if (!conversation || conversation.businessId !== businessId) {
+    // Membership + group-only checks are the access predicate here.
+    if (!conversation || conversation.type === "direct") {
       return res.status(404).json({ success: false, error: "Conversation not found" });
-    }
-    if (conversation.type === "direct") {
-      return res.status(400).json({ success: false, error: "Members can only be added to group chats" });
     }
 
     const body: any = req.body || {};
@@ -2492,9 +2513,10 @@ export const addChatParticipants: RequestHandler = async (req: AuthenticatedRequ
 export const getChatInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     const membership = await query(
@@ -2509,7 +2531,9 @@ export const getChatInvite: RequestHandler = async (req: AuthenticatedRequest, r
       [conversationId],
     );
     const conversation = convRes.rows[0];
-    if (!conversation || conversation.business_id !== businessId) {
+    // Membership (checked above) IS the access predicate — personal users and
+    // cross-workspace groups carry a different/NULL business_id.
+    if (!conversation) {
       return res.status(404).json({ success: false, error: "Conversation not found" });
     }
     if (conversation.type === "direct") {
@@ -2533,9 +2557,10 @@ export const getChatInvite: RequestHandler = async (req: AuthenticatedRequest, r
 export const rotateChatInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { conversationId } = req.params as { conversationId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     const membership = await query(
@@ -2550,7 +2575,9 @@ export const rotateChatInvite: RequestHandler = async (req: AuthenticatedRequest
       [conversationId],
     );
     const conversation = convRes.rows[0];
-    if (!conversation || conversation.business_id !== businessId) {
+    // Membership (checked above) IS the access predicate — personal users and
+    // cross-workspace groups carry a different/NULL business_id.
+    if (!conversation) {
       return res.status(404).json({ success: false, error: "Conversation not found" });
     }
     if (conversation.type === "direct") {
@@ -2584,9 +2611,10 @@ export const rotateChatInvite: RequestHandler = async (req: AuthenticatedRequest
 export const joinChatByInvite: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { code } = req.params as { code: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) are first-class chat users.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (!code || code.length < 4) {
@@ -2600,15 +2628,8 @@ export const joinChatByInvite: RequestHandler = async (req: AuthenticatedRequest
     if (!conversation || conversation.type === "direct") {
       return res.status(404).json({ success: false, error: "This invite link is invalid or has expired" });
     }
-    // Cross-business join is allowed ONLY when the invite was shared into that
-    // business — same-business invites keep the group private to the business.
-    // (Invites are per-business because chat participants are per-business.)
-    if (conversation.business_id !== businessId) {
-      return res.status(403).json({
-        success: false,
-        error: "This group belongs to a different workspace. Switch to that workspace and try again.",
-      });
-    }
+    // The invite code IS the capability token — personal users and any
+    // workspace may join with it (WhatsApp-style link invites).
     const membership = await query(
       `SELECT 1 FROM chat_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1`,
       [conversation.id, userId],

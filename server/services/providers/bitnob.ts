@@ -8,10 +8,14 @@ import crypto from "crypto";
  *   headers:  X-Auth-Client, X-Auth-Timestamp (unix seconds), X-Auth-Nonce (16-byte hex),
  *             X-Auth-Signature (hex). PAYLOAD is the exact JSON body ("" when none).
  *
- * Env:
- *   BITNOB_API_KEY      — the client id (X-Auth-Client)
- *   BITNOB_SECRET_KEY   — HMAC secret
- *   BITNOB_BASE_URL     — default https://api.bitnob.com (sandbox: https://sandboxapi.bitnob.com)
+ * Env (UNIFIED CONTRACT — same for services/bitnob.ts and providers/bitnob.ts):
+ *   BITNOB_CLIENT_ID    — the client id (X-Auth-Client header)
+ *   BITNOB_SECRET_KEY   — HMAC secret used to sign requests
+ *   BITNOB_API_KEY      — DEPRECATED alias of BITNOB_SECRET_KEY (kept for
+ *                         backward compatibility; do not use in new code)
+ *   BITNOB_BASE_URL     — default https://api.bitnob.com (live, confirmed
+ *                         2026-10; sandbox host sandboxapi.bitnob.co currently
+ *                         serves a mismatched TLS cert and 404s all routes)
  *
  * When credentials are missing the client throws BitnobNotConfiguredError; routers
  * fall back to the built-in simulator so the product still works end-to-end in
@@ -37,7 +41,7 @@ import crypto from "crypto";
 
 export class BitnobNotConfiguredError extends Error {
   constructor() {
-    super("Bitnob is not configured (BITNOB_API_KEY / BITNOB_SECRET_KEY missing)");
+    super("Bitnob is not configured (BITNOB_CLIENT_ID / BITNOB_SECRET_KEY missing)");
     this.name = "BitnobNotConfiguredError";
   }
 }
@@ -54,12 +58,14 @@ export class BitnobApiError extends Error {
 }
 
 const BASE_URL = (process.env.BITNOB_BASE_URL || "https://api.bitnob.com").replace(/\/+$/, "");
-const API_KEY = process.env.BITNOB_API_KEY || "";
-const SECRET_KEY = process.env.BITNOB_SECRET_KEY || "";
+// Unified contract: X-Auth-Client = BITNOB_CLIENT_ID, HMAC secret =
+// BITNOB_SECRET_KEY (falls back to the legacy BITNOB_API_KEY alias).
+const CLIENT_ID = process.env.BITNOB_CLIENT_ID || "";
+const SECRET_KEY = process.env.BITNOB_SECRET_KEY || process.env.BITNOB_API_KEY || "";
 const TIMEOUT_MS = 30_000;
 
 export function isBitnobConfigured(): boolean {
-  return Boolean(API_KEY && SECRET_KEY);
+  return Boolean(CLIENT_ID && SECRET_KEY);
 }
 
 /** 1 whole card-currency unit in Bitnob micro-units. */
@@ -75,10 +81,10 @@ function hmacHeaders(payload: string): Record<string, string> {
   if (!isBitnobConfigured()) throw new BitnobNotConfiguredError();
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonce = crypto.randomBytes(16).toString("hex");
-  const base = `${API_KEY}:${timestamp}:${nonce}:${payload}`;
+  const base = `${CLIENT_ID}:${timestamp}:${nonce}:${payload}`;
   const signature = crypto.createHmac("sha256", SECRET_KEY).update(base).digest("hex");
   return {
-    "X-Auth-Client": API_KEY,
+    "X-Auth-Client": CLIENT_ID,
     "X-Auth-Timestamp": timestamp,
     "X-Auth-Nonce": nonce,
     "X-Auth-Signature": signature,

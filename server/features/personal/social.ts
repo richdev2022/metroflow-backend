@@ -1,8 +1,11 @@
 import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
+import { requirePersonalService } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch for the social feed + polls.
+router.use(requirePersonalService("social"));
 
 /**
  * Social (Personal) — feed posts with likes + comments, and interactive

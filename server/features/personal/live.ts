@@ -180,6 +180,9 @@ router.post("/:id/join", authenticateToken, checkSubscriptionStatus, async (req:
         success: true,
         data: {
             call_code: session.call_code,
+            // Native clients join the underlying call room directly via the
+            // standard /calls/:id/join flow (web uses the watch_url instead).
+            call_id: session.call_id,
             title: session.title,
             viewer_count: Number(upd.rows[0]?.viewer_count) || 1,
             watch_url: `/join-call?code=${encodeURIComponent(session.call_code)}&watch=1`,

@@ -4,8 +4,26 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import { createNotification } from "../../services/notifications";
 import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
 import * as bitnob from "../../services/providers/bitnob";
+import { requirePersonalService, useProvider, getPercent } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch for crypto -> cash.
+router.use(requirePersonalService("crypto"));
+
+/** Provider routing (Personal Products console): auto | provider | simulator. */
+async function bitnobLive(): Promise<boolean> {
+    return useProvider("crypto", bitnob.isBitnobConfigured());
+}
+
+/**
+ * Admin spread (crypto_spread_percent, default 1%) — silently widens the
+ * quote so the customer pays slightly more crypto for the same NGN. Applied
+ * to both Bitnob and simulator quotes.
+ */
+async function applySpread(usdDebit: number): Promise<number> {
+    const spread = await getPercent("crypto_spread_percent", 1);
+    return Math.round(usdDebit * (1 + spread / 100) * 100) / 100;
+}
 
 /**
  * Crypto → Cash (Personal) — convert crypto assets (BTC / USDT / USDC) into
@@ -99,7 +117,7 @@ function publicSale(row: any) {
  *     security: [{ bearerAuth: [] }]
  */
 router.get("/banks", authenticateToken, checkSubscriptionStatus, async (_req: AuthenticatedRequest, res) => {
-    if (bitnob.isBitnobConfigured()) {
+    if (await bitnobLive()) {
         try {
             const banks = await bitnob.getPayoutBanks("NG");
             const list = (banks?.data?.banks || banks?.data || []).map((b: any) => ({
@@ -135,7 +153,7 @@ router.get("/banks", authenticateToken, checkSubscriptionStatus, async (_req: Au
 router.post("/lookup", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     const { account_number, bank_code } = req.body || {};
     if (!account_number || !bank_code) return res.status(400).json({ success: false, error: "account_number and bank_code are required" });
-    if (bitnob.isBitnobConfigured()) {
+    if (await bitnobLive()) {
         try {
             const r = await bitnob.accountLookup({ account_number: String(account_number), bank_code: String(bank_code), country: "NG" });
             const name = r?.data?.account_name || r?.data?.accountName;
@@ -172,7 +190,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     }
 
     const reference = randomReference("QT");
-    if (bitnob.isBitnobConfigured()) {
+    if (await bitnobLive()) {
         try {
             const q = await bitnob.createPayoutQuote({
                 from_asset: fromAsset,
@@ -184,6 +202,11 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
             });
             const p = q?.data?.payout;
             if (p) {
+                // Admin spread: the customer pays spread% more crypto for the
+                // same NGN settlement (margin stays invisible in the UI).
+                const spread = await getPercent("crypto_spread_percent", 1);
+                const factor = 1 + spread / 100;
+                const cryptoAmount = Math.round(Number(p.amount) * factor * 1e8) / 1e8;
                 return res.json({
                     success: true,
                     data: {
@@ -191,10 +214,10 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
                         reference,
                         from_asset: p.from_asset,
                         settlement_amount: Number(p.settlement_amount),
-                        crypto_amount: Number(p.amount),
+                        crypto_amount: cryptoAmount,
                         rate: Number(p.exchange_rate?.effective_rate || p.exchange_rate?.rate),
                         fees: Number(p.fees || 0),
-                        usd_debit: fromAsset === "BTC" ? Number(p.amount) * Number(p.exchange_rate?.btc_rate || 0) : Number(p.amount),
+                        usd_debit: fromAsset === "BTC" ? cryptoAmount * Number(p.exchange_rate?.btc_rate || 0) : cryptoAmount,
                         expires_at: p.expires_at,
                         mode: "bitnob",
                     },
@@ -207,7 +230,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     }
     // Simulator: stable-ish NGN/USD rate.
     const simRate = 1560 + Math.random() * 25;
-    const usdDebit = Math.round((settlementAmount / simRate) * 100) / 100;
+    const usdDebit = Math.round((settlementAmount / simRate) * 100 * (1 + (await getPercent("crypto_spread_percent", 1)) / 100)) / 100;
     return res.json({
         success: true,
         data: {
@@ -267,7 +290,7 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
 
     // ---- Quote (fresh at sell time; quote_reference is informational) ----
     let quote: any = null;
-    let mode = bitnob.isBitnobConfigured() ? "bitnob" : "simulator";
+    let mode = (await bitnobLive()) ? "bitnob" : "simulator";
     const quoteRes = await new Promise<{ ok: boolean; data?: any; error?: string }>((resolve) => {
         // Internal reuse: call the quote logic through the router by building a fake req is overkill —
         // re-derive the quote inline (same rules as GET /quote).
@@ -280,21 +303,27 @@ router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: Aut
                         settlement_amount: String(settlementAmount), reference,
                     });
                     const p = q?.data?.payout;
-                    if (p) return resolve({
-                        ok: true,
-                        data: {
-                            quote_id: p.quote_id, reference, crypto_amount: Number(p.amount),
-                            rate: Number(p.exchange_rate?.effective_rate || p.exchange_rate?.rate),
-                            fees: Number(p.fees || 0),
-                            usd_debit: fromAsset === "BTC" ? Number(p.amount) * Number(p.exchange_rate?.btc_rate || 0) : Number(p.amount),
-                        },
-                    });
+                    if (p) {
+                        // Admin spread (same rule as GET /quote).
+                        const spread = await getPercent("crypto_spread_percent", 1);
+                        const factor = 1 + spread / 100;
+                        const cryptoAmount = Math.round(Number(p.amount) * factor * 1e8) / 1e8;
+                        return resolve({
+                            ok: true,
+                            data: {
+                                quote_id: p.quote_id, reference, crypto_amount: cryptoAmount,
+                                rate: Number(p.exchange_rate?.effective_rate || p.exchange_rate?.rate),
+                                fees: Number(p.fees || 0),
+                                usd_debit: fromAsset === "BTC" ? cryptoAmount * Number(p.exchange_rate?.btc_rate || 0) : cryptoAmount,
+                            },
+                        });
+                    }
                 } catch (e: any) {
                     return resolve({ ok: false, error: e?.message || "Quote failed" });
                 }
             }
             const simRate = 1560 + Math.random() * 25;
-            const usdDebit = Math.round((settlementAmount / simRate) * 100) / 100;
+            const usdDebit = Math.round((settlementAmount / simRate) * 100 * (1 + (await getPercent("crypto_spread_percent", 1)) / 100)) / 100;
             return resolve({
                 ok: true,
                 data: {
@@ -457,7 +486,7 @@ router.get("/sales", authenticateToken, checkSubscriptionStatus, async (req: Aut
         [userId],
     );
     let providerPayouts: any[] = [];
-    if (bitnob.isBitnobConfigured()) {
+    if (await bitnobLive()) {
         try {
             const p = await bitnob.listPayouts({ limit: 20 });
             providerPayouts = p?.data?.payouts || [];

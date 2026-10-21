@@ -2,10 +2,19 @@ import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
 import { createNotification } from "../../services/notifications";
+import { creditRevenueWallet } from "../../services/fees";
 import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
 import * as bitnob from "../../services/providers/bitnob";
+import { requirePersonalService, useProvider } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch + provider routing for virtual cards.
+router.use(requirePersonalService("virtualcards"));
+/** Provider routing (Personal Products console): auto | provider | simulator. */
+async function bitnobLive(): Promise<boolean> {
+    return useProvider("virtualcards", bitnob.isBitnobConfigured());
+}
+
 
 /**
  * Virtual Cards (Personal) — USD virtual debit cards backed by Bitnob Card
@@ -161,7 +170,7 @@ router.get("/provider-status", authenticateToken, checkSubscriptionStatus, async
     res.json({
         success: true,
         data: {
-            provider: bitnob.isBitnobConfigured() ? "bitnob" : "simulator",
+            provider: (await bitnobLive()) ? "bitnob" : "simulator",
             kyc_customer_id: kyc.rows[0]?.bitnob_customer_id || null,
         },
     });
@@ -194,7 +203,7 @@ router.post("/kyc", authenticateToken, checkSubscriptionStatus, async (req: Auth
         return res.status(400).json({ success: false, error: "terms_of_service_accepted must be true" });
     }
 
-    if (!bitnob.isBitnobConfigured()) {
+    if (!(await bitnobLive())) {
         // Simulator: instant approval.
         const simId = `SIMCUST_${randomReference("K")}`;
         await query(
@@ -262,7 +271,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         [userId],
     );
     const rows = rowsRes.rows;
-    if (bitnob.isBitnobConfigured()) {
+    if (await bitnobLive()) {
         await Promise.all(rows.filter((r: any) => r.provider === "bitnob" && r.bitnob_card_id).map(async (r: any) => {
             try {
                 const live = await bitnob.getCard(r.bitnob_card_id);
@@ -279,7 +288,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
             } catch { /* keep local mirror on provider hiccups */ }
         }));
     }
-    res.json({ success: true, data: { cards: rows.map(publicCard), mode: bitnob.isBitnobConfigured() ? "bitnob" : "simulator" } });
+    res.json({ success: true, data: { cards: rows.map(publicCard), mode: (await bitnobLive()) ? "bitnob" : "simulator" } });
 });
 
 /**
@@ -313,7 +322,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     }
 
     const reference = randomReference("VC");
-    const mode = bitnob.isBitnobConfigured() ? "bitnob" : "simulator";
+    const mode = (await bitnobLive()) ? "bitnob" : "simulator";
     let bitnobCardId: string | null = null;
     let customerId: string | null = null;
     let status = "pending";
@@ -412,7 +421,7 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     let fxRate: number | null = null;
     if (walletCurrency !== "USD") {
         // Convert via Bitnob exchange rate (fallback: static 1600 NGN/USD marker is NOT used — we refuse instead).
-        if (bitnob.isBitnobConfigured()) {
+        if (await bitnobLive()) {
             try {
                 const conv = await bitnob.convertAmount(walletCurrency, "USD", 1);
                 fxRate = Number(conv?.data?.rate_used || conv?.data?.to_amount) || null;
@@ -442,10 +451,16 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     }
 
     const reference = randomReference("VCF");
+    // Funding fee (Personal Products console: virtualcard_funding_fee_percent,
+    // default 1%) — charged on the wallet-side debit, lands in revenue.
+    const { getPercent } = await import("./flags");
+    const fundingFeePercent = await getPercent("virtualcard_funding_fee_percent", 1);
+    const fundingFee = Math.round(debitAmount * fundingFeePercent) / 100;
+    const totalDebit = Math.round((debitAmount + fundingFee) * 100) / 100;
     const debit = await query(
         `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
          WHERE id = $2 AND balance >= $1 AND status = 'active' RETURNING balance`,
-        [debitAmount, wallet.id],
+        [totalDebit, wallet.id],
     );
     if (debit.rows.length === 0) {
         return res.status(400).json({ success: false, error: "Insufficient wallet balance", code: "INSUFFICIENT_BALANCE" });
@@ -455,10 +470,13 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     await query(
         `INSERT INTO transactions
          (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction, fee)
-         VALUES ($1, $2, $3, $4, $5, 'success', 'debit', $6, 'virtual_card_funding', $7, 'debit', 0)`,
-        [owningBusinessId, userId, debitAmount, walletCurrency, reference,
-         `Virtual card funding (${card.name || card.masked_pan || card.id})`, wallet.id],
+         VALUES ($1, $2, $3, $4, $5, 'success', 'debit', $6, 'virtual_card_funding', $7, 'debit', $8)`,
+        [owningBusinessId, userId, totalDebit, walletCurrency, reference,
+         `Virtual card funding (${card.name || card.masked_pan || card.id})`, wallet.id, fundingFee],
     );
+    if (fundingFee > 0) {
+        creditRevenueWallet(fundingFee, walletCurrency, reference, "Virtual Card Funding Fee", "virtualcards").catch(() => {});
+    }
 
     const insertTx = async (type: string, status_: string, txAmount: number, desc: string, providerRef?: string, before?: number, after?: number) => {
         await query(

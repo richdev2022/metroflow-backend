@@ -3,8 +3,11 @@ import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
 import { calculateFee, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
+import { requirePersonalService } from "./flags";
 
 const router = express.Router();
+// Personal Products console kill-switch for Savings Vaults.
+router.use(requirePersonalService("savings"));
 
 /**
  * Savings Vaults — the fifth REVENUE feature (daily-use).

@@ -54,7 +54,7 @@ headers      = X-Auth-Client, X-Auth-Timestamp (unix sec), X-Auth-Nonce (16-byte
 | `BITNOB_CLIENT_ID` | ✅ | Dashboard **Client ID** — sent as `X-Auth-Client`. |
 | `BITNOB_SECRET_KEY` | ✅ | Dashboard **secret key** — HMAC signing secret. |
 | `BITNOB_API_KEY` | ⚠️ deprecated | Legacy alias of `BITNOB_SECRET_KEY`. Do not use in new code. |
-| `BITNOB_BASE_URL` | optional | Default `https://api.bitnob.com/api`. |
+| `BITNOB_BASE_URL` | optional | Default `https://api.bitnob.com` (paths in code already include `/api`; a trailing `/api` here would double it). |
 | `BITNOB_ENV` | optional | `production` (default) or `sandbox` (switches base to `https://sandboxapi.bitnob.co/api`). |
 | `BITNOB_WEBHOOK_URL` | optional | Sent to Bitnob when creating cards; points at the backend webhook route. |
 | `BITNOB_WEBHOOK_SECRET` | optional | Shared secret used to verify webhook signatures (`personal-webhooks.ts`). **Strongly recommended in production** — stablecoin deposit crediting verifies `x-bitnob-signature` (HMAC-SHA512 hex **or** HMAC-SHA256 hex over the raw body) against it. |
@@ -92,7 +92,7 @@ headers      = X-Auth-Client, X-Auth-Timestamp (unix sec), X-Auth-Nonce (16-byte
 ```env
 BITNOB_CLIENT_ID=a8692858-1439-4bd5-b7cd-55cdada078f9
 BITNOB_SECRET_KEY=prd:sandbox_c4d0508e65b200c57383b0e570c718d1d6ab3cabaf3d5ee31ac48a534a792839
-BITNOB_BASE_URL=https://api.bitnob.com/api
+BITNOB_BASE_URL=https://api.bitnob.com
 ```
 
 ### Live verification (2026-10)

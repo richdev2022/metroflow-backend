@@ -3,6 +3,10 @@ import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
 import { ensureGiftcardSchema } from "./features/personal/giftcards";
 import { ensureEsimSchema } from "./features/personal/esim";
+import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
+import { ensureCryptoSchema } from "./features/personal/crypto";
+import { ensureSocialSchema } from "./features/personal/social";
+import { ensureLiveSchema } from "./features/personal/live";
 
 /**
  * Post-initialize migrations + one-off data repairs.
@@ -50,6 +54,10 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await ensurePersonalSchema(); // dormant personal features: bills hub + savings vaults
   await ensureGiftcardSchema(); // gift card trading (Prestmit)
   await ensureEsimSchema(); // eSIM top-ups (pluggable provider, simulator first)
+  await ensureVirtualCardSchema(); // personal USD virtual cards (Bitnob)
+  await ensureCryptoSchema(); // crypto -> NGN sales (Bitnob payouts)
+  await ensureSocialSchema(); // personal social feed + polls
+  await ensureLiveSchema(); // one-tap live streaming (call-room backed)
   // Cross-app accounts: Personal <-> Business with one set of credentials.
   // account_type records the product the user SIGNED UP on (personal |
   // business); NULL = unset/legacy. Either app accepts any account.

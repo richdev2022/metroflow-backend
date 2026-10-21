@@ -15,6 +15,27 @@ import { ensureSsoSchema } from "./services/sso";
  * Everything here is idempotent - safe to run on every boot.
  */
 export async function runPostInitializeMigrations(): Promise<void> {
+  const failures: { step: string; error: string }[] = [];
+
+  /**
+   * FAULT-ISOLATED step runner — a failing migration step must never take the
+   * whole API down. Before this guard, one bad step (e.g. an index referencing
+   * a column missing on an older database) aborted the whole runner, isDbReady
+   * never flipped true and EVERY route answered 503 "still initializing"
+   * (production incident 2026-10-21: virtual_cards.bitnob_card_id). Now the
+   * step logs loudly, records the failure for /health visibility and lets the
+   * remaining steps run — a half-migrated feature beats a fully-dead platform.
+   */
+  async function step(name: string, fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn();
+    } catch (error: any) {
+      const msg = error?.message || String(error);
+      failures.push({ step: name, error: msg });
+      console.error(`[migrations] ⚠ step "${name}" FAILED (non-fatal, continuing): ${msg}`);
+    }
+  }
+
   // ---- 1. Schema DDL (tables + columns) -------------------------------
   // EVERY schema-creating migration must run before any data ladder: the
   // pricing ladder below UPDATEs columns owned by the revenue schemas, and
@@ -22,79 +43,102 @@ export async function runPostInitializeMigrations(): Promise<void> {
   // ("column invoices_enabled of relation pricing_plans does not exist"),
   // which also starved every later migration (invoices/store/recurring/
   // team_roles never got created).
-  await ensureAppTables();
-  await ensurePayrollVerificationColumns();
-  await ensureSystemSettingsDefaults();
-  await ensureChatAndAiSchema();
-  await ensureChatCallUxSchema();
-  await ensureAiLimitsSchema();
-  await ensureSupportSchema();
-  await ensureCallingSchema();
-  await ensureMeetingSchedulingSchema();
-  await ensureVapidKeys();
-  await ensureSiteGrowthSchema();
-  await ensureRevenueFeaturesSchema(); // + payment_links_enabled etc.
-  await ensureInvoicesSchema(); // + invoices_enabled etc.
-  await ensureStoreSchema(); // + store_enabled etc.
-  await ensureRecurringBillingSchema(); // + recurring_enabled etc.
-  await ensureTeamRolesSchema(); // + users.role_id
-  await ensureChatGuestContacts(); // chat: invite non-registered contacts by email
-  await ensureChatStatusesSchema(); // WhatsApp-style 24h status (stories)
-  await ensureAppVersionsSchema(); // mobile app release tracking (update prompts)
-  await ensureDisputesSchema(); // transaction dispute lifecycle (customer -> admin)
-  await ensureBeneficiariesSchema(); // transfer beneficiaries (recent recipients)
-  await ensureBusinessRegistrationSchema(); // business KYC upgrade + transaction limits
-  await ensureChatInviteSchema(); // group chat invite links (join by code)
-  await ensureReferralUserBonusSchema(); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
-  await ensureAccountDeletionSchema(); // GDPR account deletion request queue
-  await ensureUserEmailChangeSchema(); // users.temp_email — personal email change staging
-  await ensureFreeForeverTrialSchema(); // pricing_plans.trial_permissions (free-forever trial tier)
-  await ensureVaptHardeningSchema(); // VAPT fixes: admin lockout, hashed OTP columns
-  await ensureFraudSchema(); // fraud rules/evaluations/cases/blacklists + due diligence
-  await repairFreeForeverStatuses(); // reactivate free-plan businesses wrongly deactivated by the old trial cron
-  await ensurePersonalSchema(); // dormant personal features: bills hub + savings vaults
-  await ensureGiftcardSchema(); // gift card trading (Prestmit)
-  await ensureEsimSchema(); // eSIM top-ups (pluggable provider, simulator first)
-  await ensureVirtualCardSchema(); // personal USD virtual cards (Bitnob)
-  await ensureCryptoSchema(); // crypto -> NGN sales (Bitnob payouts)
-  await ensureSocialSchema(); // personal social feed + polls
-  await ensureLiveSchema(); // one-tap live streaming (call-room backed)
-  await ensureSsoSchema(); // cross-app SSO one-time tickets (Business <-> Personal)
+  await step("ensureAppTables", ensureAppTables);
+  await step("ensurePayrollVerificationColumns", ensurePayrollVerificationColumns);
+  await step("ensureSystemSettingsDefaults", ensureSystemSettingsDefaults);
+  await step("ensureChatAndAiSchema", ensureChatAndAiSchema);
+  await step("ensureChatCallUxSchema", ensureChatCallUxSchema);
+  await step("ensureAiLimitsSchema", ensureAiLimitsSchema);
+  await step("ensureSupportSchema", ensureSupportSchema);
+  await step("ensureCallingSchema", ensureCallingSchema);
+  await step("ensureMeetingSchedulingSchema", ensureMeetingSchedulingSchema);
+  await step("ensureVapidKeys", ensureVapidKeys);
+  await step("ensureSiteGrowthSchema", ensureSiteGrowthSchema);
+  await step("ensureRevenueFeaturesSchema", ensureRevenueFeaturesSchema); // + payment_links_enabled etc.
+  await step("ensureInvoicesSchema", ensureInvoicesSchema); // + invoices_enabled etc.
+  await step("ensureStoreSchema", ensureStoreSchema); // + store_enabled etc.
+  await step("ensureRecurringBillingSchema", ensureRecurringBillingSchema); // + recurring_enabled etc.
+  await step("ensureTeamRolesSchema", ensureTeamRolesSchema); // + users.role_id
+  await step("ensureChatGuestContacts", ensureChatGuestContacts); // chat: invite non-registered contacts by email
+  await step("ensureChatStatusesSchema", ensureChatStatusesSchema); // WhatsApp-style 24h status (stories)
+  await step("ensureAppVersionsSchema", ensureAppVersionsSchema); // mobile app release tracking (update prompts)
+  await step("ensureDisputesSchema", ensureDisputesSchema); // transaction dispute lifecycle (customer -> admin)
+  await step("ensureBeneficiariesSchema", ensureBeneficiariesSchema); // transfer beneficiaries (recent recipients)
+  await step("ensureBusinessRegistrationSchema", ensureBusinessRegistrationSchema); // business KYC upgrade + transaction limits
+  await step("ensureChatInviteSchema", ensureChatInviteSchema); // group chat invite links (join by code)
+  await step("ensureReferralUserBonusSchema", ensureReferralUserBonusSchema); // Refer & Earn per-user bonus overrides (+ re-ensure referral_bonuses)
+  await step("ensureAccountDeletionSchema", ensureAccountDeletionSchema); // GDPR account deletion request queue
+  await step("ensureUserEmailChangeSchema", ensureUserEmailChangeSchema); // users.temp_email — personal email change staging
+  await step("ensureFreeForeverTrialSchema", ensureFreeForeverTrialSchema); // pricing_plans.trial_permissions (free-forever trial tier)
+  await step("ensureVaptHardeningSchema", ensureVaptHardeningSchema); // VAPT fixes: admin lockout, hashed OTP columns
+  await step("ensureFraudSchema", ensureFraudSchema); // fraud rules/evaluations/cases/blacklists + due diligence
+  await step("repairFreeForeverStatuses", repairFreeForeverStatuses); // reactivate free-plan businesses wrongly deactivated by the old trial cron
+  await step("ensurePersonalSchema", ensurePersonalSchema); // dormant personal features: bills hub + savings vaults
+  await step("ensureGiftcardSchema", ensureGiftcardSchema); // gift card trading (Prestmit)
+  await step("ensureEsimSchema", ensureEsimSchema); // eSIM top-ups (pluggable provider, simulator first)
+  await step("ensureVirtualCardSchema", ensureVirtualCardSchema); // personal USD virtual cards (Bitnob)
+  await step("ensureCryptoSchema", ensureCryptoSchema); // crypto -> NGN sales (Bitnob payouts)
+  await step("ensureSocialSchema", ensureSocialSchema); // personal social feed + polls
+  await step("ensureLiveSchema", ensureLiveSchema); // one-tap live streaming (call-room backed)
+  await step("ensureSsoSchema", ensureSsoSchema); // cross-app SSO one-time tickets (Business <-> Personal)
+  // Chat for PERSONAL users: conversations + blocks are no longer business-
+  // bound. business_id becomes optional — personal users (business_id NULL)
+  // create platform-wide direct chats/groups, and in-app chat notifications
+  // mirror without a business row. All idempotent.
+  await step("chat-personal-support", async () => {
+    await query(`ALTER TABLE chat_conversations ALTER COLUMN business_id DROP NOT NULL`);
+    await query(`ALTER TABLE user_blocks ALTER COLUMN business_id DROP NOT NULL`);
+    await query(`ALTER TABLE notifications ALTER COLUMN business_id DROP NOT NULL`);
+  });
   // eSIM purchase fee row (flat ₦50, mirrors the bill convenience fee) —
   // admin-editable via the Personal Products console.
-  await query(`
-    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
-    SELECT 'eSIM Purchase Fee', 'esim', 'flat', '{"amount": 50}'::jsonb, 'NGN'
-    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'esim')
-  `);
+  await step("seed-esim-fee", async () => {
+    await query(`
+      INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+      SELECT 'eSIM Purchase Fee', 'esim', 'flat', '{"amount": 50}'::jsonb, 'NGN'
+      WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'esim')
+    `);
+  });
   // Cross-app accounts: Personal <-> Business with one set of credentials.
   // account_type records the product the user SIGNED UP on (personal |
   // business); NULL = unset/legacy. Either app accepts any account.
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20)`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
+  await step("users.account_type", async () => {
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
+  });
 
   // Personal app: live streams (and personal calls) create call rooms with NO
   // owning business. calls.business_id started NOT NULL in the business-era
   // schema, which made every "go live" insert fail with a not-null violation.
   // DROP NOT NULL is idempotent.
-  await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
+  await step("calls.business_id-nullable", async () => {
+    await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
+  });
 
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
-  await ensureLedgerAndVirtualAccountFixes();
-  await reconcilePlatformLedger();
-  await backfillLedgerHistory();
-  await purgeInternalLedgerNoiseRows();
-  await checkPlatformLedgerDrift();
-  await sanitizePlaceholderPhoneNumbers();
-  await repairTransferReferenceCollisions();
-  await ensureParticipantDedupe();
-  await ensureRequestLogsSchema();
-  await ensureLoginSecurityColumns();
+  await step("ensureLedgerAndVirtualAccountFixes", ensureLedgerAndVirtualAccountFixes);
+  await step("reconcilePlatformLedger", reconcilePlatformLedger);
+  await step("backfillLedgerHistory", backfillLedgerHistory);
+  await step("purgeInternalLedgerNoiseRows", purgeInternalLedgerNoiseRows);
+  await step("checkPlatformLedgerDrift", checkPlatformLedgerDrift);
+  await step("sanitizePlaceholderPhoneNumbers", sanitizePlaceholderPhoneNumbers);
+  await step("repairTransferReferenceCollisions", repairTransferReferenceCollisions);
+  await step("ensureParticipantDedupe", ensureParticipantDedupe);
+  await step("ensureRequestLogsSchema", ensureRequestLogsSchema);
+  await step("ensureLoginSecurityColumns", ensureLoginSecurityColumns);
 
   // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
-  await ensureBusinessRevenueLadder();
-  await ensureBusinessRevenueLadderV2();
-  await ensurePlanPricingLadder();
+  await step("ensureBusinessRevenueLadder", ensureBusinessRevenueLadder);
+  await step("ensureBusinessRevenueLadderV2", ensureBusinessRevenueLadderV2);
+  await step("ensurePlanPricingLadder", ensurePlanPricingLadder);
+
+  if (failures.length > 0) {
+    console.error(`[migrations] ⚠ ${failures.length} migration step(s) failed (non-fatal):`);
+    for (const f of failures) console.error(`   - ${f.step}: ${f.error}`);
+    (globalThis as any).__schemaMigrationIssues = failures;
+  } else {
+    (globalThis as any).__schemaMigrationIssues = [];
+  }
 }
 
 /**

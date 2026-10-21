@@ -763,14 +763,15 @@ model MeetingReminder {
 // Chat
 model ChatConversation {
   id          String   @id @default(uuid())
-  businessId  String   @map("business_id")
+  // Nullable: personal users create chats without any business context.
+  businessId  String?  @map("business_id")
   name        String? // For group conversations
   type        String   @default("direct") // direct or group
   createdById String?  @map("created_by")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @default(now()) @map("updated_at")
 
-  business     Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business     Business?         @relation(fields: [businessId], references: [id], onDelete: Cascade)
   createdBy    User?             @relation(fields: [createdById], references: [id], onDelete: SetNull)
   participants ChatParticipant[]
   messages     ChatMessage[]
@@ -818,7 +819,8 @@ model ChatMessage {
 // Contact blocking for direct conversations (WhatsApp-style)
 model UserBlock {
   id         String   @id @default(uuid())
-  businessId String   @map("business_id")
+  // Nullable: personal users block contacts without any business context.
+  businessId String?  @map("business_id")
   blockerId  String   @map("blocker_id")
   blockedId  String   @map("blocked_id")
   createdAt  DateTime @default(now()) @map("created_at")

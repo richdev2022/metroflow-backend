@@ -29,12 +29,13 @@ Bitnob connectivity without touching any money movement.
 
 ---
 
-## 1. Bitnob — USD virtual cards + crypto + payouts
+## 1. Bitnob — USD virtual cards + crypto + payouts + STABLECOINS (USDT/USDC)
 
 **Files**: `server/services/bitnob.ts` (route layer) ·
 `server/services/providers/bitnob.ts` (feature layer) ·
 consumers: `server/features/personal/virtualcards.ts`, `crypto.ts`,
-`server/routes/personal-webhooks.ts`.
+`server/features/personal/stablecoin.ts` (stablecoin hub),
+`server/routes/personal-webhooks.ts` (deposit/withdraw webhooks).
 
 **Auth scheme (HMAC-SHA256)** — identical in both clients after the
 2026-10 unification:
@@ -56,9 +57,35 @@ headers      = X-Auth-Client, X-Auth-Timestamp (unix sec), X-Auth-Nonce (16-byte
 | `BITNOB_BASE_URL` | optional | Default `https://api.bitnob.com/api`. |
 | `BITNOB_ENV` | optional | `production` (default) or `sandbox` (switches base to `https://sandboxapi.bitnob.co/api`). |
 | `BITNOB_WEBHOOK_URL` | optional | Sent to Bitnob when creating cards; points at the backend webhook route. |
-| `BITNOB_WEBHOOK_SECRET` | optional | Shared secret used to verify webhook signatures (`personal-webhooks.ts`). |
+| `BITNOB_WEBHOOK_SECRET` | optional | Shared secret used to verify webhook signatures (`personal-webhooks.ts`). **Strongly recommended in production** — stablecoin deposit crediting verifies `x-bitnob-signature` (HMAC-SHA512 hex **or** HMAC-SHA256 hex over the raw body) against it. |
 | `BITNOB_PAYOUT_CALLBACK_URL` | optional | Callback URL attached to crypto payout requests (`crypto.ts`). |
-| `BITNOB_ALLOW_INSECURE_TLS` | optional | `1` tolerates the sandbox host's mismatched TLS certificate. |
+| `BITNOB_DEPOSIT_AMOUNT_MODE` | optional | How `deposit.success` webhook amounts are interpreted: `base` (token units, e.g. `75` = 75 USDT), `micro` (6-decimal base units, e.g. `75000000` = 75 USDT), or `auto` (default — integer values ≥ 1,000,000 are treated as micro-units). Verify against a real webhook payload from the Bitnob dashboard and pin it explicitly if needed. |
+
+### Stablecoin hub endpoints (mounted 2026-10)
+
+| Route | Purpose |
+|-------|---------|
+| `GET /api/crypto/stablecoin/chains` | Supported deposit networks per coin (live from `GET /api/stablecoins/supported-chains`). |
+| `POST /api/crypto/stablecoin/addresses` | Generate / re-use a personal deposit address (`POST /api/addresses`). One per user per coin per chain; 20/day fraud cap. |
+| `GET /api/crypto/stablecoin/rate` | Live `USDT/USDC → NGN` rate (trading price → convert API → simulator). |
+| `POST /api/crypto/stablecoin/convert/quote` | Locked-rate quote for stablecoin ↔ NGN (`POST /api/trading/quotes`). |
+| `POST /api/crypto/stablecoin/convert` | Execute the conversion (`POST /api/trading/orders`); debits the source wallet first, refunds on failure; PIN + fraud engine gated. |
+| `POST /api/crypto/stablecoin/withdraw` | On-chain payout (`POST /api/withdrawals`) with local + Bitnob address validation, PIN, fraud engine. |
+| `GET /api/crypto/stablecoin/{addresses,conversions,deposits,withdrawals}` | User histories. |
+| `POST /api/webhook/bitnob` + `POST /api/webhook/bitnob/stablecoin` | Webhook receivers: `deposit.success` credits the owner of the deposit address (signature → dedup → address binding → currency match → min $1 → server-side tx cross-check → idempotent ledger); `transfer.success/failed` finalizes withdrawals (refund on failure). |
+
+**Bitnob dashboard setup for stablecoins (production)**:
+1. API key scopes required: `wallet:read`, `wallet:write`, `transfer:create`.
+2. Whitelist the **droplet's** public IP (Dashboard → API Keys → IP whitelist) —
+   the container/dev IP will get `403 IP address not whitelisted`.
+3. Set the webhook URL to `https://api.metricorex.com/api/webhook/bitnob/stablecoin`
+   (the general `…/api/webhook/bitnob` also handles deposits) and copy the
+   signing secret into `BITNOB_WEBHOOK_SECRET`.
+4. Minimum deposit/withdrawal is **$1** per Bitnob; the platform adds its own
+   clamps (convert 2–50,000; withdraw 2–20,000).
+5. `BITNOB_ALLOW_INSECURE_TLS` — optional; `1` tolerates the sandbox host's
+   mismatched TLS certificate (sandbox host is broken upstream; production
+   `api.bitnob.com` is fine and does not need it).
 
 ### Current values (configured 2026-10)
 

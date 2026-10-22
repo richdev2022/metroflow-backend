@@ -13,6 +13,7 @@ import {
 import { getTenorApiKey } from "../lib/config-flags";
 import { glmChat, isGlmConfigured } from "../lib/glm";
 import { sendEmail, generateChatInviteEmailHtml } from "../services/email";
+import { areFriends } from "./friends";
 
 // Call-log messages (WhatsApp-style call history in chat) are inserted by the
 // SHARED helper in lib/call-log.ts — used by both the REST call paths and the
@@ -891,6 +892,28 @@ export const createConversation: RequestHandler = async (
           success: false,
           error: blockError.error,
         });
+      }
+    }
+
+    // PRIVATE ACCOUNT GATE: direct chats with a private account require an
+    // accepted friendship. Teammates in the target's workspace are exempt —
+    // workspaces chat freely (this is the Personal feed's public/private
+    // promise: public = chat anytime, private = friend request first).
+    if (type === "direct" && providedIds.length === 1) {
+      const targetRow = await query(
+        `SELECT account_privacy, business_id FROM users WHERE id = $1`,
+        [providedIds[0]],
+      );
+      const target = targetRow.rows[0] as { account_privacy?: string; business_id?: string } | undefined;
+      if (target && target.account_privacy === "private" && target.business_id !== businessId) {
+        const friends = await areFriends(userId, providedIds[0]);
+        if (!friends) {
+          return res.status(403).json({
+            success: false,
+            code: "PRIVATE_ACCOUNT",
+            error: "This account is private — send a friend request first.",
+          });
+        }
       }
     }
 

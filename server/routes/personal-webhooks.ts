@@ -213,11 +213,55 @@ export async function bitnobWebhookHandler(req: Request, res: Response) {
     if (cardId) {
       const r = await query(`SELECT id, user_id FROM virtual_cards WHERE provider_card_id = $1 LIMIT 1`, [String(cardId)]);
       if (r.rows.length) {
+        const card = r.rows[0];
         if (/card-ready/i.test(event)) {
-          await query(`UPDATE virtual_cards SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [r.rows[0].id]);
+          await query(`UPDATE virtual_cards SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [card.id]);
         } else if (data.balanceAmount != null || data.balance_amount != null) {
           const micro = Number(data.balanceAmount ?? data.balance_amount ?? 0);
-          await query(`UPDATE virtual_cards SET balance = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [r.rows[0].id, micro / 1_000_000]);
+          await query(`UPDATE virtual_cards SET balance = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [card.id, micro / 1_000_000]);
+        }
+        // Card spend/refund events → mirror into the wallet history so the
+        // user sees every card transaction under the funding wallet's
+        // (stablecoin/NGN) transaction history, not only inside the card.
+        const spendAmountMicro = Number(data.amount ?? data.cardChargeAmount ?? data.transactionAmount ?? 0);
+        const providerTxId = String(data.transactionId || data.id || data.reference || "");
+        if (!/card-ready/i.test(event) && spendAmountMicro > 0 && providerTxId) {
+          const ok = await claimEvent("bitnob", `cardtx:${providerTxId}`, event || "card.transaction", payload);
+          if (ok) {
+            const spendUsd = spendAmountMicro > 10_000 ? spendAmountMicro / 1_000_000 : spendAmountMicro; // micro-units guard
+            const isCredit = /credit|refund|reversal/i.test(event) || String(data.type || "").toLowerCase() === "credit";
+            const walletRes = await query(`SELECT id, currency FROM wallets WHERE id = (SELECT wallet_id FROM virtual_cards WHERE id = $1) LIMIT 1`, [card.id]);
+            const fw = walletRes.rows[0];
+            if (fw) {
+              const cur = String(fw.currency || "NGN").toUpperCase();
+              let walletAmount = Math.round(spendUsd * 100) / 100;
+              if (cur !== "USD" && cur !== "USDT" && cur !== "USDC") {
+                try {
+                  const conv = await bitnob.convertAmount("USD", cur, spendUsd);
+                  walletAmount = Math.round((Number(conv?.data?.to_amount || conv?.data?.rate_used) || 0) * 100) / 100;
+                } catch { walletAmount = 0; }
+              }
+              if (walletAmount > 0) {
+                const ref = `VCT-${providerTxId}`.slice(0, 80);
+                await query(
+                  `INSERT INTO transactions
+                     (user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
+                   VALUES ($1, $2, $3, $4, 'success', $5, $6, $7, $8, $5)
+                   ON CONFLICT (reference) DO NOTHING`,
+                  [card.user_id, walletAmount, cur, ref, isCredit ? "credit" : "debit",
+                   `Virtual card ${isCredit ? "refund" : "transaction"} — ${String(data.merchantName || data.description || "card spend")}`.slice(0, 240),
+                   isCredit ? "vcard_refund" : "vcard_spend", fw.id],
+                );
+                await query(
+                  `INSERT INTO virtual_card_transactions (card_id, user_id, type, amount, currency, status, provider_reference, description, reference)
+                   VALUES ($1,$2,$3,$4,'USD','completed',$5,$6,$7)
+                   ON CONFLICT (reference) DO NOTHING`,
+                  [card.id, card.user_id, isCredit ? "refund" : "spend", spendUsd, providerTxId,
+                   String(data.merchantName || data.description || "Card transaction"), ref],
+                ).catch(() => {});
+              }
+            }
+          }
         }
       }
     }

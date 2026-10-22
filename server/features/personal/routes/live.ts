@@ -355,7 +355,7 @@ router.get("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, re
     const session = await resolveLiveSession(String(req.params.id), true);
     if (!session) return res.status(404).json({ success: false, error: "Stream not found" });
     const recent = await query(
-      `SELECT g.gift_id, g.gift_name, g.gift_icon, g.quantity, g.total_amount, g.created_at,
+      `SELECT g.id, g.gift_id, g.gift_name, g.gift_icon, g.quantity, g.total_amount, g.created_at,
               COALESCE(NULLIF(u.name, ''), u.email, 'Someone') AS sender_name, u.avatar_url AS sender_photo
        FROM live_gifts g LEFT JOIN users u ON u.id = g.sender_id
        WHERE g.session_id = $1 AND g.status = 'completed'

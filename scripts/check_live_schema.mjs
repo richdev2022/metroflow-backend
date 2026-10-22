@@ -1,0 +1,12 @@
+import pg from "pg";
+import dotenv from "dotenv";
+dotenv.config({ override: true });
+const c = new pg.Client({ connectionString: process.env.DATABASE_URL });
+await c.connect();
+const t = await c.query("SELECT column_name FROM information_schema.columns WHERE table_name='live_sessions' ORDER BY ordinal_position");
+console.log("live_sessions columns:", t.rows.map((r) => r.column_name).join(", ") || "TABLE DOES NOT EXIST");
+const idx = await c.query("SELECT indexname FROM pg_indexes WHERE tablename='live_sessions'");
+console.log("indexes:", idx.rows.map((r) => r.indexname).join(", "));
+const other = await c.query("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'live%'");
+console.log("live* tables:", other.rows.map((r) => r.table_name).join(", "));
+await c.end();

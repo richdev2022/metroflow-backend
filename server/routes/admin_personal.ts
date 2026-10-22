@@ -173,7 +173,9 @@ router.get("/social/polls", requirePermission("view_dashboard"), async (req, res
   try {
     const status = String(req.query.status || "active");
     const r = await query(
-      `SELECT pl.*, u.name AS author_name, u.email AS author_email
+      `SELECT pl.*, u.name AS author_name, u.email AS author_email,
+              (SELECT COUNT(*)::int FROM social_poll_votes v WHERE v.poll_id = pl.id) AS vote_count,
+              COALESCE((SELECT SUM(v.amount_paid) FROM social_poll_votes v WHERE v.poll_id = pl.id), 0)::float AS pool_collected
        FROM social_polls pl JOIN users u ON u.id = pl.user_id
        WHERE pl.status = $1 ORDER BY pl.created_at DESC LIMIT 200`,
       [status],
@@ -186,8 +188,19 @@ router.get("/social/polls", requirePermission("view_dashboard"), async (req, res
 
 router.post("/social/polls/:id/:action", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
   try {
-    if (!["remove", "restore"].includes(String(req.params.action))) return res.status(400).json({ success: false, error: "Unknown action" });
-    const status = req.params.action === "remove" ? "removed" : "active";
+    const action = String(req.params.action);
+    if (!"remove,restore,close".split(",").includes(action)) return res.status(400).json({ success: false, error: "Unknown action" });
+    if (action === "close") {
+      // Force-mature a paid poll so the creator can withdraw (admin moderation).
+      const c = await query(
+        `UPDATE social_polls SET status = 'closed', ends_at = LEAST(COALESCE(ends_at, NOW()), NOW()), updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND status = 'active' RETURNING id`,
+        [String(req.params.id)],
+      );
+      if (!c.rows.length) return res.status(404).json({ success: false, error: "Poll not found (or already closed)" });
+      return res.json({ success: true });
+    }
+    const status = action === "remove" ? "removed" : "active";
     const r = await query(
       `UPDATE social_polls SET status = $2 WHERE id = $1 RETURNING id`,
       [String(req.params.id), status],

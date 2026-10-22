@@ -318,6 +318,32 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_poll_votes_poll ON social_poll_votes(poll_id)`);
 
+  // Paid polls economics: voters pay per vote from their NGN wallet; the money
+  // pools on the poll; at maturity the creator withdraws to their NGN wallet and
+  // the admin-configured withdrawal fee lands in the platform revenue ledger.
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS poll_type VARCHAR(10) NOT NULL DEFAULT 'free'`);   -- free | paid
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS vote_price NUMERIC(14,2) NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS pool_earned NUMERIC(14,2) NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS pool_withdrawn NUMERIC(14,2) NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+  await query(`ALTER TABLE social_poll_votes ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14,2) NOT NULL DEFAULT 0`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_polls_paid_user ON social_polls(user_id) WHERE poll_type = 'paid'`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS poll_withdrawals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      poll_id UUID NOT NULL REFERENCES social_polls(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,        -- debited from the poll pool
+      fee NUMERIC(14,2) NOT NULL DEFAULT 0, -- admin-configured fee → revenue ledger
+      net_amount NUMERIC(14,2) NOT NULL,    -- credited to the creator's NGN wallet
+      reference VARCHAR(80) UNIQUE NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'completed',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_poll_withdrawals_user ON poll_withdrawals(user_id, created_at DESC)`);
+
   // ------------------------------------------------------------------
   // 4. BOOST ENGINE (posts + marketplace listings share one engine)
   // ------------------------------------------------------------------
@@ -809,6 +835,24 @@ export async function ensurePersonalSchema(): Promise<void> {
       withdrawal_min: 1000,            // minimum pocket withdrawal
       battle_duration_seconds: 300,    // default PK round length
       battle_multiplier: 2,            // gifting points multiplier during a battle (x2)
+    }),
+  ]);
+
+  // Admin-configurable poll economics (vote price bounds + withdrawal fees)
+  await query(`
+    INSERT INTO system_settings (key, value, description)
+    SELECT 'poll_settings', $1::jsonb,
+           'Poll economics: default/max vote price, withdrawal fee (percent + flat) and minimum'
+    WHERE NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'poll_settings')
+  `, [
+    JSON.stringify({
+      currency: "NGN",
+      default_vote_price: 100,     // pre-filled when a creator picks a paid poll
+      min_vote_price: 20,          // per-vote floor
+      max_vote_price: 100000,      // per-vote ceiling
+      withdrawal_fee_percent: 10,  // charged at pool withdrawal → revenue ledger
+      withdrawal_fee_flat: 0,      // flat component of the withdrawal fee
+      withdrawal_min: 500,         // minimum pool withdrawal
     }),
   ]);
 

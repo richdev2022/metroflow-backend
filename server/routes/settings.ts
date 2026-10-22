@@ -1146,6 +1146,23 @@ const avatarUpload = multer({
  * the first-login prompt. Changing the phone number re-opens verification.
  * Business-level info lives in PUT /settings (owner/admin only).
  */
+router.put("/profile/privacy", authenticateToken, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const privacy = String(req.body?.privacy || "").toLowerCase();
+        if (!["public", "private"].includes(privacy)) {
+            return res.status(400).json({ success: false, error: "privacy must be 'public' or 'private'" });
+        }
+        await query(
+            `UPDATE users SET account_privacy = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [userId, privacy],
+        );
+        res.json({ success: true, data: { accountPrivacy: privacy } });
+    } catch {
+        res.status(500).json({ success: false, error: "Could not update privacy" });
+    }
+});
+
 router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;

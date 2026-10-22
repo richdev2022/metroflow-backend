@@ -9,6 +9,7 @@ import { calculateFee } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
+import { friendshipMap } from "../../../routes/friends";
 
 /**
  * SOCIAL — Facebook-style feed + robust polls + post boost engine.
@@ -188,6 +189,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     const postsRes = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.audience, p.share_count, p.created_at,
               u.name AS author_name, u.avatar_url AS author_photo,
+              COALESCE(u.account_privacy, 'public') AS account_privacy,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
               (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $1 LIMIT 1) AS my_reaction,
               (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count,
@@ -202,6 +204,11 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     const postIds = postsRes.rows.map((r) => r.id);
     const boosts = await getActiveBoostMap("post", postIds);
+
+    // Privacy + friendship context per author — drives the feed's "Message" vs
+    // "Add friend" action (public = chat, private = request first).
+    const authorIds = [...new Set(postsRes.rows.map((r) => r.user_id))] as string[];
+    const fMap = await friendshipMap(userId, authorIds);
 
     // Poll payloads for posts that carry one
     let pollsByPost = new Map<string, any>();
@@ -249,7 +256,14 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         kind: poll ? "poll" : "post",
         id: p.id,
         poll_id: poll?.id,
-        author: { id: p.user_id, name: p.author_name, photo: p.author_photo, username: null },
+        author: {
+          id: p.user_id,
+          name: p.author_name,
+          photo: p.author_photo,
+          username: null,
+          is_private: p.account_privacy === "private",
+          friendship_status: fMap.get(p.user_id) || "none",
+        },
         message: poll ? poll.question : p.body,
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         audience: p.audience,

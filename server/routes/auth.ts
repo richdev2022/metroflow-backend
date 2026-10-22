@@ -1930,7 +1930,8 @@ export const getMe: RequestHandler = async (req: AuthenticatedRequest, res) => {
               COALESCE(profile_completed, FALSE) as "profileCompleted",
               COALESCE(profile_prompt_dismissed, FALSE) as "profilePromptDismissed",
               referral_code as "referralCode",
-              (referred_by IS NOT NULL) as "hasReferrer"
+              (referred_by IS NOT NULL) as "hasReferrer",
+              COALESCE(account_privacy, 'public') as "accountPrivacy"
        FROM users WHERE id = $1`,
       [userId],
     );

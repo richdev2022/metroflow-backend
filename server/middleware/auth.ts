@@ -237,9 +237,9 @@ export const checkFeaturePermission = (requiredPermission: string | string[]) =>
     try {
       const businessId = req.user?.businessId;
       if (!businessId) {
-         // If no business context (maybe individual user or admin?), decide policy.
-         // Assuming this middleware is used for business-scoped features.
-         return res.status(401).json({ success: false, error: "Unauthorized" });
+         // PERSONAL APP: personal users have no business/plan context and the
+         // Personal app is free to use by design — plan gating never applies.
+         return next();
       }
 
       // Get plan permissions. Some admin flows store selectable feature IDs in
@@ -302,11 +302,12 @@ export const checkKycStatus = async (req: AuthenticatedRequest, res: Response, n
     const userId = req.user?.userId;
     const businessId = req.user?.businessId;
 
-    if (!userId || !businessId) {
+    if (!userId) {
       return res.status(401).json({ success: false, error: "Unauthorized" });
     }
 
-    // Check user KYC status
+    // Check user KYC status — personal users (businessId NULL) are gated on
+    // their own BVN/NIN only; no business context required.
     const userResult = await query(
       `SELECT bvn_status, nin_status FROM users WHERE id = $1`,
       [userId]

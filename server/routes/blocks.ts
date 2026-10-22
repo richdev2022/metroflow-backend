@@ -43,10 +43,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const blockUser: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { userId: targetUserId } = req.params as { userId: string };
-    const businessId = req.user?.businessId;
+    const businessId = req.user?.businessId || null;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) can block too — blocks are USER-PAIR
+    // scoped (see getBlockDirection), business_id is just metadata.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (!targetUserId || !UUID_RE.test(targetUserId)) {
@@ -56,13 +58,14 @@ export const blockUser: RequestHandler = async (req: AuthenticatedRequest, res) 
       return res.status(400).json({ success: false, error: "You cannot block yourself" });
     }
 
-    // Same-business enforcement (mirrors chat participant validation).
+    // Platform-wide lookup: chat participants may be ANY registered Metricorex
+    // user, so blocking must resolve cross-workspace as well.
     const targetResult = await query(
-      `SELECT id, name FROM users WHERE id = $1 AND business_id = $2 LIMIT 1`,
-      [targetUserId, businessId],
+      `SELECT id, name FROM users WHERE id = $1 LIMIT 1`,
+      [targetUserId],
     );
     if (targetResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "User not found in this business" });
+      return res.status(404).json({ success: false, error: "User not found" });
     }
 
     // Idempotent insert — a duplicate (blocker_id, blocked_id) means 409.
@@ -118,21 +121,22 @@ export const blockUser: RequestHandler = async (req: AuthenticatedRequest, res) 
 export const unblockUser: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const { userId: targetUserId } = req.params as { userId: string };
-    const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (!targetUserId || !UUID_RE.test(targetUserId)) {
       return res.status(400).json({ success: false, error: "Invalid user id" });
     }
 
+    // USER-PAIR scoped: matches blockUser + getBlockDirection regardless of
+    // which business (or none) the block row was created under.
     const deleteResult = await query(
       `DELETE FROM user_blocks
-       WHERE blocker_id = $1 AND blocked_id = $2 AND business_id = $3
+       WHERE blocker_id = $1 AND blocked_id = $2
        RETURNING id`,
-      [userId, targetUserId, businessId],
+      [userId, targetUserId],
     );
     if (deleteResult.rows.length === 0) {
       return res.status(404).json({ success: false, error: "This contact is not blocked" });
@@ -163,10 +167,9 @@ export const unblockUser: RequestHandler = async (req: AuthenticatedRequest, res
  */
 export const listBlocked: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -175,9 +178,9 @@ export const listBlocked: RequestHandler = async (req: AuthenticatedRequest, res
               ub.created_at as "blockedAt"
        FROM user_blocks ub
        LEFT JOIN users u ON u.id = ub.blocked_id
-       WHERE ub.blocker_id = $1 AND ub.business_id = $2
+       WHERE ub.blocker_id = $1
        ORDER BY ub.created_at DESC`,
-      [userId, businessId],
+      [userId],
     );
 
     const response: ApiResponse<{ blocked: any[] }> = {

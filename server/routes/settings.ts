@@ -366,6 +366,20 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
         const businessId = req.user!.businessId;
         const { type, value } = req.body;
 
+        // BUSINESS contact details (email/phone) are business-level fields —
+        // only the owner/admin may change them (parity with PUT /settings).
+        // Invited members edit their OWN profile via /settings/profile/*.
+        const requesterId = req.user!.userId;
+        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [requesterId]);
+        const requesterRole = roleRes.rows[0]?.role;
+        if (!['owner', 'admin'].includes(requesterRole)) {
+            return res.status(403).json({
+                success: false,
+                error: "Only business owners and admins can change the business email or phone. You can edit your personal profile instead.",
+                code: "BUSINESS_SETTINGS_FORBIDDEN",
+            });
+        }
+
         if (!type || !value) {
             return res.status(400).json({ success: false, error: "Type and value are required" });
         }
@@ -475,6 +489,19 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
     try {
         const businessId = req.user!.businessId;
         const { otp } = req.body;
+
+        // Same business-level gate as the request step — an invited member
+        // must not be able to complete a queued business contact change.
+        const verifierId = req.user!.userId;
+        const verifierRoleRes = await query(`SELECT role FROM users WHERE id = $1`, [verifierId]);
+        const verifierRole = verifierRoleRes.rows[0]?.role;
+        if (!['owner', 'admin'].includes(verifierRole)) {
+            return res.status(403).json({
+                success: false,
+                error: "Only business owners and admins can change the business email or phone.",
+                code: "BUSINESS_SETTINGS_FORBIDDEN",
+            });
+        }
 
         if (!otp) {
             return res.status(400).json({ success: false, error: "OTP is required" });
@@ -656,15 +683,30 @@ router.get("/otp-preference", authenticateToken, checkSubscriptionStatus, async 
  */
 router.post("/pin", authenticateToken, checkSubscriptionStatus, validateBody(CreateTransactionPinSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user!.businessId;
+    const businessId = req.user!.businessId || null;
+    const userId = req.user!.userId;
     const { pin } = req.body;
-    
+
+    // PERSONAL users keep their PIN on users.transaction_pin_hash.
+    if (!businessId) {
+      const existingUserPin = await query(
+        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
+        [userId]
+      );
+      if (existingUserPin.rows[0]?.transaction_pin_hash) {
+        return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
+      }
+      const pinHash = await hashPassword(pin);
+      await query(`UPDATE users SET transaction_pin_hash = $1 WHERE id = $2`, [pinHash, userId]);
+      return res.json({ success: true, message: "Transaction PIN created successfully" });
+    }
+
     // Check if PIN already exists
     const existingPin = await query(
       `SELECT transaction_pin_hash FROM businesses WHERE id = $1`,
       [businessId]
     );
-    
+
     if (existingPin.rows[0]?.transaction_pin_hash) {
       return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
     }
@@ -811,10 +853,32 @@ router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (
  */
 router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(UpdateTransactionPinSchema), async (req: AuthenticatedRequest, res) => {
   try {
-    const businessId = req.user!.businessId;
+    const businessId = req.user!.businessId || null;
     const userId = req.user!.userId;
     const { newPin, otp } = req.body;
-    
+
+    // PERSONAL users: PIN + OTP both live on the user row.
+    if (!businessId) {
+      const u = await query(
+        `SELECT otp_code, otp_expires_at, otp_type, transaction_pin_hash FROM users WHERE id = $1`,
+        [userId]
+      );
+      const userRow = u.rows[0];
+      if (!userRow) return res.status(404).json({ success: false, error: "User not found" });
+      if (userRow.otp_code) {
+        if (!otp) return res.status(400).json({ success: false, error: "OTP is required to update your PIN" });
+        if (!otpMatches(otp, userRow.otp_code)) return res.status(400).json({ success: false, error: "Invalid OTP" });
+        if (userRow.otp_expires_at && new Date(userRow.otp_expires_at) < new Date()) {
+          return res.status(400).json({ success: false, error: "OTP has expired" });
+        }
+      } else if (otp) {
+        return res.status(400).json({ success: false, error: "No OTP was requested" });
+      }
+      const newHash = await hashPassword(newPin);
+      await query(`UPDATE users SET transaction_pin_hash = $1, otp_code = NULL, otp_expires_at = NULL WHERE id = $2`, [newHash, userId]);
+      return res.json({ success: true, message: "Transaction PIN updated successfully" });
+    }
+
     // Get current PIN hash and OTP
     const [userResult, businessResult] = await Promise.all([
       query(
@@ -1259,6 +1323,127 @@ router.post("/profile/phone/verify-otp", authenticateToken, checkSubscriptionSta
     } catch (error: any) {
         console.error("Profile phone verify-otp error:", error);
         res.status(500).json({ success: false, error: error.message || "Failed to verify phone" });
+    }
+});
+
+/**
+ * POST /settings/profile/email/send-otp
+ * Request the verification code for changing the CALLER'S OWN email address
+ * (any role — this is the user's personal contact detail, NOT the business
+ * email which stays owner/admin-only via /settings/update-contact).
+ * Flow mirrors /profile/phone/*: 6-digit code, hashed at rest (VAPT MF-012),
+ * staged in users.temp_email until /profile/email/verify-otp commits it.
+ */
+router.post("/profile/email/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const email = String(req.body?.email || "").trim().toLowerCase();
+        if (!email) {
+            return res.status(400).json({ success: false, error: "New email address is required" });
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+            return res.status(400).json({ success: false, error: "Please enter a valid email address" });
+        }
+
+        // Duplicate protection: the new email must not belong to another user
+        // or to any business (business emails are unique keys too).
+        const userDupe = await query(
+            `SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2 LIMIT 1`,
+            [email, userId],
+        );
+        const bizDupe = await query(
+            `SELECT id FROM businesses WHERE LOWER(email) = $1 LIMIT 1`,
+            [email],
+        );
+        if (userDupe.rows.length > 0 || bizDupe.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: "This email is already in use by another account. Please use a different email.",
+                code: "EMAIL_ALREADY_EXISTS",
+            });
+        }
+
+        const otpCode = generateOTP();
+        const otpExpiresAt = getOTPExpiry();
+        await query(
+            `UPDATE users
+             SET temp_email = $1, otp_hash = $2, otp_expires_at = $3, otp_type = 'email_verify', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4`,
+            [email, hashOtp(otpCode), otpExpiresAt, userId],
+        );
+
+        const emailHtml = generateOtpEmailHtml(otpCode, "Verify Your New Email");
+        await sendEmail(email, "Metricorex User", "Verify Your New Email", emailHtml);
+
+        res.json({ success: true, message: `Verification code sent to ${email}` });
+    } catch (error: any) {
+        console.error("Profile email send-otp error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to send the verification code" });
+    }
+});
+
+/**
+ * POST /settings/profile/email/verify-otp
+ * Verify the code and commit the email change. users.email is the login
+ * identity, so the whole change is OTP-gated and the new address is
+ * re-checked for collisions at commit time.
+ */
+router.post("/profile/email/verify-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const otp = String(req.body?.otp || "").trim();
+        if (!otp) {
+            return res.status(400).json({ success: false, error: "Verification code is required" });
+        }
+
+        const userRes = await query(
+            `SELECT temp_email, otp_hash, otp_expires_at, otp_type FROM users WHERE id = $1`,
+            [userId],
+        );
+        const user = userRes.rows[0];
+        if (!user?.otp_hash || user.otp_type !== "email_verify" || !user.temp_email) {
+            return res.status(400).json({ success: false, error: "No email change was requested. Please request a new code." });
+        }
+        if (new Date(user.otp_expires_at) < new Date()) {
+            return res.status(400).json({ success: false, error: "Verification code has expired. Please request a new one." });
+        }
+        const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+        if (otpHash !== user.otp_hash) {
+            return res.status(400).json({ success: false, error: "Invalid verification code" });
+        }
+
+        // Re-check duplicates at commit time (another account may have taken
+        // the address while the code was in flight).
+        const userDupe = await query(
+            `SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2 LIMIT 1`,
+            [user.temp_email, userId],
+        );
+        const bizDupe = await query(
+            `SELECT id FROM businesses WHERE LOWER(email) = $1 LIMIT 1`,
+            [user.temp_email],
+        );
+        if (userDupe.rows.length > 0 || bizDupe.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: "This email is already in use by another account. Please use a different email.",
+                code: "EMAIL_ALREADY_EXISTS",
+            });
+        }
+
+        const result = await query(
+            `UPDATE users
+             SET email = temp_email, temp_email = NULL, email_verified = TRUE,
+                 otp_hash = NULL, otp_expires_at = NULL, otp_type = NULL,
+                 profile_completed = TRUE, profile_prompt_dismissed = TRUE, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+             RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role, email_verified as "emailVerified"`,
+            [userId],
+        );
+
+        res.json({ success: true, data: result.rows[0], message: "Email address updated successfully" });
+    } catch (error: any) {
+        console.error("Profile email verify-otp error:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to verify the email change" });
     }
 });
 

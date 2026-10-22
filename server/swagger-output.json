@@ -338,6 +338,19 @@
         }
       }
     },
+    "/api/wallet/swap": {
+      "post": {
+        "summary": "Swap between own wallets (USD <-> NGN) at the live Flutterwave rate",
+        "tags": [
+          "Wallet"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/wallet/verify": {
       "get": {
         "summary": "Verify payment transaction",
@@ -4152,6 +4165,48 @@
           },
           "400": {
             "description": "Only unpaid orders can be cancelled"
+          }
+        }
+      }
+    },
+    "/api/store/marketplace": {
+      "get": {
+        "summary": "Personal-app marketplace — active products across ALL enabled storefronts",
+        "tags": [
+          "Storefront"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive search on product/store name"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 60,
+              "maximum": 120
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Cursor pagination (created_at of the last item)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Marketplace feed (newest first, seller info attached)"
           }
         }
       }
@@ -12070,6 +12125,107 @@
             }
           }
         }
+      }
+    },
+    "/api/admin/referral-user-bonuses/search": {
+      "get": {
+        "summary": "Search users (name/email/referral code) for the per-user bonus picker",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/admin/referral-user-bonuses": {
+      "get": {
+        "summary": "List per-user referral bonus overrides",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/admin/referral-user-bonuses/{userId}": {
+      "put": {
+        "summary": "Set (or update) a per-user referral bonus override",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "amount"
+                ],
+                "properties": {
+                  "amount": {
+                    "type": "number"
+                  },
+                  "currency": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove a per-user referral bonus override (falls back to the global bonus)",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "userId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
       }
     },
     "/api/admin/referrals": {

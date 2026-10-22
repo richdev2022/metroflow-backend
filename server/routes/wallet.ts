@@ -293,10 +293,22 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, requir
  *       200:
  *         description: Wallet details
  */
-router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
+router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
         const businessId = req.user!.businessId;
+        // KYC gate: business wallets keep the KYC requirement; PERSONAL wallet
+        // reads are open (money movement elsewhere still enforces KYC).
+        if (businessId) {
+            const u = await query(`SELECT bvn_status, nin_status FROM users WHERE id = $1`, [userId]);
+            const verified = u.rows[0]?.bvn_status === 'verified' || u.rows[0]?.nin_status === 'verified';
+            if (!verified) {
+                return res.status(403).json({
+                    success: false, code: "KYC_REQUIRED",
+                    error: "KYC verification is required to access this feature. Please complete your KYC verification.",
+                });
+            }
+        }
         const activeProviderName = await getActiveProviderName();
         
         // Function to fetch wallet with virtual accounts
@@ -342,13 +354,50 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
             return cleanedWallet;
         };
         
+        // Personal wallets are per-currency now (NGN + USDT + USDC). user_wallet
+        // is the NGN primary for compatibility; user_wallets carries every currency.
         let userWallet = null;
-        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1`, [userId]);
+        const userWalletRes = await query(`SELECT * FROM wallets WHERE user_id = $1 AND status = 'active' ORDER BY CASE WHEN UPPER(currency) = 'NGN' THEN 0 ELSE 1 END, created_at`, [userId]);
+
+        // STABLECOIN LAZY PROVISIONING: personal features (stablecoin <-> NGN
+        // conversion, receive-international, virtual cards) expect the caller
+        // to own NGN + USDT + USDC wallets. Older accounts may be missing the
+        // stablecoin rows — create them on the fly so everything works for
+        // everyone. The legacy USD wallet is NOT recreated: it was migrated
+        // into USDT by the schema ladder.
+        const currencies = new Set(userWalletRes.rows.map((w: any) => String(w.currency || "NGN").toUpperCase()));
+        for (const cur of ["NGN", "USDT", "USDC"] as const) {
+            if (!currencies.has(cur)) {
+                try {
+                    const created = await query(
+                        `INSERT INTO wallets (user_id, balance, currency, status) VALUES ($1, 0, $2, 'active') RETURNING *`,
+                        [userId, cur],
+                    );
+                    userWalletRes.rows.push(created.rows[0]);
+                } catch (e: any) {
+                    console.warn(`Lazy ${cur} wallet provisioning skipped:`, e?.message);
+                }
+            }
+        }
+        // Every active personal wallet (NGN + stablecoins) — this is the list
+        // data.wallets renders. (Fix: this used to reference an undefined
+        // userWalletsRaw and 500'd the whole endpoint.)
+        const userWalletsRaw = userWalletRes.rows;
+
         if (userWalletRes.rows.length > 0) {
+            const primary = userWalletRes.rows.find((w: any) => String(w.currency || "NGN").toUpperCase() === "NGN") || userWalletRes.rows[0];
             userWallet = {
-                ...cleanWallet(userWalletRes.rows[0]),
-                virtual_accounts: await getWalletWithVAs(userWalletRes.rows[0].id)
+                ...cleanWallet(primary),
+                virtual_accounts: await getWalletWithVAs(primary.id)
             };
+        }
+        const userWallets = [];
+        for (const w of userWalletsRaw) {
+            userWallets.push({
+                ...cleanWallet(w),
+                wallet_type: "user",
+                virtual_accounts: await getWalletWithVAs(w.id)
+            });
         }
         
         let businessWallet = null;
@@ -365,17 +414,36 @@ router.get("/", authenticateToken, checkKycStatus, async (req: AuthenticatedRequ
                  if (bwRes.rows.length > 0) {
                      businessWallet = {
                          ...cleanWallet(bwRes.rows[0]),
+                         wallet_type: "business",
                          virtual_accounts: await getWalletWithVAs(bwRes.rows[0].id)
                      };
                  }
              }
         }
 
+        // data.wallets: every wallet the caller may use — personal wallets for
+        // everyone, + the business wallet ONLY for owners/admins. This array
+        // is what the Personal app (swap / bills / gift cards / eSIM pickers)
+        // renders: personal-only users see ONLY their personal wallets.
+        const allWallets = [
+            ...userWallets,
+            ...(businessWallet ? [businessWallet] : []),
+        ];
+
         res.json({
             success: true,
             user_wallet: userWallet,
+            user_wallets: userWallets,
             business_wallet: businessWallet,
-            canManageBusinessWallet
+            canManageBusinessWallet,
+            // Standard data envelope with every wallet the caller owns —
+            data: {
+                wallets: allWallets,
+                user_wallet: userWallet,
+                business_wallet: businessWallet,
+                canManageBusinessWallet,
+            },
+            wallets: allWallets,
         });
 
     } catch (error) {
@@ -753,6 +821,130 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
  *       200:
  *         description: Business Wallet created
  */
+
+/**
+ * @swagger
+ * /wallet/swap:
+ *   post:
+ *     summary: Swap between own wallets (USD <-> NGN) at the live Flutterwave rate
+ *     tags: [Wallet]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/swap", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const businessId = req.user!.businessId || null;
+        const { from_wallet_id, to_wallet_id, amount, pin } = req.body || {};
+        const amt = Math.round(Number(amount) * 100) / 100;
+        if (!from_wallet_id || !to_wallet_id) {
+            return res.status(400).json({ success: false, error: "Both wallets are required" });
+        }
+        if (from_wallet_id === to_wallet_id) {
+            return res.status(400).json({ success: false, error: "Pick two different wallets" });
+        }
+        if (!Number.isFinite(amt) || amt <= 0) {
+            return res.status(400).json({ success: false, error: "Enter a valid amount" });
+        }
+        const wRes = await query(
+            `SELECT id, user_id, business_id, currency, balance, status FROM wallets
+             WHERE id IN ($1, $2)`,
+            [from_wallet_id, to_wallet_id]
+        );
+        const from = wRes.rows.find(w => w.id === from_wallet_id);
+        const to = wRes.rows.find(w => w.id === to_wallet_id);
+        if (!from || !to) return res.status(404).json({ success: false, error: "Wallet not found" });
+        const owns = (w: any) =>
+            w.user_id === userId ||
+            (businessId && w.business_id === businessId);
+        if (!owns(from) || !owns(to)) {
+            return res.status(403).json({ success: false, error: "You can only swap between your own wallets" });
+        }
+        if (String(from.currency).toUpperCase() === String(to.currency).toUpperCase()) {
+            return res.status(400).json({ success: false, error: "Choose wallets in different currencies" });
+        }
+        if (from.status !== 'active' || to.status !== 'active') {
+            return res.status(400).json({ success: false, error: "Both wallets must be active" });
+        }
+
+        // PIN gate (wallet decides personal vs business hash)
+        const { verifyTransactionPin } = await import("../features/personal/personal-utils");
+        const pinCheck = await verifyTransactionPin(
+            typeof pin === "string" ? pin : undefined,
+            { userId, businessId, wallet: from as any }
+        );
+        if (!pinCheck.ok) {
+            return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
+        }
+
+        // Live rate via Flutterwave (fallback provider may differ by direction)
+        const { getRate } = await import("../services/flutterwave");
+        const fromCur = String(from.currency).toUpperCase();
+        const toCur = String(to.currency).toUpperCase();
+        let rate: number;
+        try {
+            // NOTE: amount=1 — Flutterwave returns the converted TOTAL when an
+            // amount is supplied; the unit rate is what a swap multiplier needs.
+            rate = await getRate(fromCur, toCur, 1);
+        } catch (e: any) {
+            return res.status(503).json({ success: false, error: "Live exchange rate unavailable — try again shortly." });
+        }
+        const fee = await calculateFee(amt, "swap");
+        const converted = Math.round(amt * rate * 100) / 100;
+        const debitTotal = Math.round((amt + fee) * 100) / 100;
+        if (Number(from.balance) < debitTotal) {
+            return res.status(400).json({
+                success: false, code: "INSUFFICIENT_BALANCE",
+                error: `This swap needs ${(fee > 0 ? `${amt.toLocaleString()} + ${fee.toLocaleString()} fee` : amt.toLocaleString())} ${fromCur}.`,
+            });
+        }
+        const reference = `SWAP-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+        const debit = await query(
+            `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND balance >= $1 AND status = 'active' RETURNING balance`,
+            [debitTotal, from.id]
+        );
+        if (debit.rows.length === 0) {
+            return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient balance" });
+        }
+        await query(
+            `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [converted, to.id]
+        );
+        await query(
+            `INSERT INTO transactions
+               (business_id, user_id, amount, currency, status, reference, type, description,
+                transaction_type, wallet_id, direction, fee)
+             VALUES ($1,$2,$3,$4,'success',$5,'debit',$6,'swap',$7,'debit',$8)`,
+            [from.business_id || businessId, userId, debitTotal, fromCur, reference,
+             `Swap ${amt.toLocaleString()} ${fromCur} → ${converted.toLocaleString()} ${toCur} @ ${rate}`, from.id, fee]
+        );
+        await query(
+            `INSERT INTO transactions
+               (business_id, user_id, amount, currency, status, reference, type, description,
+                transaction_type, wallet_id, direction, fee)
+             VALUES ($1,$2,$3,$4,'success',$5,'credit',$6,'swap',$7,'credit',0)`,
+            [to.business_id || businessId, userId, converted, toCur, `${reference}-IN`,
+             `Swap received ${converted.toLocaleString()} ${toCur}`, to.id]
+        );
+
+        res.json({
+            success: true,
+            message: `Swapped ${amt.toLocaleString()} ${fromCur} to ${converted.toLocaleString()} ${toCur}`,
+            data: {
+                from: { debited: debitTotal, currency: fromCur },
+                to: { credited: converted, currency: toCur },
+                rate,
+                fee,
+                reference,
+            },
+        });
+    } catch (error: any) {
+        console.error("Wallet swap error:", error?.message);
+        res.status(500).json({ success: false, error: "Swap failed — please try again" });
+    }
+});
+
 router.post("/business/create", authenticateToken, checkKycStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
@@ -1345,5 +1537,4 @@ router.get("/verify", async (req, res) => {
         `);
     }
 });
-
 export default router;

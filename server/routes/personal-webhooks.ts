@@ -40,7 +40,6 @@ function asJson(req: Request): any {
 async function handleSellApproved(payload: any) {
   const uniqueId = payload?.data?.uniqueIdentifier || payload?.uniqueIdentifier;
   const reference = payload?.data?.reference || payload?.reference;
-  const payout = Number(payload?.data?.totalAmount ?? payload?.data?.payoutTotal ?? 0);
   const r = await query(
     `SELECT * FROM giftcard_sell_trades WHERE (reference = $1 OR provider_reference = $1) LIMIT 1`,
     [uniqueId || reference].filter(Boolean),
@@ -51,35 +50,34 @@ async function handleSellApproved(payload: any) {
     return;
   }
   if (trade.status === "settled") return; // idempotent
-  if (payout > 0 && trade.wallet_id) {
-    await creditWallet(trade.wallet_id, payout);
-    await insertTransaction({
-      userId: trade.user_id, walletId: trade.wallet_id,
-      reference: `GCSP-${trade.reference}`, type: "credit", transactionType: "giftcard_sell",
-      amount: payout, currency: trade.currency || "NGN",
-      description: `Gift card sale approved — ${trade.giftcard_name || ""}`.trim(),
-    });
+  if (!trade.provider_reference && reference) {
+    await query(`UPDATE giftcard_sell_trades SET provider_reference = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [trade.id, String(reference)]);
   }
-  await query(
-    `UPDATE giftcard_sell_trades SET status = 'settled', credited_at = CURRENT_TIMESTAMP,
-       payout_amount = GREATEST(payout_amount, $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-    [trade.id, payout],
-  );
-  createNotification({
-    businessId: "", userId: trade.user_id, type: "credit", title: "Gift card sale approved",
-    message: `₦${payout.toLocaleString()} has been credited for your ${trade.giftcard_name || "gift card"} sale.`,
-  }).catch(() => {});
+  const { settleSellTradeFromProvider } = await import("../features/personal/routes/giftcards");
+  const result = await settleSellTradeFromProvider(trade.id).catch((e) => ({ updated: false, status: "pending", error: e?.message }));
+  if (!result.updated && (result as any).error) console.warn("[prestmit webhook] settle failed:", (result as any).error);
 }
 
 async function handleSellRejected(payload: any) {
   const uniqueId = payload?.data?.uniqueIdentifier || payload?.uniqueIdentifier;
   const reference = payload?.data?.reference || payload?.reference;
   const reason = payload?.data?.rejectionReason || payload?.data?.reason || "Rejected by review";
-  await query(
-    `UPDATE giftcard_sell_trades SET status = 'rejected', rejection_reason = $2, updated_at = CURRENT_TIMESTAMP
-     WHERE (reference = $1 OR provider_reference = $1) AND status NOT IN ('settled','rejected')`,
-    [uniqueId || reference, String(reason).slice(0, 500)],
+  const r = await query(
+    `SELECT id, status FROM giftcard_sell_trades WHERE (reference = $1 OR provider_reference = $1) LIMIT 1`,
+    [uniqueId || reference].filter(Boolean),
   );
+  const trade = r.rows[0];
+  if (!trade) {
+    console.warn("[prestmit webhook] sell rejected for unknown trade:", uniqueId || reference);
+    return;
+  }
+  if (trade.status !== "settled") {
+    await query(
+      `UPDATE giftcard_sell_trades SET status = 'rejected', rejection_reason = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [trade.id, String(reason).slice(0, 500)],
+    );
+  }
 }
 
 async function handleBuyOutcome(payload: any, approved: boolean) {
@@ -95,9 +93,23 @@ async function handleBuyOutcome(payload: any, approved: boolean) {
     return;
   }
   if (approved) {
+    // Try to attach the delivered codes immediately (best effort).
+    let codes = null;
+    if (order.provider_reference) {
+      try {
+        const { fetchCardCodes } = await import("../services/prestmit");
+        const remote = await fetchCardCodes(order.provider_reference);
+        codes = remote?.cardCodes || remote?.codes || (Array.isArray(remote) ? remote : remote?.data || null) || null;
+      } catch { /* codes arrive later via the codes endpoint */ }
+    }
     await query(
-      `UPDATE giftcard_buy_orders SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status != 'completed'`,
-      [order.id],
+      `UPDATE giftcard_buy_orders
+       SET status = 'completed',
+           card_codes = COALESCE($2::jsonb, card_codes),
+           provider_reference = COALESCE(NULLIF($3, ''), provider_reference),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND status != 'completed'`,
+      [order.id, codes ? JSON.stringify(codes) : null, String(reference || "")],
     );
     createNotification({
       businessId: "", userId: order.user_id, type: "system", title: "Gift card delivered",
@@ -125,6 +137,17 @@ async function handleBuyOutcome(payload: any, approved: boolean) {
   }
 }
 
+/**
+ * withdrawal-request.* — payouts from the PARTNER Prestmit wallet (platform
+ * money, not a user wallet). Recorded for reconciliation + admin visibility.
+ */
+async function handlePrestmitWithdrawal(payload: any, approved: boolean) {
+  const d = payload?.data || {};
+  const amount = Number(d.amount || 0);
+  const wallet = String(d.wallet || "NAIRA");
+  console.log(`[prestmit webhook] withdrawal ${approved ? "approved" : "rejected"}: ${amount} ${wallet} — ${d.rejectReason || "ok"}`);
+}
+
 export async function prestmitWebhookHandler(req: Request, res: Response) {
   try {
     const raw = rawBody(req);
@@ -147,6 +170,14 @@ export async function prestmitWebhookHandler(req: Request, res: Response) {
         break;
       case "giftcard-trade.buy.rejected":
         await handleBuyOutcome(payload, false);
+        break;
+      case "withdrawal-request.approved":
+      case "withdrawal-request.cedis.approved":
+        await handlePrestmitWithdrawal(payload, true);
+        break;
+      case "withdrawal-request.rejected":
+      case "withdrawal-request.cedis.rejected":
+        await handlePrestmitWithdrawal(payload, false);
         break;
       default:
         console.log("[prestmit webhook] unhandled event:", event);

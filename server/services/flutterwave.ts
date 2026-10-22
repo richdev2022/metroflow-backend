@@ -48,6 +48,7 @@ export async function getRate(from: string, to: string, amount = 1): Promise<num
 // ---------------------------------------------------------------------------
 export interface FlwBillItem {
   id: number;
+  name?: string;
   biller_code: string;
   biller_name: string;
   item_code: string;
@@ -120,6 +121,205 @@ export async function getBillStatus(reference: string): Promise<any | null> {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bills v2 — the full documented surface (categories → billers → items,
+// customer validation, status, history, summary).
+//
+// NOTE (sandbox): Flutterwave gates EVERYTHING that moves money (bill
+// payment, billers list, top categories, validation) behind account-level
+// IP whitelisting. With test keys the legacy /bill-categories read works
+// from any IP; the rest return "Please enable IP Whitelisting" until the
+// account owner whitelists the server IP (Dashboard → Settings →
+// Whitelisted IP addresses). We surface those errors verbatim — never
+// simulated.
+// ---------------------------------------------------------------------------
+
+/** GET /top-bill-categories — the top-level service categories (AIRTIME, CABLEBILLS, …). */
+export async function getTopBillCategories(country = "NG"): Promise<Array<{ id?: number; name: string; code: string; description?: string }>> {
+  const { data } = await client().get("/top-bill-categories", { params: { country } });
+  if (data?.status !== "success") throw new Error(data?.message || "Could not load bill categories");
+  return (data.data || []).map((c: any) => ({
+    id: c.id, name: String(c.name || ""), code: String(c.code || ""), description: c.description,
+  }));
+}
+
+/** GET /bills/{category}/billers — billers inside a top category. */
+export async function getBillersByCategory(category: string): Promise<any[]> {
+  const { data } = await client().get(`/bills/${encodeURIComponent(category)}/billers`);
+  if (data?.status !== "success") throw new Error(data?.message || "Could not load billers");
+  return data.data || [];
+}
+
+/** GET /billers/{biller_code}/items — purchasable items (plans) for a biller. */
+export async function getBillerItems(billerCode: string): Promise<any[]> {
+  const { data } = await client().get(`/billers/${encodeURIComponent(billerCode)}/items`);
+  if (data?.status !== "success") throw new Error(data?.message || "Could not load biller items");
+  return data.data || [];
+}
+
+/** GET /bill-items/{item_code}/validate?customer= — customer/meter/smartcard validation. */
+export async function validateBillCustomer(itemCode: string, customer: string): Promise<{ ok: boolean; info?: any; error?: string }> {
+  try {
+    const { data } = await client().get(`/bill-items/${encodeURIComponent(itemCode)}/validate`, {
+      params: { customer },
+      timeout: 25000,
+    });
+    if (data?.status === "success") return { ok: true, info: data.data };
+    // Flutterwave answers 200 with status:"error" for unknown customers too.
+    return { ok: false, error: data?.message || "Customer validation failed" };
+  } catch (e: any) {
+    return { ok: false, error: flwErr(e) };
+  }
+}
+
+export interface CreateBillPaymentArgs {
+  billerCode: string;   // e.g. BIL099
+  itemCode?: string;    // e.g. AT099 / CB141 / MD128 (fixed-price items)
+  customer: string;     // phone / smartcard / meter / customer id
+  amount: number;
+  reference: string;
+  country?: string;     // default NG
+  callbackUrl?: string; // per-transaction bill webhook URL
+}
+
+/**
+ * POST /billers/{biller_code}/items/{item_code}/payment — the documented
+ * create-a-bill-payment endpoint. Falls back to the legacy POST /bills
+ * (type = item_code || biller_code) when the path-style route is not
+ * available on the account.
+ */
+export async function createBillPayment(args: CreateBillPaymentArgs): Promise<{ ok: boolean; pending?: boolean; provider_reference?: string | null; raw?: any; error?: string }> {
+  const country = args.country || "NG";
+  const body: Record<string, any> = {
+    country,
+    customer_id: args.customer,
+    amount: args.amount,
+    reference: args.reference,
+  };
+  if (args.callbackUrl) body.callback_url = args.callbackUrl;
+
+  if (args.itemCode) {
+    try {
+      const { data } = await client().post(
+        `/billers/${encodeURIComponent(args.billerCode)}/items/${encodeURIComponent(args.itemCode)}/payment`,
+        body,
+        { timeout: 60000 },
+      );
+      if (data?.status === "success") {
+        return { ok: true, pending: isPendingStatus(data.data), provider_reference: data.data?.flw_ref || data.data?.tx_ref || data.data?.reference || args.reference, raw: data };
+      }
+      return { ok: false, error: data?.message || "Bill payment rejected", raw: data };
+    } catch (e: any) {
+      // 404/405 → the path-style endpoint is unavailable on this account;
+      // fall through to the legacy route. Anything else is a real failure.
+      const status = e?.response?.status;
+      if (status !== 404 && status !== 405) {
+        return { ok: false, error: flwErr(e), raw: e?.response?.data };
+      }
+    }
+  }
+
+  // Legacy route: type = item_code for fixed-price items, biller_code otherwise.
+  return payBill({
+    reference: args.reference,
+    country,
+    customer: args.customer,
+    amount: args.amount,
+    type: args.itemCode || args.billerCode,
+  });
+}
+
+function isPendingStatus(d: any): boolean {
+  const status = String(d?.status || "").toUpperCase();
+  return !status || ["PENDING", "PROCESSING", "IN_PROGRESS", "QUEUED"].includes(status);
+}
+
+/** GET /bills/{reference} — full bill payment record (status + token). */
+export async function getBillPaymentByReference(reference: string): Promise<any | null> {
+  try {
+    const { data } = await client().get(`/bills/${encodeURIComponent(reference)}`);
+    return data?.status === "success" ? data.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** GET /bills/history — provider-side bill payment history (reconciliation). */
+export async function getBillPaymentsHistory(from?: string, to?: string, page = 1): Promise<any | null> {
+  try {
+    const { data } = await client().get("/bills/history", { params: { from, to, page } });
+    return data?.status === "success" ? data.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** GET /bills/summary — commission earned per biller (partner earnings). */
+export async function getBillPaymentsSummary(from?: string, to?: string): Promise<any | null> {
+  try {
+    const { data } = await client().get("/bills/summary", { params: { from, to } });
+    return data?.status === "success" ? data.data : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Biller logos — hosted, dependency-free brand tiles for the bills UI.
+// Flutterwave does not return biller artwork, so we map the well-known
+// Nigerian billers to brand-accurate inline SVGs and fall back to a
+// deterministic initials tile for anything unmapped.
+// ---------------------------------------------------------------------------
+
+function svgTile(text: string, bg: string, fg = "#FFFFFF"): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="20" fill="${bg}"/><text x="48" y="60" font-family="Arial,Helvetica,sans-serif" font-size="30" font-weight="bold" fill="${fg}" text-anchor="middle">${text}</text></svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+const BILLER_LOGOS: Record<string, string> = {
+  mtn: svgTile("MTN", "#FFCC00", "#1A1A1A"),
+  airtel: svgTile("airtel", "#E40000"),
+  glo: svgTile("glo", "#00A651"),
+  "9mobile": svgTile("9mobile", "#00684B"),
+  dstv: svgTile("DStv", "#0B4EA2"),
+  gotv: svgTile("GOtv", "#F58220"),
+  startimes: svgTile("Star", "#E32636"),
+  smile: svgTile("Smile", "#7B2D8E"),
+  spectranet: svgTile("Spect", "#003087"),
+  swift: svgTile("Swift", "#E87722"),
+  ipnx: svgTile("ipNX", "#009FE3"),
+  lcc: svgTile("LCC", "#4B4B4B"),
+  dhl: svgTile("DHL", "#FFCC00", "#D40511"),
+  firs: svgTile("FIRS", "#1D7044"),
+};
+
+const DISCO_COLORS: Record<string, string> = {
+  "EKEDC": "#1B4DA0", "IKEJA": "#C8102E", "EKODISCO": "#1B4DA0",
+  "IBEDC": "#F58220", "AEDC": "#0E7C3A", "JED": "#5B2D8E",
+  "KEDCO": "#00A650", "PHED": "#005BAA", "BEDC": "#7B2D8E", "EEDC": "#B7202E",
+};
+
+/** Deterministic logo for a biller (brand tile when known, initials otherwise). */
+export function billerLogo(name: string, code?: string): string {
+  const n = String(name || "").toLowerCase();
+  const c = String(code || "").toUpperCase();
+  for (const [key, svg] of Object.entries(BILLER_LOGOS)) {
+    if (n.includes(key)) return svg;
+  }
+  // Discos — colour-coded by distribution company.
+  for (const [key, color] of Object.entries(DISCO_COLORS)) {
+    if (n.includes(key.toLowerCase()) || c === key) {
+      const initials = String(name).split(/\s+/).slice(0, 2).map((w) => w[0]?.toUpperCase() || "").join("");
+      return svgTile(initials || "DISCO", color);
+    }
+  }
+  // Generic tile: stable initials + colour derived from the biller code.
+  const seed = (code || name || "bill").split("").reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
+  const palette = ["#6D28D9", "#DB2777", "#0891B2", "#059669", "#D97706", "#4F46E5", "#DC2626"];
+  const initials = String(name).split(/\s+/).slice(0, 2).map((w) => w[0]?.toUpperCase() || "").join("") || "B";
+  return svgTile(initials, palette[seed % palette.length]);
 }
 
 // ---------------------------------------------------------------------------

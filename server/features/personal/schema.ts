@@ -771,6 +771,24 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_pocket_withdrawals_user ON live_pocket_withdrawals(user_id, created_at DESC)`);
 
+  // Raise-hand / "bring me on stage" requests. A viewer asks to join the
+  // broadcast; the host approves → the viewer lands in cohost_ids (media
+  // publishing unlocks) or declines. One row per (session, user) — a declined
+  // request can be re-raised (status flips back to pending).
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_join_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL,
+      user_id UUID NOT NULL,
+      status VARCHAR(12) NOT NULL DEFAULT 'pending', -- pending | approved | declined | cancelled
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      responded_at TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT live_join_requests_pair UNIQUE (session_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_join_requests_session ON live_join_requests(session_id, status, created_at)`);
+
   // Gift split columns (commission goes to the platform, net to the host pocket)
   await query(`ALTER TABLE live_gifts ADD COLUMN IF NOT EXISTS commission_amount NUMERIC(14,2) NOT NULL DEFAULT 0`);
   await query(`ALTER TABLE live_gifts ADD COLUMN IF NOT EXISTS host_amount NUMERIC(14,2) NOT NULL DEFAULT 0`);

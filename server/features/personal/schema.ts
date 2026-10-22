@@ -660,5 +660,28 @@ export async function ensurePersonalSchema(): Promise<void> {
     }),
   ]);
 
+  // ------------------------------------------------------------------
+  // 6. ACCOUNT PRIVACY + FRIENDSHIPS (public/private accounts)
+  //    - users.account_privacy: 'public' (default, chat-open) | 'private'
+  //      (chat locked until an accepted friendship exists)
+  //    - friend_requests: pending/accepted/declined requests. An ACCEPTED
+  //      row in EITHER direction = symmetric friendship.
+  // ------------------------------------------------------------------
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_privacy VARCHAR(10) NOT NULL DEFAULT 'public'`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      requester_id UUID NOT NULL,
+      addressee_id UUID NOT NULL,
+      status VARCHAR(12) NOT NULL DEFAULT 'pending', -- pending | accepted | declined
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      responded_at TIMESTAMP,
+      CONSTRAINT friend_requests_pair UNIQUE (requester_id, addressee_id),
+      CONSTRAINT friend_requests_not_self CHECK (requester_id <> addressee_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_friend_requests_addressee ON friend_requests (addressee_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_friend_requests_requester ON friend_requests (requester_id, status)`);
+
   console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce) schema applied");
 }

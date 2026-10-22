@@ -4,21 +4,32 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import { verifyTransactionPin } from "./personal-utils";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
-import { getBillCategories, payBill as flwPayBill, isFlutterwaveConfigured } from "../../services/flutterwave";
+import {
+    getBillCategories, createBillPayment, validateBillCustomer, getBillPaymentByReference,
+    billerLogo, isFlutterwaveConfigured, flwErr,
+} from "../../services/flutterwave";
 
 const router = express.Router();
 
 /**
- * Bills Hub — the fourth REVENUE feature (daily-use).
+ * Bills Hub — the fourth REVENUE feature (daily-use). REAL Flutterwave
+ * bill payments for EVERY category Flutterwave offers: airtime, mobile
+ * data, cable TV (DStv/GOtv/StarTimes), electricity (all Discos),
+ * internet/ISP (Smile, Spectranet, Swift, ipNX) plus tolls/tax/shipping
+ * (LCC, FIRS, DHL). Nothing is hardcoded and nothing is simulated.
  *
- * Users pay airtime, data, TV, electricity and betting top-ups straight from
- * any of their wallets (personal or business). Every bill is charged
- * amount + convenience fee (fee_configurations 'bill' — ₦50 flat by default,
- * reduced by the plan-level bill_fee_discount_percent); the fee lands in the
- * platform revenue wallet via creditRevenueWallet and every payment is
- * double-entered through the platform ledger. Fulfilment is delegated to the
- * pluggable bills provider (services/bills-provider.ts); when none is
- * configured the built-in simulator settles instantly.
+ * Catalog model (v2): the legacy /bill-categories rows carry BOTH a
+ * biller-level `name` ("MTN DATA BUNDLE") and an item-level
+ * `biller_name`/`item_code` ("MTN 1.5GB data bundle"). Grouping by the
+ * biller-level name yields a clean provider list whose fixed-price items
+ * become selectable plans; variable-amount billers (airtime, meters,
+ * betting) take a free amount. Every provider ships with a logo tile.
+ *
+ * Money: wallet debit (amount + convenience fee from fee_configurations
+ * 'bill', reduced by plan bill_fee_discount_percent) → Flutterwave bill
+ * payment (documented path-style endpoint, legacy fallback) → status
+ * sync (webhook + pull). Pending payments stay pending until the
+ * provider confirms via webhook; only hard failures refund instantly.
  *
  * Plan configuration (pricing_plans, admin-editable via /admin/pricing):
  *   - bills_enabled               (feature toggle)
@@ -31,50 +42,73 @@ const router = express.Router();
 // ---------------------------------------------------------------------------
 
 interface BillPlan {
-    code: string;
+    code: string;       // Flutterwave item_code (payment `type` for fixed items)
     name: string;
     amount: number;
     validity?: string;
+    /** set when a merged provider carries plans from a sibling biller_code */
+    biller_code?: string;
 }
 interface BillProvider {
-    code: string;
-    name: string;
+    code: string;           // Flutterwave biller_code
+    name: string;           // biller-level name ("MTN DATA BUNDLE")
+    display_name: string;   // prettified ("MTN Data")
     category: string;
-    /** customer reference label shown in UIs */
-    refLabel: string;
-    /** ref validation regex source string */
+    refLabel: string;       // customer reference label shown in UIs
     refPattern?: string;
     refExample?: string;
-    /** fixed-price plans (data bundles / TV packages) */
+    /** fixed-price plans (data bundles / TV packages / ISP bundles) */
     plans?: BillPlan[];
-    /** electricity disco token flow */
+    /** electricity disco token flow / free-amount airtime */
     requiresAmount?: boolean;
+    logo: string;
 }
 
-/**
- * DYNAMIC catalog — fetched live from Flutterwave bill categories (cached).
- * Nothing is hardcoded: airtime/data/TV/electricity/betting providers and
- * their plans all come from the provider API on every cold load.
- */
 const flwCache: { at: number; providers: BillProvider[] } = { at: 0, providers: [] };
 const FLW_CATALOG_TTL = 10 * 60 * 1000;
 
 function classifyBillItem(name: string): string {
     const n = name.toLowerCase();
     if (/(bet9ja|sporty|bet\b|betting|nairabet|betway|1xbet|msport)/.test(n)) return "betting";
-    if (/(dstv|gotv|startimes|topstar|tv|cable|dish)/.test(n)) return "tv";
-    if (/(electric|disco|ikedc|ekedc|aedc|jedc|kedco|phed|ibedc|kaedco|tcn|power|prepaid|postpaid|meter)/.test(n)) return "electricity";
-    if (/(airtime|\bat\d+)/.test(n)) return "airtime";
+    if (/(dstv|gotv|startimes|topstar|tv|cable|dish|multichoice)/.test(n)) return "tv";
+    if (/(electric|disco|ikedc|ekedc|aedc|jedc|kedco|phed|ibedc|kaedco|tcn|power|prepaid|postpaid|meter|eedc)/.test(n)) return "electricity";
+    if (/(smile|spectranet|swift|ipnx|internet|fibre|fiber|broadband)/.test(n)) return "internet";
+    if (/(airtime|vtu|hynet|\bat\d+|mtn\b|glo\b|airtel\b|9mobile\b)/.test(n) && !/data/.test(n)) return "airtime";
     if (/(\d+\s*(gb|mb)|data|sme|corporate gsm|gifting)/.test(n)) return "data";
     return "other";
 }
 
-function refLabelFor(category: string): string {
+function prettifyName(name: string, category: string): string {
+    const s = String(name || "").trim();
+    if (!s) return "Service";
+    const title = s
+        .toLowerCase()
+        .replace(/\bdata bundle\b/, "Data")
+        .replace(/\bnigeria\b/, "")
+        .replace(/\bvtu\b/, "Airtime")
+        .replace(/\belectricity bills\b/, "Electricity")
+        .replace(/\bdisco\b/, "Disco")
+        .replace(/\bsubscription payments?\b/, "Subscription")
+        .replace(/\bpayment(s)?\b/, "")
+        .replace(/\blimited\b/, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    return title
+        .split(" ")
+        .filter(Boolean)
+        .map((w) => (/^(mtn|9mobile|ipnx|lcc|firs|dhl|smile|swift|gotv|dstv|bet9ja|jvri|vtu)$/i.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
+        .join(" ") || category;
+}
+
+function refLabelFor(category: string, labelName?: string): string {
+    const l = String(labelName || "").trim();
+    if (l && !/^customer$/i.test(l)) return l.replace(/\bnumber\b/i, "number").replace(/^./, (c) => c.toUpperCase());
     switch (category) {
         case "airtime": case "data": return "Phone number";
         case "tv": return "Smartcard / IUC number";
         case "electricity": return "Meter number";
         case "betting": return "Customer ID";
+        case "internet": return "Account number";
         default: return "Customer reference";
     }
 }
@@ -84,29 +118,37 @@ function refPatternFor(category: string): string | undefined {
     return undefined;
 }
 
+/**
+ * DYNAMIC catalog — fetched live from the Flutterwave bill categories
+ * (cached 10 min). Groups rows by the biller-level `name` so data bundles
+ * land under their network provider and TV packages under their brand.
+ */
 async function loadProviders(): Promise<BillProvider[]> {
     const now = Date.now();
     if (flwCache.providers.length && now - flwCache.at < FLW_CATALOG_TTL) return flwCache.providers;
     const items = await getBillCategories("NG");
-    const byCode = new Map<string, BillProvider & { _fixed: boolean }>();
+    const byName = new Map<string, BillProvider & { _label: string }>();
     for (const it of items) {
-        const category = classifyBillItem(`${it.biller_name} ${it.short_name}`);
-        if (category === "other") continue;
+        const billerName = String(it.name || it.biller_name || "").trim();
         const code = String(it.biller_code || "").toUpperCase();
-        if (!code) continue;
-        let p = byCode.get(code);
+        if (!billerName || !code) continue;
+        const itemLabel = String(it.label_name || "").trim();
+        const category = classifyBillItem(`${billerName} ${it.biller_name || ""} ${it.short_name || ""}`);
+        const key = `${billerName}::${code}`;
+        let p = byName.get(key);
         if (!p) {
             p = {
-                code, name: (it.biller_name || code).trim(), category,
-                refLabel: refLabelFor(category), refPattern: refPatternFor(category),
-                plans: [], _fixed: false,
+                code, name: billerName, display_name: prettifyName(billerName, category), category,
+                refLabel: refLabelFor(category, itemLabel), refPattern: refPatternFor(category),
+                plans: [], requiresAmount: false, _label: itemLabel,
+                logo: billerLogo(billerName, code),
             };
-            byCode.set(code, p);
+            byName.set(key, p);
         }
-        const fixed = it.is_amount_fixed === true || (it.amount ?? 0) > 0;
-        if (fixed && (category === "data" || category === "tv")) {
+        const fixed = it.is_amount_fixed === true || (Number(it.amount) || 0) > 0;
+        if (fixed) {
             p.plans = p.plans || [];
-            if (p.plans.length < 40) {
+            if (!p.plans.some((x) => x.code === String(it.item_code)) && p.plans.length < 60) {
                 p.plans.push({
                     code: String(it.item_code || it.short_name).slice(0, 40),
                     name: (it.short_name || it.biller_name || "Bundle").trim(),
@@ -116,16 +158,50 @@ async function loadProviders(): Promise<BillProvider[]> {
         } else {
             p.requiresAmount = true;
         }
+        if (itemLabel && !p._label) p._label = itemLabel;
     }
-    const providers = [...byCode.values()];
-    flwCache.providers = providers;
+    const providers = [...byName.values()].map(({ _label, ...p }) => {
+        // Plans sorted by price; providers without plans are free-amount.
+        p.plans?.sort((a, b) => a.amount - b.amount);
+        if (p.plans?.length) p.requiresAmount = p.requiresAmount || false;
+        else p.requiresAmount = true;
+        if (_label) p.refLabel = refLabelFor(p.category, _label);
+        return p as BillProvider;
+    });
+    // Merge duplicates that share a display name + category ("DSTV" and
+    // "DSTV Payment", the two ipNX rows, FIRS/…) into one provider.
+    const merged = new Map<string, BillProvider>();
+    for (const p of providers) {
+        const key = `${p.display_name.toUpperCase()}::${p.category}`;
+        const existing = merged.get(key);
+        if (!existing) {
+            merged.set(key, p);
+            continue;
+        }
+        const plans = [...(existing.plans || []), ...(p.plans || [])].filter(
+            (x, i, arr) => arr.findIndex((y) => y.code === x.code) === i,
+        );
+        plans.sort((a, b) => a.amount - b.amount);
+        existing.plans = plans.length ? plans : undefined;
+        existing.requiresAmount = existing.requiresAmount || p.requiresAmount || !plans.length;
+        // Tag plans that came from a different biller_code so /pay can use
+        // the right biller for the path-style payment endpoint.
+        if (p.code !== existing.code) {
+            for (const plan of plans) {
+                if (plan.biller_code === undefined) plan.biller_code = p.code;
+            }
+        }
+    }
+    const finalProviders = [...merged.values()];
+    flwCache.providers = finalProviders;
     flwCache.at = now;
-    return providers;
+    return finalProviders;
 }
 
 function findProvider(providers: BillProvider[], code: string): BillProvider | undefined {
     const c = String(code || "").toUpperCase();
-    return providers.find((p) => p.code.toUpperCase() === c);
+    return providers.find((p) => p.code.toUpperCase() === c)
+        || providers.find((p) => p.display_name.toUpperCase() === c);
 }
 
 const BILL_MIN_AMOUNT = 50;
@@ -152,6 +228,14 @@ function randomReference(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Schema additions (electricity tokens etc.) — idempotent
+// ---------------------------------------------------------------------------
+export async function ensureBillsSchema(): Promise<void> {
+    await query(`ALTER TABLE bill_payments ADD COLUMN IF NOT EXISTS recharge_token TEXT`);
+    await query(`ALTER TABLE bill_payments ADD COLUMN IF NOT EXISTS item_code VARCHAR(60)`);
+}
+
+// ---------------------------------------------------------------------------
 // Catalog endpoints
 // ---------------------------------------------------------------------------
 
@@ -159,20 +243,21 @@ function randomReference(): string {
  * @openapi
  * /bills/catalog:
  *   get:
- *     summary: Bills service catalog (airtime, data, TV, electricity, betting providers + plans)
+ *     summary: Bills service catalog — every Flutterwave biller with plans and logos
  *     tags: [Bills]
  *     security: []
  *     responses:
  *       200:
- *         description: Catalog with all providers, plans and configured provider mode
+ *         description: Catalog with all providers (airtime, data, tv, electricity, internet, other), plans, ref labels and logos
  */
 router.get("/catalog", async (_req, res) => {
     try {
         const providers = await loadProviders();
+        const categories = [...new Set(providers.map((p) => p.category))];
         res.json({
             success: true,
             liveProvider: isFlutterwaveConfigured(),
-            categories: ["airtime", "data", "tv", "electricity", "betting"],
+            categories,
             providers,
         });
     } catch (e: any) {
@@ -191,6 +276,59 @@ router.get("/catalog", async (_req, res) => {
 
 /**
  * @openapi
+ * /bills/validate:
+ *   post:
+ *     summary: Validate a bill customer (meter number, smartcard, phone, account)
+ *     tags: [Bills]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [provider_code, customer_ref]
+ *             properties:
+ *               provider_code:
+ *                 type: string
+ *                 example: BIL119
+ *               item_code:
+ *                 type: string
+ *                 description: Required when the provider has fixed plans (the chosen plan code)
+ *               customer_ref:
+ *                 type: string
+ *                 description: Meter number / smartcard / phone / account id
+ *     responses:
+ *       200:
+ *         description: Validation result (ok + customer name or a readable error)
+ */
+router.post("/validate", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const allProviders = await loadProviders();
+        const provider = findProvider(allProviders, String(req.body?.provider_code || ""));
+        if (!provider) return res.status(400).json({ success: false, error: "Unknown service. Pick a valid bill provider." });
+        const customer = String(req.body?.customer_ref || "").trim();
+        if (!customer) return res.status(400).json({ success: false, error: `${provider.refLabel} is required` });
+        // Validation needs an item identifier: the chosen plan's item_code for
+        // fixed-price billers, the biller_code itself for free-amount billers.
+        let itemCode = String(req.body?.item_code || "").trim();
+        if (!itemCode && provider.plans?.length) itemCode = provider.plans[0].code;
+        const result = await validateBillCustomer(itemCode || provider.code, customer);
+        res.json({
+            success: true,
+            ok: result.ok,
+            error: result.error || null,
+            customer_name: result.info?.name || null,
+            info: result.info || null,
+        });
+    } catch (e: any) {
+        res.status(502).json({ success: false, error: flwErr(e) });
+    }
+});
+
+/**
+ * @openapi
  * /bills:
  *   get:
  *     summary: List the caller's bill payments (history)
@@ -203,7 +341,7 @@ router.get("/catalog", async (_req, res) => {
  *         schema: { type: string, enum: [pending, success, failed, all] }
  *       - in: query
  *         name: category
- *         schema: { type: string, enum: [airtime, data, tv, electricity, betting] }
+ *         schema: { type: string, enum: [airtime, data, tv, electricity, internet, other, all] }
  *       - in: query
  *         name: limit
  *         schema: { type: integer, default: 100 }
@@ -257,7 +395,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  * @openapi
  * /bills/pay:
  *   post:
- *     summary: Pay a bill (airtime, data, TV, electricity or betting) from a wallet
+ *     summary: Pay a bill (airtime, data, TV, electricity, internet, tolls/tax) from a wallet
  *     tags: [Bills]
  *     security:
  *       - bearerAuth: []
@@ -267,20 +405,20 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *         application/json:
  *           schema:
  *             type: object
- *             required: [category, provider_code, customer_ref, wallet_id, amount, pin]
+ *             required: [category, provider_code, customer_ref, wallet_id, pin]
  *             properties:
  *               category:
  *                 type: string
- *                 enum: [airtime, data, tv, electricity, betting]
+ *                 enum: [airtime, data, tv, electricity, internet, betting, other]
  *               provider_code:
  *                 type: string
- *                 example: mtn | dstv | ikedc | bet9ja
+ *                 example: BIL104
  *               plan_code:
  *                 type: string
- *                 description: Required for data and TV (fixed-price plans)
+ *                 description: Required for fixed-price billers (data/TV/ISP bundles) — the plan's item_code
  *               customer_ref:
  *                 type: string
- *                 description: Phone number, smartcard/IUC, meter number or betting user ID
+ *                 description: Phone number, smartcard/IUC, meter number or customer id
  *               customer_phone:
  *                 type: string
  *                 description: Optional contact phone for receipts
@@ -289,13 +427,13 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *                 format: uuid
  *               amount:
  *                 type: number
- *                 description: Required when the provider has no fixed plan (airtime, electricity, betting)
+ *                 description: Required when the provider has no fixed plan
  *               pin:
  *                 type: string
  *                 description: Transaction PIN (same PIN verified for transfers)
  *     responses:
  *       200:
- *         description: Bill paid and fulfilled
+ *         description: Bill paid (or queued pending provider confirmation)
  *       400:
  *         description: Validation failed / invalid PIN / plan cap reached
  *       403:
@@ -326,17 +464,21 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // ---- Amount resolution (fixed plan vs free amount) ----
         let billAmount = 0;
         let planName: string | null = null;
+        let itemCode: string | null = null;
+        let planBiller: string | null = null;
         if (provider.plans?.length) {
             const plan = provider.plans.find((p) => p.code === String(plan_code || ""));
             if (!plan) {
                 return res.status(400).json({
                     success: false,
-                    error: `Choose a ${provider.name} package`,
+                    error: `Choose a ${provider.display_name || provider.name} package`,
                     plans: provider.plans,
                 });
             }
             billAmount = plan.amount;
             planName = plan.name;
+            itemCode = plan.code;
+            planBiller = plan.biller_code || provider.code;
         } else {
             billAmount = Math.round(Number(amount) * 100) / 100;
         }
@@ -416,12 +558,12 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
         const insertRes = await query(
             `INSERT INTO bill_payments
              (business_id, user_id, wallet_id, reference, category, provider_code, provider_name,
-              plan_code, plan_name, customer_ref, customer_phone, amount, fee, total, currency, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
+              plan_code, plan_name, item_code, customer_ref, customer_phone, amount, fee, total, currency, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending')
              RETURNING *`,
             [
-                owningBusinessId, userId, wallet.id, reference, provider.category, provider.code, provider.name,
-                plan_code || null, planName, customerRef, customer_phone ? String(customer_phone).trim() : null,
+                owningBusinessId, userId, wallet.id, reference, provider.category, provider.code, provider.display_name || provider.name,
+                itemCode, planName, itemCode, customerRef, customer_phone ? String(customer_phone).trim() : null,
                 billAmount, fee, total, wallet.currency || "NGN",
             ]
         );
@@ -433,7 +575,7 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
              VALUES ($1, $2, $3, $4, $5, 'success', 'debit', $6, 'bill', $7, 'debit', $8)`,
             [
                 owningBusinessId, userId, total, wallet.currency || "NGN", reference,
-                `${provider.name}${planName ? ` (${planName})` : ""} — ${customerRef}`,
+                `${provider.display_name || provider.name}${planName ? ` (${planName})` : ""} — ${customerRef}`,
                 wallet.id, fee,
             ]
         );
@@ -447,34 +589,37 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
         }
 
         // ---- Fulfil via Flutterwave bills (REAL payment — no simulation) ----
-        const flwType = plan_code || provider.code; // fixed-price items use item_code, free-amount use biller_code
-        const fulfilmentRaw = await flwPayBill({
-            reference,
+        const fulfilment = await createBillPayment({
+            billerCode: planBiller || provider.code,
+            itemCode: itemCode || undefined,
             customer: customerRef,
             amount: billAmount,
-            type: flwType,
+            reference,
+            country: "NG",
+            callbackUrl: process.env.API_BASE_URL ? `${String(process.env.API_BASE_URL).replace(/\/$/, "")}/api/webhook` : undefined,
         });
-        const fulfilment = {
-            ok: fulfilmentRaw.ok,
-            mode: "provider" as const,
-            providerReference: fulfilmentRaw.provider_reference || null,
-            message: fulfilmentRaw.error,
-            raw: fulfilmentRaw.raw,
-        };
 
-        const finalStatus = fulfilment.ok ? "success" : "failed";
+        const providerStatus = String(fulfilment.raw?.data?.status || fulfilment.raw?.data?.code || "").toUpperCase();
+        const pendingStatuses = ["PENDING", "PROCESSING", "IN_PROGRESS", "QUEUED"];
+        const isPending = fulfilment.ok && (fulfilment.pending === true || pendingStatuses.includes(providerStatus));
+        const rechargeToken = fulfilment.raw?.data?.recharge_token || null;
+        const finalStatus = !fulfilment.ok ? "failed" : isPending ? "pending" : "success";
+
         await query(
             `UPDATE bill_payments
-             SET status = $2, fulfilment_mode = $3, provider_reference = $4,
-                 provider_response = $5::jsonb, failure_reason = $6, updated_at = CURRENT_TIMESTAMP
+             SET status = $2, fulfilment_mode = 'provider', provider_reference = $3,
+                 provider_response = $4::jsonb, failure_reason = $5,
+                 recharge_token = $6, updated_at = CURRENT_TIMESTAMP
              WHERE id = $1`,
             [
-                bill.id, finalStatus, fulfilment.mode, fulfilment.providerReference || null,
-                JSON.stringify(fulfilment), fulfilment.ok ? null : fulfilment.message || "Fulfilment failed",
+                bill.id, finalStatus, fulfilment.provider_reference || null,
+                JSON.stringify(fulfilment), fulfilment.ok ? null : fulfilment.error || "Fulfilment failed",
+                rechargeToken,
             ]
         );
 
-        // Refund on fulfilment failure (wallet is credited back instantly).
+        // Refund ONLY on a hard failure. Pending bills stay pending — the
+        // webhook (or the status poll) settles or refunds them later.
         if (!fulfilment.ok) {
             await query(
                 `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
@@ -486,7 +631,7 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
                  VALUES ($1, $2, $3, $4, $5, 'success', 'credit', $6, 'bill_refund', $7, 'credit')`,
                 [
                     owningBusinessId, userId, total, wallet.currency || "NGN", `${reference}-REFUND`,
-                    `Bill payment refund — ${provider.name} (${customerRef})`, wallet.id,
+                    `Bill payment refund — ${provider.display_name || provider.name} (${customerRef})`, wallet.id,
                 ]
             );
         }
@@ -496,12 +641,17 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
             await createNotification({
                 businessId: owningBusinessId || businessId,
                 userId,
-                type: finalStatus === "success" ? "debit" : "system",
-                title: finalStatus === "success" ? "Bill Payment Successful" : "Bill Payment Failed",
+                type: finalStatus === "success" ? "debit" : finalStatus === "pending" ? "system" : "system",
+                title:
+                    finalStatus === "success" ? "Bill Payment Successful"
+                    : finalStatus === "pending" ? "Bill Payment Processing"
+                    : "Bill Payment Failed",
                 message:
                     finalStatus === "success"
-                        ? `${provider.name}${planName ? ` (${planName})` : ""} for ${customerRef}: -${total.toLocaleString()} ${wallet.currency || "NGN"} (fee: ${fee})`
-                        : `${provider.name} payment failed and was refunded: ${fulfilment.message || "contact support"}`,
+                        ? `${provider.display_name || provider.name}${planName ? ` (${planName})` : ""} for ${customerRef}: -${total.toLocaleString()} ${wallet.currency || "NGN"} (fee: ${fee})`
+                        : finalStatus === "pending"
+                          ? `${provider.display_name || provider.name} payment is processing — we'll confirm shortly.`
+                          : `${provider.display_name || provider.name} payment failed and was refunded: ${fulfilment.error || "contact support"}`,
                 actionUrl: "/bills",
                 actionType: "view_bill",
                 metadata: { reference, category: provider.category, amount: billAmount, fee, total },
@@ -514,15 +664,81 @@ router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
         const updated = await query(`SELECT * FROM bill_payments WHERE id = $1`, [bill.id]);
         res.json({
-            success: finalStatus === "success",
+            success: finalStatus !== "failed",
+            pending: finalStatus === "pending",
             bill: updated.rows[0],
-            message: finalStatus === "success"
-                ? `${provider.name} payment successful`
-                : `Payment failed and refunded: ${fulfilment.message || "please try again"}`,
+            message:
+                finalStatus === "success"
+                    ? `${provider.display_name || provider.name} payment successful`
+                    : finalStatus === "pending"
+                      ? "Payment is processing — you'll be notified as soon as the provider confirms."
+                      : `Payment failed and refunded: ${fulfilment.error || "please try again"}`,
         });
     } catch (error) {
         console.error("Pay bill error:", error);
         res.status(500).json({ success: false, error: "Failed to process bill payment" });
+    }
+});
+
+/**
+ * @openapi
+ * /bills/{id}/sync:
+ *   post:
+ *     summary: Pull the latest status of a pending bill payment from Flutterwave
+ *     tags: [Bills]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Refreshed bill payment record (settles or refunds when the provider resolved it)
+ */
+router.post("/:id/sync", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const { userId, businessId } = req.user!;
+        const billRes = await query(
+            `SELECT * FROM bill_payments WHERE (id::text = $1 OR reference = $1) AND (user_id = $2 OR business_id = $3)`,
+            [req.params.id, userId, businessId || null]
+        );
+        const bill = billRes.rows[0];
+        if (!bill) return res.status(404).json({ success: false, error: "Bill payment not found" });
+        if (bill.status !== "pending") return res.json({ success: true, bill, changed: false });
+
+        const remote = bill.provider_reference
+            ? await getBillPaymentByReference(bill.reference)
+            : null;
+        const remoteStatus = String(remote?.status || "").toUpperCase();
+        if (!remote || !remoteStatus) return res.json({ success: true, bill, changed: false });
+
+        let finalStatus: string | null = null;
+        if (["SUCCESSFUL", "SUCCESS", "COMPLETED", "DELIVERED"].includes(remoteStatus)) finalStatus = "success";
+        else if (["FAILED", "REJECTED", "REVERSED"].includes(remoteStatus)) finalStatus = "failed";
+        if (!finalStatus) return res.json({ success: true, bill, changed: false });
+
+        const total = Number(bill.total);
+        await query(
+            `UPDATE bill_payments SET status = $2, provider_response = $3::jsonb,
+                recharge_token = COALESCE($4, recharge_token), updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [bill.id, finalStatus, JSON.stringify(remote), remote?.recharge_token || null]
+        );
+        if (finalStatus === "failed") {
+            await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [total, bill.wallet_id]);
+            await query(
+                `INSERT INTO transactions
+                 (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
+                 VALUES ($1, $2, $3, $4, $5, 'success', 'credit', $6, 'bill_refund', $7, 'credit')`,
+                [bill.business_id, bill.user_id, total, bill.currency || "NGN", `${bill.reference}-REFUND`,
+                 `Bill payment refund — ${bill.provider_name} (${bill.customer_ref})`, bill.wallet_id]
+            );
+        }
+        const updated = await query(`SELECT * FROM bill_payments WHERE id = $1`, [bill.id]);
+        res.json({ success: true, bill: updated.rows[0], changed: true, status: finalStatus });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: "Could not sync bill status" });
     }
 });
 
@@ -550,7 +766,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
         const { id } = req.params;
         const { userId, businessId } = req.user!;
         const billRes = await query(
-            `SELECT * FROM bill_payments WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
+            `SELECT * FROM bill_payments WHERE (id::text = $1 OR reference = $1) AND (user_id = $2 OR business_id = $3)`,
             [id, userId, businessId || null]
         );
         if (billRes.rows.length === 0) return res.status(404).json({ success: false, error: "Bill payment not found" });

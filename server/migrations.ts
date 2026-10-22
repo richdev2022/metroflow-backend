@@ -1,6 +1,7 @@
 import { query } from "./db";
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
+import { ensureBillsSchema } from "./features/personal/bills";
 import { ensureGiftcardSchema } from "./features/personal/giftcards";
 import { ensureEsimSchema } from "./features/personal/esim";
 import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
@@ -75,6 +76,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureFraudSchema", ensureFraudSchema); // fraud rules/evaluations/cases/blacklists + due diligence
   await step("repairFreeForeverStatuses", repairFreeForeverStatuses); // reactivate free-plan businesses wrongly deactivated by the old trial cron
   await step("ensurePersonalSchema", ensurePersonalSchema); // dormant personal features: bills hub + savings vaults
+  await step("ensureBillsSchema", ensureBillsSchema); // bills hub v2: recharge tokens + item codes
   await step("ensureGiftcardSchema", ensureGiftcardSchema); // gift card trading (Prestmit)
   await step("ensureEsimSchema", ensureEsimSchema); // eSIM top-ups (pluggable provider, simulator first)
   await step("ensureVirtualCardSchema", ensureVirtualCardSchema); // personal USD virtual cards (Bitnob)

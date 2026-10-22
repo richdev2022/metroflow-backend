@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
-import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction } from "../personal-utils";
+import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction, verifyTransactionPin } from "../personal-utils";
 import { evaluateOutflow, fraudRejectReason } from "../../../services/fraud";
 import { createNotification } from "../../../services/notifications";
 
@@ -187,7 +187,8 @@ router.get("/mine", authenticateToken, async (req: AuthenticatedRequest, res) =>
 
 // ---------------------------------------------------------------------------
 // Gifting — TikTok-style. Catalog is static in code so the tray renders
-// instantly and prices can't drift between app versions. Prices are NGN.
+// instantly; the ADMIN sets per-gift price overrides + all livestream fees
+// via system_settings ('live_settings'). Prices are NGN.
 // ---------------------------------------------------------------------------
 const LIVE_GIFTS = [
   { id: "rose", name: "Rose", icon: "🌹", price: 20 },
@@ -202,8 +203,42 @@ const LIVE_GIFTS = [
   { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000 },
 ] as const;
 
-function findGift(giftId: string) {
-  return LIVE_GIFTS.find((g) => g.id === String(giftId || "").trim().toLowerCase());
+interface LiveSettings {
+  currency: string;
+  gift_prices: Record<string, number>;
+  gift_commission_percent: number;
+  withdrawal_fee_percent: number;
+  withdrawal_fee_flat: number;
+  withdrawal_min: number;
+  battle_duration_seconds: number;
+  battle_multiplier: number;
+}
+
+const DEFAULT_LIVE_SETTINGS: LiveSettings = {
+  currency: "NGN",
+  gift_prices: {},
+  gift_commission_percent: 0,
+  withdrawal_fee_percent: 0,
+  withdrawal_fee_flat: 0,
+  withdrawal_min: 1000,
+  battle_duration_seconds: 300,
+  battle_multiplier: 2,
+};
+
+/** Admin-configurable livestream economics (fees, gift prices, battle defaults). */
+export async function getLiveSettings(): Promise<LiveSettings> {
+  try {
+    const r = await query(`SELECT value FROM system_settings WHERE key = 'live_settings' LIMIT 1`);
+    if (r.rows[0]?.value) return { ...DEFAULT_LIVE_SETTINGS, ...JSON.parse(r.rows[0].value) };
+  } catch { /* defaults */ }
+  return DEFAULT_LIVE_SETTINGS;
+}
+
+function findGift(giftId: string, settings?: LiveSettings) {
+  const g = LIVE_GIFTS.find((x) => x.id === String(giftId || "").trim().toLowerCase());
+  if (!g) return null;
+  const override = settings?.gift_prices?.[g.id];
+  return { ...g, price: Number.isFinite(override) && Number(override) >= 0 ? Math.round(Number(override) * 100) / 100 : g.price };
 }
 
 /** Resolve a live session by UUID id OR by its call_code (the room UI only knows the code). */
@@ -217,17 +252,165 @@ async function resolveLiveSession(idOrCode: string, includeEnded = false) {
 }
 
 router.get("/gifts", authenticateToken, async (_req: AuthenticatedRequest, res) => {
+  const settings = await getLiveSettings();
   res.json({
     success: true,
-    data: { gifts: LIVE_GIFTS.map((g) => ({ id: g.id, name: g.name, icon: g.icon, price: g.price, currency: "NGN" })) },
+    data: {
+      gifts: LIVE_GIFTS.map((g) => {
+        const priced = findGift(g.id, settings)!;
+        return { id: priced.id, name: priced.name, icon: priced.icon, price: priced.price, currency: settings.currency || "NGN" };
+      }),
+      battle: { duration_seconds: settings.battle_duration_seconds, multiplier: settings.battle_multiplier },
+    },
   });
+});
+
+// NOTE: pocket routes are declared BEFORE "/:id" so "pocket" is never
+// swallowed as a session id.
+router.get("/pocket", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const settings = await getLiveSettings();
+    await query(
+      `INSERT INTO live_gift_pockets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+    const pocket = await query(
+      `SELECT total_earned, total_withdrawn, updated_at FROM live_gift_pockets WHERE user_id = $1`,
+      [userId],
+    );
+    const earned = Number(pocket.rows[0]?.total_earned) || 0;
+    const withdrawn = Number(pocket.rows[0]?.total_withdrawn) || 0;
+    const withdrawals = await query(
+      `SELECT id, amount, fee, net_amount, reference, status, created_at
+         FROM live_pocket_withdrawals WHERE user_id = $1
+        ORDER BY created_at DESC LIMIT 20`,
+      [userId],
+    );
+    const perSession = await query(
+      `SELECT l.id AS session_id, l.title, l.call_code, l.started_at, l.ended_at,
+              COALESCE(SUM(g.host_amount), 0)::float8 AS earned, COUNT(g.id)::int AS gift_count
+         FROM live_gifts g JOIN live_sessions l ON l.id = g.session_id
+        WHERE g.host_user_id = $1 AND g.status = 'completed'
+        GROUP BY l.id, l.title, l.call_code, l.started_at, l.ended_at
+        ORDER BY MAX(g.created_at) DESC LIMIT 10`,
+      [userId],
+    );
+    const pct = Number(settings.withdrawal_fee_percent) || 0;
+    const flat = Number(settings.withdrawal_fee_flat) || 0;
+    res.json({
+      success: true,
+      data: {
+        balance: Math.max(0, Math.round((earned - withdrawn) * 100) / 100),
+        total_earned: earned,
+        total_withdrawn: withdrawn,
+        currency: settings.currency || "NGN",
+        fees: {
+          withdrawal_fee_percent: pct,
+          withdrawal_fee_flat: flat,
+          withdrawal_min: Number(settings.withdrawal_min) || 0,
+          example: pct + flat > 0
+            ? Math.round((0.01 * pct + flat) * 100) / 100
+            : 0,
+        },
+        withdrawals: withdrawals.rows.map((w: any) => ({ ...w, amount: Number(w.amount), fee: Number(w.fee), net_amount: Number(w.net_amount) })),
+        sessions: perSession.rows.map((s: any) => ({ ...s, earned: Number(s.earned) })),
+      },
+    });
+  } catch (e: any) {
+    console.error("live pocket error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load gift pocket" });
+  }
+});
+
+router.post("/pocket/withdraw", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const settings = await getLiveSettings();
+    const amount = Math.round(Number(req.body?.amount) * 100) / 100;
+    const min = Number(settings.withdrawal_min) || 0;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "Enter a valid withdrawal amount" });
+    }
+    if (amount < min) {
+      return res.status(400).json({ success: false, code: "BELOW_MIN", error: `Minimum withdrawal is ₦${min.toLocaleString()}.` });
+    }
+
+    const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+    if (!pinCheck.ok) {
+      return res.status(pinCheck.code === "PIN_REQUIRED" || pinCheck.code === "INVALID_PIN" ? 400 : 403)
+        .json({ success: false, code: pinCheck.code, error: pinCheck.error });
+    }
+
+    // Atomic guard: only withdraw what the pocket actually holds.
+    const upd = await query(
+      `UPDATE live_gift_pockets
+          SET total_withdrawn = total_withdrawn + $2, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $1 AND (total_earned - total_withdrawn) >= $2
+        RETURNING total_earned, total_withdrawn`,
+      [userId, amount],
+    );
+    if (!upd.rows[0]) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_POCKET", error: "Not enough earnings in your gift pocket" });
+    }
+
+    const fee = Math.round((amount * (Number(settings.withdrawal_fee_percent) || 0) / 100 + (Number(settings.withdrawal_fee_flat) || 0)) * 100) / 100;
+    const net = Math.round((amount - fee) * 100) / 100;
+    if (net <= 0) {
+      await query(`UPDATE live_gift_pockets SET total_withdrawn = GREATEST(0, total_withdrawn - $2) WHERE user_id = $1`, [userId, amount]);
+      return res.status(400).json({ success: false, error: "Fee exceeds the withdrawal amount — try a larger amount" });
+    }
+    const reference = genRef("LPWD");
+
+    try {
+      const walletRes = await query(
+        `SELECT id FROM wallets WHERE user_id = $1 AND UPPER(currency) = 'NGN' AND status = 'active' LIMIT 1`,
+        [userId],
+      );
+      const wallet = walletRes.rows[0];
+      if (!wallet) throw new Error("No active NGN wallet");
+
+      await creditWallet(wallet.id, net);
+      await insertTransaction({
+        userId, walletId: wallet.id, reference, type: "credit",
+        transactionType: "live_pocket_withdrawal", amount: net, currency: "NGN",
+        description: `Livestream gift earnings withdrawal${fee > 0 ? ` (fee ₦${fee.toLocaleString()})` : ""}`,
+      });
+      const wd = await query(
+        `INSERT INTO live_pocket_withdrawals (user_id, amount, fee, net_amount, reference)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id, created_at`,
+        [userId, amount, fee, net, reference],
+      );
+      createNotification({
+        userId, type: "transaction", title: "Gift earnings withdrawn",
+        message: `₦${net.toLocaleString()} added to your NGN wallet${fee > 0 ? ` (fee ₦${fee.toLocaleString()})` : ""}.`,
+      }).catch(() => {});
+      res.status(201).json({
+        success: true,
+        data: {
+          withdrawal: { id: wd.rows[0].id, amount, fee, net_amount: net, reference, created_at: wd.rows[0].created_at },
+          pocket_balance: Math.max(0, Math.round((Number(upd.rows[0].total_earned) - Number(upd.rows[0].total_withdrawn)) * 100) / 100),
+        },
+        message: `₦${net.toLocaleString()} sent to your NGN wallet`,
+      });
+    } catch (e: any) {
+      // Roll the pocket back — the money must never leave without landing.
+      await query(`UPDATE live_gift_pockets SET total_withdrawn = GREATEST(0, total_withdrawn - $2) WHERE user_id = $1`, [userId, amount]).catch(() => {});
+      console.error("live pocket withdraw failed:", e?.message);
+      res.status(500).json({ success: false, error: "Withdrawal failed — your earnings are safe in the pocket" });
+    }
+  } catch (e: any) {
+    console.error("live pocket withdraw error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not withdraw" });
+  }
 });
 
 router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "live"))) return;
     const userId = req.user!.userId;
-    const gift = findGift(String(req.body?.gift_id || ""));
+    const settings = await getLiveSettings();
+    const gift = findGift(String(req.body?.gift_id || ""), settings);
     const quantity = Math.floor(Number(req.body?.quantity || 1));
     if (!gift) return res.status(400).json({ success: false, error: "Unknown gift" });
     if (!Number.isFinite(quantity) || quantity < 1 || quantity > 99) {
@@ -238,6 +421,11 @@ router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, r
     if (session.host_id === userId) return res.status(400).json({ success: false, error: "You cannot gift your own stream" });
 
     const total = Math.round(gift.price * quantity * 100) / 100;
+    // Admin-configured platform commission on gifts; the net lands in the
+    // host's LIVESTREAM GIFT POCKET (not their wallet) — streamers withdraw
+    // from the pocket to their NGN wallet (withdrawal fee applies there).
+    const commission = Math.round(total * (Number(settings.gift_commission_percent) || 0)) / 100;
+    const hostAmount = Math.max(0, Math.round((total - commission) * 100) / 100);
     const reference = genRef("LGFT");
 
     // FRAUD GATE — gifting is real money leaving the sender's wallet.
@@ -287,12 +475,41 @@ router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, r
       });
     }
 
-    const hostWalletRes = await query(
-      `SELECT id FROM wallets WHERE user_id = $1 AND UPPER(currency) = 'NGN' AND status = 'active' LIMIT 1`,
-      [session.host_id],
+    // Credit the HOST'S GIFT POCKET (atomic upsert). The host's withdrawable
+    // balance = total_earned - total_withdrawn on this row.
+    await query(
+      `INSERT INTO live_gift_pockets (user_id, total_earned)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE
+          SET total_earned = live_gift_pockets.total_earned + $2,
+              updated_at = CURRENT_TIMESTAMP`,
+      [session.host_id, hostAmount],
     );
-    const hostWallet = hostWalletRes.rows[0];
-    if (hostWallet) await creditWallet(hostWallet.id, total);
+
+    // BATTLE SCORING — gifts sent to a streamer mid-battle count toward their
+    // side at the configured multiplier ("x2 gifting points").
+    let battleScored: { battle_id: string; side: "a" | "b"; points: number } | null = null;
+    try {
+      const battleRes = await query(
+        `SELECT id, session_a_id, session_b_id FROM live_battles
+          WHERE status = 'active' AND ends_at > NOW()
+            AND (session_a_id = $1 OR session_b_id = $1)
+          LIMIT 1`,
+        [session.id],
+      ).catch(() => ({ rows: [] as any[] }));
+      const battle = battleRes.rows[0];
+      if (battle) {
+        const points = Math.round(total * (Number(settings.battle_multiplier) || 1) * 100) / 100;
+        const side: "a" | "b" = battle.session_a_id === session.id ? "a" : "b";
+        await query(
+          `UPDATE live_battles SET score_${side} = score_${side} + $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [battle.id, points],
+        );
+        battleScored = { battle_id: battle.id, side, points };
+      }
+    } catch (e: any) {
+      console.error("[live:gifts] battle scoring skipped:", e?.message);
+    }
 
     try {
       await insertTransaction({
@@ -300,19 +517,11 @@ router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, r
         transactionType: "live_gift", amount: total, currency: "NGN",
         description: `Live gift ${gift.icon} ${gift.name} x${quantity} — ${String(session.title || "Live").slice(0, 60)}`,
       });
-      if (hostWallet) {
-        await insertTransaction({
-          userId: session.host_id, walletId: hostWallet.id,
-          reference: `${reference}-IN`, type: "credit",
-          transactionType: "live_gift_receive", amount: total, currency: "NGN",
-          description: `Live gift received ${gift.icon} ${gift.name} x${quantity}`,
-        });
-      }
       const ins = await query(
         `INSERT INTO live_gifts
-           (session_id, sender_id, host_user_id, gift_id, gift_name, gift_icon, quantity, unit_price, total_amount, reference, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-        [session.id, userId, session.host_id, gift.id, gift.name, gift.icon, quantity, gift.price, total, reference,
+           (session_id, sender_id, host_user_id, gift_id, gift_name, gift_icon, quantity, unit_price, total_amount, commission_amount, host_amount, reference, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [session.id, userId, session.host_id, gift.id, gift.name, gift.icon, quantity, gift.price, total, commission, hostAmount, reference,
          decision === "hold" ? "held" : "completed"],
       );
       await query(`UPDATE live_sessions SET gift_count = gift_count + $2 WHERE id = $1`, [session.id, quantity]);
@@ -334,14 +543,25 @@ router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, r
           session_id: session.id,
           reference,
           balance: Number(balRes.rows[0]?.balance || 0),
+          ...(battleScored ? { battle: battleScored } : {}),
           ...(decision === "hold" ? { held: true, fraud: { score: fraud?.score ?? 0 } } : {}),
         },
       });
     } catch (e: any) {
-      // Ledger insert failed — refund the sender so money is never lost.
+      // Ledger insert failed — refund the sender and claw the pocket credit
+      // back so money is never lost or double-counted.
       console.error("[live:gifts] ledger failed, refunding:", e?.message);
       await creditWallet(senderWallet.id, total).catch(() => {});
-      if (hostWallet) await debitWallet(hostWallet.id, total).catch(() => {});
+      await query(
+        `UPDATE live_gift_pockets SET total_earned = GREATEST(0, total_earned - $2) WHERE user_id = $1`,
+        [session.host_id, hostAmount],
+      ).catch(() => {});
+      if (battleScored) {
+        await query(
+          `UPDATE live_battles SET score_${battleScored.side} = GREATEST(0, score_${battleScored.side} - $2) WHERE id = $1`,
+          [battleScored.battle_id, battleScored.points],
+        ).catch(() => {});
+      }
       return res.status(500).json({ success: false, error: "Gift could not be recorded — you were not charged" });
     }
   } catch (e: any) {
@@ -476,7 +696,7 @@ router.post("/:id/end", authenticateToken, async (req: AuthenticatedRequest, res
     }
     const r = await query(
       `UPDATE live_sessions SET status = 'ended', ended_at = CURRENT_TIMESTAMP, current_viewers = 0
-       WHERE id = $1 RETURNING peak_viewers, total_views, reaction_count`,
+       WHERE id = $1 RETURNING id, call_code, peak_viewers, total_views, reaction_count`,
       [s.id],
     );
     await query(`UPDATE live_viewers SET left_at = CURRENT_TIMESTAMP WHERE session_id = $1 AND left_at IS NULL`, [s.id]);
@@ -694,6 +914,371 @@ router.delete("/:id/cohost/:userId", authenticateToken, async (req: Authenticate
     res.json({ success: true, data: { cohost_ids: cohosts } });
   } catch {
     res.status(500).json({ success: false, error: "Could not remove co-host" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PK BATTLES — TikTok-style LIVE battles. Two live streamers link their
+// sessions; every gift a viewer sends to either stream mid-battle counts as
+// points for that side (multiplier applied). Highest score when the clock
+// hits zero wins. Win counts are lifetime (across all battles).
+// ---------------------------------------------------------------------------
+
+/** Finalize battles whose clock expired (lazy scheduler — no timers needed). */
+async function finalizeExpiredBattles() {
+  try {
+    await query(
+      `UPDATE live_battles
+          SET status = 'ended',
+              winner = CASE WHEN score_a > score_b THEN 'a'
+                            WHEN score_b > score_a THEN 'b'
+                            ELSE 'tie' END,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'active' AND ends_at IS NOT NULL AND ends_at <= NOW()`,
+    );
+  } catch (e: any) {
+    console.error("[live:battles] finalize error:", e?.message);
+  }
+}
+
+async function battleWinsFor(hostId: string): Promise<number> {
+  const r = await query(
+    `SELECT COUNT(*)::int AS c FROM live_battles
+      WHERE status = 'ended' AND ((winner = 'a' AND host_a_id = $1) OR (winner = 'b' AND host_b_id = $1))`,
+    [hostId],
+  );
+  return Number(r.rows[0]?.c) || 0;
+}
+
+function decorateBattle(b: any, viewerId: string) {
+  const iAmA = b.host_a_id === viewerId;
+  const nowActive = b.status === "active";
+  const secondsLeft = nowActive && b.ends_at
+    ? Math.max(0, Math.round((new Date(b.ends_at).getTime() - Date.now()) / 1000))
+    : 0;
+  return {
+    id: b.id,
+    status: b.status,
+    duration_seconds: b.duration_seconds,
+    started_at: b.started_at,
+    ends_at: b.ends_at,
+    seconds_left: secondsLeft,
+    scores: { a: Number(b.score_a) || 0, b: Number(b.score_b) || 0 },
+    winner: b.winner,
+    my_side: iAmA ? "a" : "b",
+    host_a: b.host_a_name ? { id: b.host_a_id, name: b.host_a_name, photo: b.host_a_photo } : undefined,
+    host_b: b.host_b_name ? { id: b.host_b_id, name: b.host_b_name, photo: b.host_b_photo } : undefined,
+  };
+}
+
+const BATTLE_SELECT = `
+  SELECT b.*, u_a.name AS host_a_name, u_a.avatar_url AS host_a_photo,
+         u_b.name AS host_b_name, u_b.avatar_url AS host_b_photo
+    FROM live_battles b
+    JOIN users u_a ON u_a.id = b.host_a_id
+    LEFT JOIN users u_b ON u_b.id = b.host_b_id`;
+
+/** Invite another live streamer to a PK battle (host only). */
+router.post("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const userId = req.user!.userId;
+    const settings = await getLiveSettings();
+    const mine = await sessionById(String(req.params.id));
+    if (!mine) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (mine.host_id !== userId) return res.status(403).json({ success: false, error: "Only the host can start a battle" });
+    if (mine.status !== "live") return res.status(400).json({ success: false, error: "Your stream is not live" });
+
+    const opponent = await resolveLiveSession(String(req.body?.opponent_session_id || req.body?.opponent || ""));
+    if (!opponent) return res.status(404).json({ success: false, error: "Opponent stream not found (or not live)" });
+    if (opponent.host_id === userId) return res.status(400).json({ success: false, error: "You can't battle yourself" });
+
+    // One pending/active battle per session at a time.
+    const clash = await query(
+      `SELECT id FROM live_battles
+        WHERE status IN ('pending', 'active')
+          AND (session_a_id IN ($1, $2) OR session_b_id IN ($1, $2))
+        LIMIT 1`,
+      [mine.id, opponent.id],
+    );
+    if (clash.rows[0]) return res.status(400).json({ success: false, error: "One of the streams is already in a battle", code: "ALREADY_IN_BATTLE" });
+
+    const duration = Math.min(3600, Math.max(60, Number(req.body?.duration_seconds) || settings.battle_duration_seconds));
+    // ONE canonical row binds BOTH sessions from the start: side A = initiator,
+    // side B = opponent. Accept flips it active; gift scoring updates score_a
+    // or score_b based on which session the gift landed on.
+    const ins = await query(
+      `INSERT INTO live_battles (session_a_id, session_b_id, host_a_id, host_b_id, duration_seconds)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [mine.id, opponent.id, userId, opponent.host_id, duration],
+    );
+
+    createNotification({
+      userId: opponent.host_id, type: "social", title: "⚔️ Battle invite",
+      message: `${req.user!.name || "A streamer"} challenged you to a LIVE battle — open your studio to accept.`,
+    }).catch(() => {});
+
+    const full = await query(`${BATTLE_SELECT} WHERE b.id = $1`, [ins.rows[0].id]);
+    res.status(201).json({ success: true, data: { battle: decorateBattle(full.rows[0], userId) } });
+  } catch (e: any) {
+    console.error("battle invite error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not create the battle" });
+  }
+});
+
+/** Battle state for a session (any viewer can poll — powers the PK HUD). */
+router.get("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    const r = await query(
+      `${BATTLE_SELECT}
+        WHERE (b.session_a_id = $1 OR b.session_b_id = $1)
+          AND b.status IN ('pending', 'active', 'ended')
+        ORDER BY b.created_at DESC LIMIT 1`,
+      [s.id],
+    );
+    if (!r.rows[0]) return res.json({ success: true, data: { battle: null } });
+    const b = r.rows[0];
+    const wins = await Promise.all([battleWinsFor(b.host_a_id), b.host_b_id ? battleWinsFor(b.host_b_id) : Promise.resolve(0)]);
+    res.json({
+      success: true,
+      data: {
+        battle: {
+          ...decorateBattle(b, req.user!.userId),
+          wins: { a: wins[0], b: wins[1] },
+          i_am_host_a: b.host_a_id === req.user!.userId,
+          i_am_host_b: b.host_b_id === req.user!.userId,
+          can_accept: b.status === "pending" && b.host_b_id === req.user!.userId,
+        },
+      },
+    });
+  } catch (e: any) {
+    console.error("battle state error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load the battle" });
+  }
+});
+
+router.post("/battles/:id/accept", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const userId = req.user!.userId;
+    const r = await query(`SELECT * FROM live_battles WHERE id = $1 AND status = 'pending'`, [req.params.id]);
+    const battle = r.rows[0];
+    if (!battle) return res.status(404).json({ success: false, error: "Battle invite not found" });
+
+    // The accepting side is whoever was invited via the notification — we
+    // resolve their CURRENT live session to bind as side B.
+    const mine = await query(`SELECT * FROM live_sessions WHERE host_id = $1 AND status = 'live' ORDER BY started_at DESC LIMIT 1`, [userId]);
+    if (!mine.rows[0]) return res.status(400).json({ success: false, error: "Go live first to accept a battle" });
+
+    const upd = await query(
+      `UPDATE live_battles
+          SET session_b_id = $2, host_b_id = $3, status = 'active',
+              started_at = CURRENT_TIMESTAMP, ends_at = CURRENT_TIMESTAMP + (duration_seconds || ' seconds')::INTERVAL,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND status = 'pending'
+        RETURNING *`,
+      [battle.id, mine.rows[0].id, userId],
+    );
+    if (!upd.rows[0]) return res.status(400).json({ success: false, error: "Battle is no longer pending" });
+
+    createNotification({
+      userId: battle.host_a_id, type: "social", title: "⚔️ Battle started",
+      message: `${req.user!.name || "Your opponent"} accepted — the battle is LIVE. Gifts now score points!`,
+    }).catch(() => {});
+    const full = await query(`${BATTLE_SELECT} WHERE b.id = $1`, [battle.id]);
+    res.json({ success: true, data: { battle: decorateBattle(full.rows[0], userId) } });
+  } catch (e: any) {
+    console.error("battle accept error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not accept the battle" });
+  }
+});
+
+router.post("/battles/:id/decline", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `UPDATE live_battles SET status = 'declined', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND status = 'pending' RETURNING host_a_id`,
+      [req.params.id],
+    );
+    if (!r.rows[0]) return res.status(404).json({ success: false, error: "Battle invite not found" });
+    createNotification({ userId: r.rows[0].host_a_id, type: "social", title: "Battle declined", message: "Your battle invite was declined." }).catch(() => {});
+    res.json({ success: true, data: { status: "declined" } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not decline the battle" });
+  }
+});
+
+router.post("/battles/:id/cancel", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `UPDATE live_battles SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND host_a_id = $2 AND status = 'pending' RETURNING id`,
+      [req.params.id, req.user!.userId],
+    );
+    if (!r.rows[0]) return res.status(404).json({ success: false, error: "Battle invite not found" });
+    res.json({ success: true, data: { status: "cancelled" } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not cancel the battle" });
+  }
+});
+
+/** Battleable opponents — other LIVE hosts (powers the battle invite picker). */
+router.get("/battles/opponents", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const rows = await query(
+      `SELECT l.id AS session_id, l.call_code, l.title, l.category, l.current_viewers, l.started_at,
+              u.id AS host_id, u.name AS host_name, u.avatar_url AS host_photo,
+              EXISTS (SELECT 1 FROM live_battles b WHERE b.status IN ('pending','active')
+                      AND (b.session_a_id = l.id OR b.session_b_id = l.id)) AS in_battle
+         FROM live_sessions l JOIN users u ON u.id = l.host_id
+        WHERE l.status = 'live' AND l.host_id <> $1
+        ORDER BY l.current_viewers DESC LIMIT 30`,
+      [req.user!.userId],
+    );
+    res.json({ success: true, data: { opponents: rows.rows } });
+  } catch (e: any) {
+    console.error("battle opponents error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load opponents" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// VIEWER RANKINGS — TikTok "Top viewers" + "Guardian" tabs.
+//   Top viewers: ranked by cumulative watch time on this session.
+//   Guardian:    ranked by gift value sent this session; #1 is the Guardian.
+// ---------------------------------------------------------------------------
+router.get("/:id/rankings", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+
+    const topViewers = await query(
+      `SELECT v.user_id, COALESCE(NULLIF(u.name, ''), u.email, 'Viewer') AS name, u.avatar_url AS photo,
+              SUM(GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(v.left_at, NOW()), COALESCE($2::timestamptz, NOW())) - v.joined_at))))::int AS watch_seconds
+         FROM live_viewers v LEFT JOIN users u ON u.id = v.user_id
+        WHERE v.session_id = $1
+        GROUP BY v.user_id, u.name, u.email, u.avatar_url
+        ORDER BY watch_seconds DESC
+        LIMIT 20`,
+      [s.id, s.ended_at ?? null],
+    );
+    const topGifters = await query(
+      `SELECT g.sender_id, COALESCE(NULLIF(u.name, ''), u.email, 'Viewer') AS name, u.avatar_url AS photo,
+              SUM(g.total_amount)::float8 AS total_sent, COUNT(*)::int AS gift_count
+         FROM live_gifts g LEFT JOIN users u ON u.id = g.sender_id
+        WHERE g.session_id = $1 AND g.status = 'completed'
+        GROUP BY g.sender_id, u.name, u.email, u.avatar_url
+        ORDER BY total_sent DESC
+        LIMIT 20`,
+      [s.id],
+    );
+    res.json({
+      success: true,
+      data: {
+        top_viewers: topViewers.rows.map((v: any) => ({ ...v, watch_seconds: Number(v.watch_seconds) || 0 })),
+        top_gifters: topGifters.rows.map((g: any) => ({ ...g, total_sent: Number(g.total_sent) })),
+        guardian: topGifters.rows[0]
+          ? { ...topGifters.rows[0], total_sent: Number(topGifters.rows[0].total_sent) }
+          : null,
+      },
+    });
+  } catch (e: any) {
+    console.error("rankings error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load rankings" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// STREAM LOG / DETAIL — the full activity record for a session. Powers the
+// post-stream summary page (host) and the public stream recap (viewers).
+// ---------------------------------------------------------------------------
+router.get("/:id/detail", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    const viewerId = req.user!.userId;
+    const isHost = s.host_id === viewerId;
+
+    const durationSeconds = Math.max(0, Math.round(
+      ((s.ended_at ? new Date(s.ended_at).getTime() : Date.now()) - new Date(s.started_at).getTime()) / 1000,
+    ));
+
+    const [recent, topGifters, totals, viewers, reactions, chatCount, battleRows] = await Promise.all([
+      query(
+        `SELECT g.id, g.gift_id, g.gift_name, g.gift_icon, g.quantity, g.total_amount, g.created_at,
+                COALESCE(NULLIF(u.name, ''), u.email, 'Someone') AS sender_name, u.avatar_url AS sender_photo
+           FROM live_gifts g LEFT JOIN users u ON u.id = g.sender_id
+          WHERE g.session_id = $1 AND g.status = 'completed'
+          ORDER BY g.created_at DESC LIMIT 50`,
+        [s.id],
+      ),
+      query(
+        `SELECT g.sender_id, COALESCE(NULLIF(u.name, ''), u.email, 'Someone') AS name, u.avatar_url AS photo,
+                SUM(g.total_amount)::float8 AS total_sent, COUNT(*)::int AS gift_count
+           FROM live_gifts g LEFT JOIN users u ON u.id = g.sender_id
+          WHERE g.session_id = $1 AND g.status = 'completed'
+          GROUP BY g.sender_id, u.name, u.email, u.avatar_url
+          ORDER BY total_sent DESC LIMIT 10`,
+        [s.id],
+      ),
+      query(
+        `SELECT COALESCE(SUM(total_amount), 0)::float8 AS gift_value,
+                COALESCE(SUM(commission_amount), 0)::float8 AS commission,
+                COALESCE(SUM(host_amount), 0)::float8 AS host_net,
+                COUNT(*)::int AS gift_events
+           FROM live_gifts WHERE session_id = $1 AND status = 'completed'`,
+        [s.id],
+      ),
+      query(
+        `SELECT COUNT(DISTINCT user_id)::int AS unique_viewers FROM live_viewers WHERE session_id = $1`,
+        [s.id],
+      ),
+      query(`SELECT COUNT(*)::int AS c FROM live_reactions WHERE session_id = $1`, [s.id]),
+      query(`SELECT COUNT(*)::int AS c FROM live_messages WHERE session_id = $1`, [s.id]),
+      query(
+        `${BATTLE_SELECT} WHERE b.session_a_id = $1 OR b.session_b_id = $1 ORDER BY b.created_at DESC LIMIT 5`,
+        [s.id],
+      ),
+    ]);
+
+    const t = totals.rows[0] || {};
+    const battles = battleRows.rows.map((b: any) => decorateBattle(b, viewerId));
+
+    res.json({
+      success: true,
+      data: {
+        session: {
+          id: s.id, title: s.title, description: s.description, category: s.category,
+          call_code: s.call_code, status: s.status, started_at: s.started_at, ended_at: s.ended_at,
+          duration_seconds: durationSeconds,
+          peak_viewers: Number(s.peak_viewers) || 0, current_viewers: Number(s.current_viewers) || 0,
+          total_views: Number(s.total_views) || 0, reaction_count: Number(s.reaction_count) || 0,
+          gift_count: Number(s.gift_count) || 0,
+        },
+        host: { id: s.host_id, name: s.host_name, photo: s.host_photo },
+        is_host: isHost,
+        stats: {
+          unique_viewers: Number(viewers.rows[0]?.unique_viewers) || 0,
+          reaction_count: Number(reactions.rows[0]?.c) || 0,
+          message_count: Number(chatCount.rows[0]?.c) || 0,
+          gift_value: Number(t.gift_value) || 0,
+          gift_events: Number(t.gift_events) || 0,
+          // Money detail is host-only (platform commission is not public info).
+          ...(isHost ? { commission: Number(t.commission) || 0, host_net: Number(t.host_net) || 0 } : {}),
+        },
+        gifts: recent.rows.map((g: any) => ({ ...g, total_amount: Number(g.total_amount) })),
+        top_gifters: topGifters.rows.map((g: any) => ({ ...g, total_sent: Number(g.total_sent) })),
+        battles,
+      },
+    });
+  } catch (e: any) {
+    console.error("live detail error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load the stream detail" });
   }
 });
 

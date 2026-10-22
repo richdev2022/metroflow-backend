@@ -5,7 +5,7 @@ import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
   verifyTransactionPin, assertPersonalService, genRef,
 } from "../personal-utils";
-import { calculateFee } from "../../../services/fees";
+import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
@@ -27,8 +27,11 @@ import { friendshipMap } from "../../../routes/friends";
  *   POST   /social/posts/:id/comments        { body, parent_id? }
  *   DELETE /social/comments/:id
  *   POST   /social/posts/:id/share
- *   POST   /social/polls                     { question, options[], allow_multiple?, duration_hours?, hide_results_until_closed? }
- *   POST   /social/polls/:id/vote            { option_index | option_indexes[] }
+ *   POST   /social/polls                     { question, options[], allow_multiple?, duration_hours?, hide_results_until_closed?, poll_type?: free|paid, vote_price? }
+ *   GET    /social/polls/pricing             (paid-poll economics for composer UI)
+ *   POST   /social/polls/:id/vote            { option_index | option_indexes[] , pin? } — paid polls debit the NGN wallet
+ *   POST   /social/polls/:id/withdraw        (paid-poll creator withdraws the pool → NGN wallet; fee → revenue ledger)
+ *   GET    /social/vote-pocket               (creator's aggregate vote-pocket balance + withdrawal history)
  *   POST   /social/polls/:id/close           (author closes early)
  *   POST   /social/posts/:id/boost           { budget, duration_days, audience?, pin, wallet_id }
  *   GET    /social/boosts/mine
@@ -64,6 +67,37 @@ export async function getBoostPricing(): Promise<BoostPricing> {
     if (r.rows[0]?.value) return { ...DEFAULT_PRICING, ...JSON.parse(r.rows[0].value) };
   } catch { /* defaults */ }
   return DEFAULT_PRICING;
+}
+
+// ---------------------------------------------------------------------------
+// Poll economics (admin-managed via GET/PUT /admin/settings/poll)
+// ---------------------------------------------------------------------------
+export interface PollSettings {
+  currency: string;
+  default_vote_price: number;
+  min_vote_price: number;
+  max_vote_price: number;
+  withdrawal_fee_percent: number;
+  withdrawal_fee_flat: number;
+  withdrawal_min: number;
+}
+
+export const DEFAULT_POLL_SETTINGS: PollSettings = {
+  currency: "NGN",
+  default_vote_price: 100,
+  min_vote_price: 20,
+  max_vote_price: 100000,
+  withdrawal_fee_percent: 10,
+  withdrawal_fee_flat: 0,
+  withdrawal_min: 500,
+};
+
+export async function getPollSettings(): Promise<PollSettings> {
+  try {
+    const r = await query(`SELECT value FROM system_settings WHERE key = 'poll_settings' LIMIT 1`);
+    if (r.rows[0]?.value) return { ...DEFAULT_POLL_SETTINGS, ...JSON.parse(r.rows[0].value) };
+  } catch { /* defaults */ }
+  return DEFAULT_POLL_SETTINGS;
 }
 
 /** Deterministic reach estimate: budget ÷ (price per 1k) × 1000, tapered by
@@ -187,7 +221,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $3`; params.push(cursor.toISOString()); }
 
     const postsRes = await query(
-      `SELECT p.id, p.user_id, p.body, p.image_url, p.audience, p.share_count, p.created_at,
+      `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
@@ -241,6 +275,10 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           allow_multiple: pl.allow_multiple,
           hide_results_until_closed: pl.hide_results_until_closed,
           ends_at: pl.ends_at,
+          poll_type: pl.poll_type || "free",
+          vote_price: Number(pl.vote_price) || 0,
+          pool_earned: Number(pl.pool_earned) || 0,
+          pool_withdrawn: Number(pl.pool_withdrawn) || 0,
           status: pl.status === "active" && pl.ends_at && new Date(pl.ends_at) < new Date() ? "closed" : pl.status,
           total_votes: total,
           my_vote: myVotes.rows.length ? myVotes.rows.map((m) => m.option_index) : null,
@@ -265,7 +303,12 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           friendship_status: fMap.get(p.user_id) || "none",
         },
         message: poll ? poll.question : p.body,
+        // `body`/`content` aliases — clients read item.body for text posts; the
+        // missing alias is exactly why text-only posts rendered blank.
+        body: p.body,
+        content: p.body,
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
+        video_url: p.video_url || null,
         audience: p.audience,
         like_count: Number(p.like_count) || 0,
         comment_count: Number(p.comment_count) || 0,
@@ -277,6 +320,10 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           poll_options: poll.options.map((o: any) => ({ text: o.text, vote_count: o.vote_count })),
           allow_multiple: poll.allow_multiple,
           ends_at: poll.ends_at,
+          poll_type: poll.poll_type,
+          vote_price: poll.vote_price,
+          pool_earned: poll.pool_earned,
+          pool_withdrawn: poll.pool_withdrawn,
           status: poll.status,
           total_votes: poll.total_votes,
           my_vote: poll.my_vote,
@@ -321,25 +368,38 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 // ---------------------------------------------------------------------------
 // Posts
 // ---------------------------------------------------------------------------
-router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.single("image"), async (req: AuthenticatedRequest, res) => {
+router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 1 }, { name: "video", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "social"))) return;
     const userId = req.user!.userId;
     const body = String(req.body?.body ?? "").trim();
     const audience = ["public", "followers"].includes(req.body?.audience) ? req.body.audience : "public";
+    const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
+    const imageFile = files.image?.[0];
+    const videoFile = files.video?.[0];
     let imageUrl: string | null = null;
-    if (req.file) {
-      const up = await uploadMediaBuffer({ buffer: req.file.buffer, originalname: req.file.originalname, mimeType: req.file.mimetype, folder: "social-media", userId });
+    let videoUrl: string | null = null;
+    if (imageFile) {
+      const up = await uploadMediaBuffer({ buffer: imageFile.buffer, originalname: imageFile.originalname, mimeType: imageFile.mimetype, folder: "social-media", userId });
       imageUrl = up?.url || null;
     } else if (req.body?.image_url) {
       imageUrl = String(req.body.image_url).slice(0, 500);
     }
-    if (!body && !imageUrl) return res.status(400).json({ success: false, error: "Write something or attach a photo" });
+    // Video posts — the social_posts.video_url column existed but never had a
+    // write path. Accept a multipart `video` (multer allows video/* up to
+    // 500MB) or a pre-uploaded `video_url` (e.g. via /chat/media).
+    if (videoFile) {
+      const up = await uploadMediaBuffer({ buffer: videoFile.buffer, originalname: videoFile.originalname, mimeType: videoFile.mimetype, folder: "social-media", userId });
+      videoUrl = up?.url || null;
+    } else if (req.body?.video_url) {
+      videoUrl = String(req.body.video_url).slice(0, 500);
+    }
+    if (!body && !imageUrl && !videoUrl) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
     const r = await query(
-      `INSERT INTO social_posts (user_id, body, image_url, audience) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [userId, body, imageUrl, audience],
+      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [userId, body, imageUrl, videoUrl, audience],
     );
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     return res.status(201).json({
@@ -347,7 +407,9 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.single(
       data: {
         post: {
           kind: "post", id: r.rows[0].id, author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
-          message: r.rows[0].body, image_url: r.rows[0].image_url, like_count: 0, comment_count: 0,
+          message: r.rows[0].body, body: r.rows[0].body, content: r.rows[0].body,
+          image_url: r.rows[0].image_url, video_url: r.rows[0].video_url,
+          like_count: 0, comment_count: 0,
           share_count: 0, liked_by_me: false, created_at: r.rows[0].created_at,
         },
       },
@@ -483,7 +545,10 @@ router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRe
     const comments = r.rows.map((c) => ({
       id: c.id, post_id: c.post_id, parent_id: c.parent_id ?? null,
       author: { id: c.user_id, name: c.author_name, photo: c.author_photo },
-      message: c.body, like_count: c.like_count, created_at: c.created_at,
+      // `body`/`content` aliases — the web client reads comment.body; shipping
+      // only `message` made every comment render as username-only.
+      message: c.body, body: c.body, content: c.body,
+      like_count: c.like_count, created_at: c.created_at,
     }));
     res.json({ success: true, data: { comments }, comments });
   } catch {
@@ -521,7 +586,7 @@ router.post("/posts/:id/comments", authenticateToken, async (req: AuthenticatedR
     const comment = {
       id: r.rows[0].id, post_id: req.params.id, parent_id: parentId,
       author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
-      body, like_count: 0, created_at: r.rows[0].created_at,
+      body, message: body, content: body, like_count: 0, created_at: r.rows[0].created_at,
     };
     res.status(201).json({ success: true, data: { comment }, comment });
   } catch (e: any) {
@@ -584,15 +649,32 @@ router.post("/polls", authenticateToken, checkSubscriptionStatus, async (req: Au
       endsAt = new Date(Date.now() + Math.min(24 * 30, hoursArg) * 3600000);
     }
 
+    // Free vs paid: paid polls charge each voter `vote_price` from their NGN
+    // wallet into the poll pool; the creator withdraws at maturity (fee →
+    // revenue ledger). Paid polls are single-choice and votes are final.
+    const settings = await getPollSettings();
+    const pollType = req.body?.poll_type === "paid" ? "paid" : "free";
+    let votePrice = 0;
+    if (pollType === "paid") {
+      votePrice = Math.round(Number(req.body?.vote_price ?? settings.default_vote_price) * 100) / 100;
+      if (!Number.isFinite(votePrice) || votePrice < settings.min_vote_price || votePrice > settings.max_vote_price) {
+        return res.status(400).json({
+          success: false,
+          error: `Vote price must be between ₦${settings.min_vote_price.toLocaleString()} and ₦${settings.max_vote_price.toLocaleString()}`,
+          code: "INVALID_VOTE_PRICE",
+        });
+      }
+    }
+
     // A poll is a post whose body carries the question — keeps one feed model.
     const post = await query(
       `INSERT INTO social_posts (user_id, body, audience) VALUES ($1, $2, 'public') RETURNING id, created_at`,
       [userId, question],
     );
     const r = await query(
-      `INSERT INTO social_polls (post_id, user_id, question, options, allow_multiple, hide_results_until_closed, ends_at)
-       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7) RETURNING *`,
-      [post.rows[0].id, userId, question, JSON.stringify(options), allowMultiple, hideResults, endsAt],
+      `INSERT INTO social_polls (post_id, user_id, question, options, allow_multiple, hide_results_until_closed, ends_at, poll_type, vote_price)
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9) RETURNING *`,
+      [post.rows[0].id, userId, question, JSON.stringify(options), allowMultiple && pollType === "free", hideResults, endsAt, pollType, votePrice],
     );
     res.status(201).json({ success: true, data: { poll: r.rows[0], post_id: post.rows[0].id } });
   } catch (e: any) {
@@ -618,6 +700,82 @@ router.post("/polls/:id/vote", authenticateToken, async (req: AuthenticatedReque
     if (!valid.length) return res.status(400).json({ success: false, error: "Pick a valid option" });
     if (!p.allow_multiple && valid.length > 1) {
       return res.status(400).json({ success: false, error: "This poll allows one choice only" });
+    }
+
+    // ---- PAID POLLS: ₦ vote_price per vote, debited from the voter's NGN
+    // wallet into the poll pool. Single choice, votes are FINAL (no toggle,
+    // no refund, one vote per user). PIN-verified like every money flow.
+    if ((p.poll_type || "free") === "paid") {
+      const already = await query(`SELECT id FROM social_poll_votes WHERE poll_id = $1 AND user_id = $2 LIMIT 1`, [p.id, userId]);
+      if (already.rows.length) {
+        return res.status(400).json({ success: false, error: "You have already voted on this paid poll", code: "ALREADY_VOTED" });
+      }
+      if (p.user_id === userId) {
+        return res.status(400).json({ success: false, error: "You cannot vote on your own paid poll", code: "SELF_VOTE" });
+      }
+      const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+      if (!pinCheck.ok) {
+        return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
+      }
+      const w = await query(
+        `SELECT id, balance, currency FROM wallets WHERE user_id = $1 AND UPPER(currency) = 'NGN' AND status = 'active' LIMIT 1`,
+        [userId],
+      );
+      if (!w.rows.length) return res.status(400).json({ success: false, error: "You need an active NGN wallet to vote on paid polls", code: "NO_WALLET" });
+      const price = Number(p.vote_price) || 0;
+      if (Number(w.rows[0].balance) < price) {
+        return res.status(400).json({ success: false, error: "Insufficient NGN wallet balance to vote", code: "INSUFFICIENT_BALANCE" });
+      }
+      if (!(await debitWallet(w.rows[0].id, price))) {
+        return res.status(400).json({ success: false, error: "Insufficient NGN wallet balance to vote", code: "INSUFFICIENT_BALANCE" });
+      }
+      try {
+        await query(
+          `UPDATE social_polls SET pool_earned = pool_earned + $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [p.id, price],
+        );
+        await query(
+          `INSERT INTO social_poll_votes (poll_id, user_id, option_index, amount_paid) VALUES ($1,$2,$3,$4)`,
+          [p.id, userId, valid[0], price],
+        );
+      } catch (voteErr: any) {
+        // Roll the wallet debit back — never take money without recording the vote.
+        await creditWallet(w.rows[0].id, price).catch(() => {});
+        throw voteErr;
+      }
+      const reference = genRef("MF-PV");
+      await insertTransaction({
+        userId, walletId: w.rows[0].id, reference, type: "debit",
+        transactionType: "poll_vote", amount: price, currency: "NGN",
+        description: `Paid poll vote — “${String(p.question).slice(0, 60)}”`,
+      });
+      if (p.user_id !== userId) {
+        createNotification({
+          businessId: (req.user!.businessId ?? "") as string,
+          userId: p.user_id,
+          title: "New paid vote",
+          message: `Someone voted on your paid poll (+₦${price.toLocaleString()} to your Vote Pocket)`,
+          type: "social",
+        }).catch(() => {});
+      }
+      const votesRes = await query(
+        `SELECT option_index, COUNT(*)::int AS votes FROM social_poll_votes WHERE poll_id = $1 GROUP BY option_index`,
+        [p.id],
+      );
+      const mine = await query(`SELECT option_index FROM social_poll_votes WHERE poll_id = $1 AND user_id = $2`, [p.id, userId]);
+      const pool = await query(`SELECT pool_earned FROM social_polls WHERE id = $1`, [p.id]);
+      return res.json({
+        success: true,
+        data: {
+          total_votes: votesRes.rows.reduce((a, v) => a + v.votes, 0),
+          results: (p.options || []).map((o: any, i: number) => ({
+            index: i, text: o.text, vote_count: votesRes.rows.find((v) => v.option_index === i)?.votes || 0,
+          })),
+          my_votes: mine.rows.map((m) => m.option_index),
+          charged: price,
+          pool_earned: Number(pool.rows[0]?.pool_earned) || 0,
+        },
+      });
     }
 
     if (p.allow_multiple) {
@@ -690,6 +848,173 @@ router.post("/polls/:id/close", authenticateToken, async (req: AuthenticatedRequ
     res.json({ success: true, message: "Poll closed" });
   } catch {
     res.status(500).json({ success: false, error: "Could not close poll" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Paid-poll economics — pricing read, pool withdrawal, aggregate pocket
+// ---------------------------------------------------------------------------
+router.get("/polls/pricing", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await getPollSettings();
+    res.json({ success: true, data: s });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load poll pricing" });
+  }
+});
+
+// Creator withdraws a matured paid poll's pool to their NGN wallet. The
+// admin-configured fee is deducted here and posted to the platform revenue
+// ledger (creditRevenueWallet) so it shows in the admin Revenue history.
+router.post("/polls/:id/withdraw", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  const userId = req.user!.userId;
+  try {
+    const settings = await getPollSettings();
+    const poll = await query(
+      `SELECT id, user_id, question, poll_type, pool_earned, pool_withdrawn, ends_at, status
+       FROM social_polls WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!poll.rows.length) return res.status(404).json({ success: false, error: "Poll not found" });
+    const p = poll.rows[0];
+    if (p.user_id !== userId) return res.status(403).json({ success: false, error: "You can only withdraw your own polls" });
+    if ((p.poll_type || "free") !== "paid") return res.status(400).json({ success: false, error: "Only paid polls carry a withdrawable pool", code: "NOT_PAID" });
+
+    // Maturity: closed by the creator, past its ends_at, or (never-scheduled)
+    // closed manually — an open, unexpired poll is still collecting votes.
+    const matured = p.status === "closed" || (p.ends_at && new Date(p.ends_at) < new Date());
+    if (!matured) {
+      return res.status(400).json({ success: false, error: "This poll hasn't matured yet — close it or wait for its end time", code: "NOT_MATURED" });
+    }
+
+    const amount = Math.round(Number(req.body?.amount ?? 0) * 100) / 100;
+    const available = Math.max(0, (Number(p.pool_earned) || 0) - (Number(p.pool_withdrawn) || 0));
+    const target = amount > 0 ? amount : available;
+    if (target <= 0) return res.status(400).json({ success: false, error: "Nothing to withdraw yet — this pool is empty", code: "EMPTY_POOL" });
+    if (target < settings.withdrawal_min) {
+      return res.status(400).json({
+        success: false, code: "BELOW_MIN",
+        error: `Minimum withdrawal is ₦${settings.withdrawal_min.toLocaleString()} (available ₦${available.toLocaleString()})`,
+      });
+    }
+
+    const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+    if (!pinCheck.ok) return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
+
+    // Atomic guard: only withdraw what the pool actually still holds.
+    const upd = await query(
+      `UPDATE social_polls
+          SET pool_withdrawn = pool_withdrawn + $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND (pool_earned - pool_withdrawn) >= $2
+        RETURNING pool_earned, pool_withdrawn`,
+      [p.id, target],
+    );
+    if (!upd.rows.length) {
+      return res.status(400).json({ success: false, error: "Pool changed — please retry", code: "POOL_RACE" });
+    }
+
+    const fee = Math.round((target * (Number(settings.withdrawal_fee_percent) || 0) / 100
+      + (Number(settings.withdrawal_fee_flat) || 0)) * 100) / 100;
+    const net = Math.max(0, Math.round((target - fee) * 100) / 100);
+    const reference = genRef("PPLWD");
+
+    try {
+      // The withdrawal fee is admin revenue — land it in the revenue ledger.
+      if (fee > 0) {
+        await creditRevenueWallet(fee, "NGN", reference, `Poll withdrawal fee — “${String(p.question).slice(0, 50)}”`, null, undefined, { revenueType: "fee" });
+      }
+      const w = await query(
+        `SELECT id FROM wallets WHERE user_id = $1 AND UPPER(currency) = 'NGN' AND status = 'active' LIMIT 1`,
+        [userId],
+      );
+      if (!w.rows.length) throw new Error("NO_NGN_WALLET");
+      await creditWallet(w.rows[0].id, net);
+      await insertTransaction({
+        userId, walletId: w.rows[0].id, reference, type: "credit",
+        transactionType: "poll_withdrawal", amount: net, currency: "NGN",
+        description: `Poll earnings withdrawal${fee > 0 ? ` (fee ₦${fee.toLocaleString()})` : ""}`,
+      });
+      const wd = await query(
+        `INSERT INTO poll_withdrawals (poll_id, user_id, amount, fee, net_amount, reference)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, created_at`,
+        [p.id, userId, target, fee, net, reference],
+      );
+      return res.json({
+        success: true,
+        data: {
+          withdrawal: { id: wd.rows[0].id, amount: target, fee, net_amount: net, reference, created_at: wd.rows[0].created_at },
+          pool: { earned: upd.rows[0].pool_earned, withdrawn: upd.rows[0].pool_withdrawn },
+          message: `₦${net.toLocaleString()} sent to your NGN wallet${fee > 0 ? ` (fee ₦${fee.toLocaleString()})` : ""}`,
+        },
+      });
+    } catch (finErr: any) {
+      // Roll the pool back — money must never leave the pool without a payout.
+      await query(
+        `UPDATE social_polls SET pool_withdrawn = GREATEST(0, pool_withdrawn - $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [p.id, target],
+      ).catch(() => {});
+      console.error("poll withdraw error:", finErr?.message);
+      return res.status(500).json({ success: false, error: "Could not complete withdrawal — please try again" });
+    }
+  } catch (e: any) {
+    console.error("poll withdraw error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not withdraw poll earnings" });
+  }
+});
+
+// Aggregate Vote Pocket across all of the creator's paid polls.
+router.get("/vote-pocket", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const settings = await getPollSettings();
+    const totals = await query(
+      `SELECT COALESCE(SUM(pool_earned),0)::float AS total_earned,
+              COALESCE(SUM(pool_withdrawn),0)::float AS total_withdrawn
+       FROM social_polls WHERE user_id = $1 AND poll_type = 'paid'`,
+      [userId],
+    );
+    const withdrawals = await query(
+      `SELECT w.id, w.poll_id, w.amount, w.fee, w.net_amount, w.reference, w.status, w.created_at,
+              p.question AS poll_question
+       FROM poll_withdrawals w JOIN social_polls p ON p.id = w.poll_id
+       WHERE w.user_id = $1 ORDER BY w.created_at DESC LIMIT 20`,
+      [userId],
+    );
+    const pools = await query(
+      `SELECT id, post_id, question, vote_price, pool_earned, pool_withdrawn, status, ends_at, created_at,
+              (SELECT COUNT(*)::int FROM social_poll_votes v WHERE v.poll_id = social_polls.id) AS total_votes
+       FROM social_polls
+       WHERE user_id = $1 AND poll_type = 'paid' AND status != 'removed'
+       ORDER BY created_at DESC LIMIT 50`,
+      [userId],
+    );
+    const earned = Number(totals.rows[0]?.total_earned) || 0;
+    const withdrawn = Number(totals.rows[0]?.total_withdrawn) || 0;
+    res.json({
+      success: true,
+      data: {
+        balance: Math.max(0, Math.round((earned - withdrawn) * 100) / 100),
+        total_earned: earned,
+        total_withdrawn: withdrawn,
+        currency: settings.currency,
+        fees: {
+          withdrawal_fee_percent: settings.withdrawal_fee_percent,
+          withdrawal_fee_flat: settings.withdrawal_fee_flat,
+          withdrawal_min: settings.withdrawal_min,
+        },
+        pools: pools.rows.map((r) => ({
+          ...r,
+          pool_earned: Number(r.pool_earned) || 0,
+          pool_withdrawn: Number(r.pool_withdrawn) || 0,
+          withdrawable: Math.max(0, (Number(r.pool_earned) || 0) - (Number(r.pool_withdrawn) || 0)),
+          matured: r.status === "closed" || (r.ends_at && new Date(r.ends_at) < new Date()),
+        })),
+        withdrawals: withdrawals.rows,
+      },
+    });
+  } catch (e: any) {
+    console.error("vote-pocket error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load vote pocket" });
   }
 });
 

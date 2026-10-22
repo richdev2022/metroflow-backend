@@ -6908,4 +6908,47 @@ protectedRouter.put("/settings/live", requirePermission('manage_settings'), asyn
     }
 });
 
+protectedRouter.get("/settings/poll", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const r = await query(`SELECT key, value, updated_at FROM system_settings WHERE key = 'poll_settings' LIMIT 1`);
+        res.json({ success: true, data: r.rows[0] ? { ...r.rows[0], value: typeof r.rows[0].value === 'string' ? JSON.parse(r.rows[0].value) : r.rows[0].value } : null });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to fetch poll settings" });
+    }
+});
+
+protectedRouter.put("/settings/poll", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const current = await query(`SELECT value FROM system_settings WHERE key = 'poll_settings' LIMIT 1`);
+        const base = current.rows[0]
+            ? (typeof current.rows[0].value === 'string' ? JSON.parse(current.rows[0].value) : current.rows[0].value)
+            : {};
+        const b = req.body || {};
+
+        // Validated merge — only known keys, sane bounds.
+        const num = (v: any, min: number, max: number) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : undefined;
+        };
+        const next: Record<string, any> = { ...base };
+        const dvp = num(b.default_vote_price, 1, 1000000); if (dvp !== undefined) next.default_vote_price = Math.round(dvp * 100) / 100;
+        const mvp = num(b.min_vote_price, 1, 1000000); if (mvp !== undefined) next.min_vote_price = Math.round(mvp * 100) / 100;
+        const xvp = num(b.max_vote_price, 1, 1000000); if (xvp !== undefined) next.max_vote_price = Math.round(xvp * 100) / 100;
+        const wfp = num(b.withdrawal_fee_percent, 0, 90); if (wfp !== undefined) next.withdrawal_fee_percent = wfp;
+        const wff = num(b.withdrawal_fee_flat, 0, 1000000); if (wff !== undefined) next.withdrawal_fee_flat = wff;
+        const wmin = num(b.withdrawal_min, 0, 100000000); if (wmin !== undefined) next.withdrawal_min = wmin;
+        if (b.currency !== undefined) next.currency = String(b.currency).slice(0, 8).toUpperCase() || 'NGN';
+
+        await query(
+            `INSERT INTO system_settings (key, value, description)
+             VALUES ('poll_settings', $1::jsonb, 'Poll economics: default/max vote price, withdrawal fee (percent + flat) and minimum')
+             ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = CURRENT_TIMESTAMP`,
+            [JSON.stringify(next)],
+        );
+        res.json({ success: true, data: next, message: "Poll settings saved" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save poll settings" });
+    }
+});
+
 export default router;

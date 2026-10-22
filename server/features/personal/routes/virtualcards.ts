@@ -51,6 +51,72 @@ async function ensureBitnobCustomer(userId: string, userName: string, email: str
   return id;
 }
 
+// ---------------------------------------------------------------------------
+// Funding math — one source of truth for create / fund / quote.
+//
+// The user picks ANY of their active personal wallets:
+//   · Stablecoin wallet (USDT / USDC) → 1:1 USD. Fee only, NO conversion rate.
+//   · NGN wallet → live Bitnob USD rate applied + the funding fee.
+// ---------------------------------------------------------------------------
+type FundingQuote = {
+  walletId: string;
+  walletCurrency: string;
+  /** Wallet units per 1 USD (1 for stablecoins, live NGN/USD rate for NGN). */
+  fxRate: number;
+  conversionApplied: boolean;
+  /** Amount debited from the wallet (wallet currency), excluding the fee. */
+  debitAmount: number;
+  feePercent: number;
+  fee: number;
+  totalDebit: number;
+};
+
+async function fundingFeePercent(): Promise<number> {
+  const { getPercent } = await import("../flags");
+  return getPercent("virtualcard_funding_fee_percent", 1);
+}
+
+async function quoteFunding(wallet: any, amountUsd: number): Promise<FundingQuote> {
+  const walletCurrency = String(wallet.currency || "NGN").toUpperCase();
+  const isStable = walletCurrency === "USDT" || walletCurrency === "USDC" || walletCurrency === "USD";
+  let fxRate = 1;
+  let conversionApplied = false;
+  if (!isStable) {
+    // Live Bitnob rate (wallet currency per 1 USD). No hardcoded fallback —
+    // we refuse instead of guessing (same policy as the transfer rails).
+    const rate = await bitnob.getRate("USD", walletCurrency);
+    fxRate = Number(rate) || 0;
+    if (!fxRate || fxRate <= 0) {
+      throw new bitnob.BitnobError(`Live ${walletCurrency}/USD rate is unavailable — fund from a stablecoin wallet.`, "RATE_UNAVAILABLE", 503);
+    }
+    conversionApplied = true;
+  }
+  const debitAmount = Math.round(amountUsd * fxRate * 100) / 100;
+  const feePercent = await fundingFeePercent();
+  const fee = Math.round(debitAmount * feePercent) / 100;
+  const totalDebit = Math.round((debitAmount + fee) * 100) / 100;
+  return { walletId: wallet.id, walletCurrency, fxRate, conversionApplied, debitAmount, feePercent, fee, totalDebit };
+}
+
+async function resolveFundingWallet(userId: string, walletId: string | null | undefined) {
+  if (walletId) {
+    const r = await query(
+      `SELECT * FROM wallets WHERE id = $1 AND user_id = $2 AND business_id IS NULL AND status = 'active' LIMIT 1`,
+      [walletId, userId],
+    );
+    if (r.rows[0]) return r.rows[0];
+  }
+  // Default: USDT → USDC → NGN — stablecoin first (fee-only funding is cheapest).
+  const r = await query(
+    `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND status = 'active'
+      AND UPPER(currency) IN ('USDT','USDC','NGN')
+     ORDER BY (currency = 'USDT') DESC, (currency = 'USDC') DESC, (currency = 'NGN') DESC, created_at ASC
+     LIMIT 1`,
+    [userId],
+  );
+  return r.rows[0] ?? null;
+}
+
 router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "virtualcards"))) return;
@@ -87,6 +153,38 @@ router.get("/provider-status", authenticateToken, async (_req, res) => {
   });
 });
 
+/** POST /virtualcards/quote { amount_usd, wallet_id? } — show rate + fees before funding. */
+router.post("/quote", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const amountUsd = Math.round(Number(req.body?.amount_usd) * 100) / 100;
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ success: false, error: "Enter a valid amount" });
+    }
+    const wallet = await resolveFundingWallet(userId, req.body?.wallet_id);
+    if (!wallet) return res.status(400).json({ success: false, error: "No active wallet found" });
+    const q = await quoteFunding(wallet, amountUsd);
+    const balRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [wallet.id]);
+    res.json({
+      success: true,
+      data: {
+        wallet_id: q.walletId,
+        wallet_currency: q.walletCurrency,
+        conversion_applied: q.conversionApplied,
+        fx_rate: q.fxRate,
+        amount: q.debitAmount,
+        fee: q.fee,
+        fee_percent: q.feePercent,
+        total: q.totalDebit,
+        currency: q.walletCurrency,
+        balance: Number(balRes.rows[0]?.balance || 0),
+      },
+    });
+  } catch (e: any) {
+    res.status(e?.status || 502).json({ success: false, code: e?.code, error: e?.message || "Quote unavailable" });
+  }
+});
+
 router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "virtualcards"))) return;
@@ -102,34 +200,42 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     const userName = u.rows[0]?.name || "MetriCorex User";
     const email = u.rows[0]?.email;
 
-    const walletRes = await query(
-      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
-      [userId],
-    );
-    const wallet = walletRes.rows[0];
-    if (!wallet) return res.status(400).json({ success: false, error: "A USD wallet is required for cards" });
-    if (Number(wallet.balance) < amount) {
-      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient USD balance" });
+    // Wallet selection: the caller picks any active personal wallet (NGN,
+    // USDT, USDC). Stablecoin funds 1:1 (fee only); NGN converts at the live
+    // Bitnob rate with the funding fee applied on top.
+    const wallet = await resolveFundingWallet(userId, req.body?.wallet_id);
+    if (!wallet) return res.status(400).json({ success: false, error: "An active wallet is required for cards" });
+    const q = await quoteFunding(wallet, amount);
+    if (Number(wallet.balance) < q.totalDebit) {
+      return res.status(400).json({
+        success: false, code: "INSUFFICIENT_BALANCE",
+        error: `Insufficient ${q.walletCurrency} balance — this card needs ${q.totalDebit.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${q.walletCurrency} (${q.debitAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })}${q.conversionApplied ? ` @ ${q.fxRate.toLocaleString()} ${q.walletCurrency}/USD` : ""} + ${q.fee.toLocaleString(undefined, { maximumFractionDigits: 2 })} fee).`,
+      });
     }
 
     const reference = genRef("MF-VC");
-    if (!(await debitWallet(wallet.id, amount))) {
-      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient USD balance" });
+    if (!(await debitWallet(wallet.id, q.totalDebit))) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${q.walletCurrency} balance` });
     }
     await insertTransaction({
       userId, walletId: wallet.id, reference, type: "debit", transactionType: "vcard_create",
-      amount, currency: "USD", description: `Virtual card funding — ${name}`,
+      amount: q.totalDebit, currency: q.walletCurrency,
+      description: `Virtual card funding — ${name}${q.conversionApplied ? ` (@ ${q.fxRate.toLocaleString()} ${q.walletCurrency}/USD)` : ""}`,
     });
+    if (q.fee > 0) {
+      const { creditRevenueWallet } = await import("../../../services/fees");
+      creditRevenueWallet(q.fee, q.walletCurrency, reference, "Virtual Card Funding Fee", "virtualcards").catch(() => {});
+    }
 
     const pending = await query(
-      `INSERT INTO virtual_cards (user_id, provider, name, currency, card_brand, status, balance)
-       VALUES ($1,'bitnob',$2,'USD','visa','pending',$3) RETURNING id`,
-      [userId, name, amount],
+      `INSERT INTO virtual_cards (user_id, provider, name, currency, card_brand, status, balance, wallet_id)
+       VALUES ($1,'bitnob',$2,'USD','visa','pending',$3,$4) RETURNING id`,
+      [userId, name, amount, wallet.id],
     );
     await query(
-      `INSERT INTO virtual_card_transactions (card_id, user_id, type, amount, currency, status, description, reference)
-       VALUES ($1,$2,'fund',$3,'USD','success','Initial card funding',$4)`,
-      [pending.rows[0].id, userId, amount, reference],
+      `INSERT INTO virtual_card_transactions (card_id, user_id, type, amount, fee, currency, status, description, reference)
+       VALUES ($1,$2,'fund',$3,$4,$5,'success','Initial card funding',$6)`,
+      [pending.rows[0].id, userId, amount, q.fee, q.walletCurrency, reference],
     );
 
     try {
@@ -145,14 +251,20 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
         [pending.rows[0].id, card.id || card.card_id || null, customerId,
          card.masked_pan || card.maskedPan || null, JSON.stringify(card)],
       );
-      res.status(201).json({ success: true, data: { card_id: pending.rows[0].id, status: "active" } });
+      res.status(201).json({
+        success: true,
+        data: {
+          card_id: pending.rows[0].id, status: "active",
+          funding: { currency: q.walletCurrency, amount: q.debitAmount, fee: q.fee, total: q.totalDebit, fx_rate: q.fxRate, conversion_applied: q.conversionApplied },
+        },
+      });
     } catch (e: any) {
       const be = bitnob.bitnobErr(e);
       // Refund the funding on failure
-      await creditWallet(wallet.id, amount);
+      await creditWallet(wallet.id, q.totalDebit);
       await insertTransaction({
         userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
-        transactionType: "vcard_refund", amount, currency: "USD", description: "Refund — card creation failed",
+        transactionType: "vcard_refund", amount: q.totalDebit, currency: q.walletCurrency, description: "Refund — card creation failed",
       });
       await query(`UPDATE virtual_cards SET status = 'failed', failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
         [pending.rows[0].id, be.message]);
@@ -160,7 +272,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     }
   } catch (e: any) {
     console.error("vcard create error:", e?.message);
-    res.status(500).json({ success: false, error: "Could not create card" });
+    res.status(e?.status || 500).json({ success: false, code: e?.code, error: e?.message || "Could not create card" });
   }
 });
 
@@ -177,32 +289,50 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
     if (!card.provider_card_id) return res.status(400).json({ success: false, error: "Card is still provisioning — try again shortly" });
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, error: "Enter a valid amount" });
-    const walletRes = await query(
-      `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active' ORDER BY (currency = 'USDT') DESC LIMIT 1`,
-      [userId],
-    );
-    const wallet = walletRes.rows[0];
-    if (!wallet) return res.status(400).json({ success: false, error: "USD wallet required" });
-    if (Number(wallet.balance) < amount) return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient USD balance" });
+
+    // Wallet selection: caller picks any active personal wallet. Stablecoin
+    // funds 1:1 (fee only, no conversion); NGN converts at the live Bitnob
+    // rate with the funding fee on top.
+    const wallet = await resolveFundingWallet(userId, req.body?.wallet_id);
+    if (!wallet) return res.status(400).json({ success: false, error: "No active wallet found" });
+    const q = await quoteFunding(wallet, amount);
+    if (Number(wallet.balance) < q.totalDebit) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${q.walletCurrency} balance` });
+    }
     const reference = genRef("MF-VF");
-    if (!(await debitWallet(wallet.id, amount))) {
-      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient USD balance" });
+    if (!(await debitWallet(wallet.id, q.totalDebit))) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${q.walletCurrency} balance` });
+    }
+    await insertTransaction({
+      userId, walletId: wallet.id, reference, type: "debit", transactionType: "vcard_fund",
+      amount: q.totalDebit, currency: q.walletCurrency,
+      description: `Card top-up — ${card.name}${q.conversionApplied ? ` (@ ${q.fxRate.toLocaleString()} ${q.walletCurrency}/USD)` : ""}`,
+    });
+    if (q.fee > 0) {
+      const { creditRevenueWallet } = await import("../../../services/fees");
+      creditRevenueWallet(q.fee, q.walletCurrency, reference, "Virtual Card Funding Fee", "virtualcards").catch(() => {});
     }
     try {
       await bitnob.cardBalanceOp(card.provider_card_id, "fund", amount, reference);
-      await query(`UPDATE virtual_cards SET balance = balance + $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [card.id, amount]);
+      await query(`UPDATE virtual_cards SET balance = balance + $2, wallet_id = COALESCE(wallet_id, $3), updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [card.id, amount, wallet.id]);
       await query(
-        `INSERT INTO virtual_card_transactions (card_id, user_id, type, amount, currency, status, description, reference)
-         VALUES ($1,$2,'fund',$3,'USD','success','Card top-up',$4)`,
-        [card.id, userId, amount, reference],
+        `INSERT INTO virtual_card_transactions (card_id, user_id, type, amount, fee, currency, status, description, reference)
+         VALUES ($1,$2,'fund',$3,$4,$5,'success','Card top-up',$6)`,
+        [card.id, userId, amount, q.fee, q.walletCurrency, reference],
       );
-      await insertTransaction({
-        userId, walletId: wallet.id, reference, type: "debit", transactionType: "vcard_fund",
-        amount, currency: "USD", description: `Card top-up — ${card.name}`,
+      res.json({
+        success: true,
+        data: {
+          status: "completed", amount,
+          funding: { currency: q.walletCurrency, amount: q.debitAmount, fee: q.fee, total: q.totalDebit, fx_rate: q.fxRate, conversion_applied: q.conversionApplied },
+        },
       });
-      res.json({ success: true, data: { status: "completed", amount } });
     } catch (e: any) {
-      await creditWallet(wallet.id, amount);
+      await creditWallet(wallet.id, q.totalDebit);
+      await insertTransaction({
+        userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
+        transactionType: "vcard_refund", amount: q.totalDebit, currency: q.walletCurrency, description: "Refund — card top-up failed",
+      });
       throw e;
     }
   } catch (e: any) {

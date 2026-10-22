@@ -55,6 +55,12 @@ function mapListingRow(l: any, boost?: any, saved = false) {
     negotiable: l.negotiable,
     location_text: l.location_text,
     stock: l.stock === null ? null : Number(l.stock),
+    brand: l.brand || null,
+    model: l.model || null,
+    warranty_note: l.warranty_note || null,
+    pickup_ok: l.pickup_ok !== false,
+    delivery_ok: l.delivery_ok === true,
+    delivery_fee: l.delivery_fee != null ? Number(l.delivery_fee) : 0,
     image_url: (l.images || [])[0] || null,
     images: l.images || [],
     sold_out: l.status === "sold" || (l.stock !== null && Number(l.stock) <= 0),
@@ -161,6 +167,14 @@ router.post("/", authenticateToken, checkSubscriptionStatus, upload.array("image
     const locationText = req.body?.location_text ? String(req.body.location_text).slice(0, 160) : null;
     const stockRaw = req.body?.stock;
     const stock = stockRaw === "" || stockRaw === undefined || stockRaw === null ? null : Math.max(0, Number(stockRaw));
+    // Richer item details (buyer-facing).
+    const brand = req.body?.brand ? String(req.body.brand).slice(0, 80) : null;
+    const model = req.body?.model ? String(req.body.model).slice(0, 80) : null;
+    const warrantyNote = req.body?.warranty_note ? String(req.body.warranty_note).slice(0, 200) : null;
+    const pickupOk = String(req.body?.pickup_ok ?? "true") !== "false";
+    const deliveryOk = String(req.body?.delivery_ok ?? "false") === "true";
+    const deliveryFeeRaw = Number(req.body?.delivery_fee);
+    const deliveryFee = Number.isFinite(deliveryFeeRaw) && deliveryFeeRaw > 0 ? Math.round(deliveryFeeRaw * 100) / 100 : 0;
 
     if (!name) return res.status(400).json({ success: false, error: "Give your item a name" });
     if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ success: false, error: "Set a valid price" });
@@ -180,9 +194,10 @@ router.post("/", authenticateToken, checkSubscriptionStatus, upload.array("image
     const r = await query(
       `INSERT INTO market_listings
          (seller_id, name, description, category, condition, price, currency, negotiable,
-          location_text, stock, images)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) RETURNING *`,
-      [userId, name, description, category, condition, price, currency, negotiable, locationText, stock, JSON.stringify(images)],
+          location_text, stock, images, brand, model, warranty_note, pickup_ok, delivery_ok, delivery_fee)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [userId, name, description, category, condition, price, currency, negotiable, locationText, stock, JSON.stringify(images),
+       brand, model, warrantyNote, pickupOk, deliveryOk, deliveryFee],
     );
     res.status(201).json({ success: true, data: { listing: mapListingRow({ ...r.rows[0], seller_name: req.user!.name, seller_photo: null }) } });
   } catch (e: any) {
@@ -235,6 +250,7 @@ router.put("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
     const own = await query(`SELECT id FROM market_listings WHERE id = $1 AND seller_id = $2`, [req.params.id, req.user!.userId]);
     if (!own.rows.length) return res.status(404).json({ success: false, error: "Listing not found (or not yours)" });
     const b = req.body || {};
+    const deliveryFeeNum = Number(b.delivery_fee);
     await query(
       `UPDATE market_listings SET
          name = COALESCE($2, name),
@@ -244,6 +260,12 @@ router.put("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
          location_text = COALESCE($6, location_text),
          stock = COALESCE($7, stock),
          status = COALESCE($8, status),
+         brand = COALESCE($9, brand),
+         model = COALESCE($10, model),
+         warranty_note = COALESCE($11, warranty_note),
+         pickup_ok = COALESCE($12, pickup_ok),
+         delivery_ok = COALESCE($13, delivery_ok),
+         delivery_fee = COALESCE($14, delivery_fee),
          updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [
@@ -255,6 +277,12 @@ router.put("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
         b.location_text !== undefined ? (b.location_text ? String(b.location_text).slice(0, 160) : null) : null,
         b.stock !== undefined && b.stock !== null && b.stock !== "" ? Math.max(0, Number(b.stock)) : null,
         ["active", "sold"].includes(b.status) ? b.status : null,
+        b.brand ? String(b.brand).slice(0, 80) : null,
+        b.model ? String(b.model).slice(0, 80) : null,
+        b.warranty_note ? String(b.warranty_note).slice(0, 200) : null,
+        typeof b.pickup_ok === "boolean" ? b.pickup_ok : (b.pickup_ok === "true" ? true : b.pickup_ok === "false" ? false : null),
+        typeof b.delivery_ok === "boolean" ? b.delivery_ok : (b.delivery_ok === "true" ? true : b.delivery_ok === "false" ? false : null),
+        Number.isFinite(deliveryFeeNum) && deliveryFeeNum >= 0 ? Math.round(deliveryFeeNum * 100) / 100 : null,
       ],
     );
     res.json({ success: true, message: "Listing updated" });

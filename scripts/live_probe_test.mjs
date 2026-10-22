@@ -184,13 +184,19 @@ const yacht = gifts.find((g) => g.name === "Yacht");
 
 const gift = await api("POST", `/live/${callCode}/gifts`, viewerToken, { gift_id: rose.id, quantity: 2 });
 check("gift sent → sender debited (10000-40=9960)", gift.json?.data?.balance === 9960, JSON.stringify(gift.json).slice(0, 240));
+// Pocket flow (default 0% commission): the HOST's gift pocket earns the full
+// ₦40; the NGN wallet stays untouched until the streamer withdraws.
+const hostPocket = await client.query(`SELECT total_earned FROM live_gift_pockets WHERE user_id = $1`, [hostUserId]);
+check("host gift pocket credited ₦40", Number(hostPocket.rows[0]?.total_earned) === 40, String(hostPocket.rows[0]?.total_earned));
 const hostWallet = await client.query(`SELECT balance FROM wallets WHERE user_id = $1`, [hostUserId]);
-check("host wallet credited ₦40", Number(hostWallet.rows[0].balance) === 40, String(hostWallet.rows[0].balance));
+check("host NGN wallet untouched (0) until withdrawal", Number(hostWallet.rows[0].balance) === 0, String(hostWallet.rows[0].balance));
 const legs = await client.query(
-  `SELECT transaction_type, direction FROM transactions WHERE (reference LIKE 'LGFT-%' OR reference LIKE 'LGFT-%-IN') AND user_id IN ($1,$2)`,
+  `SELECT transaction_type, direction FROM transactions WHERE reference LIKE 'LGFT-%' AND user_id IN ($1,$2)`,
   [hostUserId, viewerUserId],
 );
-check("both gift legs ledgered (live_gift debit / live_gift_receive credit)", legs.rows.length === 2 && legs.rows.some((r) => r.transaction_type === "live_gift" && r.direction === "debit") && legs.rows.some((r) => r.transaction_type === "live_gift_receive" && r.direction === "credit"), JSON.stringify(legs.rows));
+check("sender leg ledgered (live_gift debit)", legs.rows.length === 1 && legs.rows.some((r) => r.transaction_type === "live_gift" && r.direction === "debit"), JSON.stringify(legs.rows));
+const giftSplit = await client.query(`SELECT commission_amount, host_amount FROM live_gifts WHERE session_id = $1 AND gift_id = 'rose' LIMIT 1`, [sessionId]);
+check("gift row carries pocket split (0% commission → host_amount = 40)", Number(giftSplit.rows[0]?.host_amount) === 40 && Number(giftSplit.rows[0]?.commission_amount) === 0, JSON.stringify(giftSplit.rows[0]));
 
 const recent = await api("GET", `/live/${callCode}/gifts`, hostToken);
 const rec = recent.json?.data?.recent || [];
@@ -225,6 +231,9 @@ check("join after end → 404 (not live)", joinEnded.status === 404);
 // Teardown
 // ---------------------------------------------------------------------------
 await client.query(`DELETE FROM live_gifts WHERE session_id = $1`, [sessionId]);
+await client.query(`DELETE FROM live_pocket_withdrawals WHERE user_id IN ($1,$2)`, [hostUserId, viewerUserId]);
+await client.query(`DELETE FROM live_gift_pockets WHERE user_id IN ($1,$2)`, [hostUserId, viewerUserId]);
+await client.query(`DELETE FROM live_battles WHERE host_a_id = $1 OR host_b_id = $1`, [hostUserId]);
 await client.query(`DELETE FROM live_messages WHERE session_id = $1`, [sessionId]);
 await client.query(`DELETE FROM live_reactions WHERE session_id = $1`, [sessionId]);
 await client.query(`DELETE FROM live_viewers WHERE session_id = $1`, [sessionId]);

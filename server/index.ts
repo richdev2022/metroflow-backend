@@ -21,6 +21,21 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
 
 
 import { handleDemo } from "./routes/demo";
+  // PERSONAL APP — routes + routers (mounted below)
+  import personalAuthRouter, { registerPersonal, mintSsoTicket, redeemSsoTicket } from "./features/personal/routes/auth";
+  import personalSocialRouter from "./features/personal/routes/social";
+  import personalLiveRouter from "./features/personal/routes/live";
+  import personalMarketplaceRouter from "./features/personal/routes/marketplace";
+  import personalGiftcardsRouter from "./features/personal/routes/giftcards";
+  import personalCryptoRouter from "./features/personal/routes/crypto";
+  import personalVirtualcardsRouter from "./features/personal/routes/virtualcards";
+  import personalEsimRouter from "./features/personal/routes/esim";
+  import billsPersonalRouter from "./features/personal/bills";
+  import savingsPersonalRouter from "./features/personal/savings";
+  import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
+  import stablecoinRouter from "./features/personal/stablecoin";
+  import adminPersonalRouter from "./routes/admin_personal";
+  import personalProductsAdminRouter from "./features/personal/admin";
 import {
   registerBusiness,
   verifyOTP,
@@ -841,6 +856,11 @@ export async function createServer() {
 
   // Auth API routes
   mainRouter.post("/auth/register", registerBusiness);
+  // PERSONAL: minimal signup (email + phone + password + optional referral code)
+  mainRouter.post("/auth/register/personal", registerPersonal);
+  // Cross-app SSO (Business <-> Personal)
+  mainRouter.post("/auth/sso/ticket", authenticateToken, checkSubscriptionStatus, mintSsoTicket);
+  mainRouter.post("/auth/sso/redeem", redeemSsoTicket);
   mainRouter.post("/auth/verify-otp", verifyOTP);
   mainRouter.post("/auth/login", login);
   mainRouter.post("/auth/resend-otp", resendOTP);
@@ -945,11 +965,20 @@ export async function createServer() {
   // Business revenue features: Storefront + Recurring Billing (Customer Subscriptions).
   // (Bills Hub & Savings Vaults live in server/features/personal — dormant until
   // the Personal app ships; see server/features/personal/README.md.)
+  // Personal marketplace MUST mount before the business store router —
+  // storeRouter has a legacy GET /marketplace that would shadow the personal wall.
+  mainRouter.use("/store/marketplace", personalMarketplaceRouter);
   mainRouter.use("/store", storeRouter);
   mainRouter.use("/recurring", recurringRouter);
 
   // Admin API routes
   mainRouter.use("/admin", adminRouter);
+  // Personal app management — the Personal Products console (flags/routing/
+  // pricing/monitoring, expected by the deployed admin UI) mounts FIRST; the
+  // ops router (boosts, moderation, ledgers, boost pricing) coexists below
+  // with distinct subpaths.
+  mainRouter.use("/admin/personal", personalProductsAdminRouter);
+  mainRouter.use("/admin/personal", adminPersonalRouter);
 
   // Dashboard API routes
   mainRouter.use("/dashboard", dashboardRouter);
@@ -1146,6 +1175,35 @@ export async function createServer() {
 
   // Customer Support desk (MetricAi handoff, guest widget chat, agent inbox)
   mainRouter.use("/support", supportRouter);
+
+  // ===================== PERSONAL APP SURFACE =====================
+  // Social feed + robust polls + post boost engine
+  mainRouter.use("/social", personalSocialRouter);
+  // TikTok-style live streaming (rides the call-room WebRTC stack)
+  mainRouter.use("/live", personalLiveRouter);
+  // Prestmit gift cards (REAL buy + sell)
+  mainRouter.use("/giftcards", personalGiftcardsRouter);
+  // Stablecoin hub (USDT/USDC wallets): receive-international addresses,
+  // stablecoin <-> NGN conversion, on-chain send — mounted BEFORE /crypto so
+  // /crypto/stablecoin/* resolves here instead of the legacy crypto router.
+  mainRouter.use("/crypto/stablecoin", stablecoinRouter);
+  // Bitnob crypto-to-cash (REAL rates + payouts)
+  mainRouter.use("/crypto", personalCryptoRouter);
+  // Bitnob USD virtual cards
+  mainRouter.use("/virtualcards", personalVirtualcardsRouter);
+  // eSIM / data bundles (Flutterwave live catalog)
+  mainRouter.use("/esim", personalEsimRouter);
+  // Bills Hub (Flutterwave dynamic catalog + real fulfilment) + Savings Vaults
+  mainRouter.use("/bills", billsPersonalRouter);
+  mainRouter.use("/savings", savingsPersonalRouter);
+
+  // Provider webhooks (public, signature-verified inside). These were
+  // previously imported but never mounted — gift-card + Bitnob callbacks 404'd.
+  mainRouter.post("/webhook/prestmit", prestmitWebhookHandler);
+  mainRouter.post("/webhook/bitnob", bitnobWebhookHandler);
+  // Stablecoin deposits/withdrawals (deposit.success / transfer.*) — stricter
+  // verification: HMAC-SHA512/256 + event de-duplication + address binding.
+  mainRouter.post("/webhook/bitnob/stablecoin", stablecoinWebhookHandler);
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);

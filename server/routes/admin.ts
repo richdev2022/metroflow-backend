@@ -6849,4 +6849,63 @@ protectedRouter.get("/ledger-adjustments", requirePermission("manage_finance"), 
   }
 });
 
+// ---------------------------------------------------------------------------
+// LIVESTREAM ECONOMICS — admin-configurable live settings (system_settings
+// key 'live_settings'): gift price overrides, gift commission, withdrawal
+// fees, battle defaults. Consumed by the Personal live router.
+// ---------------------------------------------------------------------------
+protectedRouter.get("/settings/live", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const r = await query(`SELECT key, value, updated_at FROM system_settings WHERE key = 'live_settings' LIMIT 1`);
+        res.json({ success: true, data: r.rows[0] ? { ...r.rows[0], value: typeof r.rows[0].value === 'string' ? JSON.parse(r.rows[0].value) : r.rows[0].value } : null });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to fetch live settings" });
+    }
+});
+
+protectedRouter.put("/settings/live", requirePermission('manage_settings'), async (req, res) => {
+    try {
+        const current = await query(`SELECT value FROM system_settings WHERE key = 'live_settings' LIMIT 1`);
+        const base = current.rows[0]
+            ? (typeof current.rows[0].value === 'string' ? JSON.parse(current.rows[0].value) : current.rows[0].value)
+            : {};
+        const b = req.body || {};
+
+        // Validated merge — only known keys, sane bounds.
+        const num = (v: any, min: number, max: number) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : undefined;
+        };
+        const next: Record<string, any> = { ...base };
+        if (b.gift_prices !== undefined) {
+            if (typeof b.gift_prices !== 'object' || b.gift_prices === null || Array.isArray(b.gift_prices)) {
+                return res.status(400).json({ success: false, error: "gift_prices must be an object like { rose: 25 }" });
+            }
+            const cleaned: Record<string, number> = {};
+            for (const [k, v] of Object.entries(b.gift_prices)) {
+                const n = Number(v);
+                if (Number.isFinite(n) && n >= 0) cleaned[String(k).toLowerCase()] = Math.round(n * 100) / 100;
+            }
+            next.gift_prices = cleaned;
+        }
+        const pct = num(b.gift_commission_percent, 0, 90); if (pct !== undefined) next.gift_commission_percent = pct;
+        const wfp = num(b.withdrawal_fee_percent, 0, 90); if (wfp !== undefined) next.withdrawal_fee_percent = wfp;
+        const wff = num(b.withdrawal_fee_flat, 0, 1000000); if (wff !== undefined) next.withdrawal_fee_flat = wff;
+        const wmin = num(b.withdrawal_min, 0, 100000000); if (wmin !== undefined) next.withdrawal_min = wmin;
+        const bds = num(b.battle_duration_seconds, 60, 3600); if (bds !== undefined) next.battle_duration_seconds = Math.round(bds);
+        const bm = num(b.battle_multiplier, 1, 10); if (bm !== undefined) next.battle_multiplier = bm;
+        if (b.currency !== undefined) next.currency = String(b.currency).slice(0, 8).toUpperCase() || 'NGN';
+
+        await query(
+            `INSERT INTO system_settings (key, value, description)
+             VALUES ('live_settings', $1::jsonb, 'Livestream economics: gift prices, withdrawal fee, gift commission, battle defaults')
+             ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = CURRENT_TIMESTAMP`,
+            [JSON.stringify(next)],
+        );
+        res.json({ success: true, data: next, message: "Livestream settings saved" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to save live settings" });
+    }
+});
+
 export default router;

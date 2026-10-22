@@ -109,6 +109,7 @@ import paymentLinksRouter from "./routes/payment_links";
 import aiCreditsRouter from "./routes/ai_credits";
 import invoicesRouter from "./routes/invoices";
 import storeRouter from "./routes/store";
+import friendsRouter from "./routes/friends";
 import recurringRouter from "./routes/recurring";
 import providersRouter from "./routes/providers";
 import geoRouter from "./routes/geo";
@@ -1181,6 +1182,8 @@ export async function createServer() {
   // ===================== PERSONAL APP SURFACE =====================
   // Social feed + robust polls + post boost engine
   mainRouter.use("/social", personalSocialRouter);
+  // Friends: public/private accounts, friend requests (chat gate for private)
+  mainRouter.use("/friends", friendsRouter);
   // TikTok-style live streaming (rides the call-room WebRTC stack)
   mainRouter.use("/live", personalLiveRouter);
   // Prestmit gift cards (REAL buy + sell)

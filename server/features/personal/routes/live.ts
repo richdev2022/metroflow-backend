@@ -681,6 +681,10 @@ router.post("/:id/leave", authenticateToken, async (req: AuthenticatedRequest, r
       [s.id, req.user!.userId],
     );
     if (r.rows.length) await bumpViewers(s.id, -1);
+    // Stage exit — a co-host leaving the room gives the stage slot back.
+    if (s.host_id !== req.user!.userId && isCohost(s, req.user!.userId)) {
+      await removeCohost(s.id, s.cohost_ids, req.user!.userId).catch(() => {});
+    }
     res.json({ success: true });
   } catch {
     res.status(500).json({ success: false, error: "Could not leave stream" });
@@ -916,6 +920,158 @@ router.delete("/:id/cohost/:userId", authenticateToken, async (req: Authenticate
     res.status(500).json({ success: false, error: "Could not remove co-host" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// RAISE HAND — "bring me on stage". A viewer requests to join the broadcast;
+// the host approves (viewer lands in cohost_ids → publishing unlocks) or
+// declines. Role-aware polling endpoints — no socket infra required: the
+// viewer polls their own request status, the host polls the pending queue.
+// ---------------------------------------------------------------------------
+
+/** Add a user to the session's cohost list (cap shared with manual invites). */
+async function addCohost(sessionId: string, current: any, userId: string): Promise<string[]> {
+  const cohosts = Array.isArray(current) ? current : [];
+  if (cohosts.includes(userId)) return cohosts;
+  const next = [...cohosts, userId];
+  await query(`UPDATE live_sessions SET cohost_ids = $2::jsonb WHERE id = $1`, [sessionId, JSON.stringify(next)]);
+  return next;
+}
+
+/** Remove a user from the session's cohost list (stage exit). */
+async function removeCohost(sessionId: string, current: any, userId: string): Promise<string[]> {
+  const next = (Array.isArray(current) ? current : []).filter((x: string) => x !== userId);
+  await query(`UPDATE live_sessions SET cohost_ids = $2::jsonb WHERE id = $1`, [sessionId, JSON.stringify(next)]);
+  return next;
+}
+
+// Viewer raises (or re-raises after a decline) / no-ops when already pending.
+router.post("/:id/join-requests", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s || s.status !== "live") return res.status(404).json({ success: false, error: "This stream is not live" });
+    const userId = req.user!.userId;
+    if (s.host_id === userId) return res.status(400).json({ success: false, error: "You are the host of this stream" });
+    const cohosts = Array.isArray(s.cohost_ids) ? s.cohost_ids : [];
+    if (cohosts.includes(userId)) return res.json({ success: true, data: { status: "approved", is_stage: true } });
+    if (cohosts.length >= 5) return res.status(400).json({ success: false, error: "The stage is full right now (5 guests max)" });
+
+    const existing = await query(
+      `SELECT id, status FROM live_join_requests WHERE session_id = $1 AND user_id = $2 LIMIT 1`,
+      [s.id, userId],
+    );
+    if (!existing.rows.length) {
+      const ins = await query(
+        `INSERT INTO live_join_requests (session_id, user_id) VALUES ($1, $2) RETURNING id, status, created_at`,
+        [s.id, userId],
+      );
+      return res.json({ success: true, data: { request: ins.rows[0], status: ins.rows[0].status } });
+    }
+    const row = existing.rows[0];
+    if (row.status === "pending") return res.json({ success: true, data: { request: row, status: "pending" } });
+    if (row.status === "approved") return res.json({ success: true, data: { status: "approved", is_stage: true } });
+    // declined / cancelled — re-raise
+    const up = await query(
+      `UPDATE live_join_requests SET status = 'pending', responded_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING id, status, created_at`,
+      [row.id],
+    );
+    res.json({ success: true, data: { request: up.rows[0], status: up.rows[0].status } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not raise your hand" });
+  }
+});
+
+// Role-aware list — HOST: pending queue (with profiles); VIEWER: own status.
+router.get("/:id/join-requests", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    const userId = req.user!.userId;
+    const cohosts = Array.isArray(s.cohost_ids) ? s.cohost_ids : [];
+    const imHost = s.host_id === userId;
+
+    if (imHost) {
+      const pending = await query(
+        `SELECT r.id, r.user_id, r.created_at, u.name, u.avatar_url AS photo
+         FROM live_join_requests r JOIN users u ON u.id = r.user_id
+         WHERE r.session_id = $1 AND r.status = 'pending'
+         ORDER BY r.created_at ASC LIMIT 30`,
+        [s.id],
+      );
+      return res.json({
+        success: true,
+        data: {
+          pending: pending.rows,
+          pending_count: pending.rows.length,
+          stage: cohosts,
+          stage_count: cohosts.length,
+        },
+      });
+    }
+
+    const mine = await query(
+      `SELECT id, status, created_at, responded_at FROM live_join_requests
+       WHERE session_id = $1 AND user_id = $2 LIMIT 1`,
+      [s.id, userId],
+    );
+    const row = mine.rows[0] ?? null;
+    // A request can be approved while the user has no pending row (manual
+    // co-host invite) — surface stage membership either way. A cancelled
+    // request reads as "none" so the client can cleanly re-raise.
+    const raw = cohosts.includes(userId) ? "approved" : row?.status ?? "none";
+    const status = raw === "cancelled" ? "none" : raw;
+    res.json({ success: true, data: { mine: row, status, is_stage: cohosts.includes(userId) } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load join requests" });
+  }
+});
+
+// Viewer cancels their own pending request.
+router.delete("/:id/join-requests", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    await query(
+      `UPDATE live_join_requests SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+       WHERE session_id = $1 AND user_id = $2 AND status = 'pending'`,
+      [s.id, req.user!.userId],
+    );
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not cancel the request" });
+  }
+});
+
+// Host responds — approve brings the viewer ON STAGE (cohost_ids → media
+// publishing unlocks on the client), decline flips the row so the viewer's
+// next poll settles immediately. NOTE: Express 5 (path-to-regexp v8) rejects
+// `:param(regex)` routes at REGISTRATION time, so approve/decline are two
+// explicit paths instead of `:action(approve|decline)`.
+const respondToJoinRequest = (action: "approve" | "decline") =>
+  async (req: AuthenticatedRequest, res: any) => {
+    try {
+      const s = await sessionById(String(req.params.id));
+      if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+      if (s.host_id !== req.user!.userId) return res.status(403).json({ success: false, error: "Only the host can respond to requests" });
+      const r = await query(
+        `UPDATE live_join_requests SET status = $2, responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3 AND session_id = $1 AND status = 'pending' RETURNING id, user_id, status`,
+        [s.id, action === "approve" ? "approved" : "declined", req.params.rid],
+      );
+      if (!r.rows.length) return res.status(404).json({ success: false, error: "Request is no longer pending" });
+      let cohost_ids = Array.isArray(s.cohost_ids) ? s.cohost_ids : [];
+      if (action === "approve") {
+        if (cohost_ids.length >= 5) return res.status(400).json({ success: false, error: "The stage is full right now (5 guests max)" });
+        cohost_ids = await addCohost(s.id, cohost_ids, r.rows[0].user_id);
+      }
+      res.json({ success: true, data: { request: r.rows[0], cohost_ids } });
+    } catch {
+      res.status(500).json({ success: false, error: "Could not respond to the request" });
+    }
+  };
+
+router.post("/:id/join-requests/:rid/approve", authenticateToken, respondToJoinRequest("approve"));
+router.post("/:id/join-requests/:rid/decline", authenticateToken, respondToJoinRequest("decline"));
 
 // ---------------------------------------------------------------------------
 // PK BATTLES — TikTok-style LIVE battles. Two live streamers link their

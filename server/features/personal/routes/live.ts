@@ -44,12 +44,49 @@ const isCohost = (session: any, userId: string) =>
   Array.isArray(session.cohost_ids) && session.cohost_ids.includes(userId);
 
 async function sessionById(id: string) {
+  // Accepts a UUID id OR the call_code (the watch page only knows the code,
+  // e.g. /live/watch?code=LIVE-XXXX). `id::text = $1` keeps the UUID match
+  // cast-safe — comparing a raw code against the UUID column makes Postgres
+  // throw "invalid input syntax for type uuid" and the endpoint 500s with
+  // "Could not join the stream".
   const r = await query(
     `SELECT l.*, u.name AS host_name, u.avatar_url AS host_photo
-     FROM live_sessions l JOIN users u ON u.id = l.host_id WHERE l.id = $1`,
+     FROM live_sessions l JOIN users u ON u.id = l.host_id
+     WHERE (l.id::text = $1 OR l.call_code = $1) LIMIT 1`,
     [id],
   );
   return r.rows[0] ?? null;
+}
+
+/**
+ * Every live stream is backed by a real row in `calls` (type='live'). The call
+ * room stack (socket room resolution, media credentials, participants) only
+ * resolves rooms that exist in `calls`/`meetings` — without this row the
+ * socket `call:join` for the LIVE- code fails with "Call or meeting not found"
+ * and viewers get no media even though the REST join succeeded.
+ * Idempotent: returns the existing call id when the row is already there.
+ */
+async function ensureLiveCallRow(session: { call_code: string; host_id: string; started_at?: string | Date | null }): Promise<string | null> {
+  try {
+    const existing = await query(`SELECT id FROM calls WHERE call_code = $1 LIMIT 1`, [session.call_code]);
+    if (existing.rows.length) return existing.rows[0].id;
+    const hostRes = await query(`SELECT business_id FROM users WHERE id = $1 LIMIT 1`, [session.host_id]);
+    const businessId = hostRes.rows[0]?.business_id;
+    if (!businessId) return null;
+    const ins = await query(
+      `INSERT INTO calls (business_id, type, status, created_by, host_id, call_code, is_group_call, started_at, provider)
+       VALUES ($1, 'live', 'ongoing', $2, $2, $3, TRUE, COALESCE($4::timestamptz, NOW()), NULL)
+       ON CONFLICT (call_code) DO UPDATE SET updated_at = NOW()
+       RETURNING id`,
+      [businessId, session.host_id, session.call_code, session.started_at ?? null],
+    );
+    return ins.rows[0]?.id ?? null;
+  } catch (e: any) {
+    // Never block the join on the backing row — the room can still open via
+    // the ad-hoc path; log so ops can spot a broken sequence.
+    console.error("[live] ensureLiveCallRow failed:", e?.message);
+    return null;
+  }
 }
 
 async function bumpViewers(sessionId: string, delta: number) {
@@ -96,10 +133,12 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
        VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [userId, title, description, category, callCode],
     );
+    const callId = await ensureLiveCallRow(r.rows[0]);
     return res.status(201).json({
       success: true,
       data: {
         session: r.rows[0],
+        call_id: callId,
         broadcast_url: `/join-call?code=${callCode}&broadcast=1`,
         message: "You are LIVE",
       },
@@ -396,9 +435,13 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
       bumpViewers(s.id, 1).catch(() => {});
       await query(`UPDATE live_sessions SET total_views = total_views + 1 WHERE id = $1`, [s.id]);
     }
+    // Guarantee the backing `calls` row exists (also repairs sessions created
+    // before the backing-row fix) and hand the call id to the watch page so it
+    // can mint media credentials via POST /calls/:id/join.
+    const callId = await ensureLiveCallRow(s);
     res.json({
       success: true,
-      data: { watch_url: `/join-call?code=${s.call_code}&watch=1`, session: s },
+      data: { watch_url: `/join-call?code=${s.call_code}&watch=1`, call_id: callId, session: s },
     });
   } catch (e: any) {
     console.error("live join error:", e?.message);
@@ -408,12 +451,16 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
 
 router.post("/:id/leave", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
+    // Resolve by UUID or call_code so a stale client holding the code still
+    // decrements the viewer count instead of hitting a UUID cast error.
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.json({ success: true });
     const r = await query(
       `UPDATE live_viewers SET left_at = CURRENT_TIMESTAMP
        WHERE session_id = $1 AND user_id = $2 AND left_at IS NULL RETURNING id`,
-      [req.params.id, req.user!.userId],
+      [s.id, req.user!.userId],
     );
-    if (r.rows.length) await bumpViewers(String(req.params.id), -1);
+    if (r.rows.length) await bumpViewers(s.id, -1);
     res.json({ success: true });
   } catch {
     res.status(500).json({ success: false, error: "Could not leave stream" });
@@ -430,9 +477,15 @@ router.post("/:id/end", authenticateToken, async (req: AuthenticatedRequest, res
     const r = await query(
       `UPDATE live_sessions SET status = 'ended', ended_at = CURRENT_TIMESTAMP, current_viewers = 0
        WHERE id = $1 RETURNING peak_viewers, total_views, reaction_count`,
-      [req.params.id],
+      [s.id],
     );
-    await query(`UPDATE live_viewers SET left_at = CURRENT_TIMESTAMP WHERE session_id = $1 AND left_at IS NULL`, [req.params.id]);
+    await query(`UPDATE live_viewers SET left_at = CURRENT_TIMESTAMP WHERE session_id = $1 AND left_at IS NULL`, [s.id]);
+    // Close the backing call room so it no longer resolves as an active call.
+    await query(
+      `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE call_code = $1 AND status <> 'completed'`,
+      [s.call_code],
+    ).catch(() => {});
     res.json({ success: true, data: { summary: r.rows[0] } });
   } catch {
     res.status(500).json({ success: false, error: "Could not end the stream" });
@@ -485,8 +538,12 @@ router.post("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, re
 
 router.get("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
+    // Resolve by UUID or call_code first — comparing a code against the UUID
+    // session_id column directly makes Postgres throw a cast error.
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.json({ success: true, data: { messages: [] } });
     const sinceId = req.query.since_id ? String(req.query.since_id) : null;
-    const params: any[] = [req.params.id];
+    const params: any[] = [s.id];
     let where = `m.session_id = $1 AND m.is_removed = FALSE`;
     if (sinceId && /^[0-9a-f-]{36}$/i.test(sinceId)) {
       params.push(sinceId);
@@ -530,12 +587,14 @@ router.post("/:id/react", authenticateToken, async (req: AuthenticatedRequest, r
 
 router.get("/:id/reactions", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.json({ success: true, data: { reactions: [] } });
     const minutes = Math.min(10, Math.max(1, Number(req.query.minutes) || 2));
     const r = await query(
       `SELECT emoji, COUNT(*)::int AS n FROM live_reactions
        WHERE session_id = $1 AND created_at > NOW() - ($2 || ' minutes')::INTERVAL
        GROUP BY emoji`,
-      [req.params.id, minutes],
+      [s.id, minutes],
     );
     res.json({ success: true, data: { reactions: r.rows } });
   } catch {

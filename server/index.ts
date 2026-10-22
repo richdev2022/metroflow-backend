@@ -35,6 +35,7 @@ import { handleDemo } from "./routes/demo";
   import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
   import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
+  import adminPrestmitRouter from "./routes/admin_prestmit";
   import personalProductsAdminRouter from "./features/personal/admin";
 import {
   registerBusiness,
@@ -977,6 +978,7 @@ export async function createServer() {
   // pricing/monitoring, expected by the deployed admin UI) mounts FIRST; the
   // ops router (boosts, moderation, ledgers, boost pricing) coexists below
   // with distinct subpaths.
+  mainRouter.use("/admin/personal/prestmit", adminPrestmitRouter);
   mainRouter.use("/admin/personal", personalProductsAdminRouter);
   mainRouter.use("/admin/personal", adminPersonalRouter);
 

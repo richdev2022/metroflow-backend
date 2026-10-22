@@ -495,6 +495,15 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
             min_amount, max_amount, start_date, end_date,
             page = "1", limit = "20", format = "json",
         } = req.query as Record<string, string>;
+        // The web client has always sent `walletId`; honour both spellings so
+        // the wallet filter actually filters (it was silently ignored before).
+        const q = req.query as Record<string, string>;
+        const walletIdParam = wallet_id || q.walletId || "";
+        // Same story for the camelCase amount/date filters sent by the web UI.
+        const minAmountParam = min_amount || q.minAmount || "";
+        const maxAmountParam = max_amount || q.maxAmount || "";
+        const startDateParam = start_date || q.startDate || "";
+        const endDateParam = end_date || q.endDate || "";
 
         // Resolve the wallets visible to this user: personal wallet + business wallet (admins/owner)
         const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
@@ -519,10 +528,22 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         params.push(walletIds, businessId);
         let idx = params.length + 1;
 
-        if (wallet_id && walletIds.includes(wallet_id)) {
+        if (walletIdParam && walletIds.includes(walletIdParam)) {
             sql += ` AND t.wallet_id = $${idx}`;
-            params.push(wallet_id);
+            params.push(walletIdParam);
             idx++;
+        }
+        // Wallet-GROUP filters (Transactions page wallet picker): NGN, USDT,
+        // USDC, or the aggregated "stablecoin" (USDT + USDC together).
+        const walletGroup = String((req.query as Record<string, string>).wallet_group || "").toLowerCase();
+        if (!walletIdParam && walletGroup) {
+            if (walletGroup === "stablecoin") {
+                sql += ` AND UPPER(w.currency) IN ('USDT','USDC')`;
+            } else if (["ngn", "usdt", "usdc", "usd"].includes(walletGroup)) {
+                sql += ` AND UPPER(w.currency) = $${idx}`;
+                params.push(walletGroup.toUpperCase());
+                idx++;
+            }
         }
         if (direction === 'credit' || direction === 'debit') {
             sql += ` AND t.direction = $${idx}`;
@@ -539,25 +560,25 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
             params.push(`%${search}%`);
             idx++;
         }
-        if (min_amount) {
+        if (minAmountParam) {
             sql += ` AND t.amount >= $${idx}`;
-            params.push(Number(min_amount));
+            params.push(Number(minAmountParam));
             idx++;
         }
-        if (max_amount) {
+        if (maxAmountParam) {
             sql += ` AND t.amount <= $${idx}`;
-            params.push(Number(max_amount));
+            params.push(Number(maxAmountParam));
             idx++;
         }
-        if (start_date) {
+        if (startDateParam) {
             sql += ` AND t.created_at >= $${idx}`;
-            params.push(start_date);
+            params.push(startDateParam);
             idx++;
         }
-        if (end_date) {
+        if (endDateParam) {
             // inclusive of the whole end day
             sql += ` AND t.created_at < ($${idx}::timestamp + interval '1 day')`;
-            params.push(end_date);
+            params.push(endDateParam);
             idx++;
         }
 

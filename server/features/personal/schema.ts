@@ -441,6 +441,15 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_market_listings_status ON market_listings(status, created_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_market_listings_category ON market_listings(category)`);
 
+  // Richer item details — everything a buyer should see before deciding
+  // (idempotent ladder so existing deployments gain the columns on boot).
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS brand VARCHAR(80)`);
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS model VARCHAR(80)`);
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS warranty_note VARCHAR(200)`);
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS pickup_ok BOOLEAN NOT NULL DEFAULT TRUE`);
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS delivery_ok BOOLEAN NOT NULL DEFAULT FALSE`);
+  await query(`ALTER TABLE market_listings ADD COLUMN IF NOT EXISTS delivery_fee DECIMAL(12,2) NOT NULL DEFAULT 0`);
+
   await query(`
     CREATE TABLE IF NOT EXISTS market_orders (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

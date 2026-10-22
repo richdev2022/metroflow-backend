@@ -17,6 +17,100 @@ import { checkFundingLimit, rejectOverLimitFunding } from "../services/funding-l
 const router = express.Router();
 
 /**
+ * Flutterwave BILL PAYMENT webhooks — settle pending bill_payments rows.
+ *
+ * Bills arrive on the generic webhook as either a dedicated bill event
+ * (bills.completed / bills.failed / bill.*) or as charge.completed with the
+ * bill's tx_ref (our BILL-… reference). Both routes end up here BEFORE the
+ * generic charge logic, which would otherwise try (and fail) to verify a
+ * bill as a card charge. Outcome is cross-checked against
+ * GET /v3/bills/{reference} when the payload status is unclear.
+ */
+const handleFlutterwaveBillWebhook = async (event: any): Promise<boolean> => {
+    const eventType = String(event?.event || "");
+    const data = event?.data || {};
+    const reference = String(data.tx_ref || data.reference || "");
+
+    const isBillEvent = /^bills?\./i.test(eventType);
+    const isBillReference = /^BILL-/i.test(reference);
+    if (!isBillEvent && !(eventType === "charge.completed" && isBillReference)) return false;
+
+    if (!reference) {
+        console.warn("Flutterwave bill webhook without reference, ignoring");
+        return true;
+    }
+
+    const billRes = await query(`SELECT * FROM bill_payments WHERE reference = $1 LIMIT 1`, [reference]);
+    const bill = billRes.rows[0];
+    if (!bill) {
+        console.warn(`Flutterwave bill webhook for unknown reference ${reference}`);
+        return true;
+    }
+
+    // Idempotency — only pending rows are settled here.
+    if (bill.status !== "pending") return true;
+
+    let outcome: "success" | "failed" | null = null;
+    const payloadStatus = String(data.status || "").toUpperCase();
+    if (["SUCCESSFUL", "SUCCESS", "COMPLETED", "DELIVERED"].includes(payloadStatus)) outcome = "success";
+    else if (["FAILED", "REJECTED", "REVERSED", "CANCELLED", "CANCELED"].includes(payloadStatus)) outcome = "failed";
+
+    if (!outcome) {
+        // Payload status unclear — pull the authoritative bill record.
+        try {
+            const { getBillPaymentByReference } = await import("../services/flutterwave");
+            const remote = await getBillPaymentByReference(reference);
+            const remoteStatus = String(remote?.status || "").toUpperCase();
+            if (["SUCCESSFUL", "SUCCESS", "COMPLETED", "DELIVERED"].includes(remoteStatus)) outcome = "success";
+            else if (["FAILED", "REJECTED", "REVERSED"].includes(remoteStatus)) outcome = "failed";
+        } catch (e: any) {
+            console.warn(`Bill status pull failed for ${reference}:`, e?.message);
+        }
+    }
+    if (!outcome) return true; // still processing — leave pending
+
+    const total = parseFloat(bill.total);
+    await query(
+        `UPDATE bill_payments
+         SET status = $2, provider_response = $3::jsonb,
+             recharge_token = COALESCE($4, recharge_token), updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [bill.id, outcome, JSON.stringify(event), data.recharge_token || null]
+    );
+
+    if (outcome === "failed" && bill.wallet_id) {
+        await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [total, bill.wallet_id]);
+        await query(
+            `INSERT INTO transactions
+             (business_id, user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
+             VALUES ($1, $2, $3, $4, $5, 'success', 'credit', $6, 'bill_refund', $7, 'credit')`,
+            [bill.business_id, bill.user_id, total, bill.currency || "NGN", `${bill.reference}-REFUND`,
+             `Bill payment refund — ${bill.provider_name} (${bill.customer_ref})`, bill.wallet_id]
+        );
+    }
+
+    try {
+        await createNotification({
+            businessId: bill.business_id,
+            userId: bill.user_id,
+            type: outcome === "success" ? "debit" : "system",
+            title: outcome === "success" ? "Bill Payment Successful" : "Bill Payment Failed",
+            message: outcome === "success"
+                ? `${bill.provider_name} for ${bill.customer_ref} was successful${data.recharge_token ? ` — token: ${data.recharge_token}` : ""}.`
+                : `${bill.provider_name} payment failed and your wallet has been refunded.`,
+            actionUrl: "/bills",
+            actionType: "view_bill",
+            metadata: { reference, status: outcome },
+            isActionable: false,
+            expiresInHours: 72,
+        });
+    } catch { /* best effort */ }
+
+    return true;
+};
+
+
+/**
  * @swagger
  * tags:
  *   name: Webhooks
@@ -917,6 +1011,11 @@ async function creditWalletFundingTransaction(transaction: any, providerName: st
 const handleFlutterwaveWebhook = async (event: any) => {
     const eventType = event?.event;
     const data = event?.data || {};
+
+    // ---------- Bill payments (dedicated events + charge.completed bridge) ----------
+    if (await handleFlutterwaveBillWebhook(event)) {
+        return;
+    }
 
     // ---------- Charge (checkout / card / bank transfer / USSD...) ----------
     if (eventType === 'charge.completed') {

@@ -1166,7 +1166,7 @@ router.put("/profile/privacy", authenticateToken, async (req: AuthenticatedReque
 router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const userId = req.user!.userId;
-        const { name, phone_number } = req.body || {};
+        const { name, phone_number, username, bio } = req.body || {};
 
         const updates: string[] = [];
         const values: any[] = [];
@@ -1217,6 +1217,32 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             // A hand-typed phone number is UNVERIFIED until confirmed via the
             // phone-verify OTP flow.
             updates.push(`phone_verified = FALSE`);
+        }
+        if (username !== undefined) {
+            // TikTok-style handle for shareable profile links (/u/:username).
+            const handle = String(username).trim().toLowerCase();
+            if (handle) {
+                if (!/^[a-z0-9._]{3,32}$/.test(handle)) {
+                    return res.status(400).json({
+                        success: false,
+                        error: "Username must be 3-32 characters — letters, numbers, dots or underscores.",
+                        code: "INVALID_USERNAME",
+                    });
+                }
+                const taken = await query(
+                    `SELECT id FROM users WHERE LOWER(username) = $1 AND id <> $2 LIMIT 1`,
+                    [handle, userId],
+                );
+                if (taken.rows.length > 0) {
+                    return res.status(409).json({ success: false, error: "That username is already taken.", code: "USERNAME_TAKEN" });
+                }
+                updates.push(`username = $${idx}`); values.push(handle); idx++;
+            } else {
+                updates.push(`username = NULL`); // clearing the handle
+            }
+        }
+        if (bio !== undefined) {
+            updates.push(`bio = $${idx}`); values.push(String(bio).slice(0, 300)); idx++;
         }
         if (updates.length === 0) {
             return res.status(400).json({ success: false, error: "Nothing to update" });

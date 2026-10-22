@@ -683,5 +683,116 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_friend_requests_addressee ON friend_requests (addressee_id, status)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_friend_requests_requester ON friend_requests (requester_id, status)`);
 
+  // ------------------------------------------------------------------
+  // 8. TIKTOK-STYLE SOCIAL GRAPH + LIVE MONETISATION
+  //    - users.username / users.bio for shareable public profiles (/u/:username)
+  //    - social_follows: asymmetric TikTok follow graph (follow / follow-back)
+  //    - social_follow_requests: follow requests INTO private accounts
+  //    - live_battles: PK battles between two live streamers (gift-driven score)
+  //    - live_gift_pockets: per-streamer earnings pocket → withdraw to NGN
+  //    - live_pocket_withdrawals: withdrawal ledger (fee applied here)
+  // ------------------------------------------------------------------
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(32)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users (LOWER(username)) WHERE username IS NOT NULL`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_follows (
+      follower_id UUID NOT NULL,
+      following_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (follower_id, following_id),
+      CONSTRAINT social_follows_not_self CHECK (follower_id <> following_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_following ON social_follows(following_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_follower ON social_follows(follower_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_follow_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      requester_id UUID NOT NULL,
+      target_id UUID NOT NULL,
+      status VARCHAR(12) NOT NULL DEFAULT 'pending', -- pending | accepted | declined
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      responded_at TIMESTAMP,
+      CONSTRAINT social_follow_requests_pair UNIQUE (requester_id, target_id),
+      CONSTRAINT social_follow_requests_not_self CHECK (requester_id <> target_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_follow_requests_target ON social_follow_requests (target_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_follow_requests_requester ON social_follow_requests (requester_id, status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_battles (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_a_id UUID NOT NULL,                 -- initiator's live session
+      session_b_id UUID,                          -- opponent's live session (set on accept)
+      host_a_id UUID NOT NULL,
+      host_b_id UUID,
+      status VARCHAR(16) NOT NULL DEFAULT 'pending',
+      -- pending | active | ended | declined | cancelled | expired
+      duration_seconds INTEGER NOT NULL DEFAULT 300,
+      started_at TIMESTAMP,
+      ends_at TIMESTAMP,
+      score_a NUMERIC(14,2) NOT NULL DEFAULT 0,   -- gifting points, side A
+      score_b NUMERIC(14,2) NOT NULL DEFAULT 0,   -- gifting points, side B
+      winner VARCHAR(4),                          -- 'a' | 'b' | 'tie'
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_session_a ON live_battles(session_a_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_session_b ON live_battles(session_b_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_host_a ON live_battles(host_a_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_host_b ON live_battles(host_b_id, status)`);
+
+  // Per-streamer earnings pocket. available = total_earned − total_withdrawn.
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_gift_pockets (
+      user_id UUID PRIMARY KEY,
+      total_earned NUMERIC(14,2) NOT NULL DEFAULT 0,
+      total_withdrawn NUMERIC(14,2) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_pocket_withdrawals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,              -- debited from the pocket
+      fee NUMERIC(14,2) NOT NULL DEFAULT 0,       -- admin-configured withdrawal fee
+      net_amount NUMERIC(14,2) NOT NULL,          -- credited to the NGN wallet
+      reference VARCHAR(80) UNIQUE NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'completed',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_pocket_withdrawals_user ON live_pocket_withdrawals(user_id, created_at DESC)`);
+
+  // Gift split columns (commission goes to the platform, net to the host pocket)
+  await query(`ALTER TABLE live_gifts ADD COLUMN IF NOT EXISTS commission_amount NUMERIC(14,2) NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_gifts ADD COLUMN IF NOT EXISTS host_amount NUMERIC(14,2) NOT NULL DEFAULT 0`);
+
+  // Admin-configurable live economics (fees, gift prices, battle defaults)
+  await query(`
+    INSERT INTO system_settings (key, value, description)
+    SELECT 'live_settings', $1::jsonb,
+           'Livestream economics: gift prices, withdrawal fee, gift commission, battle defaults'
+    WHERE NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'live_settings')
+  `, [
+    JSON.stringify({
+      currency: "NGN",
+      gift_prices: {},                 // { rose: 20, ... } — overrides the built-in catalog
+      gift_commission_percent: 0,      // platform cut on every gift (0 = host keeps everything)
+      withdrawal_fee_percent: 0,       // charged when withdrawing pocket → NGN wallet
+      withdrawal_fee_flat: 0,          // flat component of the withdrawal fee
+      withdrawal_min: 1000,            // minimum pocket withdrawal
+      battle_duration_seconds: 300,    // default PK round length
+      battle_multiplier: 2,            // gifting points multiplier during a battle (x2)
+    }),
+  ]);
+
   console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce) schema applied");
 }

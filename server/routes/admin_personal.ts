@@ -177,6 +177,100 @@ router.post("/social/posts/:id/:action", requirePermission("manage_settings"), a
   }
 });
 
+// ---------------------------------------------------------------------------
+// Post reports — community moderation queue + decisions
+//   GET  /admin/personal/social/post-reports?status=pending|actioned|dismissed
+//   POST /admin/personal/social/post-reports/:id/decision  { decision, note? }
+//     decision: remove_post | dismiss | warn_user
+// ---------------------------------------------------------------------------
+router.get("/social/post-reports", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const status = String(req.query.status || "pending");
+    if (!["pending", "actioned", "dismissed", "all"].includes(status)) {
+      return res.status(400).json({ success: false, error: "Unknown status filter" });
+    }
+    const where = status === "all" ? "TRUE" : `r.status = $1`;
+    const params: any[] = status === "all" ? [] : [status];
+    const r = await query(
+      `SELECT r.id, r.post_id, r.reason, r.details, r.status, r.decision, r.decision_note,
+              r.decided_by, r.decided_at, r.created_at,
+              p.body AS post_body, p.image_url AS post_image, p.video_url AS post_video,
+              p.status AS post_status, p.created_at AS post_created_at,
+              author.id AS author_id, author.name AS author_name, author.email AS author_email,
+              reporter.id AS reporter_id, reporter.name AS reporter_name,
+              (SELECT COUNT(*)::int FROM social_post_reports r2 WHERE r2.post_id = r.post_id) AS report_count
+       FROM social_post_reports r
+       JOIN social_posts p ON p.id = r.post_id
+       JOIN users author ON author.id = p.user_id
+       JOIN users reporter ON reporter.id = r.reporter_id
+       WHERE ${where}
+       ORDER BY r.created_at DESC
+       LIMIT 200`,
+      params,
+    );
+    const counts = await query(
+      `SELECT status, COUNT(*)::int AS n FROM social_post_reports GROUP BY status`,
+    );
+    res.json({
+      success: true,
+      data: {
+        reports: r.rows,
+        counts: Object.fromEntries(counts.rows.map((c) => [c.status, c.n])),
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load reports" });
+  }
+});
+
+router.post("/social/post-reports/:id/decision", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const decision = String(req.body?.decision || "");
+    const note = String(req.body?.note || "").slice(0, 500);
+    if (!["remove_post", "dismiss", "warn_user"].includes(decision)) {
+      return res.status(400).json({ success: false, error: "decision must be remove_post | dismiss | warn_user" });
+    }
+    const report = await query(
+      `SELECT r.id, r.post_id, r.status, p.user_id AS author_id, p.status AS post_status
+       FROM social_post_reports r JOIN social_posts p ON p.id = r.post_id WHERE r.id = $1`,
+      [String(req.params.id)],
+    );
+    if (!report.rows.length) return res.status(404).json({ success: false, error: "Report not found" });
+    const rep = report.rows[0];
+    if (rep.status !== "pending") return res.status(400).json({ success: false, error: "This report was already decided" });
+
+    if (decision === "remove_post") {
+      await query(
+        `UPDATE social_posts SET status = 'removed', removed_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [rep.post_id, note || "Removed after community reports — platform moderation"],
+      );
+    } else if (decision === "warn_user") {
+      // Notify the author with a moderation warning (keep the post up).
+      await query(
+        `INSERT INTO notifications (user_id, type, title, message, is_actionable, expires_at)
+         VALUES ($1, 'moderation', $2, $3, false, NOW() + INTERVAL '30 days')`,
+        [
+          rep.author_id,
+          "Community guidelines warning",
+          note || "Your recent post was reported by the community. Please review our community guidelines — repeated violations may lead to removal.",
+        ],
+      );
+    }
+    // Decision closes ALL pending reports on the same post (one bad post,
+    // many reporters — they all get resolved by this decision).
+    const statusMap: Record<string, string> = { remove_post: "actioned", warn_user: "actioned", dismiss: "dismissed" };
+    await query(
+      `UPDATE social_post_reports
+       SET status = $2, decision = $3, decision_note = $4, decided_by = $5, decided_at = CURRENT_TIMESTAMP
+       WHERE post_id = $1 AND status = 'pending'`,
+      [rep.post_id, statusMap[decision], decision, note || null, adminOf(req)],
+    );
+    res.json({ success: true, data: { decision } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not apply the decision" });
+  }
+});
+
 router.get("/social/polls", requirePermission("view_dashboard"), async (req, res) => {
   try {
     const status = String(req.query.status || "active");
@@ -484,3 +578,92 @@ router.put("/service-flags", requirePermission("manage_settings"), async (req: A
 });
 
 export default router;
+
+// ---------------------------------------------------------------------------
+// Account verification badge — pricing + subscriber management
+//   GET/PUT /admin/personal/verification-pricing   (system_settings
+//       `verification_badge_pricing` = { price, currency, duration_days })
+//   GET  /admin/personal/verifications?status=     subscribers + badge state
+//   POST /admin/personal/verifications/:userId/grant  { days }  (manual comp)
+//   POST /admin/personal/verifications/:userId/revoke
+// ---------------------------------------------------------------------------
+router.get("/verification-pricing", requirePermission("manage_settings"), async (_req, res) => {
+  try {
+    const raw = await getSetting("verification_badge_pricing", "");
+    const pricing = raw
+      ? JSON.parse(raw)
+      : { price: 2500, currency: "NGN", duration_days: 30 };
+    res.json({ success: true, data: pricing });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load verification pricing" });
+  }
+});
+
+router.put("/verification-pricing", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const price = Math.max(0, Number(req.body?.price));
+    const duration_days = Math.max(1, Number(req.body?.duration_days) || 30);
+    const currency = String(req.body?.currency || "NGN").toUpperCase();
+    if (!Number.isFinite(price)) return res.status(400).json({ success: false, error: "price must be a number" });
+    await setSetting(
+      "verification_badge_pricing",
+      JSON.stringify({ price, currency, duration_days }),
+      "Verified badge monthly subscription pricing (personal app)",
+    );
+    res.json({ success: true, data: { price, currency, duration_days } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not save verification pricing" });
+  }
+});
+
+router.get("/verifications", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const status = String(req.query.status || "active");
+    const where = status === "all" ? "u.verified_badge_status != 'none'" : `u.verified_badge_status = $1`;
+    const params: any[] = status === "all" ? [] : [status];
+    const r = await query(
+      `SELECT u.id, u.name, u.email, u.avatar_url, u.verified_badge_status, u.verified_since, u.verified_until,
+              (SELECT COUNT(*)::int FROM social_follows f WHERE f.following_id = u.id) AS followers,
+              (SELECT COUNT(*)::int FROM social_posts p WHERE p.user_id = u.id AND p.status = 'active') AS posts
+       FROM users u WHERE ${where} ORDER BY u.verified_since DESC NULLS LAST LIMIT 200`,
+      params,
+    );
+    const counts = await query(`SELECT verified_badge_status, COUNT(*)::int AS n FROM users GROUP BY verified_badge_status`);
+    res.json({
+      success: true,
+      data: {
+        verifications: r.rows,
+        counts: Object.fromEntries(counts.rows.map((c) => [c.verified_badge_status, c.n])),
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load verifications" });
+  }
+});
+
+router.post("/verifications/:userId/:action", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const action = String(req.params.action);
+    if (!["grant", "revoke"].includes(action)) return res.status(400).json({ success: false, error: "Unknown action" });
+    const userId = String(req.params.userId);
+    if (action === "grant") {
+      const days = Math.max(1, Number(req.body?.days) || 30);
+      const endsAt = new Date(Date.now() + days * 86400000);
+      await query(
+        `UPDATE users SET verified_badge_status = 'active', verified_since = COALESCE(verified_since, CURRENT_TIMESTAMP), verified_until = $2 WHERE id = $1`,
+        [userId, endsAt],
+      );
+      await query(
+        `INSERT INTO verification_subscriptions (user_id, price, currency, duration_days, status, reference, ends_at)
+         VALUES ($1, 0, 'NGN', $2, 'active', $3, $4)`,
+        [userId, days, `ADMIN-GRANT-${adminOf(req)}`, endsAt],
+      );
+      return res.json({ success: true, data: { verified_until: endsAt } });
+    }
+    await query(`UPDATE users SET verified_badge_status = 'revoked', verified_until = NULL WHERE id = $1`, [userId]);
+    await query(`UPDATE verification_subscriptions SET status = 'revoked' WHERE user_id = $1 AND status = 'active'`, [userId]);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not update verification" });
+  }
+});

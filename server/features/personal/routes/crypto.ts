@@ -8,6 +8,7 @@ import {
 import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
 import * as sogo from "../../../services/sogo";
+import { userSafeErr } from "../user-safe-errors";
 import { useProvider, getPercent } from "../flags";
 import { getActiveProvider } from "../provider-routing";
 import { getRate as flwRate } from "../../../services/flutterwave";
@@ -142,7 +143,7 @@ router.get("/catalog", authenticateToken, checkSubscriptionStatus, async (_req, 
       ],
     });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -163,7 +164,7 @@ router.get("/deposit-address", authenticateToken, checkSubscriptionStatus, async
     if (!(await assertPersonalService(res, "crypto"))) return;
     const provider = await activeCryptoProvider();
     if (provider !== "sogo") {
-      return res.status(400).json({ success: false, error: "Deposit addresses are only available when the Sogo crypto provider is active", code: "PROVIDER_UNAVAILABLE" });
+      return res.status(400).json({ success: false, error: "Crypto deposits are not available right now — please try again later", code: "PROVIDER_UNAVAILABLE" });
     }
     await ensureCryptoDepositSchema();
     const asset = String(req.query.asset || "").trim().toLowerCase();
@@ -193,7 +194,7 @@ router.get("/deposit-address", authenticateToken, checkSubscriptionStatus, async
     }
     return res.json({ success: true, provider, data: null });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -202,7 +203,7 @@ router.post("/deposit-address", authenticateToken, requirePersonalKyc(), checkSu
     if (!(await assertPersonalService(res, "crypto"))) return;
     const provider = await activeCryptoProvider();
     if (provider !== "sogo") {
-      return res.status(400).json({ success: false, error: "Deposit addresses are only available when the Sogo crypto provider is active", code: "PROVIDER_UNAVAILABLE" });
+      return res.status(400).json({ success: false, error: "Crypto deposits are not available right now — please try again later", code: "PROVIDER_UNAVAILABLE" });
     }
     await ensureCryptoDepositSchema();
     const asset = String(req.body?.asset || "").trim().toLowerCase();
@@ -232,7 +233,7 @@ router.post("/deposit-address", authenticateToken, requirePersonalKyc(), checkSu
     );
     return res.status(201).json({ success: true, provider, data: { asset, network: result?.network || network, address, extra: result, cached: false } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -259,7 +260,7 @@ router.post("/test-deposit", authenticateToken, checkSubscriptionStatus, async (
     const result = await sogo.cryptoTestDeposit({ asset, network, crypto_amount: cryptoAmount, test_reference: testReference });
     return res.json({ success: true, data: result });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -285,7 +286,7 @@ router.get("/deposits", authenticateToken, checkSubscriptionStatus, async (req: 
 
 router.post("/lookup", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const accountNumber = String(req.body?.account_number || "").trim();
+    const accountNumber = String(req.body?.account_number || "").replace(/\D+/g, "");
     const bankCode = String(req.body?.bank_code || "").trim();
     if (!/^\d{10}$/.test(accountNumber)) return res.status(400).json({ success: false, error: "Enter a valid 10-digit account number" });
     if (!bankCode) return res.status(400).json({ success: false, error: "Select a bank" });
@@ -490,7 +491,7 @@ router.get("/rate", authenticateToken, checkSubscriptionStatus, async (req: Auth
   try {
     const provider = await activeCryptoProvider();
     if (provider !== "sogo") {
-      return res.status(400).json({ success: false, error: "Multi-asset rates are only available when the Sogo crypto provider is active", code: "PROVIDER_UNAVAILABLE" });
+      return res.status(400).json({ success: false, error: "Multi-asset rates are not available right now — please try again later", code: "PROVIDER_UNAVAILABLE" });
     }
     const asset = String(req.query.asset || "").trim().toLowerCase();
     const amount = Number(req.query.amount) || 1;
@@ -498,7 +499,7 @@ router.get("/rate", authenticateToken, checkSubscriptionStatus, async (req: Auth
     const rate = await sogo.cryptoRate(asset, amount);
     return res.json({ success: true, provider, data: { asset, amount, ...rate } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 

@@ -10,6 +10,7 @@ import { uploadMediaBuffer } from "../../../services/media-upload";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
 import { friendshipMap } from "../../../routes/friends";
+import { getSetting } from "../../../services/app-config";
 
 /**
  * SOCIAL — Facebook-style feed + robust polls + post boost engine.
@@ -132,36 +133,81 @@ export async function getActiveBoostMap(targetType: "post" | "listing", ids: str
 }
 
 /**
- * FEED RANKING ALGORITHM (organic + paid):
- *   score = engagement_score × recency_decay + boost_priority
+ * FEED RANKING ALGORITHM (organic + paid + personalized):
+ *   score = engagement_score × recency_decay × personalization + boost_priority
  *   engagement_score = likes×1 + comments×3 + shares×5 (+ reaction weight)
  *   recency_decay    = 100 / (hours_since_post + 2)
+ *   personalization  = author affinity (viewer's recent interactions) ×
+ *                      follow bonus × rich-media bonus — the "niche engine":
+ *                      the more a viewer engages with an author or format,
+ *                      the more of that niche the feed serves (Facebook-style).
  *   boost_priority   = 1000 × remaining_reach_ratio  (paid placement dominates
  *                      until its estimated reach is served, then decays)
- * Boosted items additionally surface at the top of the first page.
+ * A light diversity pass demotes runs of 3+ posts from the same author.
  */
-function rankFeed(rows: any[], boosts: Map<string, any>): any[] {
+function rankFeed(
+  rows: any[],
+  boosts: Map<string, any>,
+  ctx?: { affinity?: Map<string, number>; followed?: Set<string> },
+): any[] {
   const now = Date.now();
-  return rows
-    .map((row) => {
-      const hours = Math.max(0, (now - new Date(row.created_at).getTime()) / 3600000);
-      const likes = Number(row.like_count) || 0;
-      const comments = Number(row.comment_count) || 0;
-      const shares = Number(row.share_count) || 0;
-      const engagement = likes * 1 + comments * 3 + shares * 5;
-      const organic = (engagement + 1) * (100 / (hours + 2));
-      const boost = boosts.get(row.id);
-      let boostPriority = 0;
-      if (boost) {
-        const served = Number(boost.impressions) || 0;
-        const planned = Number(boost.estimated_reach) || 1;
-        const remaining = Math.max(0, 1 - served / planned);
-        boostPriority = 1000 * remaining + 100; // floor keeps it above fresh organic
+  const affinity = ctx?.affinity;
+  const followed = ctx?.followed;
+  const scored = rows.map((row) => {
+    const hours = Math.max(0, (now - new Date(row.created_at).getTime()) / 3600000);
+    const likes = Number(row.like_count) || 0;
+    const comments = Number(row.comment_count) || 0;
+    const shares = Number(row.share_count) || 0;
+    const engagement = likes * 1 + comments * 3 + shares * 5;
+    let organic = (engagement + 1) * (100 / (hours + 2));
+
+    // ---- Personalization (niche recognition) ----
+    const authorId = String(row.user_id ?? row.author?.id ?? "");
+    if (affinity && affinity.size) {
+      const hits = affinity.get(authorId) || 0;
+      if (hits > 0) {
+        // 1 interaction ×1.15 → 4+ interactions ×1.60 (saturating).
+        organic *= 1 + 0.15 * Math.min(4, hits);
       }
-      return { ...row, _score: organic + boostPriority, boost: boost ? { active: true, ends_at: boost.ends_at } : undefined };
-    })
-    .sort((a, b) => b._score - a._score)
-    .map(({ _score, ...rest }) => rest);
+    }
+    if (followed?.has(authorId)) organic *= 1.2;
+    // Rich media earns a small organic edge (video > photo > text).
+    if (row.video_url) organic *= 1.15;
+    else if (row.image_url) organic *= 1.05;
+
+    const boost = boosts.get(row.id);
+    let boostPriority = 0;
+    if (boost) {
+      const served = Number(boost.impressions) || 0;
+      const planned = Number(boost.estimated_reach) || 1;
+      const remaining = Math.max(0, 1 - served / planned);
+      boostPriority = 1000 * remaining + 100; // floor keeps it above fresh organic
+    }
+    return { ...row, _score: organic + boostPriority, _authorId: authorId, boost: boost ? { active: true, ends_at: boost.ends_at } : undefined };
+  });
+
+  scored.sort((a, b) => b._score - a._score);
+
+  // ---- Diversity pass: no 3-in-a-row from one author (demote the 3rd) ----
+  const out: any[] = [];
+  const recent = new Map<string, number>(); // authorId → index of their 2nd-most-recent appearance
+  for (const item of scored) {
+    const aid = item._authorId as string;
+    const lastIdx = recent.get(aid);
+    if (lastIdx !== undefined && out.length - lastIdx <= 1) {
+      // Author already occupies the previous slot — push one slot down if possible.
+      const nextDifferent = out.findIndex((x, i) => i > lastIdx && (x._authorId as string) !== aid);
+      if (nextDifferent !== -1) {
+        out.splice(nextDifferent, 0, item);
+        recent.set(aid, nextDifferent);
+        continue;
+      }
+    }
+    out.push(item);
+    recent.set(aid, out.length - 1);
+  }
+
+  return out.map(({ _score, _authorId, ...rest }) => rest);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +270,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
+              (u.verified_badge_status = 'active' AND u.verified_until > NOW()) AS author_verified,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
               (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $1 LIMIT 1) AS my_reaction,
               (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count,
@@ -243,6 +290,40 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // "Add friend" action (public = chat, private = request first).
     const authorIds = [...new Set(postsRes.rows.map((r) => r.user_id))] as string[];
     const fMap = await friendshipMap(userId, authorIds);
+
+    // Follow context per author — so the feed's Follow/Following button
+    // reflects reality after a refresh instead of resetting to "Follow".
+    const followSet = new Set<string>();
+    if (authorIds.length) {
+      const followRes = await query(
+        `SELECT following_id FROM social_follows WHERE follower_id = $1 AND following_id = ANY($2::uuid[])`,
+        [userId, authorIds],
+      );
+      for (const row of followRes.rows) followSet.add(String(row.following_id));
+    }
+
+    // Niche affinity — authors the viewer reacted to or commented on in the
+    // last 30 days (weight = interaction count). This powers the personalized
+    // ranking: the feed learns WHOSE content this viewer engages with and
+    // serves more of that niche.
+    let affinity = new Map<string, number>();
+    try {
+      const affRes = await query(
+        `SELECT author_id, SUM(n)::int AS hits FROM (
+           SELECT p.user_id AS author_id, COUNT(*)::int AS n
+           FROM social_reactions r JOIN social_posts p ON p.id = r.post_id
+           WHERE r.user_id = $1 AND r.created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY p.user_id
+           UNION ALL
+           SELECT p.user_id AS author_id, COUNT(*)::int AS n
+           FROM social_comments c JOIN social_posts p ON p.id = c.post_id
+           WHERE c.user_id = $1 AND c.status = 'active' AND c.created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY p.user_id
+         ) t GROUP BY author_id`,
+        [userId],
+      );
+      for (const row of affRes.rows) affinity.set(String(row.author_id), Number(row.hits) || 0);
+    } catch { /* affinity is best-effort — ranking still works without it */ }
 
     // Poll payloads for posts that carry one
     let pollsByPost = new Map<string, any>();
@@ -300,7 +381,12 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           photo: p.author_photo,
           username: null,
           is_private: p.account_privacy === "private",
+          is_verified: !!p.author_verified,
           friendship_status: fMap.get(p.user_id) || "none",
+          // "none" | "following" — seeded from social_follows on load so the
+          // UI shows Following (with an Unfollow action) for accounts the
+          // viewer already follows.
+          viewer_follow_status: p.user_id === userId ? "self" : followSet.has(String(p.user_id)) ? "following" : "none",
         },
         message: poll ? poll.question : p.body,
         // `body`/`content` aliases — clients read item.body for text posts; the
@@ -336,7 +422,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     if (filter === "polls") items = items.filter((i) => i.kind === "poll");
     if (filter === "posts") items = items.filter((i) => i.kind === "post");
 
-    items = rankFeed(items, boosts);
+    items = rankFeed(items, boosts, { affinity, followed: followSet });
 
     // Impression accounting for active boosts surfaced in this page (throttled
     // by only counting the first N boosted rows per request).
@@ -447,6 +533,153 @@ router.delete("/posts/:id", authenticateToken, async (req: AuthenticatedRequest,
     res.json({ success: true, message: "Post deleted" });
   } catch {
     res.status(500).json({ success: false, error: "Could not delete post" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Report a post — feeds the admin moderation queue end-to-end
+// ---------------------------------------------------------------------------
+const REPORT_REASONS = new Set([
+  "spam", "harassment", "hate_speech", "violence", "nudity",
+  "misinformation", "scam", "self_harm", "other",
+]);
+
+router.post("/posts/:id/report", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const reason = String(req.body?.reason || "").trim();
+    const details = String(req.body?.details || "").trim().slice(0, 1000);
+    if (!REPORT_REASONS.has(reason)) {
+      return res.status(400).json({ success: false, error: "Pick a reason for the report" });
+    }
+    const post = await query(`SELECT id FROM social_posts WHERE id = $1 AND status = 'active'`, [req.params.id]);
+    if (!post.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
+
+    // One report per user per post (re-reporting just updates reason/details).
+    const existing = await query(
+      `SELECT id, status FROM social_post_reports WHERE post_id = $1 AND reporter_id = $2`,
+      [req.params.id, userId],
+    );
+    if (existing.rows.length) {
+      if (existing.rows[0].status === "pending") {
+        await query(`UPDATE social_post_reports SET reason = $2, details = $3 WHERE id = $1`, [existing.rows[0].id, reason, details || null]);
+        return res.json({ success: true, message: "Thanks — your report is already with our moderation team." });
+      }
+      return res.json({ success: true, message: "You already reported this post — our team has reviewed it." });
+    }
+    await query(
+      `INSERT INTO social_post_reports (post_id, reporter_id, reason, details) VALUES ($1, $2, $3, $4)`,
+      [req.params.id, userId, reason, details || null],
+    );
+    res.json({ success: true, message: "Report received — our moderation team will review it shortly." });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not submit the report" });
+  }
+});
+
+// Has the viewer already reported this post? (UI shows "Reported" state.)
+router.get("/posts/:id/report-status", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `SELECT status FROM social_post_reports WHERE post_id = $1 AND reporter_id = $2 LIMIT 1`,
+      [req.params.id, req.user!.userId],
+    );
+    res.json({ success: true, data: { reported: r.rows.length > 0, status: r.rows[0]?.status || null } });
+  } catch {
+    res.json({ success: true, data: { reported: false, status: null } });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Post view tracking — powers profile / video analytics
+// ---------------------------------------------------------------------------
+router.post("/posts/:id/view", async (req, res) => {
+  try {
+    // Best-effort viewer identity (optional auth — public posts are trackable
+    // anonymously; logged-in viewers power "unique viewers" analytics).
+    const viewerId: string | null = (req as any).user?.userId || null;
+    const source = ["feed", "deep_link", "share", "boost"].includes(String(req.body?.source)) ? String(req.body.source) : "feed";
+    // Skip self-views — authors never inflate their own analytics.
+    const authorRow = await query(`SELECT user_id FROM social_posts WHERE id = $1 AND status = 'active'`, [req.params.id]);
+    if (authorRow.rows.length && viewerId && String(authorRow.rows[0].user_id) === String(viewerId)) {
+      return res.json({ success: true, skipped: true });
+    }
+    await query(
+      `INSERT INTO social_post_views (post_id, author_id, viewer_id, source)
+       SELECT p.id, p.user_id, $2, $3 FROM social_posts p WHERE p.id = $1 AND p.status = 'active'`,
+      [req.params.id, viewerId, source],
+    );
+    await query(`UPDATE social_posts SET view_count = COALESCE(view_count, 0) + 1 WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch {
+    res.json({ success: true }); // never break the client over analytics
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Analytics — profile-level + per-post (own content only)
+// ---------------------------------------------------------------------------
+router.get("/analytics/overview", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const days = Math.min(90, Math.max(7, Number(req.query.days) || 28));
+    const since = new Date(Date.now() - days * 86400000);
+
+    const [totals, daily, top, engage] = await Promise.all([
+      query(
+        `SELECT COUNT(*)::int AS views, COUNT(DISTINCT viewer_id)::int AS unique_viewers
+         FROM social_post_views WHERE author_id = $1 AND viewed_at >= $2`,
+        [userId, since],
+      ),
+      query(
+        `SELECT day::text, COUNT(*)::int AS views,
+                COUNT(DISTINCT viewer_id)::int AS unique_viewers
+         FROM social_post_views WHERE author_id = $1 AND viewed_at >= $2
+         GROUP BY day ORDER BY day`,
+        [userId, since],
+      ),
+      query(
+        `SELECT p.id, p.body, p.image_url, p.video_url, p.created_at,
+                COALESCE(p.view_count,0) AS view_count,
+                (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+                (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count,
+                p.share_count
+         FROM social_posts p WHERE p.user_id = $1 AND p.status = 'active'
+         ORDER BY COALESCE(p.view_count,0) DESC, p.created_at DESC LIMIT 10`,
+        [userId],
+      ),
+      query(
+        `SELECT COUNT(*)::int AS posts,
+           COALESCE(SUM((SELECT COUNT(*) FROM social_reactions r WHERE r.post_id = p.id)),0)::int AS likes,
+           COALESCE(SUM((SELECT COUNT(*) FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active')),0)::int AS comments,
+           COALESCE(SUM(p.share_count),0)::int AS shares,
+           COALESCE(SUM(COALESCE(p.view_count,0)),0)::int AS views
+         FROM social_posts p WHERE p.user_id = $1 AND p.status = 'active' AND p.created_at >= $2`,
+        [userId, since],
+      ),
+    ]);
+
+    const e = engage.rows[0] || { posts: 0, likes: 0, comments: 0, shares: 0, views: 0 };
+    const interactions = Number(e.likes) + Number(e.comments) + Number(e.shares);
+    res.json({
+      success: true,
+      data: {
+        window_days: days,
+        totals: {
+          views: Number(totals.rows[0]?.views || 0),
+          unique_viewers: Number(totals.rows[0]?.unique_viewers || 0),
+          posts: Number(e.posts || 0),
+          likes: Number(e.likes || 0),
+          comments: Number(e.comments || 0),
+          shares: Number(e.shares || 0),
+          engagement_rate: Number(e.views) > 0 ? Math.round((interactions / Number(e.views)) * 1000) / 10 : 0,
+        },
+        daily: daily.rows.map((d) => ({ day: d.day, views: Number(d.views), unique_viewers: Number(d.unique_viewers) })),
+        top_posts: top.rows,
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load analytics" });
   }
 });
 
@@ -762,10 +995,24 @@ router.get("/share/post/:id", async (req, res) => {
 
     const host = `https://${req.headers.host || "api.metricorex.com"}`;
     const appUrl = process.env.PERSONAL_SITE_URL || "https://personal.metricorex.com";
+    const apiOrigin = String(
+      process.env.API_PUBLIC_BASE_URL || process.env.APP_BASE_URL || host,
+    ).replace(/\/$/, "");
+    // Stored post media can be:
+    //   1. a full https URL          → use as-is
+    //   2. a root-relative path      → prefix the API origin
+    //      ("/uploads/x.jpg", "/files/<key>")
+    //   3. a bare R2 object KEY      → "/files/<key>" then the origin — this is
+    //      the shape that previously produced "https://host/bare-key" and
+    //      broken share thumbnails for R2-backed posts.
     const abs = (u?: string | null) => {
       if (!u) return "";
-      if (/^https?:\/\//i.test(u)) return u;
-      return `${host}/${String(u).replace(/^\/+/, "")}`;
+      const s = String(u).trim();
+      if (!s) return "";
+      if (/^https?:\/\//i.test(s)) return s;
+      if (/^uploads\//i.test(s)) return `${apiOrigin}/uploads/${s.slice("uploads/".length)}`;
+      if (s.startsWith("/")) return `${apiOrigin}${s}`;
+      return `${apiOrigin}/files/${s}`;
     };
     const image = abs(p.image_url) || abs(p.author_photo);
     const video = abs(p.video_url);
@@ -785,9 +1032,10 @@ router.get("/share/post/:id", async (req, res) => {
 <meta charset="utf-8" />
 <title>${esc(title)}</title>
 <meta property="og:type" content="${video ? "video.other" : "article"}" />
+<meta property="og:site_name" content="MetriCorex" />
 <meta property="og:title" content="${esc(title)}" />
 <meta property="og:description" content="${esc(excerpt || "Check this out on MetriCorex")}" />
-${ogImage ? `<meta property="og:image" content="${esc(ogImage)}" />\n<meta property="og:image:secure_url" content="${esc(ogImage)}" />` : ""}
+${ogImage ? `<meta property="og:image" content="${esc(ogImage)}" />\n<meta property="og:image:secure_url" content="${esc(ogImage)}" />\n<meta property="og:image:width" content="1200" />\n<meta property="og:image:height" content="630" />` : ""}
 ${video ? `<meta property="og:video" content="${esc(video)}" />\n<meta property="og:video:secure_url" content="${esc(video)}" />` : ""}
 <meta name="twitter:card" content="${video && !image ? "player" : "summary_large_image"}" />
 ${ogImage ? `<meta name="twitter:image" content="${esc(ogImage)}" />` : ""}
@@ -1308,3 +1556,194 @@ router.post("/boosts/:id/:action", authenticateToken, async (req: AuthenticatedR
 });
 
 export default router;
+
+// ---------------------------------------------------------------------------
+// ACCOUNT VERIFICATION BADGE — monthly subscription with auto-evaluated
+// criteria. Pricing is admin-controlled (system_settings
+// `verification_badge_pricing` = { price, currency, duration_days }).
+//   GET  /social/verification/status   → criteria checklist + pricing + sub
+//   POST /social/verification/subscribe { pin, wallet_id }
+// Badge exposure: users.verified_badge_status + verified_until; is_verified
+// is computed (active AND verified_until > NOW()) wherever users are served.
+// ---------------------------------------------------------------------------
+
+export interface VerificationPricing {
+  price: number;
+  currency: string;
+  duration_days: number;
+}
+
+const DEFAULT_VERIFICATION_PRICING: VerificationPricing = {
+  price: 2500,
+  currency: "NGN",
+  duration_days: 30,
+};
+
+export async function getVerificationPricing(): Promise<VerificationPricing> {
+  try {
+    const raw = await getSetting("verification_badge_pricing", "");
+    if (raw) {
+      const p = JSON.parse(raw);
+      return {
+        price: Math.max(0, Number(p.price) || DEFAULT_VERIFICATION_PRICING.price),
+        currency: String(p.currency || DEFAULT_VERIFICATION_PRICING.currency),
+        duration_days: Math.max(1, Number(p.duration_days) || DEFAULT_VERIFICATION_PRICING.duration_days),
+      };
+    }
+  } catch { /* fall through to defaults */ }
+  return DEFAULT_VERIFICATION_PRICING;
+}
+
+/** Evaluate every eligibility criterion for the badge. */
+export async function evaluateVerificationCriteria(userId: string): Promise<Array<{ key: string; label: string; passed: boolean; detail: string }>> {
+  const MIN_FOLLOWERS = 50;
+  const MIN_POSTS = 5;
+  const MIN_AGE_DAYS = 30;
+
+  const [u, followers, posts, violations] = await Promise.all([
+    query(
+      `SELECT kyc_status, phone_verified, avatar_url, bio, username, created_at FROM users WHERE id = $1`,
+      [userId],
+    ),
+    query(`SELECT COUNT(*)::int AS n FROM social_follows WHERE following_id = $1`, [userId]),
+    query(`SELECT COUNT(*)::int AS n FROM social_posts WHERE user_id = $1 AND status = 'active'`, [userId]),
+    query(
+      `SELECT COUNT(*)::int AS n FROM social_post_reports r
+       JOIN social_posts p ON p.id = r.post_id
+       WHERE p.user_id = $1 AND r.status = 'actioned' AND r.decision IN ('remove_post') AND r.decided_at >= NOW() - INTERVAL '90 days'`,
+      [userId],
+    ),
+  ]);
+
+  const row = u.rows[0] || {};
+  const bio = String(row.bio || "").trim();
+  const username = String(row.username || "").trim();
+  const avatar = String(row.avatar_url || "").trim();
+  const profileScore = [avatar, bio.length >= 20, username].filter(Boolean).length;
+  const ageDays = row.created_at ? Math.floor((Date.now() - new Date(row.created_at).getTime()) / 86400000) : 0;
+
+  return [
+    { key: "kyc", label: "Identity verified (KYC)", passed: String(row.kyc_status) === "verified", detail: String(row.kyc_status) === "verified" ? "Your identity is verified" : "Complete KYC in the app to verify your identity" },
+    { key: "phone", label: "Phone number verified", passed: row.phone_verified === true, detail: row.phone_verified ? "Phone verified" : "Verify your phone number in Account settings" },
+    { key: "profile", label: "Complete profile (photo, bio, username)", passed: profileScore === 3, detail: `${profileScore}/3 done — ${!avatar ? "add a photo, " : ""}${bio.length < 20 ? "write a longer bio, " : ""}${!username ? "set a username" : ""}`.replace(/, $/, "") || "Profile complete" },
+    { key: "age", label: `Account at least ${MIN_AGE_DAYS} days old`, passed: ageDays >= MIN_AGE_DAYS, detail: `${ageDays} day${ageDays === 1 ? "" : "s"} so far` },
+    { key: "followers", label: `At least ${MIN_FOLLOWERS} followers`, passed: Number(followers.rows[0]?.n) >= MIN_FOLLOWERS, detail: `${Number(followers.rows[0]?.n) || 0}/${MIN_FOLLOWERS} followers` },
+    { key: "posts", label: `At least ${MIN_POSTS} posts`, passed: Number(posts.rows[0]?.n) >= MIN_POSTS, detail: `${Number(posts.rows[0]?.n) || 0}/${MIN_POSTS} active posts` },
+    { key: "standing", label: "Good standing (no removed posts in 90 days)", passed: Number(violations.rows[0]?.n) === 0, detail: Number(violations.rows[0]?.n) === 0 ? "No moderation actions against you" : "Recent content was removed after community reports" },
+  ];
+}
+
+router.get("/verification/status", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const [pricing, criteria, subRows, badgeRow] = await Promise.all([
+      getVerificationPricing(),
+      evaluateVerificationCriteria(userId),
+      query(
+        `SELECT * FROM verification_subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [userId],
+      ),
+      query(`SELECT verified_badge_status, verified_until FROM users WHERE id = $1`, [userId]),
+    ]);
+
+    // Lazy expiry — a stale 'active' badge past its end date flips to expired.
+    const until = badgeRow.rows[0]?.verified_until ? new Date(badgeRow.rows[0].verified_until) : null;
+    let badge = String(badgeRow.rows[0]?.verified_badge_status || "none");
+    if (badge === "active" && until && until.getTime() < Date.now()) {
+      await query(`UPDATE users SET verified_badge_status = 'expired' WHERE id = $1`, [userId]);
+      await query(`UPDATE verification_subscriptions SET status = 'expired' WHERE user_id = $1 AND status = 'active'`, [userId]);
+      badge = "expired";
+    }
+    const activeBadge = badge === "active" && until && until.getTime() > Date.now();
+    const daysLeft = activeBadge && until ? Math.max(0, Math.ceil((until.getTime() - Date.now()) / 86400000)) : 0;
+
+    res.json({
+      success: true,
+      data: {
+        pricing,
+        criteria,
+        eligible: criteria.every((c) => c.passed),
+        badge: activeBadge ? "active" : badge,
+        verified_until: activeBadge ? until : null,
+        days_left: daysLeft,
+        subscription: subRows.rows[0]
+          ? {
+              status: subRows.rows[0].status,
+              price: Number(subRows.rows[0].price),
+              currency: subRows.rows[0].currency,
+              duration_days: subRows.rows[0].duration_days,
+              starts_at: subRows.rows[0].starts_at,
+              ends_at: subRows.rows[0].ends_at,
+            }
+          : null,
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load verification status" });
+  }
+});
+
+router.post("/verification/subscribe", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const { pin, wallet_id } = req.body || {};
+    const pricing = await getVerificationPricing();
+
+    // All criteria must pass — no paying around the checklist.
+    const criteria = await evaluateVerificationCriteria(userId);
+    if (!criteria.every((c) => c.passed)) {
+      return res.status(400).json({
+        success: false,
+        code: "CRITERIA_NOT_MET",
+        error: "You don't meet all the verification criteria yet",
+        data: { criteria },
+      });
+    }
+
+    const wallet = await getOwnedWallet(String(wallet_id || ""), userId, req.user!.businessId ?? null);
+    if (!wallet) return res.status(404).json({ success: false, error: "Wallet not found" });
+    const price = Math.round(pricing.price * 100) / 100;
+    if (Number(wallet.balance) < price) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient balance — the badge costs ${pricing.currency === "NGN" ? "₦" : ""}${price.toLocaleString()}/${pricing.duration_days} days` });
+    }
+    const pinCheck = await verifyTransactionPin(pin, { userId, businessId: req.user!.businessId ?? null, wallet });
+    if (!pinCheck.ok) {
+      return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
+    }
+
+    const reference = genRef("MF-VFY");
+    if (!(await debitWallet(wallet.id, price))) {
+      return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: "Insufficient wallet balance" });
+    }
+    await insertTransaction({
+      userId, businessId: wallet.business_id, walletId: wallet.id, reference,
+      type: "debit", transactionType: "verification_badge", amount: price, currency: wallet.currency,
+      fee: 0, description: `Verified badge — ${pricing.duration_days} day subscription`,
+    });
+    await creditRevenueWallet(price, wallet.currency, reference, `Verified badge subscription — revenue`);
+
+    const startsAt = new Date();
+    const endsAt = new Date(startsAt.getTime() + pricing.duration_days * 86400000);
+    await query(
+      `INSERT INTO verification_subscriptions (user_id, price, currency, duration_days, status, reference, starts_at, ends_at)
+       VALUES ($1, $2, $3, $4, 'active', $5, $6, $7)`,
+      [userId, price, wallet.currency, pricing.duration_days, reference, startsAt, endsAt],
+    );
+    await query(
+      `UPDATE users SET verified_badge_status = 'active', verified_since = CURRENT_TIMESTAMP, verified_until = $2 WHERE id = $1`,
+      [userId, endsAt],
+    );
+    createNotification({
+      businessId: (req.user!.businessId ?? "") as string,
+      userId,
+      type: "verification",
+      title: "You're verified ✓",
+      message: `Your verified badge is active for the next ${pricing.duration_days} days. Thank you for keeping your account in good standing!`,
+    }).catch(() => {});
+
+    res.json({ success: true, data: { verified_until: endsAt, days_left: pricing.duration_days } });
+  } catch (e: any) {
+    console.error("verification subscribe error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not subscribe to the verified badge" });
+  }
+});

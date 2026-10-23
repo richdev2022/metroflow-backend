@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  verifyTransactionPin, assertPersonalService, genRef,
+  verifyTransactionPin, assertPersonalService, genRef, requirePersonalKyc, isPersonalKycVerified,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
@@ -883,6 +883,14 @@ router.post("/polls/:id/vote", authenticateToken, async (req: AuthenticatedReque
     // wallet into the poll pool. Single choice, votes are FINAL (no toggle,
     // no refund, one vote per user). PIN-verified like every money flow.
     if ((p.poll_type || "free") === "paid") {
+      // Voting with a wallet = selecting/using a wallet → KYC must be done.
+      // (Free polls stay open to everyone — no KYC gate on this branch.)
+      if (!(await isPersonalKycVerified(userId))) {
+        return res.status(403).json({
+          success: false, code: "KYC_REQUIRED",
+          error: "KYC verification is required to vote on paid polls. Please complete your KYC verification.",
+        });
+      }
       const already = await query(`SELECT id FROM social_poll_votes WHERE poll_id = $1 AND user_id = $2 LIMIT 1`, [p.id, userId]);
       if (already.rows.length) {
         return res.status(400).json({ success: false, error: "You have already voted on this paid poll", code: "ALREADY_VOTED" });
@@ -1043,7 +1051,7 @@ router.get("/polls/pricing", authenticateToken, async (req: AuthenticatedRequest
 // Creator withdraws a matured paid poll's pool to their NGN wallet. The
 // admin-configured fee is deducted here and posted to the platform revenue
 // ledger (creditRevenueWallet) so it shows in the admin Revenue history.
-router.post("/polls/:id/withdraw", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/polls/:id/withdraw", authenticateToken, requirePersonalKyc(), async (req: AuthenticatedRequest, res) => {
   const userId = req.user!.userId;
   try {
     const settings = await getPollSettings();
@@ -1198,7 +1206,7 @@ router.get("/vote-pocket", authenticateToken, async (req: AuthenticatedRequest, 
 // ---------------------------------------------------------------------------
 // POST BOOST — wallet-funded paid placement
 // ---------------------------------------------------------------------------
-router.post("/posts/:id/boost", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/posts/:id/boost", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const { budget, duration_days, audience, pin, wallet_id } = req.body || {};

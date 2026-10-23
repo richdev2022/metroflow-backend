@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  verifyTransactionPin, assertPersonalService, genRef,
+  verifyTransactionPin, assertPersonalService, genRef, requirePersonalKyc,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
@@ -352,7 +352,7 @@ router.get("/saves/all", authenticateToken, async (req: AuthenticatedRequest, re
 // ---------------------------------------------------------------------------
 // Buy (escrow-lite)
 // ---------------------------------------------------------------------------
-router.post("/:id/buy", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const { pin, wallet_id, delivery_address, delivery_phone } = req.body || {};
@@ -536,7 +536,7 @@ router.post("/orders/:id/cancel", authenticateToken, async (req: AuthenticatedRe
 // ---------------------------------------------------------------------------
 // Listing boost (same engine as posts)
 // ---------------------------------------------------------------------------
-router.post("/:id/boost", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/boost", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const { budget, duration_days, audience, pin, wallet_id } = req.body || {};

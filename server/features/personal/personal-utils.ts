@@ -48,6 +48,21 @@ export function requirePersonalKyc() {
 }
 
 /**
+ * Inline KYC probe for endpoints where only a BRANCH of the handler moves
+ * money (e.g. paid poll votes — free votes stay open to everyone). Use the
+ * requirePersonalKyc() middleware when the WHOLE endpoint needs KYC.
+ */
+export async function isPersonalKycVerified(userId: string): Promise<boolean> {
+  try {
+    const r = await query(`SELECT bvn_status, nin_status FROM users WHERE id = $1`, [userId]);
+    const u = r.rows[0];
+    return !!u && (u.bvn_status === "verified" || u.nin_status === "verified");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Verify the transaction PIN. Personal users: users.transaction_pin_hash.
  * Business users: businesses.transaction_pin_hash. The wallet row decides
  * which side the caller is on (wallet.user_id / wallet.business_id).
@@ -153,7 +168,7 @@ export async function getPersonalServiceFlags(): Promise<Record<string, boolean>
     );
     if (r.rows[0]?.value) return JSON.parse(r.rows[0].value);
   } catch { /* fall through to defaults */ }
-  return { bills: true, savings: true, giftcards: true, esim: true, virtualcards: true, crypto: true, social: true, live: true, marketplace: true, swap: true };
+  return { bills: true, savings: true, giftcards: true, esim: true, virtualcards: true, crypto: true, social: true, live: true, marketplace: true, swap: true, donations: true };
 }
 
 export async function assertPersonalService(res: Response, flag: string): Promise<boolean> {

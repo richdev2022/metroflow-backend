@@ -33,6 +33,7 @@ import { handleDemo } from "./routes/demo";
   import personalEsimRouter from "./features/personal/routes/esim";
   import billsPersonalRouter from "./features/personal/bills";
   import savingsPersonalRouter from "./features/personal/savings";
+  import personalDonationsRouter from "./features/personal/routes/donations";
   import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
   import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
@@ -1204,6 +1205,9 @@ export async function createServer() {
   // Bills Hub (Flutterwave dynamic catalog + real fulfilment) + Savings Vaults
   mainRouter.use("/bills", billsPersonalRouter);
   mainRouter.use("/savings", savingsPersonalRouter);
+  // Fundraising donations: create campaigns, contribute from NGN wallet,
+  // donor lists, creator redemption to NGN wallet (admin manages economics).
+  mainRouter.use("/donations", personalDonationsRouter);
 
   // Provider webhooks (public, signature-verified inside). These were
   // previously imported but never mounted — gift-card + Bitnob callbacks 404'd.

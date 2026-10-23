@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  assertPersonalService, genRef,
+  assertPersonalService, genRef, requirePersonalKyc,
 } from "../personal-utils";
 import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
@@ -113,7 +113,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
   }
 });
 
-router.post("/sell", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "crypto"))) return;
     const userId = req.user!.userId;

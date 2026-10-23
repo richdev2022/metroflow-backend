@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../middleware/auth";
-import { verifyTransactionPin } from "./personal-utils";
+import { verifyTransactionPin, requirePersonalKyc } from "./personal-utils";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 import {
@@ -439,7 +439,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
  *       403:
  *         description: Bills disabled on the current plan (PLAN_UPGRADE_REQUIRED)
  */
-router.post("/pay", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { userId, businessId } = req.user!;
         const {

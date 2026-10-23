@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction, verifyTransactionPin,
-  assertPersonalService, genRef,
+  assertPersonalService, genRef, requirePersonalKyc,
 } from "../personal-utils";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../../services/fees";
 import { getBillCategories, payBill } from "../../../services/flutterwave";
@@ -122,7 +122,7 @@ router.get("/orders", authenticateToken, async (req: AuthenticatedRequest, res) 
   }
 });
 
-router.post("/purchase", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/purchase", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "esim"))) return;
     const userId = req.user!.userId;

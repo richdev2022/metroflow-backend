@@ -871,5 +871,89 @@ export async function ensurePersonalSchema(): Promise<void> {
     }),
   ]);
 
-  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce) schema applied");
+  // ------------------------------------------------------------------
+  // 8. DONATIONS (fundraising)
+  // ------------------------------------------------------------------
+  // Users create fundraising campaigns; other users contribute from their NGN
+  // wallet; the creator redeems the raised amount to their NGN wallet (the
+  // admin-configured redemption fee lands in the platform revenue ledger).
+  await query(`
+    CREATE TABLE IF NOT EXISTS donations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_id UUID NOT NULL,
+      title VARCHAR(160) NOT NULL,
+      description TEXT NOT NULL,
+      cover_url TEXT,                       -- optional cover image
+      category VARCHAR(40) NOT NULL DEFAULT 'other',
+      goal_amount NUMERIC(14,2) NOT NULL,
+      currency VARCHAR(8) NOT NULL DEFAULT 'NGN',
+      deadline TIMESTAMP,                   -- optional end date
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | ended | suspended
+      status_reason TEXT,
+      amount_raised NUMERIC(14,2) NOT NULL DEFAULT 0,
+      amount_redeemed NUMERIC(14,2) NOT NULL DEFAULT 0,
+      redeemed_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donations_creator ON donations(creator_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donations_status ON donations(status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donations_category ON donations(category)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS donation_contributions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      donation_id UUID NOT NULL REFERENCES donations(id) ON DELETE CASCADE,
+      donor_id UUID NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,        -- debited from the donor's NGN wallet
+      fee NUMERIC(14,2) NOT NULL DEFAULT 0, -- admin-configured contribution fee → revenue ledger
+      net_amount NUMERIC(14,2) NOT NULL,    -- amount that lands in the fundraiser pool
+      currency VARCHAR(8) NOT NULL DEFAULT 'NGN',
+      reference VARCHAR(80) UNIQUE NOT NULL,
+      message TEXT,                          -- optional words of support
+      anonymous BOOLEAN NOT NULL DEFAULT FALSE,
+      status VARCHAR(20) NOT NULL DEFAULT 'success',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donation_contributions_donation ON donation_contributions(donation_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donation_contributions_donor ON donation_contributions(donor_id, created_at DESC)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS donation_redemptions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      donation_id UUID NOT NULL REFERENCES donations(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,        -- debited from the fundraiser pool
+      fee NUMERIC(14,2) NOT NULL DEFAULT 0, -- admin-configured redemption fee → revenue ledger
+      net_amount NUMERIC(14,2) NOT NULL,    -- credited to the creator's NGN wallet
+      reference VARCHAR(80) UNIQUE NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'completed',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_donation_redemptions_user ON donation_redemptions(user_id, created_at DESC)`);
+
+  // Admin-configurable donation economics (contribution bounds + fees)
+  await query(`
+    INSERT INTO system_settings (key, value, description)
+    SELECT 'donation_settings', $1::jsonb,
+           'Donation economics: contribution bounds + contribution/redemption fees (percent + flat), minimum redemption'
+    WHERE NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'donation_settings')
+  `, [
+    JSON.stringify({
+      currency: "NGN",
+      min_donation: 100,           // per-contribution floor
+      max_donation: 5000000,       // per-contribution ceiling
+      contribution_fee_percent: 0, // charged on each contribution → revenue ledger (0 = donors give in full)
+      contribution_fee_flat: 0,
+      redemption_fee_percent: 5,   // charged at redemption → revenue ledger
+      redemption_fee_flat: 0,
+      redemption_min: 1000,        // minimum redemption amount
+      max_active_per_user: 5,      // concurrent active fundraisers per creator
+    }),
+  ]);
+
+  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations) schema applied");
 }

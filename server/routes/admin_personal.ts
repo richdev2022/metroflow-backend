@@ -22,6 +22,10 @@ import { getBoostPricing } from "../features/personal/routes/social";
  *   POST /admin/personal/marketplace/listings/:id/approve|remove|suspend
  *   GET  /admin/personal/marketplace/orders
  *   GET  /admin/personal/giftcards/sell | /buy     → provider trade ledgers
+ *   GET  /admin/personal/donations?status=&q=      → all fundraisers + stats
+ *   GET/PUT /admin/personal/donations/settings     → donation economics (system_settings)
+ *   GET  /admin/personal/donations/:id/contributions → donor drill-down
+ *   POST /admin/personal/donations/:id/suspend|activate|end
  *   GET/PUT /admin/personal/service-flags          → global personal feature kill-switches
  */
 
@@ -34,7 +38,7 @@ const adminOf = (req: AuthenticatedAdminRequest) => req.admin?.adminId ?? "admin
 // ---------------------------------------------------------------------------
 router.get("/overview", requirePermission("view_dashboard"), async (_req, res) => {
   try {
-    const [users, posts, polls, live, listings, orders, boosts, gcSell, gcBuy, crypto] = await Promise.all([
+    const [users, posts, polls, live, listings, orders, boosts, gcSell, gcBuy, crypto, donations] = await Promise.all([
       query(`SELECT COUNT(*)::int AS n FROM users WHERE account_type = 'personal'`),
       query(`SELECT COUNT(*)::int AS n FROM social_posts WHERE status = 'active'`),
       query(`SELECT COUNT(*)::int AS n FROM social_polls WHERE status = 'active'`),
@@ -45,6 +49,7 @@ router.get("/overview", requirePermission("view_dashboard"), async (_req, res) =
       query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(payout_amount),0)::float AS payout FROM giftcard_sell_trades WHERE status = 'settled'`),
       query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(total_charged),0)::float AS gmv FROM giftcard_buy_orders WHERE status = 'completed'`),
       query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(settlement_amount),0)::float AS gmv FROM crypto_sales WHERE status = 'completed'`),
+      query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(amount_raised),0)::float AS raised, COALESCE(SUM(amount_redeemed),0)::float AS redeemed FROM donations`),
     ]);
     res.json({
       success: true,
@@ -64,6 +69,9 @@ router.get("/overview", requirePermission("view_dashboard"), async (_req, res) =
         giftcard_buy_gmv: gcBuy.rows[0].gmv,
         crypto_sales: crypto.rows[0].n,
         crypto_gmv: crypto.rows[0].gmv,
+        donations: donations.rows[0].n,
+        donations_raised: donations.rows[0].raised,
+        donations_redeemed: donations.rows[0].redeemed,
       },
     });
   } catch (e: any) {
@@ -323,18 +331,144 @@ router.get("/giftcards/buy", requirePermission("view_dashboard"), async (req, re
 });
 
 // ---------------------------------------------------------------------------
+// Donations (fundraising) — management + economics
+// ---------------------------------------------------------------------------
+router.get("/donations", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const { status, q } = req.query as Record<string, string | undefined>;
+    const params: any[] = [];
+    let where = "TRUE";
+    if (status && ["active", "ended", "suspended"].includes(status)) {
+      params.push(status); where = `d.status = $1`;
+    }
+    if (q && String(q).trim()) {
+      params.push(`%${String(q).trim().toLowerCase()}%`);
+      where += ` AND (LOWER(d.title) LIKE $${params.length} OR LOWER(u.name) LIKE $${params.length} OR LOWER(u.email) LIKE $${params.length})`;
+    }
+    const [rows, stats] = await Promise.all([
+      query(
+        `SELECT d.*, u.name AS creator_name, u.email AS creator_email,
+                LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS creator_username,
+                (SELECT COUNT(*)::int FROM donation_contributions c WHERE c.donation_id = d.id AND c.status = 'success') AS donors_count
+         FROM donations d JOIN users u ON u.id = d.creator_id
+         WHERE ${where} ORDER BY d.created_at DESC LIMIT 200`,
+        params,
+      ),
+      query(
+        `SELECT COUNT(*)::int AS n,
+                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0)::int AS active_n,
+                COALESCE(SUM(amount_raised),0)::float AS raised,
+                COALESCE(SUM(amount_redeemed),0)::float AS redeemed
+         FROM donations`,
+      ),
+    ]);
+    res.json({ success: true, data: { donations: rows.rows, stats: stats.rows[0] } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load donations" });
+  }
+});
+
+router.get("/donations/settings", requirePermission("manage_settings"), async (_req, res) => {
+  try {
+    const raw = await getSetting("donation_settings", "");
+    let settings: Record<string, any> = {};
+    try { settings = raw ? JSON.parse(raw) : {}; } catch { settings = {}; }
+    res.json({
+      success: true,
+      data: {
+        currency: "NGN", min_donation: 100, max_donation: 5000000,
+        contribution_fee_percent: 0, contribution_fee_flat: 0,
+        redemption_fee_percent: 5, redemption_fee_flat: 0,
+        redemption_min: 1000, max_active_per_user: 5,
+        ...settings,
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load donation settings" });
+  }
+});
+
+router.put("/donations/settings", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const body = req.body || {};
+    const numericKeys = [
+      "min_donation", "max_donation", "contribution_fee_percent", "contribution_fee_flat",
+      "redemption_fee_percent", "redemption_fee_flat", "redemption_min", "max_active_per_user",
+    ] as const;
+    const raw = await getSetting("donation_settings", "");
+    let current: Record<string, any> = {};
+    try { current = raw ? JSON.parse(raw) : {}; } catch { current = {}; }
+    const next: Record<string, any> = { ...current };
+    for (const k of numericKeys) {
+      if (body[k] !== undefined && body[k] !== null && body[k] !== "") {
+        const n = Number(body[k]);
+        if (!Number.isFinite(n) || n < 0) {
+          return res.status(400).json({ success: false, error: `${k} must be a non-negative number` });
+        }
+        next[k] = Math.round(n * 100) / 100;
+      }
+    }
+    if (next.min_donation != null && next.max_donation != null && next.min_donation > next.max_donation) {
+      return res.status(400).json({ success: false, error: "min_donation cannot exceed max_donation" });
+    }
+    await setSetting("donation_settings", JSON.stringify(next), "Donation economics: contribution bounds + fees (personal app)");
+    res.json({ success: true, data: next });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not save donation settings" });
+  }
+});
+
+router.get("/donations/:id/contributions", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT c.*, u.name AS donor_name, u.email AS donor_email,
+              LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS donor_username
+       FROM donation_contributions c JOIN users u ON u.id = c.donor_id
+       WHERE c.donation_id = $1 ORDER BY c.created_at DESC LIMIT 200`,
+      [req.params.id],
+    );
+    res.json({ success: true, data: { contributions: r.rows } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load contributions" });
+  }
+});
+
+router.post("/donations/:id/:action", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const action = String(req.params.action);
+    const map: Record<string, { status?: string; reason?: string }> = {
+      suspend: { status: "suspended", reason: String(req.body?.reason || "Suspended by admin") },
+      activate: { status: "active" },
+      end: { status: "ended" },
+    };
+    const target = map[action];
+    if (!target?.status) return res.status(400).json({ success: false, error: "Unknown action — use suspend | activate | end" });
+    const upd = await query(
+      `UPDATE donations SET status = $2,
+         status_reason = ${target.reason ? "$3" : "status_reason"}, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING id, status, status_reason`,
+      target.reason ? [req.params.id, target.status, target.reason] : [req.params.id, target.status],
+    );
+    if (!upd.rows.length) return res.status(404).json({ success: false, error: "Donation not found" });
+    res.json({ success: true, data: { donation: upd.rows[0], message: `Fundraiser ${target.status}` } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not update donation" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Personal service flags (global kill-switches)
 // ---------------------------------------------------------------------------
 router.get("/service-flags", requirePermission("manage_settings"), async (_req, res) => {
   const raw = await getSetting("personal_service_flags", "");
   let flags: Record<string, boolean> = {};
   try { flags = raw ? JSON.parse(raw) : {}; } catch { flags = {}; }
-  res.json({ success: true, data: { bills: true, savings: true, giftcards: true, esim: true, virtualcards: true, crypto: true, social: true, live: true, marketplace: true, swap: true, ...flags } });
+  res.json({ success: true, data: { bills: true, savings: true, giftcards: true, esim: true, virtualcards: true, crypto: true, social: true, live: true, marketplace: true, swap: true, donations: true, ...flags } });
 });
 
 router.put("/service-flags", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
   try {
-    const allowed = ["bills", "savings", "giftcards", "esim", "virtualcards", "crypto", "social", "live", "marketplace", "swap"];
+    const allowed = ["bills", "savings", "giftcards", "esim", "virtualcards", "crypto", "social", "live", "marketplace", "swap", "donations"];
     const body = req.body || {};
     const currentRaw = await getSetting("personal_service_flags", "");
     let flags: Record<string, boolean> = {};

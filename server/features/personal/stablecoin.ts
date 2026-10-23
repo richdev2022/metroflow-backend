@@ -5,7 +5,7 @@ import { createNotification } from "../../services/notifications";
 import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
 import * as bitnob from "../../services/providers/bitnob";
 import { requirePersonalService, useProvider, getPercent } from "./flags";
-import { verifyTransactionPin } from "./personal-utils";
+import { verifyTransactionPin, requirePersonalKyc } from "./personal-utils";
 
 /**
  * Stablecoin hub (USDT + USDC) — the replacement for the retired "USD wallet".
@@ -505,7 +505,7 @@ router.get("/addresses", authenticateToken, checkSubscriptionStatus, async (req:
  * Generate (or re-use) a deposit address. One address per user per coin per
  * chain — re-issuance keeps reconciliation clean and dodges address-farming.
  */
-router.post("/addresses", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/addresses", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     const userId = req.user!.userId;
     const currency = String(req.body?.currency || "").toUpperCase() as Stablecoin;
     const chain = String(req.body?.chain || "").toLowerCase().trim();
@@ -641,7 +641,7 @@ router.post("/convert/quote", authenticateToken, checkSubscriptionStatus, async 
  * Executes the conversion end-to-end: debit source wallet → Bitnob trade →
  * credit destination wallet (spread applied). Refund on any failure.
  */
-router.post("/convert", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     const userId = req.user!.userId;
     const direction = String(req.body?.direction || "");
     const currency = String(req.body?.currency || "USDT").toUpperCase() as Stablecoin;
@@ -839,7 +839,7 @@ router.get("/deposits", authenticateToken, checkSubscriptionStatus, async (req: 
  * Fraud gates: local + provider address validation, PIN, outflow engine,
  * min/max clamps, atomic debit with automatic refund when the provider fails.
  */
-router.post("/withdraw", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/withdraw", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     const userId = req.user!.userId;
     const currency = String(req.body?.currency || "").toUpperCase() as Stablecoin;
     const chain = String(req.body?.chain || "").toLowerCase().trim();

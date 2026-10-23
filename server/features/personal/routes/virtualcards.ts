@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  assertPersonalService, genRef,
+  assertPersonalService, genRef, requirePersonalKyc,
 } from "../personal-utils";
 import * as bitnob from "../../../services/bitnob";
 import { createNotification } from "../../../services/notifications";
@@ -281,7 +281,7 @@ async function ownedCard(userId: string, cardId: string) {
   return r.rows[0] ?? null;
 }
 
-router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/fund", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const card = await ownedCard(userId, String(req.params.id));
@@ -342,7 +342,7 @@ router.post("/:id/fund", authenticateToken, checkSubscriptionStatus, async (req:
   }
 });
 
-router.post("/:id/withdraw", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/withdraw", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const card = await ownedCard(userId, String(req.params.id));

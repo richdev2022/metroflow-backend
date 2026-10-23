@@ -133,13 +133,15 @@ export function getOTPExpiry(): Date {
 }
 
 // Generate secure random token
-export async function generateToken(userId: string, businessId: string): Promise<string> {
+export async function generateToken(userId: string, businessId: string | null): Promise<string> {
   // Generate secure token
   const token = crypto.randomBytes(32).toString("hex");
   // NEVER log the token value — logs are shipped to third parties.
   console.log("Generated new session token for user:", { userId, businessId });
-  
-  // Store token in user_sessions table with last_activity_at set explicitly
+
+  // Store token in user_sessions table with last_activity_at set explicitly.
+  // business_id is nullable: personal-only users (and personal wallet fundings
+  // via the /wallet/verify redirect) legitimately have no business context.
   await query(
     `INSERT INTO user_sessions (user_id, business_id, token, last_activity_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
     [userId, businessId, token]

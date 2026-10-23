@@ -286,6 +286,25 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     const postIds = postsRes.rows.map((r) => r.id);
     const boosts = await getActiveBoostMap("post", postIds);
 
+    // Ordered media carousels for this page — one batched query, grouped per
+    // post. Older posts (created before the multi-media upgrade) have no rows
+    // here and fall back to their legacy image_url/video_url columns.
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null }>>();
+    if (postIds.length) {
+      try {
+        const mediaRes = await query(
+          `SELECT post_id, media_type, url, poster_url FROM social_post_media
+           WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+          [postIds],
+        );
+        for (const row of mediaRes.rows) {
+          const list = mediaByPost.get(String(row.post_id)) || [];
+          list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+          mediaByPost.set(String(row.post_id), list);
+        }
+      } catch { /* table may not exist yet on a cold deploy — legacy columns still render */ }
+    }
+
     // Privacy + friendship context per author — drives the feed's "Message" vs
     // "Add friend" action (public = chat, private = request first).
     const authorIds = [...new Set(postsRes.rows.map((r) => r.user_id))] as string[];
@@ -395,6 +414,12 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         content: p.body,
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         video_url: p.video_url || null,
+        // Ordered multi-media carousel — synthesized from the legacy columns
+        // for posts created before social_post_media existed.
+        media: mediaByPost.get(String(p.id)) || [
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null } : null,
+        ].filter(Boolean),
         audience: p.audience,
         like_count: Number(p.like_count) || 0,
         comment_count: Number(p.comment_count) || 0,
@@ -454,56 +479,98 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 // ---------------------------------------------------------------------------
 // Posts
 // ---------------------------------------------------------------------------
-router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 1 }, { name: "video", maxCount: 1 }, { name: "poster", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
+router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 10 }, { name: "video", maxCount: 10 }, { name: "poster", maxCount: 10 }]), async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "social"))) return;
     const userId = req.user!.userId;
     const body = String(req.body?.body ?? "").trim();
     const audience = ["public", "followers"].includes(req.body?.audience) ? req.body.audience : "public";
     const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
-    const imageFile = files.image?.[0];
-    const videoFile = files.video?.[0];
-    // Poster frame — captured client-side from the video at composition time
-    // (canvas snapshot). Stored as the post's image_url so EVERY video post
-    // carries a real thumbnail for feed display AND og:image share previews.
-    const posterFile = files.poster?.[0];
-    let imageUrl: string | null = null;
-    let videoUrl: string | null = null;
-    if (imageFile) {
-      const up = await uploadMediaBuffer({ buffer: imageFile.buffer, originalname: imageFile.originalname, mimeType: imageFile.mimetype, folder: "social-media", userId });
-      imageUrl = up?.url || null;
-    } else if (req.body?.image_url) {
-      imageUrl = String(req.body.image_url).slice(0, 500);
-    }
-    // Video posts — the social_posts.video_url column existed but never had a
-    // write path. Accept a multipart `video` (multer allows video/* up to
-    // 500MB) or a pre-uploaded `video_url` (e.g. via /chat/media).
-    if (videoFile) {
-      const up = await uploadMediaBuffer({ buffer: videoFile.buffer, originalname: videoFile.originalname, mimeType: videoFile.mimetype, folder: "social-media", userId });
-      videoUrl = up?.url || null;
-      // Attach the poster frame (only when the post has no explicit image).
-      if (posterFile && !imageUrl) {
-        const pp = await uploadMediaBuffer({ buffer: posterFile.buffer, originalname: posterFile.originalname || "poster.jpg", mimeType: posterFile.mimetype || "image/jpeg", folder: "social-media", userId });
-        imageUrl = pp?.url || null;
+    const imageFiles = files.image || [];
+    const videoFiles = files.video || [];
+    // Poster frames — captured client-side per video (canvas snapshot), in the
+    // same order as the videos were appended.
+    const posterFiles = files.poster || [];
+    // Ordered media sequence. The composer sends `media_order` (JSON array of
+    // "image"|"video") so mixed carousels render in the user's chosen order;
+    // when absent (old clients) fall back to images-then-videos.
+    let order: string[] = [];
+    try {
+      const raw = JSON.parse(String(req.body?.media_order || "[]"));
+      if (Array.isArray(raw)) order = raw.map((x: any) => String(x)).filter((x: string) => x === "image" || x === "video").slice(0, 10);
+    } catch { /* malformed order — fall back below */ }
+    if (order.length === 0) order = [...imageFiles.map(() => "image"), ...videoFiles.map(() => "video")].slice(0, 10);
+
+    // Upload every media file (cap 10 per post), then walk the requested
+    // order to build the carousel sequence. Videos consume their poster
+    // frames in the same order the composer appended them.
+    const MAX_MEDIA = 10;
+    const imageQueue = [...imageFiles];
+    const videoQueue = [...videoFiles];
+    const posterQueue = [...posterFiles];
+    const uploadOne = async (f: Express.Multer.File) =>
+      (await uploadMediaBuffer({ buffer: f.buffer, originalname: f.originalname, mimeType: f.mimetype, folder: "social-media", userId }))?.url || null;
+
+    type MediaRow = { media_type: "image" | "video"; url: string | null; poster_url: string | null };
+    const mediaRows: MediaRow[] = [];
+    for (const kind of order) {
+      if (mediaRows.length >= MAX_MEDIA) break;
+      if (kind === "image" && imageQueue.length) {
+        mediaRows.push({ media_type: "image", url: await uploadOne(imageQueue.shift()!), poster_url: null });
+      } else if (kind === "video" && videoQueue.length) {
+        const poster = posterQueue.length ? await uploadOne(posterQueue.shift()!) : null;
+        mediaRows.push({ media_type: "video", url: await uploadOne(videoQueue.shift()!), poster_url: poster });
       }
-    } else if (req.body?.video_url) {
-      videoUrl = String(req.body.video_url).slice(0, 500);
     }
-    if (!body && !imageUrl && !videoUrl) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
+    // Leftover files when media_order was absent/short (cap respected).
+    while (mediaRows.length < MAX_MEDIA && (imageQueue.length || videoQueue.length)) {
+      if (imageQueue.length) mediaRows.push({ media_type: "image", url: await uploadOne(imageQueue.shift()!), poster_url: null });
+      else if (videoQueue.length) {
+        const poster = posterQueue.length ? await uploadOne(posterQueue.shift()!) : null;
+        mediaRows.push({ media_type: "video", url: await uploadOne(videoQueue.shift()!), poster_url: poster });
+      }
+    }
+
+    // Back-compat columns: first image / first video also land on social_posts
+    // so OG share previews, profile grids and older clients keep working.
+    let imageUrl: string | null = mediaRows.find((m) => m.media_type === "image")?.url || null;
+    let videoUrl: string | null = mediaRows.find((m) => m.media_type === "video")?.url || null;
+    if (!mediaRows.length) {
+      // Legacy single-file shape (image_url / video_url body fields).
+      if (req.body?.image_url) imageUrl = String(req.body.image_url).slice(0, 500);
+      if (req.body?.video_url) videoUrl = String(req.body.video_url).slice(0, 500);
+      if (imageUrl) mediaRows.push({ media_type: "image", url: imageUrl, poster_url: null });
+      if (videoUrl) mediaRows.push({ media_type: "video", url: videoUrl, poster_url: null });
+    }
+    if (!body && !mediaRows.length) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
     const r = await query(
       `INSERT INTO social_posts (user_id, body, image_url, video_url, audience) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [userId, body, imageUrl, videoUrl, audience],
     );
+    const postId = r.rows[0].id;
+    // Persist the ordered carousel (best-effort — a media-row failure must not
+    // fail the post, the back-compat columns already carry the first media).
+    const savedMedia: Array<{ media_type: string; url: string | null; poster_url: string | null }> = [];
+    for (let i = 0; i < mediaRows.length; i++) {
+      const m = mediaRows[i];
+      if (!m.url) continue;
+      await query(
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position) VALUES ($1,$2,$3,$4,$5)`,
+        [postId, m.media_type, m.url, m.poster_url, i],
+      ).catch(() => {});
+      savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
+    }
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     return res.status(201).json({
       success: true,
       data: {
         post: {
-          kind: "post", id: r.rows[0].id, author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
+          kind: "post", id: postId, author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
           message: r.rows[0].body, body: r.rows[0].body, content: r.rows[0].body,
           image_url: r.rows[0].image_url, video_url: r.rows[0].video_url,
+          media: savedMedia,
           like_count: 0, comment_count: 0,
           share_count: 0, liked_by_me: false, created_at: r.rows[0].created_at,
         },
@@ -526,7 +593,17 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
       [req.params.id, userId],
     );
     if (!p.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
-    res.json({ success: true, data: { post: p.rows[0] } });
+    // Ordered media carousel (falls back to the legacy columns when empty).
+    const m = await query(
+      `SELECT media_type, url, poster_url FROM social_post_media WHERE post_id = $1 ORDER BY position, created_at`,
+      [req.params.id],
+    );
+    const post = p.rows[0];
+    post.media = m.rows.length
+      ? m.rows
+      : [post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
+         post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean);
+    res.json({ success: true, data: { post } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: "Could not load post" });
   }
@@ -1002,6 +1079,19 @@ router.get("/share/post/:id", async (req, res) => {
     if (!r.rows.length) return res.status(404).send("<html><body><p>Post not found</p></body></html>");
     const p = r.rows[0];
 
+    // Multi-media posts: the ordered carousel is the best thumbnail source —
+    // first image wins, else the first video's captured poster frame.
+    let ogMediaImage = "";
+    let ogMediaVideo = "";
+    try {
+      const m = await query(
+        `SELECT media_type, url, poster_url FROM social_post_media WHERE post_id = $1 ORDER BY position, created_at LIMIT 10`,
+        [req.params.id],
+      );
+      ogMediaImage = String(m.rows.find((x) => x.media_type === "image")?.url || m.rows.find((x) => x.poster_url)?.poster_url || "");
+      ogMediaVideo = String(m.rows.find((x) => x.media_type === "video")?.url || "");
+    } catch { /* pre-upgrade post — legacy columns below */ }
+
     const host = `https://${req.headers.host || "api.metricorex.com"}`;
     const appUrl = process.env.PERSONAL_SITE_URL || "https://personal.metricorex.com";
     const apiOrigin = String(
@@ -1023,8 +1113,8 @@ router.get("/share/post/:id", async (req, res) => {
       if (s.startsWith("/")) return `${apiOrigin}${s}`;
       return `${apiOrigin}/files/${s}`;
     };
-    const image = abs(p.image_url) || abs(p.author_photo);
-    const video = abs(p.video_url);
+    const image = ogMediaImage || abs(p.image_url) || abs(p.author_photo);
+    const video = ogMediaVideo || abs(p.video_url);
     // Video posts: some scrapers only render images — reuse the poster image
     // when present, otherwise point og:image at the video (WhatsApp falls
     // back to a frame) and ship the og:video tag for the ones that honor it.

@@ -877,6 +877,83 @@ router.get("/:id/reactions", authenticateToken, async (req: AuthenticatedRequest
 });
 
 // ---------------------------------------------------------------------------
+// Clip highlights — "bookmark this moment" (TikTok-style)
+// ---------------------------------------------------------------------------
+//   POST   /live/:id/clips       { label? } → host/cohost/moderator saves a
+//                                highlight at the CURRENT stream timestamp
+//   GET    /live/:id/clips       → ordered highlight list (any viewer)
+//   DELETE /live/clips/:clipId   → creator or host removes one
+router.post("/:id/clips", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (!canModerate(s, req.user!.userId)) {
+      return res.status(403).json({ success: false, error: "Only the host or moderators can clip moments" });
+    }
+    const label = String(req.body?.label || "").slice(0, 120);
+    const startedAt = s.started_at ? new Date(s.started_at).getTime() : Date.now();
+    const offsetSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+    const r = await query(
+      `INSERT INTO live_clips (session_id, created_by, label, offset_seconds)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, session_id, created_by, label, offset_seconds, created_at`,
+      [s.id, req.user!.userId, label, offsetSeconds],
+    );
+    res.status(201).json({
+      success: true,
+      data: {
+        clip: {
+          ...r.rows[0],
+          creator_name: s.host_name === req.user!.name ? s.host_name : req.user!.name,
+        },
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not save the highlight" });
+  }
+});
+
+router.get("/:id/clips", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.json({ success: true, data: { clips: [] } });
+    const r = await query(
+      `SELECT c.id, c.label, c.offset_seconds, c.created_at, c.created_by,
+              u.name AS creator_name, u.avatar_url AS creator_photo
+       FROM live_clips c LEFT JOIN users u ON u.id = c.created_by
+       WHERE c.session_id = $1
+       ORDER BY c.offset_seconds ASC, c.created_at ASC
+       LIMIT 100`,
+      [s.id],
+    );
+    res.json({ success: true, data: { clips: r.rows } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load highlights" });
+  }
+});
+
+router.delete("/clips/:clipId", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const clipId = String(req.params.clipId || "");
+    const r = await query(
+      `SELECT c.*, l.host_id FROM live_clips c
+       JOIN live_sessions l ON l.id = c.session_id
+       WHERE c.id::text = $1 LIMIT 1`,
+      [clipId],
+    );
+    const clip = r.rows[0];
+    if (!clip) return res.status(404).json({ success: false, error: "Highlight not found" });
+    if (clip.created_by !== req.user!.userId && clip.host_id !== req.user!.userId) {
+      return res.status(403).json({ success: false, error: "Only the creator or the host can remove a highlight" });
+    }
+    await query(`DELETE FROM live_clips WHERE id::text = $1`, [clipId]);
+    res.json({ success: true, data: { removed: clipId } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not remove the highlight" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Host tools: pin, slow mode, moderation, co-host
 // ---------------------------------------------------------------------------
 router.post("/:id/pin", authenticateToken, async (req: AuthenticatedRequest, res) => {

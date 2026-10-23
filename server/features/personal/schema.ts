@@ -537,6 +537,22 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_reactions_session ON live_reactions(session_id, created_at)`);
 
+  // TikTok-style "clip this moment" highlights. The host (or a moderator)
+  // bookmarks a timestamp mid-broadcast; the room UI and the stream summary
+  // surface them so viewers can jump to / rewatch the good parts once VOD
+  // recording lands. offset_seconds is measured from started_at.
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_clips (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+      created_by UUID NOT NULL,
+      label VARCHAR(120) NOT NULL DEFAULT '',
+      offset_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_clips_session ON live_clips(session_id, offset_seconds)`);
+
   // ------------------------------------------------------------------
   // 6a. MARKETPLACE — Facebook-Marketplace-style
   // ------------------------------------------------------------------

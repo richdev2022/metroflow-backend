@@ -4,6 +4,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import { calculateFee, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 import { requirePersonalService } from "./flags";
+import { requirePersonalKyc } from "./personal-utils";
 
 const router = express.Router();
 // Personal Products console kill-switch for Savings Vaults.
@@ -479,7 +480,7 @@ router.delete("/vaults/:id", authenticateToken, checkSubscriptionStatus, async (
  *       400:
  *         description: Insufficient balance or invalid vault/wallet
  */
-router.post("/vaults/:id/deposit", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/vaults/:id/deposit", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
         const { userId, businessId } = req.user!;
@@ -591,7 +592,7 @@ router.post("/vaults/:id/deposit", authenticateToken, checkSubscriptionStatus, a
  *       400:
  *         description: Amount exceeds balance or invalid vault/wallet
  */
-router.post("/vaults/:id/withdraw", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/vaults/:id/withdraw", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
         const { userId, businessId } = req.user!;

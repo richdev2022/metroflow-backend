@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  assertPersonalService, genRef,
+  assertPersonalService, genRef, requirePersonalKyc,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import * as prestmit from "../../../services/prestmit";
@@ -233,7 +233,7 @@ router.get("/sell/history", authenticateToken, checkSubscriptionStatus, async (r
   }
 });
 
-router.post("/sell", authenticateToken, checkSubscriptionStatus, uploadCardMedia, async (req: AuthenticatedRequest, res) => {
+router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, uploadCardMedia, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "giftcards"))) return;
     const userId = req.user!.userId;
@@ -517,7 +517,7 @@ router.post("/buy/calculate", authenticateToken, checkSubscriptionStatus, async 
   }
 });
 
-router.post("/buy", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "giftcards"))) return;
     await ensureSchema();

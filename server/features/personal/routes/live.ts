@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
-import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction, verifyTransactionPin } from "../personal-utils";
+import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction, verifyTransactionPin, requirePersonalKyc } from "../personal-utils";
 import { evaluateOutflow, fraudRejectReason } from "../../../services/fraud";
 import { createNotification } from "../../../services/notifications";
 
@@ -330,7 +330,7 @@ router.get("/pocket", authenticateToken, async (req: AuthenticatedRequest, res) 
   }
 });
 
-router.post("/pocket/withdraw", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/pocket/withdraw", authenticateToken, requirePersonalKyc(), async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const settings = await getLiveSettings();
@@ -412,7 +412,7 @@ router.post("/pocket/withdraw", authenticateToken, async (req: AuthenticatedRequ
   }
 });
 
-router.post("/:id/gifts", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.post("/:id/gifts", authenticateToken, requirePersonalKyc(), async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "live"))) return;
     const userId = req.user!.userId;

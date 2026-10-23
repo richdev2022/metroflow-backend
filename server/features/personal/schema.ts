@@ -553,6 +553,29 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_clips_session ON live_clips(session_id, offset_seconds)`);
 
+  // VOD replays — the host's client records the composed stream (canvas +
+  // mixed audio via MediaRecorder) and uploads the file when the recording
+  // stops (or when the broadcast ends). Replays surface on the live wall
+  // ("Replays" rail), the ended screen and the stream summary, and the clip
+  // highlights (live_clips.offset_seconds) act as chapter markers inside the
+  // recording so viewers can jump straight to the good parts.
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_vods (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+      host_id UUID NOT NULL,
+      url TEXT NOT NULL,
+      poster_url TEXT,
+      duration_seconds INTEGER NOT NULL DEFAULT 0,
+      size_bytes BIGINT NOT NULL DEFAULT 0,
+      mime_type VARCHAR(60),
+      view_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_vods_session ON live_vods(session_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_vods_recent ON live_vods(created_at DESC)`);
+
   // ------------------------------------------------------------------
   // 6a. MARKETPLACE — Facebook-Marketplace-style
   // ------------------------------------------------------------------

@@ -4,6 +4,9 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction, verifyTransactionPin, requirePersonalKyc } from "../personal-utils";
 import { evaluateOutflow, fraudRejectReason } from "../../../services/fraud";
 import { createNotification } from "../../../services/notifications";
+import { upload } from "../../../middleware/upload";
+import { uploadMediaBuffer } from "../../../services/media-upload";
+import { sendPushToUsers } from "../../../services/push";
 
 /**
  * LIVE — TikTok-style one-tap live streaming (rides the proven call-room
@@ -30,6 +33,15 @@ import { createNotification } from "../../../services/notifications";
  *                                    NGN wallet, credits the host 1:1, fraud-gated,
  *                                    ledgered both sides, refund-on-ledger-failure)
  *   GET  /live/:id/gifts            → recent gifts + top-sender leaderboard + earnings
+ *   POST /live/:id/vod              (multipart video[, poster]) → save the room recording
+ *                                   as a replay (host/co-host; the client composites
+ *                                   the stream onto a canvas + mixes audio and uploads
+ *                                   it via MediaRecorder when recording stops)
+ *   GET  /live/:id/vod              → the session's replay (latest) + clip chapters
+ *   GET  /live/replays              → recent replays across sessions (live wall)
+ *   POST /live/vods/:vodId/view     → count a replay view
+ *   POST /live/:id/invite           { user_ids } → push-invite Metricorex users to
+ *                                   the stream (deep-links straight into the room)
  *
  * Categories mirror TikTok: general, chat, talent, music, dance, food,
  * fashion, gaming, sports, education, business, faith, comedy.
@@ -189,6 +201,62 @@ router.get("/mine", authenticateToken, async (req: AuthenticatedRequest, res) =>
     res.json({ success: true, data: { sessions: r.rows } });
   } catch {
     res.status(500).json({ success: false, error: "Could not load your streams" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// VOD replays — wall + view counting. Registered BEFORE GET /:id so Express
+// does not swallow "/replays" as a session id.
+// ---------------------------------------------------------------------------
+router.get("/replays", authenticateToken, checkSubscriptionStatus, async (_req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "live"))) return;
+    const r = await query(
+      `SELECT v.id, v.url, v.poster_url, v.duration_seconds, v.view_count, v.created_at,
+              s.id AS session_id, s.title, s.category, s.call_code, s.host_id, s.total_views,
+              u.name AS host_name, u.avatar_url AS host_photo
+         FROM live_vods v
+         JOIN live_sessions s ON s.id = v.session_id
+         JOIN users u ON u.id = v.host_id
+        ORDER BY v.created_at DESC
+        LIMIT 30`,
+    );
+    res.json({
+      success: true,
+      data: {
+        replays: r.rows.map((v: any) => ({
+          id: v.id,
+          url: v.url,
+          poster_url: v.poster_url,
+          duration_seconds: Number(v.duration_seconds) || 0,
+          view_count: Number(v.view_count) || 0,
+          created_at: v.created_at,
+          session: {
+            id: v.session_id, title: v.title, category: v.category,
+            call_code: v.call_code, host_id: v.host_id, total_views: Number(v.total_views) || 0,
+            host_name: v.host_name, host_photo: v.host_photo,
+          },
+        })),
+      },
+    });
+  } catch (e: any) {
+    console.error("live replays error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load replays" });
+  }
+});
+
+router.post("/vods/:vodId/view", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const vodId = String(req.params.vodId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(vodId)) return res.status(400).json({ success: false, error: "Invalid replay" });
+    const r = await query(
+      `UPDATE live_vods SET view_count = view_count + 1 WHERE id = $1 RETURNING view_count`,
+      [vodId],
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Replay not found" });
+    res.json({ success: true, data: { view_count: Number(r.rows[0].view_count) || 0 } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not count the view" });
   }
 });
 
@@ -1638,6 +1706,166 @@ router.get("/:id/rankings", authenticateToken, async (req: AuthenticatedRequest,
   } catch (e: any) {
     console.error("rankings error:", e?.message);
     res.status(500).json({ success: false, error: "Could not load rankings" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// VOD replay — the host client records the composed room (canvas video + mixed
+// audio) and uploads the file here. Same storage chain as chat media
+// (R2 → Cloudinary → local), so replays stream from permanent public URLs.
+// ---------------------------------------------------------------------------
+router.post("/:id/vod", authenticateToken, upload.fields([{ name: "video", maxCount: 1 }, { name: "poster", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (s.host_id !== req.user!.userId && !isCohost(s, req.user!.userId)) {
+      return res.status(403).json({ success: false, error: "Only the host can save the replay" });
+    }
+    const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+    const videoFile = files?.video?.[0];
+    if (!videoFile || !videoFile.buffer?.length) {
+      return res.status(400).json({ success: false, error: "No recording attached" });
+    }
+    if (videoFile.size > 500 * 1024 * 1024) {
+      return res.status(413).json({ success: false, error: "Recording too large (max 500MB)" });
+    }
+    const durationSeconds = Math.max(0, Math.min(24 * 3600, Math.round(Number(req.body?.duration_seconds) || 0)));
+
+    const stored = await uploadMediaBuffer({
+      buffer: videoFile.buffer,
+      originalname: videoFile.originalname || `vod-${s.call_code}.webm`,
+      mimeType: videoFile.mimetype || "video/webm",
+      folder: "live-vods",
+      userId: req.user!.userId,
+    });
+
+    let posterUrl: string | null = null;
+    const posterFile = files?.poster?.[0];
+    if (posterFile?.buffer?.length) {
+      const posterStored = await uploadMediaBuffer({
+        buffer: posterFile.buffer,
+        originalname: posterFile.originalname || `vod-${s.call_code}.jpg`,
+        mimeType: posterFile.mimetype || "image/jpeg",
+        folder: "live-vods",
+        userId: req.user!.userId,
+      }).catch(() => null);
+      posterUrl = posterStored?.url || null;
+    }
+
+    const ins = await query(
+      `INSERT INTO live_vods (session_id, host_id, url, poster_url, duration_seconds, size_bytes, mime_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [s.id, s.host_id, stored.url, posterUrl, durationSeconds, videoFile.size, stored.mimeType],
+    );
+
+    res.status(201).json({
+      success: true,
+      data: {
+        vod: {
+          id: ins.rows[0].id,
+          url: stored.url,
+          poster_url: posterUrl,
+          duration_seconds: durationSeconds,
+          view_count: 0,
+          created_at: ins.rows[0].created_at,
+        },
+      },
+    });
+  } catch (e: any) {
+    console.error("live vod upload error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not save the replay" });
+  }
+});
+
+router.get("/:id/vod", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    const [vodR, clipR] = await Promise.all([
+      query(
+        `SELECT id, url, poster_url, duration_seconds, view_count, created_at
+           FROM live_vods WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [s.id],
+      ),
+      query(
+        `SELECT id, label, offset_seconds, created_by FROM live_clips WHERE session_id = $1 ORDER BY offset_seconds ASC LIMIT 100`,
+        [s.id],
+      ),
+    ]);
+    const vod = vodR.rows[0]
+      ? {
+          id: vodR.rows[0].id,
+          url: vodR.rows[0].url,
+          poster_url: vodR.rows[0].poster_url,
+          duration_seconds: Number(vodR.rows[0].duration_seconds) || 0,
+          view_count: Number(vodR.rows[0].view_count) || 0,
+          created_at: vodR.rows[0].created_at,
+        }
+      : null;
+    res.json({
+      success: true,
+      data: {
+        vod,
+        clips: clipR.rows.map((c: any) => ({ id: c.id, label: c.label, offset_seconds: Number(c.offset_seconds) || 0 })),
+      },
+    });
+  } catch (e: any) {
+    console.error("live vod fetch error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load the replay" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Invite — push-notify Metricorex users with a deep link straight into the
+// room. Any viewer can invite (TikTok share semantics); capped per request.
+// ---------------------------------------------------------------------------
+router.post("/:id/invite", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (s.status !== "live") return res.status(400).json({ success: false, error: "This stream is not live anymore" });
+
+    const raw = Array.isArray(req.body?.user_ids) ? req.body.user_ids : [];
+    const selfId = req.user!.userId;
+    const ids = Array.from(new Set(raw.map((x: any) => String(x || "").trim()).filter((x: string) => /^[0-9a-f-]{36}$/i.test(x)))).slice(0, 25);
+    if (!ids.length) return res.status(400).json({ success: false, error: "Pick at least one person to invite" });
+
+    // Only real users — silently skip deleted accounts, yourself, and the host
+    // (the host is already here).
+    const users = await query(
+      `SELECT id, name FROM users WHERE id = ANY($1::uuid[]) AND id <> $2 AND id <> $3`,
+      [ids, selfId, s.host_id],
+    );
+    const targets = users.rows.map((u: any) => ({ userId: u.id }));
+
+    const senderName = req.user!.name || "Someone";
+    const deepLink = `/live?join=${s.id}`;
+    if (targets.length) {
+      await sendPushToUsers(
+        targets,
+        {
+          title: `${senderName} invited you to a live stream`,
+          body: `${s.host_name || "A streamer"} is LIVE: ${String(s.title).slice(0, 80)}`,
+          data: {
+            type: "live_invite",
+            url: deepLink,
+            session_id: s.id,
+            live_code: s.call_code,
+            host: s.host_name || "",
+            sender: senderName,
+          },
+        },
+        { inApp: true, type: "live_invite" },
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      data: { invited: targets.length, skipped: ids.length - targets.length },
+    });
+  } catch (e: any) {
+    console.error("live invite error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not send the invites" });
   }
 });
 

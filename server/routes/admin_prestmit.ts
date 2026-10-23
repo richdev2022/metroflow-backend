@@ -55,6 +55,8 @@ router.get("/wallet", async (_req, res) => {
       data: {
         configured: prestmit.isPrestmitConfigured(),
         sandbox: prestmit.isPrestmitSandbox(),
+        key_kind: prestmit.prestmitKeyKind(),
+        provider_host: prestmit.prestmitBaseUrl(),
         user: user?.error ? null : user,
         user_error: user?.error || null,
         availability,

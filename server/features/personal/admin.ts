@@ -40,25 +40,27 @@ router.use(requirePermission("manage_settings"));
 function providerConfigured(service: RoutedService): boolean {
     switch (service) {
         case "bills":
-            return !!process.env.BILLS_PROVIDER_URL;
+            // Sogo default (SOGO_SECRET_KEY) with the Flutterwave v3 bridge second.
+            return !!(process.env.SOGO_SECRET_KEY || process.env.FLW_SECRET_KEY || process.env.FLUTTERWAVE_SECRET_KEY || process.env.BILLS_PROVIDER_URL);
         case "esim":
             return !!process.env.ESIM_PROVIDER_URL;
         case "giftcards":
-            return !!(process.env.PRESTMIT_PUBLIC_KEY || process.env.PRESTMIT_PRIVATE_KEY);
+            // Sogo default for gift cards too; Prestmit remains the legacy rail.
+            return !!(process.env.SOGO_SECRET_KEY || process.env.PRESTMIT_PUBLIC_KEY || process.env.PRESTMIT_PRIVATE_KEY);
         case "virtualcards":
         case "crypto":
-            return !!(process.env.BITNOB_SECRET_KEY || process.env.BITNOB_API_KEY);
+            return !!(process.env.SOGO_SECRET_KEY || process.env.BITNOB_SECRET_KEY || process.env.BITNOB_API_KEY);
         default:
             return false;
     }
 }
 
 const PROVIDER_LABELS: Record<RoutedService, string> = {
-    bills: "Bills aggregator (BILLS_PROVIDER_URL)",
+    bills: "Sogo (SOGO_SECRET_KEY) — Flutterwave v3 bridge (FLW_SECRET_KEY)",
     esim: "eSIM provider (ESIM_PROVIDER_URL)",
-    giftcards: "Prestmit (PRESTMIT_* keys)",
+    giftcards: "Sogo (SOGO_SECRET_KEY) — Prestmit legacy (PRESTMIT_* keys)",
     virtualcards: "Bitnob card issuing (BITNOB_* keys)",
-    crypto: "Bitnob payouts (BITNOB_* keys)",
+    crypto: "Sogo deposit off-ramp (SOGO_SECRET_KEY) — Bitnob payouts (BITNOB_* keys)",
 };
 
 // ---------------------------------------------------------------------------
@@ -273,7 +275,7 @@ router.get("/overview", async (_req, res) => {
                         : providerConfigured(s) ? "provider" : "simulator";
                     return {
                         service: s,
-                        provider: s === "giftcards" ? "Prestmit" : s === "bills" ? "Bills aggregator" : s === "esim" ? "eSIM provider" : "Bitnob",
+                        provider: s === "giftcards" ? "Sogo / Prestmit" : s === "bills" ? "Sogo / Flutterwave" : s === "esim" ? "eSIM provider" : s === "crypto" ? "Sogo / Bitnob" : "Bitnob",
                         env_configured: providerConfigured(s),
                         mode,
                         effective,
@@ -510,13 +512,12 @@ router.put("/providers", async (req, res) => {
         if (!(SERVICE_PROVIDERS as any)[svc].includes(prov)) {
             return res.status(400).json({ success: false, error: `${svc} supports providers: ${(SERVICE_PROVIDERS as any)[svc].join(", ")}` });
         }
-        await setActiveProvider(svc as any, prov);
+        await setActiveProvider(svc as any, prov as any);
         await logAuditEvent({
             action: "personal.provider_routing.update",
-            actorType: "admin",
-            actorId: (req as any).admin?.id || (req as any).admin?.email || null,
-            target: `service:${svc}`,
-            metadata: { service: svc, provider: prov },
+            entityType: "personal_provider_routing",
+            entityId: `service:${svc}`,
+            newValues: { service: svc, provider: prov },
         }).catch(() => {});
         const { getRoutingStatus } = await import("./provider-routing");
         const status = await getRoutingStatus();

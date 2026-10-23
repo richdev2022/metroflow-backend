@@ -28,6 +28,7 @@ export const PERSONAL_SERVICES = [
     "social",
     "live",
     "swap",
+    "rmb",
 ] as const;
 export type PersonalService = (typeof PERSONAL_SERVICES)[number];
 
@@ -47,6 +48,7 @@ const DEFAULT_FLAGS: Record<PersonalService, boolean> = {
     social: true,
     live: true,
     swap: true,
+    rmb: true,
 };
 
 export async function getPersonalServiceFlags(): Promise<Record<PersonalService, boolean>> {
@@ -85,6 +87,7 @@ export function requirePersonalService(service: PersonalService) {
                 social: "The social feed",
                 live: "Live streaming",
                 swap: "Wallet swap",
+                rmb: "RMB (yuan) purchase",
             };
             return res.status(403).json({
                 success: false,

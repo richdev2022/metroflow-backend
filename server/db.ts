@@ -1795,6 +1795,11 @@ export async function initializeDatabase() {
     // ensureLiveCallRow silently skipped the insert and every socket join for
     // that LIVE- code failed with "Call or meeting not found"). Allow NULL.
     await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
+    // Same story for sessions: a personal wallet funded by card stores
+    // business_id NULL on its transaction, so the post-payment redirect's
+    // generateToken(user_id, NULL) insert needs a nullable user_sessions
+    // business_id (NULL passes the FK check, so the constraint can stay).
+    await query(`ALTER TABLE user_sessions ALTER COLUMN business_id DROP NOT NULL`);
 
     await query(`
       CREATE TABLE IF NOT EXISTS call_participants (

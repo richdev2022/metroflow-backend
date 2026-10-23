@@ -923,9 +923,14 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const { reference } = req.body;
-    const businessId = authReq.user?.businessId;
-
-    if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    // Personal users have NO business context in their session — and a
+    // personal wallet funding stores business_id NULL on its fresh session
+    // too (generateToken(user_id, transaction.business_id)). The old hard
+    // 401 here logged every Personal app user out RIGHT AFTER a successful
+    // card funding, because this endpoint is exactly what the client's
+    // /payment/callback page calls to confirm the payment. Business-scoped
+    // flows (subscription activation, card tokens) still require it below.
+    const businessId = authReq.user?.businessId || null;
 
     // Check if transaction exists
     const txnResult = await query(`SELECT * FROM transactions WHERE reference = $1`, [reference]);
@@ -933,6 +938,12 @@ router.post("/verify-payment", authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, error: "Transaction not found" });
     }
     const transaction = txnResult.rows[0];
+
+    // Wallet-funding verifications are owner-agnostic (the wallet id on the
+    // transaction decides where the money lands) — no business context needed.
+    if (!businessId && transaction.transaction_type !== 'wallet_funding') {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
 
     // If already successful, just return success
     if (transaction.status === 'success') {

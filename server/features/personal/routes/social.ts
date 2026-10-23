@@ -38,6 +38,14 @@ import { getSetting } from "../../../services/app-config";
  *   POST   /social/posts/:id/boost           { budget, duration_days, audience?, pin, wallet_id }
  *   GET    /social/boosts/mine
  *   POST   /social/boosts/:id/pause | resume
+ *   GET    /social/collections                       (saved-post collections + counts + covers)
+ *   POST   /social/collections                       { name }
+ *   PATCH  /social/collections/:id                   { name }
+ *   DELETE /social/collections/:id
+ *   GET    /social/collections/:id/posts             (feed-shaped saved posts)
+ *   GET    /social/posts/:id/save-state              { saved, collection_ids }
+ *   POST   /social/posts/:id/save                    { collection_ids?, collection_name? }
+ *   DELETE /social/posts/:id/save                    { collection_id? } (omit = remove everywhere)
  */
 
 const router = express.Router();
@@ -448,6 +456,13 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     if (filter === "polls") items = items.filter((i) => i.kind === "poll");
     if (filter === "posts") items = items.filter((i) => i.kind === "post");
 
+    // Bookmark state for this page — the card shows a filled bookmark when
+    // the viewer saved the post to one of their collections.
+    try {
+      const savedMap = await savedStateForPosts(userId, postIds);
+      items = items.map((i) => ({ ...i, saved_collection_ids: savedMap.get(String(i.id)) || [] }));
+    } catch { /* cosmetic */ }
+
     items = rankFeed(items, boosts, { affinity, followed: followSet });
 
     // Impression accounting for active boosts surfaced in this page (throttled
@@ -657,6 +672,358 @@ router.delete("/posts/:id", authenticateToken, async (req: AuthenticatedRequest,
     res.json({ success: true, message: "Post deleted" });
   } catch {
     res.status(500).json({ success: false, error: "Could not delete post" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Saved posts — Facebook-style collections. Users file posts into named
+// folders ("Videos", "Photos", or anything they create) and browse them from
+// the Saved page. Membership is idempotent per (collection, post).
+// ---------------------------------------------------------------------------
+
+const MAX_COLLECTIONS_PER_USER = 50;
+
+/** Shape saved posts exactly like feed items (media carousel + poll payloads). */
+async function shapeSavedPosts(userId: string, postIds: string[]) {
+  if (!postIds.length) return [];
+  const postsRes = await query(
+    `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
+            u.name AS author_name, u.avatar_url AS author_photo,
+            COALESCE(u.account_privacy, 'public') AS account_privacy,
+            (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+            (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+            (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $1 LIMIT 1) AS my_reaction,
+            (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count,
+            (SELECT COUNT(*)::int FROM social_polls pl WHERE pl.post_id = p.id AND pl.status = 'active') AS has_poll
+     FROM social_posts p
+     JOIN users u ON u.id = p.user_id
+     WHERE p.id = ANY($2::uuid[]) AND p.status = 'active'`,
+    [userId, postIds],
+  );
+  const ids = postsRes.rows.map((r) => r.id);
+
+  const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null }>>();
+  if (ids.length) {
+    try {
+      const mediaRes = await query(
+        `SELECT post_id, media_type, url, poster_url FROM social_post_media
+         WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+        [ids],
+      );
+      for (const row of mediaRes.rows) {
+        const list = mediaByPost.get(String(row.post_id)) || [];
+        list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+        mediaByPost.set(String(row.post_id), list);
+      }
+    } catch { /* legacy columns still render */ }
+  }
+
+  const pollsByPost = new Map<string, any>();
+  if (ids.length) {
+    try {
+      const pollsRes = await query(
+        `SELECT pl.*, u.name AS poll_author FROM social_polls pl JOIN users u ON u.id = pl.user_id
+         WHERE pl.post_id = ANY($1::uuid[]) AND pl.status != 'removed'`,
+        [ids],
+      );
+      for (const pl of pollsRes.rows) {
+        const options = (pl.options || []).map((o: any, i: number) => ({ ...o, index: i }));
+        const votesRes = await query(
+          `SELECT option_index, COUNT(*)::int AS votes FROM social_poll_votes WHERE poll_id = $1 GROUP BY option_index`,
+          [pl.id],
+        );
+        const myVotes = await query(
+          `SELECT option_index FROM social_poll_votes WHERE poll_id = $1 AND user_id = $2`,
+          [pl.id, userId],
+        );
+        const total = votesRes.rows.reduce((a, v) => a + v.votes, 0);
+        pollsByPost.set(pl.post_id, {
+          kind: "poll",
+          id: pl.id,
+          post_id: pl.post_id,
+          question: pl.question,
+          options: options.map((o: any) => ({
+            index: o.index,
+            text: o.text,
+            image_url: o.image_url ?? null,
+            vote_count: votesRes.rows.find((v) => v.option_index === o.index)?.votes || 0,
+          })),
+          allow_multiple: pl.allow_multiple,
+          hide_results_until_closed: pl.hide_results_until_closed,
+          ends_at: pl.ends_at,
+          poll_type: pl.poll_type || "free",
+          vote_price: Number(pl.vote_price) || 0,
+          status: pl.status === "active" && pl.ends_at && new Date(pl.ends_at) < new Date() ? "closed" : pl.status,
+          total_votes: total,
+          my_vote: myVotes.rows.length ? myVotes.rows.map((m) => m.option_index) : null,
+          created_at: pl.created_at,
+          author: { id: pl.user_id, name: pl.poll_author },
+        });
+      }
+    } catch { /* polls are optional in saved views */ }
+  }
+
+  const byId = new Map(
+    postsRes.rows.map((p) => {
+      const poll = pollsByPost.get(p.id);
+      return [String(p.id), {
+        kind: poll ? "poll" : "post",
+        id: p.id,
+        poll_id: poll?.id,
+        author: {
+          id: p.user_id,
+          name: p.author_name,
+          photo: p.author_photo,
+          username: null,
+          is_private: p.account_privacy === "private",
+          is_verified: !!p.author_verified,
+          friendship_status: "none",
+          viewer_follow_status: p.user_id === userId ? "self" : "none",
+        },
+        message: poll ? poll.question : p.body,
+        body: p.body,
+        content: p.body,
+        image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
+        video_url: p.video_url || null,
+        media: mediaByPost.get(String(p.id)) || [
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null } : null,
+        ].filter(Boolean),
+        audience: p.audience,
+        like_count: Number(p.like_count) || 0,
+        comment_count: Number(p.comment_count) || 0,
+        share_count: Number(p.share_count) || 0,
+        my_reaction: p.my_reaction || null,
+        liked_by_me: !!p.my_reaction,
+        ...(poll ? { poll, poll_question: poll.question, poll_type: poll.poll_type, status: poll.status, total_votes: poll.total_votes, my_vote: poll.my_vote } : {}),
+        created_at: p.created_at,
+      }];
+    }),
+  );
+  // Preserve the caller's (saved_at DESC) ordering.
+  return postIds.map((id) => byId.get(String(id))).filter(Boolean);
+}
+
+/** The viewer's collection memberships for a batch of posts (bookmark state). */
+async function savedStateForPosts(userId: string, postIds: string[]): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (!postIds.length) return out;
+  try {
+    const r = await query(
+      `SELECT i.post_id, i.collection_id
+       FROM social_post_collection_items i
+       JOIN social_post_collections c ON c.id = i.collection_id
+       WHERE c.user_id = $1 AND i.post_id = ANY($2::uuid[])`,
+      [userId, postIds],
+    );
+    for (const row of r.rows) {
+      const list = out.get(String(row.post_id)) || [];
+      list.push(String(row.collection_id));
+      out.set(String(row.post_id), list);
+    }
+  } catch { /* table may still be migrating on a cold deploy */ }
+  return out;
+}
+
+// List the viewer's collections (with per-collection counts + cover thumbs).
+router.get("/collections", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const cols = await query(
+      `SELECT c.id, c.name, c.created_at, c.updated_at,
+              (SELECT COUNT(*)::int FROM social_post_collection_items i WHERE i.collection_id = c.id) AS post_count,
+              (SELECT m.url FROM social_post_collection_items i
+                 JOIN social_post_media m ON m.post_id = i.post_id
+                 WHERE i.collection_id = c.id
+                 ORDER BY i.saved_at DESC, m.position ASC LIMIT 1) AS cover_url,
+              (SELECT p.image_url FROM social_post_collection_items i
+                 JOIN social_posts p ON p.id = i.post_id
+                 WHERE i.collection_id = c.id
+                 ORDER BY i.saved_at DESC LIMIT 1) AS cover_fallback
+       FROM social_post_collections c
+       WHERE c.user_id = $1
+       ORDER BY c.updated_at DESC`,
+      [userId],
+    );
+    const collections = cols.rows.map((c) => ({
+      id: c.id,
+      name: c.name,
+      post_count: Number(c.post_count) || 0,
+      cover_url: c.cover_url || c.cover_fallback || null,
+      created_at: c.created_at,
+      updated_at: c.updated_at,
+    }));
+    res.json({ success: true, data: { collections } });
+  } catch (e: any) {
+    console.error("social/collections error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load your collections" });
+  }
+});
+
+// Create a collection ("folder").
+router.post("/collections", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const name = String(req.body?.name || "").trim().slice(0, 60);
+    if (!name) return res.status(400).json({ success: false, error: "Give the collection a name" });
+    const countRes = await query(`SELECT COUNT(*)::int AS n FROM social_post_collections WHERE user_id = $1`, [userId]);
+    if (Number(countRes.rows[0]?.n) >= MAX_COLLECTIONS_PER_USER) {
+      return res.status(400).json({ success: false, error: "You've reached the collection limit (50)" });
+    }
+    const ins = await query(
+      `INSERT INTO social_post_collections (user_id, name) VALUES ($1, $2)
+       ON CONFLICT (user_id, name) DO UPDATE SET updated_at = NOW()
+       RETURNING id, name, created_at`,
+      [userId, name],
+    );
+    res.json({ success: true, data: { collection: ins.rows[0] } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not create the collection" });
+  }
+});
+
+// Rename a collection.
+router.patch("/collections/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const name = String(req.body?.name || "").trim().slice(0, 60);
+    if (!name) return res.status(400).json({ success: false, error: "Give the collection a name" });
+    const r = await query(
+      `UPDATE social_post_collections SET name = $2, updated_at = NOW()
+       WHERE id = $1 AND user_id = $3 RETURNING id, name`,
+      [req.params.id, name, req.user!.userId],
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Collection not found" });
+    res.json({ success: true, data: { collection: r.rows[0] } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not rename the collection" });
+  }
+});
+
+// Delete a collection (saved posts themselves are untouched).
+router.delete("/collections/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `DELETE FROM social_post_collections WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, req.user!.userId],
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Collection not found" });
+    res.json({ success: true, message: "Collection deleted" });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not delete the collection" });
+  }
+});
+
+// Posts inside one collection — feed-shaped so the feed renderer works as-is.
+router.get("/collections/:id/posts", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 30));
+    const owned = await query(
+      `SELECT id FROM social_post_collections WHERE id = $1 AND user_id = $2`,
+      [req.params.id, userId],
+    );
+    if (!owned.rows.length) return res.status(404).json({ success: false, error: "Collection not found" });
+    const itemsRes = await query(
+      `SELECT post_id FROM social_post_collection_items WHERE collection_id = $1 ORDER BY saved_at DESC LIMIT $2`,
+      [req.params.id, limit],
+    );
+    const postIds = itemsRes.rows.map((r) => r.post_id);
+    const posts = await shapeSavedPosts(userId, postIds);
+    const state = await savedStateForPosts(userId, postIds);
+    const withState = posts.map((p: any) => ({ ...p, saved_collection_ids: state.get(String(p.id)) || [req.params.id] }));
+    res.json({ success: true, data: { posts: withState } });
+  } catch (e: any) {
+    console.error("social/collections/:id/posts error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load the collection" });
+  }
+});
+
+// Bookmark state for one post — drives the save sheet's pre-checked rows.
+router.get("/posts/:id/save-state", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const postId = String(req.params.id);
+    const state = await savedStateForPosts(req.user!.userId, [postId]);
+    const collectionIds = state.get(postId) || [];
+    res.json({ success: true, data: { saved: collectionIds.length > 0, collection_ids: collectionIds } });
+  } catch {
+    res.json({ success: true, data: { saved: false, collection_ids: [] } });
+  }
+});
+
+// Save a post into one or more collections (create-on-the-fly supported).
+router.post("/posts/:id/save", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const postId = String(req.params.id);
+    const postRes = await query(`SELECT id FROM social_posts WHERE id = $1 AND status = 'active'`, [postId]);
+    if (!postRes.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
+
+    const collectionIds = new Set<string>(
+      Array.isArray(req.body?.collection_ids) ? req.body.collection_ids.map(String) : [],
+    );
+    const newName = String(req.body?.collection_name || "").trim().slice(0, 60);
+    if (newName) {
+      const ins = await query(
+        `INSERT INTO social_post_collections (user_id, name) VALUES ($1, $2)
+         ON CONFLICT (user_id, name) DO UPDATE SET updated_at = NOW()
+         RETURNING id`,
+        [userId, newName],
+      );
+      if (ins.rows[0]?.id) collectionIds.add(String(ins.rows[0].id));
+    }
+    if (!collectionIds.size) {
+      return res.status(400).json({ success: false, error: "Pick at least one collection" });
+    }
+    for (const cid of collectionIds) {
+      await query(
+        `INSERT INTO social_post_collection_items (collection_id, post_id)
+         SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM social_post_collections WHERE id = $1 AND user_id = $3)
+         ON CONFLICT (collection_id, post_id) DO NOTHING`,
+        [cid, postId, userId],
+      );
+    }
+    await query(
+      `UPDATE social_post_collections SET updated_at = NOW() WHERE id = ANY($1::uuid[])`,
+      [[...collectionIds]],
+    );
+    const state = await savedStateForPosts(userId, [postId]);
+    res.json({
+      success: true,
+      message: "Post saved",
+      data: { saved: true, collection_ids: state.get(postId) || [...collectionIds] },
+    });
+  } catch (e: any) {
+    console.error("social/posts/:id/save error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not save the post" });
+  }
+});
+
+// Unsave — from one collection (collection_id) or everywhere.
+router.delete("/posts/:id/save", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const postId = String(req.params.id);
+    const collectionId = req.body?.collection_id ? String(req.body.collection_id) : null;
+    if (collectionId) {
+      await query(
+        `DELETE FROM social_post_collection_items i
+         USING social_post_collections c
+         WHERE i.collection_id = c.id AND c.user_id = $1 AND i.post_id = $2 AND i.collection_id = $3`,
+        [userId, postId, collectionId],
+      );
+    } else {
+      await query(
+        `DELETE FROM social_post_collection_items i
+         USING social_post_collections c
+         WHERE i.collection_id = c.id AND c.user_id = $1 AND i.post_id = $2`,
+        [userId, postId],
+      );
+    }
+    const state = await savedStateForPosts(userId, [postId]);
+    const collectionIds = state.get(postId) || [];
+    res.json({ success: true, message: "Removed", data: { saved: collectionIds.length > 0, collection_ids: collectionIds } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not update the saved post" });
   }
 });
 

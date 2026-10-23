@@ -216,7 +216,7 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     if (!pinCheck.ok) return res.status(400).json({ success: false, code: pinCheck.code, error: pinCheck.error });
 
     // ---- Wallet + cost -----------------------------------------------------
-    const wallet = await getOwnedWallet(String(b.wallet_id || ""), userId, businessId);
+    let wallet = await getOwnedWallet(String(b.wallet_id || ""), userId, businessId);
     if (!wallet) {
       const fallback = await query(
         `SELECT id, business_id, balance, currency FROM wallets
@@ -225,7 +225,7 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         [userId],
       );
       if (!fallback.rows.length) return res.status(404).json({ success: false, error: "No active NGN wallet found" });
-      (wallet as any) = fallback.rows[0];
+      wallet = fallback.rows[0] as typeof wallet;
     }
     if (String((wallet as any).currency || "NGN").toUpperCase() !== "NGN") {
       return res.status(400).json({ success: false, error: "RMB purchases are charged in NGN — use your Naira wallet." });

@@ -108,7 +108,13 @@ export function prestmitErr(e: any): string {
     const first = Object.values(d.errors)[0];
     if (Array.isArray(first) && first.length) return String(first[0]);
   }
-  const base = d?.message || d?.details || d?.error || e?.message || "Prestmit request failed";
+  // d.error may be a full object (e.g. { code, message, doc_url }) — never
+  // return objects to the client: they crash React render trees (#31).
+  const base = String(
+    d?.message || d?.details ||
+    (typeof d?.error === "string" ? d.error : d?.error?.message) ||
+    e?.message || "Prestmit request failed",
+  );
   const status = e?.response?.status;
   // 401 "Unauthenticated." = Prestmit rejected the credentials. With prefix
   // auto-routing in place this now almost always means a wrong/revoked key

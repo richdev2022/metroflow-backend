@@ -258,6 +258,87 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_user ON social_posts(user_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_recent ON social_posts(created_at DESC)`);
 
+  // Community reports — users flag posts; admins review + decide end-to-end.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      reporter_id UUID NOT NULL,
+      reason VARCHAR(30) NOT NULL,             -- spam|harassment|hate_speech|violence|nudity|misinformation|scam|other
+      details TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending | actioned | dismissed
+      decision VARCHAR(30),                    -- remove_post | dismiss | warn_user
+      decision_note TEXT,
+      decided_by VARCHAR(64),
+      decided_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(post_id, reporter_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_reports_status ON social_post_reports(status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_reports_post ON social_post_reports(post_id)`);
+
+  // Post view ledger — powers profile/video analytics (views, unique viewers,
+  // reach). One row per view event; `day` buckets allow unique-per-day counts.
+  // `author_id` is denormalised so profile analytics never needs a join.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_views (
+      id BIGSERIAL PRIMARY KEY,
+      post_id UUID NOT NULL,
+      author_id UUID NOT NULL,
+      viewer_id UUID,
+      source VARCHAR(20) NOT NULL DEFAULT 'feed', -- feed | deep_link | share | boost
+      day DATE NOT NULL DEFAULT CURRENT_DATE,
+      viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_post ON social_post_views(post_id, viewed_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_author_day ON social_post_views(author_id, day)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_day ON social_post_views(day)`);
+
+  // Multi-media posts — a post may carry up to 10 photos/videos in an ordered
+  // carousel. `social_posts.image_url`/`video_url` stay populated with the
+  // FIRST media (back-compat for OG share previews + older clients); this
+  // table is the ordered source of truth the feed renders from.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_media (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      media_type VARCHAR(10) NOT NULL DEFAULT 'image', -- image | video
+      url TEXT NOT NULL,
+      poster_url TEXT,                                 -- captured frame for videos
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_media_post ON social_post_media(post_id, position)`);
+
+  // ------------------------------------------------------------------
+  // 3b. ACCOUNT VERIFICATION BADGE — monthly subscription
+  //     Badge status lives on users (verified_badge_status/verified_until);
+  //     payments are ledgered in verification_subscriptions. Pricing is
+  //     admin-configurable via system_settings `verification_badge_pricing`.
+  // ------------------------------------------------------------------
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_badge_status VARCHAR(20) NOT NULL DEFAULT 'none'`); // none|active|expired|revoked
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_until TIMESTAMP`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_since TIMESTAMP`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS verification_subscriptions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      price NUMERIC(14,2) NOT NULL,
+      currency VARCHAR(10) NOT NULL DEFAULT 'NGN',
+      duration_days INTEGER NOT NULL DEFAULT 30,
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | expired | revoked
+      reference VARCHAR(60),
+      starts_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      ends_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_verification_subs_user ON verification_subscriptions(user_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_badge ON users(verified_badge_status) WHERE verified_badge_status != 'none'`);
+
   await query(`
     CREATE TABLE IF NOT EXISTS social_reactions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

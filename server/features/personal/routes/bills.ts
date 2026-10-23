@@ -8,6 +8,7 @@ import {
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { createNotification } from "../../../services/notifications";
 import * as sogo from "../../../services/sogo";
+import { userSafeErr } from "../user-safe-errors";
 import * as flwBills from "../flutterwave-bills";
 import { getActiveProvider, providerLabel } from "../provider-routing";
 
@@ -188,7 +189,7 @@ router.get("/catalog", authenticateToken, checkSubscriptionStatus, async (req, r
     });
   } catch (e: any) {
     console.error("[bills] catalog error:", e?.message);
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -205,7 +206,7 @@ router.get("/data-plans", authenticateToken, checkSubscriptionStatus, async (req
     const plans = items.filter((i: any) => i.__category === "DATA" && (!network || String(i.short_name || "").toLowerCase().includes(network)));
     return res.json({ success: true, provider, plans });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -221,7 +222,7 @@ router.get("/cable-packages", authenticateToken, checkSubscriptionStatus, async 
     const packages = items.filter((i: any) => i.__category === "CABLEBILLS");
     return res.json({ success: true, provider, packages });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -235,7 +236,7 @@ router.get("/education-plans", authenticateToken, checkSubscriptionStatus, async
     const items = await flwBills.getBillItems();
     return res.json({ success: true, provider, plans: items.filter((i: any) => i.__category === "MORE") });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -264,7 +265,7 @@ router.get("/epin-stock", authenticateToken, checkSubscriptionStatus, async (_re
     }
     return res.json({ success: true, provider, stock: {} });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -275,7 +276,7 @@ router.get("/epin/vouchers/:id/image", authenticateToken, checkSubscriptionStatu
     res.setHeader("Content-Disposition", `inline; filename="voucher-${req.params.id}.webp"`);
     return res.send(buffer);
   } catch (e: any) {
-    return res.status(e?.response?.status || 502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(e?.response?.status || 502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -295,7 +296,7 @@ router.post("/verify-meter", authenticateToken, checkSubscriptionStatus, async (
     }
     return res.json({ success: true, provider, data: { verified: false, message: "Verification is unavailable on the active provider — the payment will confirm the meter." } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -312,7 +313,7 @@ router.post("/verify-smartcard", authenticateToken, checkSubscriptionStatus, asy
     }
     return res.json({ success: true, provider: active, data: { verified: false, message: "Verification is unavailable on the active provider — the payment will confirm the smartcard." } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -327,7 +328,7 @@ router.post("/verify-jamb", authenticateToken, checkSubscriptionStatus, async (r
     }
     return res.json({ success: true, provider: active, data: { verified: false, message: "Verification is unavailable on the active provider — the payment will confirm the profile." } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -344,7 +345,7 @@ router.post("/verify-betting", authenticateToken, checkSubscriptionStatus, async
     }
     return res.json({ success: true, provider: active, data: { verified: false, message: "Verification is unavailable on the active provider — the payment will confirm the account." } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 
@@ -456,7 +457,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     const total = Math.round((amount + fee) * 100) / 100;
 
     // ---- Wallet (NGN) + guarded debit ------------------------------------
-    const wallet = await getOwnedWallet(String(b.wallet_id || ""), userId, businessId);
+    let wallet = await getOwnedWallet(String(b.wallet_id || ""), userId, businessId);
     if (!wallet) {
       const fallback = await query(
         `SELECT id, business_id, balance, currency FROM wallets
@@ -465,7 +466,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         [userId],
       );
       if (!fallback.rows.length) return res.status(404).json({ success: false, error: "No active NGN wallet found" });
-      (wallet as any) = fallback.rows[0];
+      wallet = fallback.rows[0] as typeof wallet;
     }
     if (String(wallet.currency || "NGN").toUpperCase() !== "NGN") {
       return res.status(400).json({ success: false, error: "Bill payments are charged in NGN — use your Naira wallet." });
@@ -545,7 +546,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         if (delivered) details.delivered = delivered;
       } catch (e: any) {
         await fail("failed", sogo.sogoErr(e), true);
-        return res.status(502).json({ success: false, error: `${sogo.sogoErr(e)} — your wallet has been refunded.` });
+        return res.status(502).json({ success: false, error: `${userSafeErr(sogo.sogoErr(e))} — your wallet has been refunded.` });
       }
     } else if (provider === "flutterwave") {
       const result = await flwBills.payBill({
@@ -697,7 +698,7 @@ router.post("/transactions/:reference/sync", authenticateToken, checkSubscriptio
     }
     return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: sogo.sogoErr(e) });
+    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
 

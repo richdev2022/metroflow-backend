@@ -8,6 +8,7 @@ import {
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import * as prestmit from "../../../services/prestmit";
 import * as sogo from "../../../services/sogo";
+import { userSafeErr } from "../user-safe-errors";
 import { getActiveProvider } from "../provider-routing";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
@@ -244,7 +245,7 @@ router.get("/sell/catalog", authenticateToken, checkSubscriptionStatus, async (_
     });
   } catch (e: any) {
     console.error("gc sell catalog error:", e?.message);
-    res.status(502).json({ success: false, error: provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });
 
@@ -253,7 +254,7 @@ router.get("/sell/categories", authenticateToken, async (_req, res) => {
     const cats = await prestmit.sellCategories();
     res.json({ success: true, categories: cats });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
   }
 });
 
@@ -267,7 +268,7 @@ router.get("/sell/subcategories", authenticateToken, async (req, res) => {
     const subs = await prestmit.sellSubcategories(params);
     res.json({ success: true, subcategories: subs });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
   }
 });
 
@@ -289,7 +290,7 @@ router.get("/sell/countries", authenticateToken, async (_req, res) => {
     const countries = await prestmit.sellCountries();
     res.json({ success: true, provider, countries });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
   }
 });
 
@@ -298,7 +299,7 @@ router.get("/sell/payout-methods", authenticateToken, async (_req, res) => {
     const methods = await prestmit.sellPayoutMethods();
     res.json({ success: true, payout_methods: methods });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
   }
 });
 
@@ -675,7 +676,7 @@ router.post("/sell/:reference/sync", authenticateToken, checkSubscriptionStatus,
     const updated = await query(`SELECT status FROM giftcard_sell_trades WHERE id = $1`, [row.rows[0].id]);
     res.json({ success: true, data: { ...result, status: updated.rows[0]?.status || result.status } });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
   }
 });
 
@@ -773,13 +774,13 @@ router.get("/buy/catalog", authenticateToken, checkSubscriptionStatus, async (re
     });
   } catch (e: any) {
     console.error("gc buy catalog error:", e?.message);
-    res.status(502).json({ success: false, error: provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });
 
 router.get("/buy/currencies", authenticateToken, async (_req, res) => {
+  const provider = await activeGiftcardProvider();
   try {
-    const provider = await activeGiftcardProvider();
     if (provider === "sogo") {
       const countries = await sogo.giftcardBuyCountries();
       const currencies = Array.from(new Set((countries || []).map((c: any) => c.currency_code).filter(Boolean)));
@@ -788,13 +789,14 @@ router.get("/buy/currencies", authenticateToken, async (_req, res) => {
     const currencies = await prestmit.buyCurrencies();
     res.json({ success: true, provider, currencies });
   } catch (e: any) {
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });
 
 // Contract note: the personal-web client reads the quote from r.data ITSELF
 // (no data wrapper) — { partner_total, fee, total, isAvailable }.
 router.post("/buy/calculate", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  const provider = await activeGiftcardProvider();
   try {
     const sku = String(req.body?.giftCardSKU || "").trim();
     const price = Number(req.body?.price);
@@ -802,7 +804,6 @@ router.post("/buy/calculate", authenticateToken, checkSubscriptionStatus, async 
     if (!sku || !Number.isFinite(price) || price <= 0) {
       return res.status(400).json({ success: false, error: "giftCardSKU and a positive price are required" });
     }
-    const provider = await activeGiftcardProvider();
     let naira = 0;
     let available = true;
     let raw: any = null;
@@ -824,7 +825,7 @@ router.post("/buy/calculate", authenticateToken, checkSubscriptionStatus, async 
     res.json({ ...raw, partner_total: naira, fee, total, isAvailable: available && raw?.isAvailable !== false });
   } catch (e: any) {
     console.error("gc calculate error:", e?.message);
-    res.status(502).json({ success: false, error: prestmit.prestmitErr(e) });
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });
 

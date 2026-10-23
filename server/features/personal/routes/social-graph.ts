@@ -34,7 +34,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const USER_CARD = `
   u.id, u.name, u.avatar_url, COALESCE(u.account_privacy, 'public') AS account_privacy,
   LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS username,
-  LEFT(COALESCE(u.bio, ''), 160) AS bio
+  LEFT(COALESCE(u.bio, ''), 160) AS bio,
+  (u.verified_badge_status = 'active' AND u.verified_until > NOW()) AS is_verified
 `;
 
 async function userByIdOrUsername(key: string) {
@@ -118,7 +119,30 @@ router.get("/users/:key", authenticateToken, async (req: AuthenticatedRequest, r
           ORDER BY p.created_at DESC LIMIT 60`,
         [user.id, viewerId],
       );
-      posts_grid = grid.rows;
+      // Multi-media: attach ordered carousels + a media_count for the grid's
+      // "stack" badge (falls back to the legacy single columns).
+      let mediaMap = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null }>>();
+      if (grid.rows.length) {
+        try {
+          const gm = await query(
+            `SELECT post_id, media_type, url, poster_url FROM social_post_media
+             WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+            [grid.rows.map((r: any) => r.id)],
+          );
+          for (const row of gm.rows) {
+            const list = mediaMap.get(String(row.post_id)) || [];
+            list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+            mediaMap.set(String(row.post_id), list);
+          }
+        } catch { mediaMap = new Map(); /* pre-upgrade posts render from legacy columns */ }
+      }
+      posts_grid = grid.rows.map((p: any) => {
+        const media = mediaMap.get(String(p.id)) || [
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null } : null,
+        ].filter(Boolean);
+        return { ...p, media, media_count: media.length };
+      });
     }
 
     res.json({

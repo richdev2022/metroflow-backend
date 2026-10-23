@@ -2278,7 +2278,7 @@ router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedReq
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
-    const { id } = req.params;
+    const id = String(req.params.id || "");
     // Guard BEFORE the uuid-cast query: a malformed id used to reach Postgres
     // and surface as 500 "Failed to update beneficiary".
     if (!UUID_RE.test(id)) {
@@ -2435,7 +2435,7 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
-    const { id } = req.params;
+    const id = String(req.params.id || "");
     if (!UUID_RE.test(id)) {
       return res.status(404).json({ success: false, error: "Beneficiary not found" });
     }
@@ -2537,7 +2537,7 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
 router.delete("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
-    const { id } = req.params;
+    const id = String(req.params.id || "");
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
     if (!UUID_RE.test(id)) {
       return res.status(404).json({ success: false, error: "Beneficiary not found" });

@@ -7,6 +7,7 @@ import {
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
+import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
 import { friendshipMap } from "../../../routes/friends";
@@ -531,10 +532,47 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       }
     }
 
+    // Server-side poster fill — any video that arrived WITHOUT a client-captured
+    // frame (old clients, mobile app, failed canvas capture) gets a thumbnail
+    // extracted on the host with ffmpeg. Best-effort per video: a missing
+    // binary or an exotic codec degrades to the no-poster path and never fails
+    // the post. Keeps og:image/feed thumbnails real for EVERY video post.
+    // Pair video rows with their original buffers in upload order.
+    {
+      const videoRowIdx: number[] = [];
+      mediaRows.forEach((m, i) => { if (m.media_type === "video") videoRowIdx.push(i); });
+      for (let v = 0; v < videoRowIdx.length && v < videoFiles.length; v++) {
+        const row = mediaRows[videoRowIdx[v]];
+        if (row.poster_url) continue; // client already supplied a poster
+        try {
+          const frame = await extractVideoPosterFrame(videoFiles[v].buffer, { maxWidth: 720 });
+          if (frame) {
+            const up = await uploadMediaBuffer({
+              buffer: frame,
+              originalname: `poster-${v}.jpg`,
+              mimeType: "image/jpeg",
+              folder: "social-media",
+              userId,
+            });
+            if (up?.url) row.poster_url = up.url;
+          }
+        } catch (err: any) {
+          console.warn("social/posts server-side poster extraction skipped:", err?.message);
+        }
+      }
+    }
+
     // Back-compat columns: first image / first video also land on social_posts
     // so OG share previews, profile grids and older clients keep working.
     let imageUrl: string | null = mediaRows.find((m) => m.media_type === "image")?.url || null;
     let videoUrl: string | null = mediaRows.find((m) => m.media_type === "video")?.url || null;
+    // Video-only post with no client poster? Mirror the server-extracted
+    // poster to image_url too so legacy og:image consumers always get a real
+    // preview instead of a blank share card.
+    if (!imageUrl) {
+      const firstVideoWithPoster = mediaRows.find((m) => m.media_type === "video" && m.poster_url);
+      if (firstVideoWithPoster?.poster_url) imageUrl = firstVideoWithPoster.poster_url;
+    }
     if (!mediaRows.length) {
       // Legacy single-file shape (image_url / video_url body fields).
       if (req.body?.image_url) imageUrl = String(req.body.image_url).slice(0, 500);

@@ -202,20 +202,23 @@ export const livekitProvider: CallingProvider = {
       }),
     });
 
+    // LIVE broadcast rooms mint receive-only tokens for viewers: only the
+    // host and approved stage guests may publish mic/cam into the stream.
+    const mayPublish = ctx.canPublish !== false;
     token.addGrant({
       roomJoin: true,
       room: ctx.roomId,
-      canPublish: true,
+      canPublish: mayPublish,
       canSubscribe: true,
-      canPublishData: true,
+      canPublishData: mayPublish,
       // Mic, camera, screen share (incl. audio). Hosts may publish everything;
       // participants the same — host *moderation* is what differs.
-      canPublishSources: [
+      canPublishSources: mayPublish ? [
         TrackSource.CAMERA,
         TrackSource.MICROPHONE,
         TrackSource.SCREEN_SHARE,
         TrackSource.SCREEN_SHARE_AUDIO,
-      ],
+      ] : [],
       // Hosts become room admins: they can mute/remove other participants and
       // receive participant-level moderation events.
       roomAdmin: ctx.isHost,

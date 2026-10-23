@@ -8,6 +8,7 @@ import { createNotification } from "../services/notifications";
 import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
+import { liveStageForCallRoom } from "../lib/live-stage";
 import { pushIncomingCall, pushMissedCall, acknowledgeCallPush } from "../lib/call-push";
 import { roomManager } from "../lib/roomManager";
 import { resolveRecordingMediaUrl } from "../lib/storage";
@@ -1088,13 +1089,17 @@ export const joinCall: RequestHandler = async (
     try {
       const userRes = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
       const provider = await resolveProviderForRoom("call", actualId, (call as any).provider || null);
+      // LIVE broadcast room? Viewers get receive-only media credentials until
+      // the host admits them to the stage.
+      const liveStage = await liveStageForCallRoom(actualId, userId);
       call.calling = await buildCallingCredentials(provider, {
         roomType: "call",
         roomId: actualId,
         title: call.callCode || "",
         identity: userId,
         displayName: userRes.rows[0]?.name || "User",
-        isHost: joiningAsHost,
+        isHost: liveStage.isLiveSession ? liveStage.isHost || liveStage.isStage : joiningAsHost,
+        canPublish: liveStage.isLiveSession ? liveStage.canPublish : undefined,
         remainingSeconds: computeRemainingSeconds(call.endedAt),
         maxParticipants: call.maxParticipants || null,
       });

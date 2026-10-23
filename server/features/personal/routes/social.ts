@@ -534,21 +534,31 @@ router.post("/posts/:id/like", authenticateToken, async (req: AuthenticatedReque
 // ---------------------------------------------------------------------------
 router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.userId;
+    const postRow = await query(`SELECT user_id FROM social_posts WHERE id = $1`, [req.params.id]);
+    const isPostAuthor = !!postRow.rows.length && postRow.rows[0].user_id === userId;
     const r = await query(
       `SELECT c.id, c.post_id, c.parent_id, c.user_id, c.body, c.like_count, c.status, c.created_at,
-              u.name AS author_name, u.avatar_url AS author_photo
+              u.name AS author_name, u.avatar_url AS author_photo,
+              EXISTS (SELECT 1 FROM social_comment_likes cl WHERE cl.comment_id = c.id AND cl.user_id = $2) AS liked_by_me
        FROM social_comments c JOIN users u ON u.id = c.user_id
        WHERE c.post_id = $1 AND c.status = 'active'
        ORDER BY c.created_at ASC`,
-      [req.params.id],
+      [req.params.id, userId],
     );
+    const isAdmin = req.user!.businessId === "platform_admin";
     const comments = r.rows.map((c) => ({
       id: c.id, post_id: c.post_id, parent_id: c.parent_id ?? null,
       author: { id: c.user_id, name: c.author_name, photo: c.author_photo },
       // `body`/`content` aliases — the web client reads comment.body; shipping
       // only `message` made every comment render as username-only.
       message: c.body, body: c.body, content: c.body,
-      like_count: c.like_count, created_at: c.created_at,
+      like_count: c.like_count, liked_by_me: !!c.liked_by_me,
+      // Edit = your own comment. Delete = your own comment, any comment on
+      // your post, or platform admin.
+      can_edit: c.user_id === userId,
+      can_delete: c.user_id === userId || isPostAuthor || isAdmin,
+      created_at: c.created_at,
     }));
     res.json({ success: true, data: { comments }, comments });
   } catch {
@@ -597,14 +607,118 @@ router.post("/posts/:id/comments", authenticateToken, async (req: AuthenticatedR
 
 router.delete("/comments/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const r = await query(
-      `DELETE FROM social_comments WHERE id = $1 AND (user_id = $2 OR $3 = ANY(ARRAY['platform_admin'])) RETURNING id`,
-      [req.params.id, req.user!.userId, req.user!.businessId ?? ""],
+    // Rules: you can delete YOUR OWN comment; the POST AUTHOR can delete any
+    // comment on their post; platform admins can delete anything. Deleting a
+    // comment also removes its replies (recursive descendants) so no orphaned
+    // reply chains linger in the thread tree.
+    const isAdmin = req.user!.businessId === "platform_admin";
+    const row = await query(
+      `SELECT c.id, c.user_id, p.user_id AS post_author_id
+       FROM social_comments c
+       JOIN social_posts p ON p.id = c.post_id
+       WHERE c.id = $1 LIMIT 1`,
+      [req.params.id],
     );
-    if (!r.rows.length) return res.status(404).json({ success: false, error: "Comment not found (or not yours)" });
+    if (!row.rows.length) return res.status(404).json({ success: false, error: "Comment not found" });
+    const { user_id, post_author_id } = row.rows[0];
+    const allowed = user_id === req.user!.userId || post_author_id === req.user!.userId || isAdmin;
+    if (!allowed) return res.status(403).json({ success: false, error: "You can only delete your own comments" });
+    // Recursive descendants (replies of replies included).
+    await query(
+      `WITH RECURSIVE tree AS (
+         SELECT id FROM social_comments WHERE id = $1
+         UNION ALL
+         SELECT c.id FROM social_comments c JOIN tree t ON c.parent_id = t.id
+       )
+       DELETE FROM social_comments WHERE id IN (SELECT id FROM tree)`,
+      [req.params.id],
+    );
     res.json({ success: true, message: "Comment deleted" });
   } catch {
     res.status(500).json({ success: false, error: "Could not delete comment" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Comment edit + comment likes
+// ---------------------------------------------------------------------------
+router.patch("/comments/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = String(req.body?.body || "").trim();
+    if (!body) return res.status(400).json({ success: false, error: "Comment cannot be empty" });
+    if (body.length > 2000) return res.status(400).json({ success: false, error: "Comment too long" });
+    const r = await query(
+      `UPDATE social_comments SET body = $1 WHERE id = $2 AND user_id = $3 AND status = 'active' RETURNING id, post_id, parent_id, body, like_count, created_at`,
+      [body, req.params.id, req.user!.userId],
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Comment not found (or not yours)" });
+    const c = r.rows[0];
+    res.json({
+      success: true,
+      data: { comment: { id: c.id, post_id: c.post_id, parent_id: c.parent_id ?? null, body: c.body, message: c.body, content: c.body, like_count: c.like_count, created_at: c.created_at, updated: true } },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not edit comment" });
+  }
+});
+
+// Toggle a like on a comment OR reply (same endpoint — replies are comments).
+router.post("/comments/:id/like", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const c = await query(`SELECT id, user_id FROM social_comments WHERE id = $1 AND status = 'active'`, [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ success: false, error: "Comment not found" });
+    const existing = await query(
+      `SELECT id FROM social_comment_likes WHERE comment_id = $1 AND user_id = $2`,
+      [req.params.id, userId],
+    );
+    let liked: boolean;
+    if (existing.rows.length) {
+      await query(`DELETE FROM social_comment_likes WHERE id = $1`, [existing.rows[0].id]);
+      await query(`UPDATE social_comments SET like_count = GREATEST(like_count - 1, 0) WHERE id = $1`, [req.params.id]);
+      liked = false;
+    } else {
+      await query(`INSERT INTO social_comment_likes (comment_id, user_id) VALUES ($1, $2)`, [req.params.id, userId]);
+      await query(`UPDATE social_comments SET like_count = like_count + 1 WHERE id = $1`, [req.params.id]);
+      liked = true;
+      if (c.rows[0].user_id !== userId) {
+        createNotification({
+          businessId: (req.user!.businessId ?? "") as string,
+          userId: c.rows[0].user_id,
+          title: "New like",
+          message: "Someone liked your comment",
+          type: "social",
+        }).catch(() => {});
+      }
+    }
+    const cnt = await query(`SELECT like_count FROM social_comments WHERE id = $1`, [req.params.id]);
+    res.json({ success: true, data: { liked_by_me: liked, like_count: cnt.rows[0]?.like_count ?? 0 } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not like the comment" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Post edit — author only
+// ---------------------------------------------------------------------------
+router.patch("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = String(req.body?.body ?? "").trim();
+    const hasBody = req.body?.body !== undefined;
+    if (hasBody && !body) return res.status(400).json({ success: false, error: "Post cannot be empty" });
+    if (body.length > 5000) return res.status(400).json({ success: false, error: "Post too long" });
+    const r = await query(
+      `UPDATE social_posts SET
+         body = CASE WHEN $2 THEN $3 ELSE body END,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND user_id = $4 AND status = 'active'
+       RETURNING id, body, image_url, video_url, updated_at`,
+      [req.params.id, hasBody, body, req.user!.userId],
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Post not found (or not yours)" });
+    res.json({ success: true, data: { post: r.rows[0] }, post: r.rows[0] });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not edit post" });
   }
 });
 
@@ -621,6 +735,69 @@ router.post("/posts/:id/share", authenticateToken, async (req: AuthenticatedRequ
     res.json({ success: true, data: { share_count: r.rows[0].share_count } });
   } catch {
     res.status(500).json({ success: false, error: "Could not record share" });
+  }
+});
+
+/**
+ * GET /social/share/post/:id — PUBLIC link-preview endpoint.
+ *
+ * WhatsApp / Telegram / X / iMessage scrape the shared URL server-side and
+ * render its Open Graph tags. The app is an auth-gated SPA, so sharing
+ * `/post/:id` produced the fallback SEO logo instead of the post media.
+ * This endpoint returns a tiny HTML page whose og:* tags point at the POST's
+ * own photo/video thumbnail (plus a meta-refresh + JS redirect into the app
+ * for humans), so chats show the actual post media as the share thumbnail.
+ * No auth by design — link previewers are anonymous.
+ */
+router.get("/share/post/:id", async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT p.id, p.body, p.image_url, p.video_url, p.created_at, u.name AS author_name, u.avatar_url AS author_photo
+       FROM social_posts p JOIN users u ON u.id = p.user_id
+       WHERE p.id = $1 AND p.status = 'active' LIMIT 1`,
+      [req.params.id],
+    );
+    if (!r.rows.length) return res.status(404).send("<html><body><p>Post not found</p></body></html>");
+    const p = r.rows[0];
+
+    const host = `https://${req.headers.host || "api.metricorex.com"}`;
+    const appUrl = process.env.PERSONAL_SITE_URL || "https://personal.metricorex.com";
+    const abs = (u?: string | null) => {
+      if (!u) return "";
+      if (/^https?:\/\//i.test(u)) return u;
+      return `${host}/${String(u).replace(/^\/+/, "")}`;
+    };
+    const image = abs(p.image_url) || abs(p.author_photo);
+    const video = abs(p.video_url);
+    // Video posts: some scrapers only render images — reuse the poster image
+    // when present, otherwise point og:image at the video (WhatsApp falls
+    // back to a frame) and ship the og:video tag for the ones that honor it.
+    const ogImage = image || video;
+    const excerpt = String(p.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    const title = `${p.author_name || "Someone"} on MetriCorex`;
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const target = `${appUrl}/post/${p.id}`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<title>${esc(title)}</title>
+<meta property="og:type" content="${video ? "video.other" : "article"}" />
+<meta property="og:title" content="${esc(title)}" />
+<meta property="og:description" content="${esc(excerpt || "Check this out on MetriCorex")}" />
+${ogImage ? `<meta property="og:image" content="${esc(ogImage)}" />\n<meta property="og:image:secure_url" content="${esc(ogImage)}" />` : ""}
+${video ? `<meta property="og:video" content="${esc(video)}" />\n<meta property="og:video:secure_url" content="${esc(video)}" />` : ""}
+<meta name="twitter:card" content="${video && !image ? "player" : "summary_large_image"}" />
+${ogImage ? `<meta name="twitter:image" content="${esc(ogImage)}" />` : ""}
+<meta http-equiv="refresh" content="0;url=${esc(target)}" />
+</head><body>
+<script>window.location.replace(${JSON.stringify(target)});</script>
+<noscript><p>Opening MetriCorex… <a href="${esc(target)}">Continue</a></p></noscript>
+</body></html>`);
+  } catch {
+    res.status(500).send("<html><body><p>Preview unavailable</p></body></html>");
   }
 });
 

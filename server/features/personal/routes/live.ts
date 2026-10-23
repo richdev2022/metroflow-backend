@@ -89,9 +89,12 @@ async function ensureLiveCallRow(session: { call_code: string; host_id: string; 
   try {
     const existing = await query(`SELECT id FROM calls WHERE call_code = $1 LIMIT 1`, [session.call_code]);
     if (existing.rows.length) return existing.rows[0].id;
+    // Personal hosts usually have NO business row — business_id is nullable
+    // now (see db.ts migration). Skipping the insert used to leave the room
+    // unresolvable and every viewer's socket join failing with
+    // "Call or meeting not found".
     const hostRes = await query(`SELECT business_id FROM users WHERE id = $1 LIMIT 1`, [session.host_id]);
-    const businessId = hostRes.rows[0]?.business_id;
-    if (!businessId) return null;
+    const businessId = hostRes.rows[0]?.business_id || null;
     const ins = await query(
       `INSERT INTO calls (business_id, type, status, created_by, host_id, call_code, is_group_call, started_at, provider)
        VALUES ($1, 'live', 'ongoing', $2, $2, $3, TRUE, COALESCE($4::timestamptz, NOW()), NULL)

@@ -1790,6 +1790,11 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS duration_started_at TIMESTAMPTZ`);
     // Make jitsi_room_id nullable (in case it was originally NOT NULL)
     await query(`ALTER TABLE calls ALTER COLUMN jitsi_room_id DROP NOT NULL`);
+    // Personal-app live streams are backed by calls(type='live') rows, but the
+    // host may have NO business record (business_id used to be NOT NULL, so
+    // ensureLiveCallRow silently skipped the insert and every socket join for
+    // that LIVE- code failed with "Call or meeting not found"). Allow NULL.
+    await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
 
     await query(`
       CREATE TABLE IF NOT EXISTS call_participants (

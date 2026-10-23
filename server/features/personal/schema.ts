@@ -414,6 +414,9 @@ export async function ensurePersonalSchema(): Promise<void> {
     )
   `);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS moderator_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  // TikTok-style tap-to-like counter — incremented in small batches by the
+  // room UI as viewers tap the stream (see POST /live/:id/likes).
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS like_count INTEGER NOT NULL DEFAULT 0`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_status ON live_sessions(status, started_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_host ON live_sessions(host_id)`);
 

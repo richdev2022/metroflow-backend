@@ -219,6 +219,8 @@ interface LiveSettings {
   withdrawal_min: number;
   battle_duration_seconds: number;
   battle_multiplier: number;
+  /** Points a viewer earns their side per battle cheer tap (default 1). */
+  battle_cheer_weight: number;
 }
 
 const DEFAULT_LIVE_SETTINGS: LiveSettings = {
@@ -230,6 +232,7 @@ const DEFAULT_LIVE_SETTINGS: LiveSettings = {
   withdrawal_min: 1000,
   battle_duration_seconds: 300,
   battle_multiplier: 2,
+  battle_cheer_weight: 1,
 };
 
 /** Admin-configurable livestream economics (fees, gift prices, battle defaults). */
@@ -816,6 +819,46 @@ router.post("/:id/react", authenticateToken, async (req: AuthenticatedRequest, r
   }
 });
 
+// ---------------------------------------------------------------------------
+// Tap-to-like — the room UI batches screen taps (max 10 per call) and fires
+// this every ~1.2s while the viewer keeps tapping. The running total rides
+// back on every session detail poll (SELECT * includes like_count).
+// Per-user token bucket keeps a single client from inflating the counter.
+// ---------------------------------------------------------------------------
+const likeBuckets = new Map<string, { tokens: number; last: number }>();
+const LIKE_CAPACITY = 90;          // burst allowance
+const LIKE_REFILL_PER_SEC = 15;    // sustained rate
+function takeLikeTokens(key: string, wanted: number): number {
+  const now = Date.now();
+  const b = likeBuckets.get(key) || { tokens: LIKE_CAPACITY, last: now };
+  b.tokens = Math.min(LIKE_CAPACITY, b.tokens + ((now - b.last) / 1000) * LIKE_REFILL_PER_SEC);
+  b.last = now;
+  const granted = Math.max(0, Math.min(Math.floor(wanted), Math.floor(b.tokens)));
+  b.tokens -= granted;
+  likeBuckets.set(key, b);
+  if (likeBuckets.size > 5000) likeBuckets.clear(); // bound memory on long uptimes
+  return granted;
+}
+
+router.post("/:id/likes", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await resolveLiveSession(String(req.params.id));
+    if (!s || s.status !== "live") return res.status(404).json({ success: false, error: "Stream not live" });
+    const wanted = Math.floor(Number(req.body?.count) || 1);
+    const granted = takeLikeTokens(`${req.user!.userId}:${s.id}`, Math.min(Math.max(wanted, 1), 10));
+    if (granted <= 0) {
+      return res.json({ success: true, data: { like_count: Number(s.like_count || 0), throttled: true } });
+    }
+    const r = await query(
+      `UPDATE live_sessions SET like_count = like_count + $2 WHERE id = $1 RETURNING like_count`,
+      [s.id, granted],
+    );
+    res.json({ success: true, data: { like_count: Number(r.rows[0]?.like_count || 0), counted: granted } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not register likes" });
+  }
+});
+
 router.get("/:id/reactions", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const s = await sessionById(String(req.params.id));
@@ -1317,6 +1360,75 @@ router.get("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, r
   } catch (e: any) {
     console.error("battle state error:", e?.message);
     res.status(500).json({ success: false, error: "Could not load the battle" });
+  }
+});
+
+// BATTLE CHEER — viewers tap their favourite streamer's side and the points
+// ticker climbs. Each tap is worth `battle_cheer_weight` points (default 1);
+// gifts remain the heavyweight scorer (total × battle_multiplier). The tap
+// layer batches up to 10 taps per call; a per-user token bucket stops a
+// single client from farming the scoreboard.
+const cheerBuckets = new Map<string, { tokens: number; last: number }>();
+const CHEER_CAPACITY = 60;
+const CHEER_REFILL_PER_SEC = 8;
+function takeCheerTokens(key: string, wanted: number): number {
+  const now = Date.now();
+  const b = cheerBuckets.get(key) || { tokens: CHEER_CAPACITY, last: now };
+  b.tokens = Math.min(CHEER_CAPACITY, b.tokens + ((now - b.last) / 1000) * CHEER_REFILL_PER_SEC);
+  b.last = now;
+  const granted = Math.max(0, Math.min(Math.floor(wanted), Math.floor(b.tokens)));
+  b.tokens -= granted;
+  cheerBuckets.set(key, b);
+  if (cheerBuckets.size > 5000) cheerBuckets.clear();
+  return granted;
+}
+
+router.post("/battles/:id/cheer", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await finalizeExpiredBattles();
+    const userId = req.user!.userId;
+    const side = String(req.body?.side) === "b" ? "b" : String(req.body?.side) === "a" ? "a" : null;
+    if (!side) return res.status(400).json({ success: false, error: "side must be 'a' or 'b'" });
+    const wanted = Math.floor(Number(req.body?.count) || 1);
+    const granted = takeCheerTokens(`${userId}:${req.params.id}`, Math.min(Math.max(wanted, 1), 10));
+    if (granted <= 0) {
+      return res.json({ success: true, data: { throttled: true } });
+    }
+    const b = (
+      await query(
+        `SELECT id, session_a_id, session_b_id, host_a_id, host_b_id, status, ends_at, score_a, score_b
+         FROM live_battles WHERE id = $1::uuid LIMIT 1`,
+        [String(req.params.id)],
+      )
+    ).rows[0];
+    if (!b || b.status !== "active") return res.status(404).json({ success: false, error: "Battle is not active" });
+    if (b.ends_at && new Date(b.ends_at).getTime() <= Date.now()) {
+      return res.status(400).json({ success: false, error: "Battle is not active" });
+    }
+    // A streamer cannot pump their own side (matches the gifting self-block);
+    // they CAN cheer the opponent — keeps 2-account testing and rival banter alive.
+    const ownSide = b.host_a_id === userId ? "a" : b.host_b_id === userId ? "b" : null;
+    if (ownSide === side) {
+      return res.status(400).json({ success: false, error: "You cannot cheer your own side — your fans do that!" });
+    }
+    const settings = await getLiveSettings();
+    const weight = Math.max(0, Number(settings.battle_cheer_weight) || 1);
+    const points = Math.round(granted * weight * 100) / 100;
+    const scoreCol = side === "a" ? "score_a" : "score_b";
+    const r = await query(
+      `UPDATE live_battles SET ${scoreCol} = ${scoreCol} + $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING score_a, score_b`,
+      [b.id, points],
+    );
+    res.json({
+      success: true,
+      data: {
+        side, counted: granted, points,
+        scores: { a: Number(r.rows[0]?.score_a || 0), b: Number(r.rows[0]?.score_b || 0) },
+      },
+    });
+  } catch (e: any) {
+    console.error("battle cheer error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not register the cheer" });
   }
 });
 

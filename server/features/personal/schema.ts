@@ -296,6 +296,23 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_author_day ON social_post_views(author_id, day)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_day ON social_post_views(day)`);
 
+  // Multi-media posts — a post may carry up to 10 photos/videos in an ordered
+  // carousel. `social_posts.image_url`/`video_url` stay populated with the
+  // FIRST media (back-compat for OG share previews + older clients); this
+  // table is the ordered source of truth the feed renders from.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_media (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      media_type VARCHAR(10) NOT NULL DEFAULT 'image', -- image | video
+      url TEXT NOT NULL,
+      poster_url TEXT,                                 -- captured frame for videos
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_media_post ON social_post_media(post_id, position)`);
+
   // ------------------------------------------------------------------
   // 3b. ACCOUNT VERIFICATION BADGE — monthly subscription
   //     Badge status lives on users (verified_badge_status/verified_until);

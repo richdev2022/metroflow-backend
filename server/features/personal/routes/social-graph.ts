@@ -3,6 +3,8 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken } from "../../../middleware/auth";
 import { createNotification } from "../../../services/notifications";
 import { assertPersonalService } from "../personal-utils";
+import { evaluateFollowerBadge } from "../../../services/verification-criteria";
+import { getStatuses, getUserStatuses } from "../../../routes/statuses";
 
 /**
  * SOCIAL GRAPH — TikTok-style follow system + shareable public profiles.
@@ -35,7 +37,7 @@ const USER_CARD = `
   u.id, u.name, u.avatar_url, COALESCE(u.account_privacy, 'public') AS account_privacy,
   LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS username,
   LEFT(COALESCE(u.bio, ''), 160) AS bio,
-  (u.verified_badge_status = 'active' AND u.verified_until > NOW()) AS is_verified
+  (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS is_verified
 `;
 
 async function userByIdOrUsername(key: string) {
@@ -227,6 +229,9 @@ router.post("/users/:id/follow", authenticateToken, async (req: AuthenticatedReq
       `INSERT INTO social_follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
       [userId, target],
     );
+    // Criteria badge: crossing the follower threshold (admin-configurable,
+    // default 10k) grants the verified badge automatically.
+    evaluateFollowerBadge(target, "up").catch(() => {});
     await createNotification({
       userId: target,
       type: "social",
@@ -248,6 +253,9 @@ router.delete("/users/:id/follow", authenticateToken, async (req: AuthenticatedR
     await query(`DELETE FROM social_follows WHERE follower_id = $1 AND following_id = $2`, [userId, target]);
     // Also retract a pending follow request to the same user.
     await query(`DELETE FROM social_follow_requests WHERE requester_id = $1 AND target_id = $2 AND status = 'pending'`, [userId, target]);
+    // Criteria badge: dropping below the follower threshold removes a
+    // criteria-earned badge (paid/admin badges are never touched).
+    evaluateFollowerBadge(target, "down").catch(() => {});
     res.json({ success: true, data: { status: "not_following" } });
   } catch {
     res.status(500).json({ success: false, error: "Could not unfollow" });
@@ -284,6 +292,13 @@ router.get("/users/:id/followers", authenticateToken, listGraph("following_id"))
 router.get("/users/:id/following", authenticateToken, listGraph("follower_id"));
 
 // ---------------------------------------------------------------------------
+// PROFILE STORIES — the same 24h statuses, surfaced on the social profile
+// WITHOUT the chat feature gate (every personal user can post + view here).
+// ---------------------------------------------------------------------------
+router.get("/statuses/wall", authenticateToken, (req, res, next) => getStatuses(req, res, next));
+router.get("/users/:key/statuses", authenticateToken, (req, res, next) => getUserStatuses(req, res, next));
+
+// ---------------------------------------------------------------------------
 // Follow requests (private accounts)
 // ---------------------------------------------------------------------------
 router.get("/follow/requests", authenticateToken, async (req: AuthenticatedRequest, res) => {
@@ -314,6 +329,8 @@ router.post("/follow/requests/:id/accept", authenticateToken, async (req: Authen
     const req0 = r.rows[0];
     await query(`UPDATE social_follow_requests SET status = 'accepted', responded_at = CURRENT_TIMESTAMP WHERE id = $1`, [req0.id]);
     await query(`INSERT INTO social_follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [req0.requester_id, userId]);
+    // Criteria badge: an accepted request adds a follower to THIS user.
+    evaluateFollowerBadge(userId, "up").catch(() => {});
     await createNotification({
       userId: req0.requester_id,
       type: "social",

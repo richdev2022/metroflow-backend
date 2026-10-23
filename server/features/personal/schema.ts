@@ -285,6 +285,19 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_parent ON social_comments(parent_id)`);
 
+  // Per-user comment/reply likes — social_comments.like_count stays a
+  // denormalized counter maintained by the toggle endpoint.
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_comment_likes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      comment_id UUID NOT NULL REFERENCES social_comments(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(comment_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_comment_likes_comment ON social_comment_likes(comment_id)`);
+
   // Robust polls: up to 10 options, optional media, expiry, single/multi choice,
   // revocable votes, per-option image, closed/active status.
   await query(`
@@ -321,7 +334,8 @@ export async function ensurePersonalSchema(): Promise<void> {
   // Paid polls economics: voters pay per vote from their NGN wallet; the money
   // pools on the poll; at maturity the creator withdraws to their NGN wallet and
   // the admin-configured withdrawal fee lands in the platform revenue ledger.
-  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS poll_type VARCHAR(10) NOT NULL DEFAULT 'free'`);   -- free | paid
+  // poll_type: free | paid
+  await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS poll_type VARCHAR(10) NOT NULL DEFAULT 'free'`);
   await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS vote_price NUMERIC(14,2) NOT NULL DEFAULT 0`);
   await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS pool_earned NUMERIC(14,2) NOT NULL DEFAULT 0`);
   await query(`ALTER TABLE social_polls ADD COLUMN IF NOT EXISTS pool_withdrawn NUMERIC(14,2) NOT NULL DEFAULT 0`);
@@ -399,6 +413,7 @@ export async function ensurePersonalSchema(): Promise<void> {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS moderator_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_status ON live_sessions(status, started_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_sessions_host ON live_sessions(host_id)`);
 

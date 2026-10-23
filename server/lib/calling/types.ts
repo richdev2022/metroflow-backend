@@ -27,6 +27,8 @@ export interface CallingJoinContext {
   /** Display name shown to other participants. */
   displayName: string;
   isHost: boolean;
+  /** May publish media tracks? Undefined = normal room (true). LIVE viewers are minted false. */
+  canPublish?: boolean;
   /** Remaining seconds the participant may stay connected (backend-enforced duration); null = unlimited. */
   remainingSeconds: number | null;
   maxParticipants: number | null;

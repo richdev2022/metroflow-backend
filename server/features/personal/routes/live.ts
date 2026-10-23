@@ -43,6 +43,13 @@ const EMOJIS = new Set(["heart", "fire", "clap", "laugh", "wow", "sad", "party",
 const isCohost = (session: any, userId: string) =>
   Array.isArray(session.cohost_ids) && session.cohost_ids.includes(userId);
 
+const isModerator = (session: any, userId: string) =>
+  Array.isArray(session.moderator_ids) && session.moderator_ids.includes(userId);
+
+/** Host + assigned moderators manage the room (approve guests, drop, moderate). */
+const canModerate = (session: any, userId: string) =>
+  session.host_id === userId || isModerator(session, userId);
+
 async function sessionById(id: string) {
   // Accepts a UUID id OR the call_code (the watch page only knows the code,
   // e.g. /live/watch?code=LIVE-XXXX). `id::text = $1` keeps the UUID match
@@ -870,8 +877,8 @@ router.post("/:id/moderate", authenticateToken, async (req: AuthenticatedRequest
   try {
     const s = await sessionById(String(req.params.id));
     if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
-    if (s.host_id !== req.user!.userId && !isCohost(s, req.user!.userId)) {
-      return res.status(403).json({ success: false, error: "Only the host can moderate" });
+    if (!canModerate(s, req.user!.userId)) {
+      return res.status(403).json({ success: false, error: "Only the host or a moderator can moderate" });
     }
     const action = String(req.body?.action);
     const target = String(req.body?.target_id || "");
@@ -918,6 +925,93 @@ router.delete("/:id/cohost/:userId", authenticateToken, async (req: Authenticate
     res.json({ success: true, data: { cohost_ids: cohosts } });
   } catch {
     res.status(500).json({ success: false, error: "Could not remove co-host" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// MODERATORS — the host assigns trusted viewers to help run the room.
+// Moderators can approve/decline stage requests, drop guests, remove messages
+// and ban viewers. Host-only: assigning/removing moderators, co-hosts, ending.
+// ---------------------------------------------------------------------------
+
+router.post("/:id/moderator", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (s.host_id !== req.user!.userId) return res.status(403).json({ success: false, error: "Only the host can assign moderators" });
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ success: false, error: "user_id is required" });
+    if (user_id === s.host_id) return res.status(400).json({ success: false, error: "The host does not need a moderator badge" });
+    const mods = Array.isArray(s.moderator_ids) ? s.moderator_ids : [];
+    if (mods.includes(user_id)) return res.json({ success: true, data: { moderator_ids: mods } });
+    if (mods.length >= 10) return res.status(400).json({ success: false, error: "Maximum 10 moderators per stream" });
+    const next = [...mods, user_id];
+    await query(`UPDATE live_sessions SET moderator_ids = $2::jsonb WHERE id = $1`, [s.id, JSON.stringify(next)]);
+    createNotification({
+      businessId: "", userId: user_id,
+      title: "You are now a moderator",
+      message: `You were assigned as a moderator on "${s.title}".`,
+      type: "social",
+    }).catch(() => {});
+    res.json({ success: true, data: { moderator_ids: next } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not assign moderator" });
+  }
+});
+
+router.delete("/:id/moderator/:userId", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (s.host_id !== req.user!.userId) return res.status(403).json({ success: false, error: "Only the host manages moderators" });
+    const mods = (Array.isArray(s.moderator_ids) ? s.moderator_ids : []).filter((x: string) => x !== req.params.userId);
+    await query(`UPDATE live_sessions SET moderator_ids = $2::jsonb WHERE id = $1`, [s.id, JSON.stringify(mods)]);
+    res.json({ success: true, data: { moderator_ids: mods } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not remove moderator" });
+  }
+});
+
+/**
+ * POST /:id/guests/:userId/drop — host/moderator removes a stage guest.
+ * Demotes the guest to viewer (cohost_ids) AND cancels their join-request
+ * rows, so the guest's own 4s status poll flips out of "approved" and their
+ * client stops publishing — otherwise the dropped guest would still look
+ * on-stage to themselves.
+ */
+router.post("/:id/guests/:userId/drop", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (!canModerate(s, req.user!.userId)) return res.status(403).json({ success: false, error: "Only the host or a moderator can drop guests" });
+    const targetUser = String(req.params.userId);
+    if (targetUser === s.host_id) return res.status(400).json({ success: false, error: "The host cannot be dropped" });
+    const cohosts = await removeCohost(s.id, s.cohost_ids, targetUser);
+    await query(
+      `UPDATE live_join_requests SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+       WHERE session_id = $1 AND user_id = $2 AND status IN ('pending','approved')`,
+      [s.id, targetUser],
+    );
+    res.json({ success: true, data: { cohost_ids: cohosts, dropped: targetUser } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not drop the guest" });
+  }
+});
+
+/** POST /:id/stage/exit — a stage guest leaves the stage themselves. */
+router.post("/:id/stage/exit", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    const cohosts = await removeCohost(s.id, s.cohost_ids, req.user!.userId);
+    await query(
+      `UPDATE live_join_requests SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+       WHERE session_id = $1 AND user_id = $2 AND status IN ('pending','approved')`,
+      [s.id, req.user!.userId],
+    );
+    res.json({ success: true, data: { cohost_ids: cohosts, is_stage: false } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not leave the stage" });
   }
 });
 
@@ -1005,6 +1099,7 @@ router.get("/:id/join-requests", authenticateToken, async (req: AuthenticatedReq
           pending_count: pending.rows.length,
           stage: cohosts,
           stage_count: cohosts.length,
+          moderators: Array.isArray(s.moderator_ids) ? s.moderator_ids : [],
         },
       });
     }
@@ -1020,7 +1115,16 @@ router.get("/:id/join-requests", authenticateToken, async (req: AuthenticatedReq
     // request reads as "none" so the client can cleanly re-raise.
     const raw = cohosts.includes(userId) ? "approved" : row?.status ?? "none";
     const status = raw === "cancelled" ? "none" : raw;
-    res.json({ success: true, data: { mine: row, status, is_stage: cohosts.includes(userId) } });
+    res.json({
+      success: true,
+      data: {
+        mine: row,
+        status,
+        is_stage: cohosts.includes(userId),
+        is_moderator: isModerator(s, userId),
+        moderators: Array.isArray(s.moderator_ids) ? s.moderator_ids : [],
+      },
+    });
   } catch {
     res.status(500).json({ success: false, error: "Could not load join requests" });
   }
@@ -1052,7 +1156,7 @@ const respondToJoinRequest = (action: "approve" | "decline") =>
     try {
       const s = await sessionById(String(req.params.id));
       if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
-      if (s.host_id !== req.user!.userId) return res.status(403).json({ success: false, error: "Only the host can respond to requests" });
+      if (!canModerate(s, req.user!.userId)) return res.status(403).json({ success: false, error: "Only the host or a moderator can respond to requests" });
       const r = await query(
         `UPDATE live_join_requests SET status = $2, responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
          WHERE id = $3 AND session_id = $1 AND status = 'pending' RETURNING id, user_id, status`,

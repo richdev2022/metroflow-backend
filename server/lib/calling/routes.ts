@@ -7,6 +7,7 @@ import {
   resolveProviderForRoom,
 } from "./factory";
 import { logActivity } from "../../services/activity";
+import { liveStageForCallRoom } from "../live-stage";
 
 /**
  * RTC session routes — token refresh + host moderation.
@@ -106,13 +107,18 @@ const postToken: RequestHandler = async (req: AuthenticatedRequest, res) => {
     const isHost = room.host_id === userId || room.co_host_id === userId || room.created_by === userId;
     const provider = await resolveProviderForRoom(roomType, room.id, room.provider);
 
+    // LIVE broadcast room? Viewers get a receive-only token (canPublish:false)
+    // until the host admits them to the stage (cohost_ids).
+    const liveStage = await liveStageForCallRoom(room.id, userId);
+
     const credentials = await buildCallingCredentials(provider, {
       roomType,
       roomId: room.id,
       title: "",
       identity: userId,
       displayName: userRes.rows[0]?.name || "User",
-      isHost,
+      isHost: liveStage.isLiveSession ? liveStage.isHost || liveStage.isStage : isHost,
+      canPublish: liveStage.isLiveSession ? liveStage.canPublish : undefined,
       remainingSeconds: computeRemainingSeconds(room.ended_at || room.end_time),
       maxParticipants: room.max_participants,
     });

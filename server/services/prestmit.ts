@@ -58,16 +58,41 @@ import FormData from "form-data";
 const SANDBOX_BASE = "https://dev-api.prestmit.io/partners/v1";
 const LIVE_BASE = "https://api.prestmit.io/partners/v1";
 
-function resolveBaseUrl(): string {
-  const override = process.env.PRESTMIT_BASE_URL;
-  if (override) return override;
-  if (String(process.env.PRESTMIT_SANDBOX || "").toLowerCase() === "true") return SANDBOX_BASE;
-  if (String(process.env.PRESTMIT_ENV || "").toLowerCase() === "live") return LIVE_BASE;
-  return LIVE_BASE; // default: production
+const API_KEY = (process.env.PRESTMIT_API_KEY || "").trim();
+const API_SECRET = (process.env.PRESTMIT_API_SECRET || "").trim();
+
+/**
+ * "sandbox" | "live" | "unknown" — inferred from the API key prefix.
+ * Prestmit enforces key/env pairing (a key_dev_ key is rejected by the live
+ * host with 401 "Unauthenticated." and vice versa), so the prefix is the
+ * most reliable signal for which base URL to use.
+ */
+export function prestmitKeyKind(): "sandbox" | "live" | "unknown" {
+  if (API_KEY.startsWith("key_dev_")) return "sandbox";
+  if (API_KEY.startsWith("key_live_")) return "live";
+  return "unknown";
 }
 
-const API_KEY = process.env.PRESTMIT_API_KEY || "";
-const API_SECRET = process.env.PRESTMIT_API_SECRET || "";
+/** Host (no path, no secrets) for diagnostics surfaces. */
+export function prestmitBaseUrl(): string {
+  try { return new URL(resolveBaseUrl()).host; } catch { return ""; }
+}
+
+function resolveBaseUrl(): string {
+  // 1. Explicit override always wins (escape hatch).
+  const override = (process.env.PRESTMIT_BASE_URL || "").trim();
+  if (override) return override;
+  // 2. Key-prefix routing — Prestmit enforces key/env pairing, so a sandbox
+  //    key MUST hit dev-api and a live key MUST hit api. This auto-fixes the
+  //    "Unauthenticated." failure caused by a key/env mismatch in the env.
+  const kind = prestmitKeyKind();
+  if (kind === "sandbox") return SANDBOX_BASE;
+  if (kind === "live") return LIVE_BASE;
+  // 3. Legacy env switches (keys without a recognisable prefix).
+  if (String(process.env.PRESTMIT_SANDBOX || "").trim().toLowerCase() === "true") return SANDBOX_BASE;
+  if (String(process.env.PRESTMIT_ENV || "").trim().toLowerCase() === "live") return LIVE_BASE;
+  return LIVE_BASE; // default: production
+}
 
 export function isPrestmitConfigured(): boolean {
   return !!(API_KEY && API_SECRET);
@@ -83,7 +108,17 @@ export function prestmitErr(e: any): string {
     const first = Object.values(d.errors)[0];
     if (Array.isArray(first) && first.length) return String(first[0]);
   }
-  return d?.message || d?.details || d?.error || e?.message || "Prestmit request failed";
+  const base = d?.message || d?.details || d?.error || e?.message || "Prestmit request failed";
+  const status = e?.response?.status;
+  // 401 "Unauthenticated." = Prestmit rejected the credentials. With prefix
+  // auto-routing in place this now almost always means a wrong/revoked key
+  // or an IP-whitelist block — give the operator something actionable.
+  if (status === 401 || /unauthenticated/i.test(String(base))) {
+    return `${base} — Prestmit rejected the API key. ` +
+      `Check PRESTMIT_API_KEY / PRESTMIT_API_SECRET (a key_dev_ key only works against dev-api.prestmit.io, key_live_ against api.prestmit.io) ` +
+      `and confirm this server's IP is whitelisted on the Prestmit console.`;
+  }
+  return base;
 }
 
 function client(): AxiosInstance {

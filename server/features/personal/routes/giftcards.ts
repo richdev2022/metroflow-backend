@@ -124,7 +124,12 @@ async function buyFeePercent(): Promise<number> {
 router.get("/status", authenticateToken, async (_req: AuthenticatedRequest, res) => {
   res.json({
     success: true,
-    data: { configured: prestmit.isPrestmitConfigured(), sandbox: prestmit.isPrestmitSandbox() },
+    data: {
+      configured: prestmit.isPrestmitConfigured(),
+      sandbox: prestmit.isPrestmitSandbox(),
+      key_kind: prestmit.prestmitKeyKind(),   // sandbox | live | unknown
+      provider_host: prestmit.prestmitBaseUrl(), // host only, no secrets
+    },
   });
 });
 

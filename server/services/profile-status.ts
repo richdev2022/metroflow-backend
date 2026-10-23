@@ -54,6 +54,31 @@ export async function getProfileStatus(userId: string): Promise<ProfileStatus> {
     const role: string = row.role || "member";
     const admin = isBusinessAdminRole(role);
     const profileCompleted = admin ? true : Boolean(row.profile_completed);
+    let phoneVerified = Boolean(row.phone_verified);
+
+    // CROSS-APP PHONE SYNC: a phone number verified in the BUSINESS app must
+    // count as verified on the Personal app too. The business contact-change
+    // flow only lands the OTP-verified number on businesses.phone_number —
+    // so when the user's personal number matches their business's (necessarily
+    // OTP-verified) number, treat it as verified and lazily converge the DB
+    // so both apps agree from then on.
+    if (!phoneVerified && row.phone_number) {
+      try {
+        const biz = await query(
+          `SELECT 1 FROM businesses
+           WHERE id = (SELECT business_id FROM users WHERE id = $1)
+             AND phone_number IS NOT NULL AND phone_number = $2
+           LIMIT 1`,
+          [userId, row.phone_number],
+        );
+        if (biz.rows.length > 0) {
+          phoneVerified = true;
+          query(`UPDATE users SET phone_verified = TRUE WHERE id = $1 AND COALESCE(phone_verified, FALSE) = FALSE`, [userId])
+            .catch(() => { /* lazy sync is best-effort */ });
+        }
+      } catch { /* best-effort fallback check */ }
+    }
+
     // "Skip for now" (profile_prompt_dismissed) must STICK: a member who
     // dismissed the personal prompt once is never re-routed to the completion
     // screen — requiresProfileCompletion would otherwise stay true on every
@@ -62,7 +87,7 @@ export async function getProfileStatus(userId: string): Promise<ProfileStatus> {
       role,
       isBusinessAdmin: admin,
       profileCompleted,
-      phoneVerified: Boolean(row.phone_verified),
+      phoneVerified,
       profilePromptDismissed: Boolean(row.prompt_dismissed),
       requiresProfileCompletion: !admin && !profileCompleted && !Boolean(row.prompt_dismissed),
       avatarUrl: row.avatar_url || null,

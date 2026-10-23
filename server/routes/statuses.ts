@@ -345,4 +345,62 @@ export const repostStatus: RequestHandler = async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to repost the status" });
   }
 };
+
+/**
+ * PROFILE STORIES (social surface) — the SAME 24h statuses, exposed for the
+ * personal-app profile pages (/u/:username and /profile) without the chat
+ * feature gate. `getUserStatuses` returns ONE author's active stories so the
+ * profile avatar can show the ring + open the viewer directly.
+ */
+export const getUserStatuses: RequestHandler = async (req, res) => {
+  purgeExpired();
+  try {
+    const viewerId = req.user?.userId;
+    if (!viewerId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    const key = String(req.params.key || "").trim();
+    if (!key) return res.status(400).json({ success: false, error: "User required" });
+
+    const target = await query(
+      `SELECT id FROM users
+        WHERE (id::text = $1 AND $1 ~ '^[0-9a-f-]{36}$')
+           OR (username IS NOT NULL AND LOWER(username) = LOWER($1))
+           OR LOWER(SPLIT_PART(email, '@', 1)) = LOWER($1)
+        ORDER BY (id::text = $1) DESC
+        LIMIT 1`,
+      [key],
+    );
+    const authorId = target.rows[0]?.id;
+    if (!authorId) return res.status(404).json({ success: false, error: "User not found" });
+
+    // Blocked pairs never see each other's stories (same rule as the rail).
+    const blocked = await query(
+      `SELECT 1 FROM user_blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1) LIMIT 1`,
+      [viewerId, authorId],
+    );
+    if (blocked.rows.length > 0) return res.json({ success: true, data: { statuses: [] } });
+
+    const rows = await query(
+      `SELECT s.id, s.user_id as "userId", u.name as "authorName", u.avatar_url as "authorAvatar",
+              s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
+              s.background_color as "backgroundColor",
+              s.reposted_from as "repostedFrom", s.repost_author as "repostAuthor",
+              s.created_at as "createdAt", s.expires_at as "expiresAt",
+              (s.user_id = $1) as "isMine",
+              (SELECT COUNT(*)::int FROM chat_status_views v WHERE v.status_id = s.id) as "viewsCount",
+              EXISTS (SELECT 1 FROM chat_status_views v WHERE v.status_id = s.id AND v.viewer_id = $1) as "viewed",
+              (SELECT COUNT(*)::int FROM chat_status_likes l WHERE l.status_id = s.id) as "likesCount",
+              EXISTS (SELECT 1 FROM chat_status_likes l WHERE l.status_id = s.id AND l.user_id = $1) as "liked"
+         FROM chat_statuses s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.expires_at > NOW() AND s.user_id = $2 AND u.status = 'active'
+        ORDER BY s.created_at ASC
+        LIMIT 50`,
+      [viewerId, authorId],
+    );
+    res.json({ success: true, data: { statuses: rows.rows } });
+  } catch (error) {
+    console.error("User statuses error:", error);
+    res.status(500).json({ success: false, error: "Failed to load statuses" });
+  }
+};
 export default router;

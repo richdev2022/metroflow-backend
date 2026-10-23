@@ -482,5 +482,49 @@ router.put("/config", async (req, res) => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// PROVIDER ROUTING — the active provider per routed service
+// (bills: sogo|flutterwave|simulator · giftcards: sogo|prestmit|simulator ·
+//  crypto: sogo|bitnob|simulator). "sogo" is the default for all three.
+// ---------------------------------------------------------------------------
+
+router.get("/providers", async (_req, res) => {
+    try {
+        const { getRoutingStatus } = await import("./provider-routing");
+        const status = await getRoutingStatus();
+        res.json({ success: true, data: status });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load provider routing" });
+    }
+});
+
+router.put("/providers", async (req, res) => {
+    try {
+        const { setActiveProvider, SERVICE_PROVIDERS } = await import("./provider-routing");
+        const { service, provider } = req.body || {};
+        const svc = String(service || "").toLowerCase();
+        const prov = String(provider || "").toLowerCase();
+        if (!Object.keys(SERVICE_PROVIDERS).includes(svc)) {
+            return res.status(400).json({ success: false, error: `service must be one of: ${Object.keys(SERVICE_PROVIDERS).join(", ")}` });
+        }
+        if (!(SERVICE_PROVIDERS as any)[svc].includes(prov)) {
+            return res.status(400).json({ success: false, error: `${svc} supports providers: ${(SERVICE_PROVIDERS as any)[svc].join(", ")}` });
+        }
+        await setActiveProvider(svc as any, prov);
+        await logAuditEvent({
+            action: "personal.provider_routing.update",
+            actorType: "admin",
+            actorId: (req as any).admin?.id || (req as any).admin?.email || null,
+            target: `service:${svc}`,
+            metadata: { service: svc, provider: prov },
+        }).catch(() => {});
+        const { getRoutingStatus } = await import("./provider-routing");
+        const status = await getRoutingStatus();
+        return res.json({ success: true, data: status, message: `${svc} now routes to ${prov}` });
+    } catch (error: any) {
+        return res.status(400).json({ success: false, error: error.message || "Failed to update provider routing" });
+    }
+});
+
 export default router;
 export type { PersonalService };

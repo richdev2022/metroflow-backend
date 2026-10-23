@@ -32,6 +32,9 @@ import { handleDemo } from "./routes/demo";
   import personalVirtualcardsRouter from "./features/personal/routes/virtualcards";
   import personalEsimRouter from "./features/personal/routes/esim";
   import billsPersonalRouter from "./features/personal/bills";
+  import billsUnifiedRouter from "./features/personal/routes/bills";
+  import personalRmbRouter from "./features/personal/routes/rmb";
+  import { sogoWebhookHandler } from "./routes/personal-webhooks";
   import savingsPersonalRouter from "./features/personal/savings";
   import personalDonationsRouter from "./features/personal/routes/donations";
   import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
@@ -380,6 +383,14 @@ export async function createServer() {
         }
       } catch (error) {
         logger.error("Recurring billing cron error:", error);
+      }
+      // Sogo gift card reconciliation: settle completed sell trades (credit
+      // wallets) + pull codes for fulfilled buy orders.
+      try {
+        const { processSogoGiftcardSync } = await import("./features/personal/routes/giftcards");
+        await processSogoGiftcardSync();
+      } catch (error: any) {
+        logger.error("Sogo giftcard sync cron error:", error?.message);
       }
     });
   }
@@ -1202,12 +1213,15 @@ export async function createServer() {
   mainRouter.use("/virtualcards", personalVirtualcardsRouter);
   // eSIM / data bundles (Flutterwave live catalog)
   mainRouter.use("/esim", personalEsimRouter);
-  // Bills Hub (Flutterwave dynamic catalog + real fulfilment) + Savings Vaults
-  mainRouter.use("/bills", billsPersonalRouter);
+  // Bills Hub — UNIFIED multi-provider router (Sogo default, Flutterwave
+  // bridge, simulator) with the provider-routing layer in front.
+  mainRouter.use("/bills", billsUnifiedRouter);
   mainRouter.use("/savings", savingsPersonalRouter);
   // Fundraising donations: create campaigns, contribute from NGN wallet,
   // donor lists, creator redemption to NGN wallet (admin manages economics).
   mainRouter.use("/donations", personalDonationsRouter);
+  // RMB purchase — buy Chinese yuan with naira (Sogo rails).
+  mainRouter.use("/rmb", personalRmbRouter);
 
   // Provider webhooks (public, signature-verified inside). These were
   // previously imported but never mounted — gift-card + Bitnob callbacks 404'd.
@@ -1216,6 +1230,8 @@ export async function createServer() {
   // Stablecoin deposits/withdrawals (deposit.success / transfer.*) — stricter
   // verification: HMAC-SHA512/256 + event de-duplication + address binding.
   mainRouter.post("/webhook/bitnob/stablecoin", stablecoinWebhookHandler);
+  // Sogo partner webhooks — bills, gift cards, RMB, crypto deposits.
+  mainRouter.post("/webhook/sogo", sogoWebhookHandler);
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);

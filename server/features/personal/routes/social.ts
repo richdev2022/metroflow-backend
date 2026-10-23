@@ -271,7 +271,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
-              (u.verified_badge_status = 'active' AND u.verified_until > NOW()) AS author_verified,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
               (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $1 LIMIT 1) AS my_reaction,
               (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count,
@@ -1780,10 +1780,12 @@ router.get("/verification/status", authenticateToken, checkSubscriptionStatus, a
         `SELECT * FROM verification_subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
         [userId],
       ),
-      query(`SELECT verified_badge_status, verified_until FROM users WHERE id = $1`, [userId]),
+      query(`SELECT verified_badge_status, verified_until, verified_badge_source FROM users WHERE id = $1`, [userId]),
     ]);
 
     // Lazy expiry — a stale 'active' badge past its end date flips to expired.
+    // Criteria-earned badges (verified_badge_source = 'criteria') have NO end
+    // date and never expire here.
     const until = badgeRow.rows[0]?.verified_until ? new Date(badgeRow.rows[0].verified_until) : null;
     let badge = String(badgeRow.rows[0]?.verified_badge_status || "none");
     if (badge === "active" && until && until.getTime() < Date.now()) {
@@ -1791,7 +1793,7 @@ router.get("/verification/status", authenticateToken, checkSubscriptionStatus, a
       await query(`UPDATE verification_subscriptions SET status = 'expired' WHERE user_id = $1 AND status = 'active'`, [userId]);
       badge = "expired";
     }
-    const activeBadge = badge === "active" && until && until.getTime() > Date.now();
+    const activeBadge = badge === "active" && (!until || until.getTime() > Date.now());
     const daysLeft = activeBadge && until ? Math.max(0, Math.ceil((until.getTime() - Date.now()) / 86400000)) : 0;
 
     res.json({
@@ -1867,7 +1869,7 @@ router.post("/verification/subscribe", authenticateToken, requirePersonalKyc(), 
       [userId, price, wallet.currency, pricing.duration_days, reference, startsAt, endsAt],
     );
     await query(
-      `UPDATE users SET verified_badge_status = 'active', verified_since = CURRENT_TIMESTAMP, verified_until = $2 WHERE id = $1`,
+      `UPDATE users SET verified_badge_status = 'active', verified_badge_source = 'subscription', verified_since = CURRENT_TIMESTAMP, verified_until = $2 WHERE id = $1`,
       [userId, endsAt],
     );
     createNotification({

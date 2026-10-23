@@ -82,7 +82,8 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
                     bank_code as "bankCode", bank_name as "bankName", account_number as "accountNumber",
                     account_name as "accountName", verification_status as "verificationStatus",
                     verified_account_name as "verifiedAccountName",
-                    referral_code as "referralCode"
+                    referral_code as "referralCode",
+                    username, bio, COALESCE(account_privacy, 'public') as "accountPrivacy"
              FROM users WHERE id = $1`,
             [userId]
         );
@@ -570,6 +571,21 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
                  SET phone_number = temp_phone, temp_phone = NULL, otp_code = NULL, otp_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1`,
                 [businessId]
+            );
+            // CROSS-APP PHONE SYNC: this number was just OTP-verified at the
+            // business level, so it is verified for the Personal app too —
+            // mark every member of the business who uses this number as
+            // phone_verified, and seed it onto the verifying admin's personal
+            // profile when they don't have a personal number yet.
+            await query(
+                `UPDATE users SET phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
+                 WHERE business_id = $1 AND phone_number = $2 AND COALESCE(phone_verified, FALSE) = FALSE`,
+                [businessId, temp_phone]
+            );
+            await query(
+                `UPDATE users SET phone_number = $2, phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $3 AND (phone_number IS NULL OR phone_number = '')`,
+                [businessId, temp_phone, verifierId]
             );
         } else {
             return res.status(400).json({ success: false, error: "No pending update found" });
@@ -1256,7 +1272,7 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
              WHERE id = $${idx}
              RETURNING id, name, email, phone_number, avatar_url as "avatarUrl", role,
-                       COALESCE(phone_verified, FALSE) as "phoneVerified"`,
+                       COALESCE(phone_verified, FALSE) as "phoneVerified", username, bio`,
             [...values, userId]
         );
 

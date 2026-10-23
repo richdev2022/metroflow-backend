@@ -322,6 +322,10 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_badge_status VARCHAR(20) NOT NULL DEFAULT 'none'`); // none|active|expired|revoked
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_until TIMESTAMP`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_since TIMESTAMP`);
+  // Where the badge came from: 'subscription' (paid), 'criteria' (earned via
+  // the admin-configurable follower threshold — never expires), 'admin'
+  // (manual grant). Guards criteria revocation on unfollow.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_badge_source VARCHAR(20)`);
   await query(`
     CREATE TABLE IF NOT EXISTS verification_subscriptions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -3,6 +3,7 @@ import { query } from "../db";
 import { AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { requirePermission } from "../middleware/adminAuth";
 import { getSetting, setSetting } from "../services/app-config";
+import { getBadgeCriteria, setBadgeCriteria } from "../services/verification-criteria";
 import { getBoostPricing } from "../features/personal/routes/social";
 
 /**
@@ -599,6 +600,28 @@ router.get("/verification-pricing", requirePermission("manage_settings"), async 
   }
 });
 
+// Criteria engine — the auto-grant rules (default: 10,000 followers). Fully
+// admin-manageable from the dashboard's Verifications page.
+router.get("/verification-criteria", requirePermission("manage_settings"), async (_req, res) => {
+  try {
+    const criteria = await getBadgeCriteria();
+    res.json({ success: true, data: criteria });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load verification criteria" });
+  }
+});
+
+router.put("/verification-criteria", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const enabled = req.body?.enabled !== false;
+    const followers = Math.max(1, Math.round(Number(req.body?.followers) || 10000));
+    const saved = await setBadgeCriteria({ enabled, followers });
+    res.json({ success: true, data: saved });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not save verification criteria" });
+  }
+});
+
 router.put("/verification-pricing", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
   try {
     const price = Math.max(0, Number(req.body?.price));
@@ -622,7 +645,7 @@ router.get("/verifications", requirePermission("view_dashboard"), async (req, re
     const where = status === "all" ? "u.verified_badge_status != 'none'" : `u.verified_badge_status = $1`;
     const params: any[] = status === "all" ? [] : [status];
     const r = await query(
-      `SELECT u.id, u.name, u.email, u.avatar_url, u.verified_badge_status, u.verified_since, u.verified_until,
+      `SELECT u.id, u.name, u.email, u.avatar_url, u.verified_badge_status, u.verified_badge_source, u.verified_since, u.verified_until,
               (SELECT COUNT(*)::int FROM social_follows f WHERE f.following_id = u.id) AS followers,
               (SELECT COUNT(*)::int FROM social_posts p WHERE p.user_id = u.id AND p.status = 'active') AS posts
        FROM users u WHERE ${where} ORDER BY u.verified_since DESC NULLS LAST LIMIT 200`,
@@ -650,7 +673,7 @@ router.post("/verifications/:userId/:action", requirePermission("manage_settings
       const days = Math.max(1, Number(req.body?.days) || 30);
       const endsAt = new Date(Date.now() + days * 86400000);
       await query(
-        `UPDATE users SET verified_badge_status = 'active', verified_since = COALESCE(verified_since, CURRENT_TIMESTAMP), verified_until = $2 WHERE id = $1`,
+        `UPDATE users SET verified_badge_status = 'active', verified_badge_source = 'admin', verified_since = COALESCE(verified_since, CURRENT_TIMESTAMP), verified_until = $2 WHERE id = $1`,
         [userId, endsAt],
       );
       await query(
@@ -660,7 +683,7 @@ router.post("/verifications/:userId/:action", requirePermission("manage_settings
       );
       return res.json({ success: true, data: { verified_until: endsAt } });
     }
-    await query(`UPDATE users SET verified_badge_status = 'revoked', verified_until = NULL WHERE id = $1`, [userId]);
+    await query(`UPDATE users SET verified_badge_status = 'revoked', verified_badge_source = NULL, verified_until = NULL WHERE id = $1`, [userId]);
     await query(`UPDATE verification_subscriptions SET status = 'revoked' WHERE user_id = $1 AND status = 'active'`, [userId]);
     res.json({ success: true });
   } catch {

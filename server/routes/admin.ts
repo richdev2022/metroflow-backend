@@ -2819,7 +2819,7 @@ protectedRouter.get("/referral-user-bonuses", requirePermission('manage_settings
  */
 protectedRouter.put("/referral-user-bonuses/:userId", requirePermission('manage_settings'), async (req, res) => {
     try {
-        const { userId } = req.params;
+        const userId = String(req.params.userId || "");
         const { amount, currency } = req.body || {};
 
         if (!userId || !/^[0-9a-fA-F-]{36}$/.test(userId)) {
@@ -2886,7 +2886,7 @@ protectedRouter.put("/referral-user-bonuses/:userId", requirePermission('manage_
  */
 protectedRouter.delete("/referral-user-bonuses/:userId", requirePermission('manage_settings'), async (req, res) => {
     try {
-        const { userId } = req.params;
+        const userId = String(req.params.userId || "");
         if (!userId || !/^[0-9a-fA-F-]{36}$/.test(userId)) {
             return res.status(400).json({ success: false, error: "Invalid user id" });
         }
@@ -6366,7 +6366,7 @@ protectedRouter.post("/account-deletion/requests/:id/complete", requirePermissio
     try {
         const adminId = req.admin?.adminId;
         if (!adminId) return res.status(401).json({ success: false, error: "Unauthorized" });
-        const result = await executeAccountDeletion(req.params.id, adminId);
+        const result = await executeAccountDeletion(String(req.params.id || ""), adminId);
         if (!result.ok) {
             return res.status(409).json({ success: false, error: result.error || "Could not complete deletion" });
         }
@@ -6381,7 +6381,7 @@ protectedRouter.post("/account-deletion/requests/:id/reject", requirePermission(
         const adminId = req.admin?.adminId;
         if (!adminId) return res.status(401).json({ success: false, error: "Unauthorized" });
         const note = typeof req.body?.note === "string" ? req.body.note : null;
-        const result = await rejectDeletionRequest(req.params.id, adminId, note);
+        const result = await rejectDeletionRequest(String(req.params.id || ""), adminId, note);
         if (!result.ok) {
             return res.status(404).json({ success: false, error: "Request not found or already processed" });
         }
@@ -6463,7 +6463,7 @@ protectedRouter.get("/business-kyc/submissions/:id", requirePermission("manage_b
 // Approve → business becomes Registered (Verified)
 protectedRouter.post("/business-kyc/submissions/:id/approve", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
     try {
-        const id = req.params.id;
+        const id = String(req.params.id || "");
         const adminId = (req as any).admin?.adminId || null;
         const rowRes = await query(`SELECT * FROM business_kyc_submissions WHERE id = $1 LIMIT 1`, [id]);
         const submission = rowRes.rows[0];
@@ -6511,13 +6511,13 @@ protectedRouter.post("/business-kyc/submissions/:id/approve", requirePermission(
             const { sendPushToUsers } = await import("../services/push");
             if (submission.user_id) {
                 sendPushToUsers(
-                    [{ userId: submission.user_id, businessId: submission.business_id }],
+                    [{ userId: String(submission.user_id || ""), businessId: String(submission.business_id || "") }],
                     {
                         title: "Business KYC approved 🎉",
                         body: `${bizName} is now a Registered Business (Verified). Higher transaction limits are active.`,
                         data: { type: "business-kyc", eventType: "approved", submissionId: id },
                     },
-                    { inApp: true, type: "business_kyc", businessId: submission.business_id },
+                    { inApp: true, type: "business_kyc", businessId: String(submission.business_id || "") },
                 ).catch(() => {});
             }
         } catch {}
@@ -6531,7 +6531,7 @@ protectedRouter.post("/business-kyc/submissions/:id/approve", requirePermission(
 // Reject with a mandatory reason → owner can resubmit
 protectedRouter.post("/business-kyc/submissions/:id/reject", requirePermission("manage_businesses"), async (req: AuthenticatedAdminRequest, res) => {
     try {
-        const id = req.params.id;
+        const id = String(req.params.id || "");
         const adminId = (req as any).admin?.adminId || null;
         const reason = String((req.body as any)?.reason || "").trim();
         if (!reason) return res.status(400).json({ success: false, error: "A rejection reason is required" });
@@ -6568,13 +6568,13 @@ protectedRouter.post("/business-kyc/submissions/:id/reject", requirePermission("
             const { sendPushToUsers } = await import("../services/push");
             if (submission.user_id) {
                 sendPushToUsers(
-                    [{ userId: submission.user_id, businessId: submission.business_id }],
+                    [{ userId: String(submission.user_id || ""), businessId: String(submission.business_id || "") }],
                     {
                         title: "Business KYC rejected",
                         body: `Your business verification was rejected: ${reason.slice(0, 120)}`,
                         data: { type: "business-kyc", eventType: "rejected", submissionId: id },
                     },
-                    { inApp: true, type: "business_kyc", businessId: submission.business_id },
+                    { inApp: true, type: "business_kyc", businessId: String(submission.business_id || "") },
                 ).catch(() => {});
             }
         } catch {}

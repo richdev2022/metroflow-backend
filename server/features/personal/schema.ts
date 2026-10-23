@@ -313,6 +313,32 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_media_post ON social_post_media(post_id, position)`);
 
+  // Saved posts — Facebook-style collections. A user files any post into one
+  // or more named folders ("Videos", "Photos", or their own creations);
+  // membership rows are idempotent per (collection, post).
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_collections (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name VARCHAR(80) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id, name)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_collections_user ON social_post_collections(user_id, updated_at DESC)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_collection_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      collection_id UUID NOT NULL REFERENCES social_post_collections(id) ON DELETE CASCADE,
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (collection_id, post_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_collection_items_coll ON social_post_collection_items(collection_id, saved_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_collection_items_post ON social_post_collection_items(post_id)`);
+
   // ------------------------------------------------------------------
   // 3b. ACCOUNT VERIFICATION BADGE — monthly subscription
   //     Badge status lives on users (verified_badge_status/verified_until);

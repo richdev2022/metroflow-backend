@@ -61,6 +61,44 @@ async function resolveMeetingId(inputId: string): Promise<string | null> {
   return null;
 }
 
+/**
+ * Live-room self-heal: every live session is backed by a calls(type='live')
+ * row keyed by its LIVE- code. Sessions created before business_id became
+ * nullable (personal hosts without a business record) have no row, so room
+ * resolution failed with "Call or meeting not found". When we see a code that
+ * only exists in live_sessions, create the missing calls row and report that
+ * the caller should re-resolve. Mirrors the logic in features/personal/routes/live.ts.
+ */
+async function ensureLiveCallRowByCode(code: string): Promise<boolean> {
+  if (!code || code.length < 4) return false;
+  try {
+    const sessionRes = await query(
+      `SELECT id, host_id, call_code, started_at FROM live_sessions WHERE call_code = $1 LIMIT 1`,
+      [code],
+    );
+    const session = sessionRes.rows[0];
+    if (!session) return false;
+    const existing = await query(`SELECT id FROM calls WHERE call_code = $1 LIMIT 1`, [code]);
+    if (existing.rows.length) return true; // row exists; just re-resolve
+    let businessId: string | null = null;
+    if (session.host_id) {
+      const hostRes = await query(`SELECT business_id FROM users WHERE id = $1 LIMIT 1`, [session.host_id]);
+      businessId = hostRes.rows[0]?.business_id || null;
+    }
+    await query(
+      `INSERT INTO calls (business_id, type, status, created_by, host_id, call_code, is_group_call, started_at, provider)
+       VALUES ($1, 'live', 'ongoing', $2, $2, $3, TRUE, COALESCE($4::timestamptz, NOW()), NULL)
+       ON CONFLICT (call_code) DO UPDATE SET updated_at = NOW()`,
+      [businessId, session.host_id, code, session.started_at ?? null],
+    );
+    logger.info(`[socket] live room self-heal created backing calls row for ${code}`);
+    return true;
+  } catch (e: any) {
+    logger.warn(`[socket] live room self-heal failed for ${code}: ${e?.message}`);
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Room-resolve cache. High-frequency relay events (caption:segment fires
 // per utterance, call:reaction per tap, meeting-chat per message) each paid
@@ -794,7 +832,18 @@ export function initSocketServer(server: http.Server): void {
     // 2. Join call (works for both calls and meetings; guests use guest-* ids)
     socket.on("call:join", async (data: { roomId: string; userId: string; userName: string; isHost: boolean; audioEnabled: boolean; videoEnabled: boolean; isGuest?: boolean }, callback?: (response: any) => void) => {
       try {
-        const resolved = await resolveRoomId(data.roomId);
+        let resolved = await resolveRoomId(data.roomId);
+        if (!resolved) {
+          // SELF-HEAL for live rooms: the LIVE- code may not have a backing
+          // calls row yet (host without a business record on older deploys).
+          // Create it right here so the join succeeds instead of erroring
+          // with "Call or meeting not found".
+          const healed = await ensureLiveCallRowByCode(String(data.roomId || ""));
+          if (healed) {
+            roomResolveCache.delete(String(data.roomId || ""));
+            resolved = await resolveRoomId(data.roomId);
+          }
+        }
         if (!resolved) {
           logger.warn(`call:join failed - cannot resolve roomId/code: ${data.roomId}`);
           if (callback) callback({ success: false, error: "Call or meeting not found" });

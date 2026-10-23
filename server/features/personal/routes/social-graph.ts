@@ -34,7 +34,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const USER_CARD = `
   u.id, u.name, u.avatar_url, COALESCE(u.account_privacy, 'public') AS account_privacy,
   LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS username,
-  LEFT(COALESCE(u.bio, ''), 160) AS bio
+  LEFT(COALESCE(u.bio, ''), 160) AS bio,
+  (u.verified_badge_status = 'active' AND u.verified_until > NOW()) AS is_verified
 `;
 
 async function userByIdOrUsername(key: string) {

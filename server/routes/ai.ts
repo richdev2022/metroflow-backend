@@ -18,6 +18,7 @@ import {
   GlmVideoStatus,
 } from "../lib/glm";
 import { uploadMediaBuffer } from "../services/media-upload";
+import { getSetting } from "../services/app-config";
 import {
   AiFeatureUsage,
   AiPlanLimits,
@@ -483,14 +484,71 @@ export const postAiAttachment: RequestHandler = async (req: MetricAiRequest, res
 /**
  * Plan-gate: the caller's business plan must have metric_ai_enabled = TRUE.
  * Attaches aiAccess to the request on success.
+ *
+ * PERSONAL branch: personal users (business_id NULL) have no pricing plan —
+ * they get MetricAi under admin-configurable personal defaults
+ * (system_settings key `personal_metric_ai_limits`, JSON
+ * { chat:{daily,monthly}, image:{...}, video:{...} }), with the same
+ * credit-pack fallback as plan users. Packs are how personal users "subscribe"
+ * for extra usage.
  */
+const PERSONAL_METRIC_AI_DEFAULT_LIMITS = {
+  chat: { daily: 30, monthly: 300 },
+  image: { daily: 5, monthly: 50 },
+  video: { daily: 2, monthly: 10 },
+};
+
+async function getPersonalAiLimits(): Promise<AiPlanLimits> {
+  try {
+    const raw = await getSetting("personal_metric_ai_limits", "");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const num = (v: unknown): number | null => {
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? n : null;
+      };
+      const pick = (k: string, def: { daily: number; monthly: number }) => ({
+        daily: num(parsed?.[k]?.daily ?? def.daily),
+        monthly: num(parsed?.[k]?.monthly ?? def.monthly),
+      });
+      return {
+        chat: pick("chat", PERSONAL_METRIC_AI_DEFAULT_LIMITS.chat),
+        image: pick("image", PERSONAL_METRIC_AI_DEFAULT_LIMITS.image),
+        video: pick("video", PERSONAL_METRIC_AI_DEFAULT_LIMITS.video),
+      };
+    }
+  } catch { /* fall through to defaults */ }
+  return {
+    chat: { daily: PERSONAL_METRIC_AI_DEFAULT_LIMITS.chat.daily, monthly: PERSONAL_METRIC_AI_DEFAULT_LIMITS.chat.monthly },
+    image: { daily: PERSONAL_METRIC_AI_DEFAULT_LIMITS.image.daily, monthly: PERSONAL_METRIC_AI_DEFAULT_LIMITS.image.monthly },
+    video: { daily: PERSONAL_METRIC_AI_DEFAULT_LIMITS.video.daily, monthly: PERSONAL_METRIC_AI_DEFAULT_LIMITS.video.monthly },
+  };
+}
+
 const requireMetricAiAccess: RequestHandler = async (req, res, next) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const businessId = authReq.user?.businessId;
-    if (!userId || !businessId) {
+
+    if (!userId) {
       return res.status(401).json({ success: false, error: "User authentication required" });
+    }
+
+    if (!businessId) {
+      // ---- Personal user branch ----
+      const u = await query(`SELECT id, account_type FROM users WHERE id = $1`, [userId]);
+      if (u.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "User not found" });
+      }
+      (req as MetricAiRequest).aiAccess = {
+        userId,
+        businessId: null,
+        planName: "Personal",
+        planId: null,
+        limits: await getPersonalAiLimits(),
+      };
+      return next();
     }
 
     const result = await query(

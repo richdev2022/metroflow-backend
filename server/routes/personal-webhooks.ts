@@ -571,3 +571,254 @@ export async function stablecoinWebhookHandler(req: Request, res: Response) {
     res.status(500).json({ success: false });
   }
 }
+
+// ===========================================================================
+// SOGO WEBHOOKS — transaction.completed | failed | cancelled | refunded | ping
+//   Headers: X-Sogo-Signature-256 = "sha256=" + HMAC_SHA256(rawBody, secret)
+//   Every Sogo write we make carries OUR reference as the Idempotency-Key, so
+//   webhook data.object.reference reconciles 1:1 with our tables.
+//
+//   type=buy_giftcard   → codes via GET /transactions/{ref}; mark completed
+//   type=sell_giftcard  → credit wallet payout − our sell fee (settled)
+//   type=bill_payment   → status + provider-side refund handling
+//   type=rmb / buy_rmb  → status + wallet refund on cancelled/refunded
+//   crypto deposits     → matched by deposit address (no pre-existing ref) —
+//                         NGN settles to our Sogo wallet; we credit the user.
+// ===========================================================================
+
+import { verifySogoWebhook } from "../services/sogo";
+import { getPercent } from "../features/personal/flags";
+
+async function creditUserWallet(userId: string | null, walletId: string | null, amount: number, reference: string, description: string, businessId?: string | null) {
+  if (!walletId || !(amount > 0)) return;
+  await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [amount, walletId]);
+  await insertTransaction({
+    userId, businessId: businessId ?? null, walletId,
+    reference, type: "credit", transactionType: "sogo_credit",
+    amount, currency: "NGN", description,
+  });
+}
+
+async function handleSogoCryptoDeposit(tx: any) {
+  // Match by deposit address (metadata.deposit_address || deposit_address),
+  // falling back to a pre-recorded sale row keyed by reference.
+  const address = String(
+    tx?.metadata?.deposit_address || tx?.deposit_address || tx?.address || "",
+  );
+  let sale = null;
+  if (tx?.reference) {
+    const byRef = await query(`SELECT * FROM crypto_deposit_sales WHERE reference = $1 LIMIT 1`, [String(tx.reference)]);
+    sale = byRef.rows[0] || null;
+  }
+  if (!sale && address) {
+    const byAddr = await query(
+      `SELECT * FROM crypto_deposit_sales WHERE address = $1 AND status = 'processing' ORDER BY created_at ASC LIMIT 1`,
+      [address],
+    );
+    sale = byAddr.rows[0] || null;
+  }
+  if (!sale && address) {
+    // First deposit on a known address — resolve the owner and open a row.
+    const addr = await query(`SELECT * FROM crypto_deposit_addresses WHERE address = $1 LIMIT 1`, [address]);
+    if (!addr.rows.length) {
+      console.warn("[sogo webhook] deposit for unknown address:", address);
+      return;
+    }
+    const owner = addr.rows[0];
+    const wallet = await query(
+      `SELECT id, business_id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
+      [owner.user_id],
+    );
+    const insert = await query(
+      `INSERT INTO crypto_deposit_sales
+         (user_id, wallet_id, address, reference, provider, asset, network, crypto_amount, status, provider_response)
+       VALUES ($1,$2,$3,$4,'sogo',$5,$6,$7,'processing',$8::jsonb) RETURNING *`,
+      [owner.user_id, wallet.rows[0]?.id || null, address, String(tx.reference || `SO-${Date.now()}`),
+       owner.asset, owner.network, Number(tx.crypto_amount || tx.amount || 0) || null, JSON.stringify(tx)],
+    );
+    sale = insert.rows[0];
+  }
+  if (!sale) {
+    console.warn("[sogo webhook] crypto deposit without match:", tx?.reference);
+    return;
+  }
+  if (sale.status === "completed") return; // idempotent
+
+  const gross = Number(tx?.payout_amount ?? tx?.net_amount ?? tx?.amount ?? sale.ngn_gross ?? 0);
+  const spreadPct = await getPercent("crypto_spread_percent", 1);
+  const fee = Math.round(gross * (spreadPct / 100) * 100) / 100;
+  const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
+
+  await creditUserWallet(sale.user_id, sale.wallet_id, net, `SOGO-DEP-${sale.reference}`, `Crypto deposit credit — ${sale.asset || ""} ${sale.crypto_amount || ""}`.trim());
+  await query(
+    `UPDATE crypto_deposit_sales SET status = 'completed', ngn_gross = $2, fee = $3, ngn_net = $4,
+       rate = COALESCE($5, rate), provider_response = $6::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [sale.id, gross, fee, net, tx?.rate ?? null, JSON.stringify(tx)],
+  );
+  try {
+    await createNotification({
+      businessId: "", userId: String(sale.user_id), type: "credit",
+      title: "Crypto deposit settled",
+      message: `₦${net.toLocaleString()} has been credited to your wallet from your ${sale.asset || "crypto"} deposit.`,
+      actionUrl: "/crypto", actionType: "view_transaction",
+      metadata: { reference: sale.reference }, isActionable: false, expiresInHours: 720,
+    });
+  } catch { /* best effort */ }
+}
+
+async function handleSogoBillPayment(tx: any) {
+  const { sogoStatus } = await import("../services/sogo");
+  const reference = String(tx?.reference || "");
+  if (!reference) return;
+  const rows = await query(`SELECT * FROM bill_transactions WHERE reference = $1 OR provider_reference = $1 LIMIT 1`, [reference]);
+  const bill = rows.rows[0];
+  if (!bill) return;
+  const status = sogoStatus(tx);
+  const mapped = ["completed", "failed", "refunded", "cancelled"].includes(status) ? status : "processing";
+  if (mapped === bill.status) return;
+  if (mapped === "refunded" || mapped === "failed" || mapped === "cancelled") {
+    // Provider-side refund → return the customer's money.
+    await creditUserWallet(bill.user_id, bill.wallet_id, Number(bill.total), `${bill.reference}-REFUND`, "Refund — bill payment reversed", bill.business_id);
+  }
+  await query(
+    `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [bill.id, mapped, JSON.stringify(tx)],
+  );
+}
+
+async function handleSogoGiftcardBuy(tx: any) {
+  const { sogoStatus } = await import("../services/sogo");
+  const reference = String(tx?.reference || "");
+  if (!reference) return;
+  const rows = await query(`SELECT * FROM giftcard_buy_orders WHERE provider = 'sogo' AND (reference = $1 OR provider_reference = $1) LIMIT 1`, [reference]);
+  const order = rows.rows[0];
+  if (!order) return;
+  const status = sogoStatus(tx);
+  if (status === "completed") {
+    let codes = order.card_codes;
+    if (!codes) {
+      const { getTransaction } = await import("../services/sogo");
+      const remote = await getTransaction(reference).catch(() => null);
+      codes = remote?.gift_card_codes || remote?.codes || null;
+    }
+    await query(
+      `UPDATE giftcard_buy_orders SET status = 'completed', card_codes = COALESCE($2::jsonb, card_codes), provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [order.id, codes ? JSON.stringify(codes) : null, JSON.stringify(tx)],
+    );
+    try {
+      await createNotification({
+        businessId: String(order.business_id || ""), userId: String(order.user_id),
+        type: "system", title: "Your gift card is ready",
+        message: `Your ${order.giftcard_name || "gift card"} purchase has arrived. Open the app to view the code.`,
+        actionUrl: "/giftcards", actionType: "view_transaction",
+        metadata: { reference: order.reference }, isActionable: true, expiresInHours: 720,
+      });
+    } catch { /* best effort */ }
+  } else if (["refunded", "cancelled", "failed"].includes(status)) {
+    if (order.status !== "failed") {
+      await creditUserWallet(order.user_id, order.wallet_id, Number(order.total_charged), `${order.reference}-REFUND`, "Refund — gift card order failed", order.business_id);
+      await query(
+        `UPDATE giftcard_buy_orders SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [order.id, String(tx?.failure_reason || status).slice(0, 500)],
+      );
+    }
+  } else {
+    await query(`UPDATE giftcard_buy_orders SET status = $2, provider_response = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [order.id, status === "processing" ? "processing" : order.status, JSON.stringify(tx)]);
+  }
+}
+
+async function handleSogoGiftcardSell(tx: any) {
+  const reference = String(tx?.reference || "");
+  if (!reference) return;
+  const rows = await query(
+    `SELECT * FROM giftcard_sell_trades WHERE provider = 'sogo' AND (reference = $1 OR provider_reference = $1) LIMIT 1`,
+    [reference],
+  );
+  const trade = rows.rows[0];
+  if (!trade || trade.status === "settled") return;
+  const { sogoStatus } = await import("../services/sogo");
+  const status = sogoStatus(tx);
+  if (status === "completed") {
+    const gross = Number(tx?.payout_amount ?? tx?.amount ?? 0);
+    const feePct = await getPercent("giftcard_sell_fee_percent", 5);
+    const fee = Math.round(gross * (feePct / 100) * 100) / 100;
+    const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
+    await creditUserWallet(trade.user_id, trade.wallet_id, net, `GCSP-${trade.reference}`, `Gift card sale payout — ${trade.giftcard_name || "card"}`, trade.business_id);
+    await query(
+      `UPDATE giftcard_sell_trades SET status = 'settled', credited_at = CURRENT_TIMESTAMP,
+         payout_amount = GREATEST(payout_amount, $2), provider_response = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [trade.id, gross, JSON.stringify(tx)],
+    );
+    try {
+      await createNotification({
+        businessId: String(trade.business_id || ""), userId: String(trade.user_id),
+        type: "credit", title: "Gift card sale approved",
+        message: `₦${net.toLocaleString()} has been credited for your ${trade.giftcard_name || "gift card"} sale.`,
+        actionUrl: "/giftcards", actionType: "view_transaction",
+        metadata: { reference: trade.reference }, isActionable: false, expiresInHours: 168,
+      });
+    } catch { /* best effort */ }
+  } else if (["cancelled", "failed"].includes(status)) {
+    await query(
+      `UPDATE giftcard_sell_trades SET status = $2, rejection_reason = $3, provider_response = $4::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [trade.id, status === "cancelled" ? "rejected" : "failed",
+       String(tx?.failure_reason || "Rejected by review").slice(0, 500), JSON.stringify(tx)],
+    );
+  }
+}
+
+async function handleSogoRmb(tx: any) {
+  const reference = String(tx?.reference || "");
+  if (!reference) return;
+  const rows = await query(`SELECT * FROM rmb_orders WHERE reference = $1 OR provider_reference = $1 LIMIT 1`, [reference]);
+  const order = rows.rows[0];
+  if (!order) return;
+  const { sogoStatus } = await import("../services/sogo");
+  const status = sogoStatus(tx);
+  const mapped = ["completed", "refunded", "cancelled", "failed"].includes(status) ? status : null;
+  if (!mapped || mapped === order.status) return;
+  if (mapped === "refunded" || mapped === "cancelled" || mapped === "failed") {
+    await creditUserWallet(order.user_id, order.wallet_id, Number(order.ngn_total), `${order.reference}-REFUND`, "Refund — RMB order failed", order.business_id);
+  }
+  await query(
+    `UPDATE rmb_orders SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [order.id, mapped, JSON.stringify(tx)],
+  );
+}
+
+export async function sogoWebhookHandler(req: Request, res: Response) {
+  try {
+    const raw = rawBody(req);
+    const signature = (req.headers["x-sogo-signature-256"] as string) || "";
+    if (!verifySogoWebhook(raw, signature)) {
+      console.warn("[sogo webhook] signature verification failed");
+      return res.status(401).json({ success: false, error: "Invalid webhook signature" });
+    }
+    const payload = asJson(req);
+    const event = String(payload?.event || "");
+    const tx = payload?.data?.object || payload?.data || {};
+    console.log(`[sogo webhook] event: ${event || "unknown"} ref=${tx?.reference || "n/a"}`);
+    if (event === "ping") return res.json({ success: true });
+    if (!["transaction.completed", "transaction.failed", "transaction.cancelled", "transaction.refunded"].includes(event)) {
+      return res.json({ success: true });
+    }
+    const type = String(tx?.type || "").toLowerCase();
+    // Crypto deposits carry a deposit hash + address and no bill/giftcard type.
+    if (type.includes("crypto") || tx?.metadata?.deposit_tx_hash || type.includes("deposit")) {
+      await handleSogoCryptoDeposit(tx);
+    } else if (type.includes("gift") && type.includes("buy")) {
+      await handleSogoGiftcardBuy(tx);
+    } else if (type.includes("gift")) {
+      await handleSogoGiftcardSell(tx);
+    } else if (type.includes("rmb")) {
+      await handleSogoRmb(tx);
+    } else {
+      await handleSogoBillPayment(tx);
+    }
+    return res.json({ success: true });
+  } catch (e: any) {
+    console.error("[sogo webhook] error:", e?.message);
+    return res.status(500).json({ success: false });
+  }
+}

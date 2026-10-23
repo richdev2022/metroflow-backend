@@ -2,6 +2,10 @@ import { query } from "./db";
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
 import { ensureBillsSchema } from "./features/personal/bills";
+import { ensureBillTransactionsSchema } from "./features/personal/routes/bills";
+import { ensureGiftcardRoutesSchema } from "./features/personal/routes/giftcards";
+import { ensureRmbSchema } from "./features/personal/routes/rmb";
+import { ensureCryptoDepositSchema } from "./features/personal/routes/crypto";
 import { ensureGiftcardSchema } from "./features/personal/giftcards";
 import { ensureEsimSchema } from "./features/personal/esim";
 import { ensureVirtualCardSchema } from "./features/personal/virtualcards";
@@ -85,6 +89,10 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureSocialSchema", ensureSocialSchema); // personal social feed + polls
   await step("ensureLiveSchema", ensureLiveSchema); // one-tap live streaming (call-room backed)
   await step("ensureSsoSchema", ensureSsoSchema); // cross-app SSO one-time tickets (Business <-> Personal)
+  await step("ensureBillTransactionsSchema", ensureBillTransactionsSchema); // unified bills hub (Sogo/Flutterwave routing)
+  await step("ensureGiftcardRoutesSchema", ensureGiftcardRoutesSchema); // giftcard trades + provider columns (Sogo/Prestmit)
+  await step("ensureRmbSchema", ensureRmbSchema); // RMB purchase orders (Sogo)
+  await step("ensureCryptoDepositSchema", ensureCryptoDepositSchema); // Sogo crypto deposit addresses + deposit sales
   // Chat for PERSONAL users: conversations + blocks are no longer business-
   // bound. business_id becomes optional — personal users (business_id NULL)
   // create platform-wide direct chats/groups, and in-app chat notifications

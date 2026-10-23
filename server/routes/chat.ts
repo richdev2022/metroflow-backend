@@ -444,7 +444,7 @@ export const deleteChatGuestContact: RequestHandler = async (req, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, error: "Unauthorized" });
-    const { id } = req.params;
+    const id = String(req.params.id || "");
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
       return res.status(404).json({ success: false, error: "Contact not found" });
     }

@@ -144,7 +144,7 @@ export async function pushIncomingCall(
     // match PKPushPayload.dictionaryPayload readers in AppDelegate
     // (callId / callerName / callType, with call_id / caller_name / call_type
     // fallbacks) and the Dart CallKitService handlers.
-    sendVoipPushToUsers(targets, {
+    sendVoipPushToUsers(targets.map((userId) => ({ userId })), {
       type: "incoming-call",
       callId: info.callId,
       callType: callTypeLabel,

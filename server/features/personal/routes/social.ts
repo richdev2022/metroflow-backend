@@ -454,7 +454,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 // ---------------------------------------------------------------------------
 // Posts
 // ---------------------------------------------------------------------------
-router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 1 }, { name: "video", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
+router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 1 }, { name: "video", maxCount: 1 }, { name: "poster", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "social"))) return;
     const userId = req.user!.userId;
@@ -463,6 +463,10 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
     const imageFile = files.image?.[0];
     const videoFile = files.video?.[0];
+    // Poster frame — captured client-side from the video at composition time
+    // (canvas snapshot). Stored as the post's image_url so EVERY video post
+    // carries a real thumbnail for feed display AND og:image share previews.
+    const posterFile = files.poster?.[0];
     let imageUrl: string | null = null;
     let videoUrl: string | null = null;
     if (imageFile) {
@@ -477,6 +481,11 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     if (videoFile) {
       const up = await uploadMediaBuffer({ buffer: videoFile.buffer, originalname: videoFile.originalname, mimeType: videoFile.mimetype, folder: "social-media", userId });
       videoUrl = up?.url || null;
+      // Attach the poster frame (only when the post has no explicit image).
+      if (posterFile && !imageUrl) {
+        const pp = await uploadMediaBuffer({ buffer: posterFile.buffer, originalname: posterFile.originalname || "poster.jpg", mimeType: posterFile.mimetype || "image/jpeg", folder: "social-media", userId });
+        imageUrl = pp?.url || null;
+      }
     } else if (req.body?.video_url) {
       videoUrl = String(req.body.video_url).slice(0, 500);
     }

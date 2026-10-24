@@ -123,9 +123,24 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         const profile = meRes.rows[0] || null;
         if (profile) profile.isOwner = isOwner;
 
+        // IDENTITY SEPARATION (hard backend guarantee): invited users must
+        // NEVER receive the business contact details (email/phone) — their
+        // profile pages render ONLY their own identity, so even a client bug
+        // can never leak the company email/phone onto an invited user's
+        // profile. Business contact fields are delivered to the business
+        // OWNER (the admin who registered the account) only. App-wide
+        // preferences the UI needs (currency/timezone/time_format) remain
+        // available to everyone.
+        const canSeeBusinessContact = isOwner;
+        const settings = { ...result.rows[0] };
+        if (!canSeeBusinessContact) {
+            delete settings.email;
+            delete settings.phone_number;
+        }
+
         res.json({
             success: true,
-            settings: result.rows[0],
+            settings,
             profile,
         });
     } catch (error) {
@@ -273,12 +288,15 @@ router.post("/business/complete", authenticateToken, checkSubscriptionStatus, co
         const businessId = req.user!.businessId;
         const userId = req.user!.userId;
 
-        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
-        const role = roleRes.rows[0]?.role;
-        if (!['owner', 'admin'].includes(role)) {
+        // OWNER-ONLY: completing/updating the business profile is reserved for
+        // the admin user who REGISTERED the account (businesses.owner_id).
+        // Invited admins and members manage their own profile instead.
+        const { isOwner: isCompleterOwner, isPersonalSpace: completerPersonal } = await isBusinessOwner(userId);
+        if (!isCompleterOwner && !completerPersonal) {
             return res.status(403).json({
                 success: false,
-                error: "Only business owners and admins can complete the business profile.",
+                error: "Only the business owner who registered this account can update the business profile. Invited members manage their own profile instead.",
+                code: "BUSINESS_SETTINGS_FORBIDDEN",
             });
         }
 
@@ -669,6 +687,12 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
  */
 router.put("/otp-preference", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
+        // OWNER-ONLY: the transfer-OTP preference is a business-wide security
+        // policy. An invited member (admin or not) must never be able to
+        // change how the company's transaction OTPs are delivered.
+        const guard = await requireBusinessOwnerForContact(req);
+        if (!guard.ok) return res.status(guard.status!).json(guard.body);
+
         const businessId = req.user!.businessId;
         const { preference } = req.body;
 
@@ -991,20 +1015,22 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
  */
 router.post("/otp-enabled/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
+    // OWNER-ONLY: toggling the business-wide transfer-OTP requirement is a
+    // security-policy change reserved for the business owner. The confirmation
+    // OTP is delivered to the CALLER'S OWN contact points (their email and
+    // their own profile phone) — never to the shared business phone.
+    const guard = await requireBusinessOwnerForContact(req);
+    if (!guard.ok) return res.status(guard.status!).json(guard.body);
+
     const userId = req.user!.userId;
-    const businessId = req.user!.businessId;
 
     const userRes = await query(
-      `SELECT email FROM users WHERE id = $1`,
+      `SELECT email, phone_number FROM users WHERE id = $1`,
       [userId]
-    );
-    const businessRes = await query(
-      `SELECT phone_number FROM businesses WHERE id = $1`,
-      [businessId]
     );
 
     const email = userRes.rows[0]?.email;
-    const phone = businessRes.rows[0]?.phone_number;
+    const phone = userRes.rows[0]?.phone_number || null;
 
     if (!email && !phone) {
       return res.status(400).json({
@@ -1077,6 +1103,12 @@ router.post("/otp-enabled/send-otp", authenticateToken, checkSubscriptionStatus,
  */
 router.put("/otp-enabled", authenticateToken, checkSubscriptionStatus, validateBody(ToggleOtpSchema), async (req: AuthenticatedRequest, res) => {
   try {
+    // OWNER-ONLY: this flips the BUSINESS-wide transfer-OTP requirement. An
+    // invited member (even an admin) must never be able to strip the OTP
+    // layer off the company's transfers.
+    const guard = await requireBusinessOwnerForContact(req);
+    if (!guard.ok) return res.status(guard.status!).json(guard.body);
+
     const userId = req.user!.userId;
     const businessId = req.user!.businessId;
     const { enabled, otp } = req.body;
@@ -1154,10 +1186,14 @@ router.get("/otp-enabled", authenticateToken, checkSubscriptionStatus, async (re
             [businessId, userId]
         );
 
+        // PER-USER PIN: "pinCreated" reflects ONLY the caller's own PIN. The
+        // legacy shared business hash must NOT leak the owner's PIN state to
+        // invited members (each user manages their own PIN separately).
+        const { isOwner } = await isBusinessOwner(userId);
         res.json({
             success: true,
             otpEnabled: result.rows[0]?.otp_enabled ?? true,
-            pinCreated: !!(result.rows[0]?.user_pin || result.rows[0]?.business_pin)
+            pinCreated: !!(result.rows[0]?.user_pin || (isOwner && result.rows[0]?.business_pin))
         });
     } catch (error) {
         console.error("Get OTP status error:", error);
@@ -1685,12 +1721,14 @@ router.post("/business/logo", authenticateToken, (req: AuthenticatedRequest, res
             const businessId = req.user!.businessId;
             const userId = req.user!.userId;
 
-            const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
-            const role = roleRes.rows[0]?.role;
-            if (!['owner', 'admin'].includes(role)) {
+            // OWNER-ONLY: the business logo is company identity — only the
+            // admin who registered the account may change it.
+            const { isOwner: isLogoOwner, isPersonalSpace: logoPersonal } = await isBusinessOwner(userId);
+            if (!isLogoOwner && !logoPersonal) {
                 return res.status(403).json({
                     success: false,
-                    error: "Only business owners and admins can change the business logo.",
+                    error: "Only the business owner who registered this account can change the business logo.",
+                    code: "BUSINESS_SETTINGS_FORBIDDEN",
                 });
             }
 

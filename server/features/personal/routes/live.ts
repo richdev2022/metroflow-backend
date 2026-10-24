@@ -295,16 +295,35 @@ router.post("/vods/:vodId/view", authenticateToken, async (req: AuthenticatedReq
 // via system_settings ('live_settings'). Prices are NGN.
 // ---------------------------------------------------------------------------
 const LIVE_GIFTS = [
-  { id: "rose", name: "Rose", icon: "🌹", price: 20 },
-  { id: "heart", name: "Heart", icon: "❤️", price: 50 },
-  { id: "star", name: "Star", icon: "⭐", price: 100 },
-  { id: "clap", name: "Applause", icon: "👏", price: 150 },
-  { id: "crown", name: "Crown", icon: "👑", price: 250 },
-  { id: "ring", name: "Ring", icon: "💍", price: 500 },
-  { id: "teddy", name: "Teddy", icon: "🧸", price: 1000 },
-  { id: "rocket", name: "Rocket", icon: "🚀", price: 2000 },
-  { id: "diamond", name: "Diamond", icon: "💎", price: 5000 },
-  { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000 },
+  // ---- Starter ----
+  { id: "rose", name: "Rose", icon: "🌹", price: 20, tier: "starter" },
+  { id: "heart", name: "Heart", icon: "❤️", price: 50, tier: "starter" },
+  { id: "candy", name: "Candy", icon: "🍭", price: 80, tier: "starter" },
+  { id: "star", name: "Star", icon: "⭐", price: 100, tier: "starter" },
+  { id: "clap", name: "Applause", icon: "👏", price: 150, tier: "starter" },
+  { id: "coffee", name: "Coffee", icon: "☕", price: 200, tier: "starter" },
+  // ---- Classic ----
+  { id: "crown", name: "Crown", icon: "👑", price: 250, tier: "classic" },
+  { id: "balloon", name: "Balloon", icon: "🎈", price: 300, tier: "classic" },
+  { id: "tophat", name: "Top Hat", icon: "🎩", price: 400, tier: "classic" },
+  { id: "ring", name: "Ring", icon: "💍", price: 500, tier: "classic" },
+  { id: "bouquet", name: "Bouquet", icon: "💐", price: 600, tier: "classic" },
+  { id: "chocolate", name: "Chocolate", icon: "🍫", price: 700, tier: "classic" },
+  // ---- Premium ----
+  { id: "teddy", name: "Teddy", icon: "🧸", price: 1000, tier: "premium" },
+  { id: "guitar", name: "Guitar", icon: "🎸", price: 1200, tier: "premium" },
+  { id: "rocket", name: "Rocket", icon: "🚀", price: 2000, tier: "premium" },
+  { id: "airplane", name: "Airplane", icon: "✈️", price: 2500, tier: "premium" },
+  { id: "trophy", name: "Trophy", icon: "🏆", price: 3000, tier: "premium" },
+  // ---- Luxury ----
+  { id: "diamond", name: "Diamond", icon: "💎", price: 5000, tier: "luxury" },
+  { id: "castle", name: "Castle", icon: "🏰", price: 6000, tier: "luxury" },
+  { id: "racecar", name: "Race Car", icon: "🏎️", price: 7500, tier: "luxury" },
+  { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000, tier: "luxury" },
+  { id: "island", name: "Private Island", icon: "🏝️", price: 15000, tier: "luxury" },
+  // ---- Legendary ----
+  { id: "universe", name: "Universe", icon: "🌌", price: 25000, tier: "legendary" },
+  { id: "galaxy", name: "Galaxy", icon: "🌠", price: 50000, tier: "legendary" },
 ] as const;
 
 interface LiveSettings {
@@ -365,7 +384,7 @@ router.get("/gifts", authenticateToken, async (_req: AuthenticatedRequest, res) 
     data: {
       gifts: LIVE_GIFTS.map((g) => {
         const priced = findGift(g.id, settings)!;
-        return { id: priced.id, name: priced.name, icon: priced.icon, price: priced.price, currency: settings.currency || "NGN" };
+        return { id: priced.id, name: priced.name, icon: priced.icon, price: priced.price, tier: (priced as any).tier || "classic", currency: settings.currency || "NGN" };
       }),
       battle: { duration_seconds: settings.battle_duration_seconds, multiplier: settings.battle_multiplier },
     },
@@ -740,8 +759,12 @@ router.get("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
         session: {
           ...s,
           is_host: imHost,
-          watch_url: `/join-call?code=${s.call_code}&watch=1`,
-          broadcast_url: `/join-call?code=${s.call_code}&broadcast=1`,
+          // MODERN ROUTE: the web app watches lives at /live/watch?code=…
+          // (LiveWatch). The legacy /join-call?watch=1 URL is ignored by
+          // JoinCallRing, which dead-ended the mobile WebView on the login
+          // page. Broadcast keeps the host flag so the studio controls load.
+          watch_url: `/live/watch?code=${encodeURIComponent(s.call_code)}`,
+          broadcast_url: `/live/watch?code=${encodeURIComponent(s.call_code)}&host=1`,
         },
         viewers: viewers.rows,
       },
@@ -792,7 +815,10 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
     const callId = await ensureLiveCallRow(s);
     res.json({
       success: true,
-      data: { watch_url: `/join-call?code=${s.call_code}&watch=1`, call_id: callId, session: s },
+      // MODERN ROUTE (see GET /:id): /live/watch?code=… — the mobile WebView
+      // and any deep link land on the real watch room instead of the legacy
+      // /join-call URL the web app ignores.
+      data: { watch_url: `/live/watch?code=${encodeURIComponent(s.call_code)}`, call_id: callId, session: s },
     });
   } catch (e: any) {
     console.error("live join error:", e?.message);

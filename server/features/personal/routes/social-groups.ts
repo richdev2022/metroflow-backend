@@ -218,6 +218,15 @@ async function listCommunityPosts(container: { groupId?: string; pageId?: string
   const params: any[] = [];
   if (container.groupId) { params.push(container.groupId); where.push(`p.group_id = $${params.length}`); }
   if (container.pageId) { params.push(container.pageId); where.push(`p.page_id = $${params.length}`); }
+  // MY-REACTION BINDING (refresh-bug fix): the viewer's own user id must be
+  // bound explicitly. The old code referenced a hardcoded "$2" in the
+  // my_reaction subquery without ever pushing userId into the params array —
+  // so $2 actually pointed at the pagination limit (or the cursor date).
+  // Postgres then failed with "invalid input syntax for type uuid" and the
+  // whole posts SELECT 500'd, which the client swallowed as an empty feed —
+  // posts appeared to "disappear on refresh" for pages and groups.
+  params.push(userId);
+  const myReactionIdx = params.length;
   if (cursor && !isNaN(cursor.getTime())) { params.push(cursor.toISOString()); where.push(`p.created_at < $${params.length}`); }
   params.push(limit + 1);
   const limitIdx = params.length;
@@ -227,7 +236,7 @@ async function listCommunityPosts(container: { groupId?: string; pageId?: string
             u.name AS author_name, u.avatar_url AS author_photo,
             (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
             (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
-            (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $${container.groupId ? 2 : 2} LIMIT 1) AS my_reaction,
+            (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $${myReactionIdx}::uuid LIMIT 1) AS my_reaction,
             (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
      FROM social_posts p
      JOIN users u ON u.id = p.user_id
@@ -417,6 +426,23 @@ router.post("/groups/:id/cover", authenticateToken, upload.single("cover"), asyn
     res.json({ success: true, data: { cover_url: r.rows[0]?.cover_url } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: "Could not upload cover" });
+  }
+});
+
+// Group profile image (circular avatar). social_groups.avatar_url has existed
+// in the schema but had no upload endpoint — admins can now set it.
+router.post("/groups/:id/avatar", authenticateToken, upload.single("avatar"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const loaded = await loadGroup(String(req.params.id), req.user!.userId);
+    if (!loaded) return res.status(404).json({ success: false, error: "Group not found" });
+    if (!loaded.canManage) return res.status(403).json({ success: false, error: "Only group admins can change the group profile image" });
+    const avatar = (req as any).file;
+    if (!avatar) return res.status(400).json({ success: false, error: "Attach a profile image" });
+    const up = await uploadMediaBuffer({ buffer: avatar.buffer, originalname: avatar.originalname, mimeType: avatar.mimetype, folder: "social-covers", userId: req.user!.userId });
+    const r = await query(`UPDATE social_groups SET avatar_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING avatar_url`, [up?.url || null, req.params.id]);
+    res.json({ success: true, data: { avatar_url: r.rows[0]?.avatar_url } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: "Could not upload profile image" });
   }
 });
 
@@ -681,6 +707,23 @@ router.post("/pages/:id/cover", authenticateToken, upload.single("cover"), async
     res.json({ success: true, data: { cover_url: r.rows[0]?.cover_url } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: "Could not upload cover" });
+  }
+});
+
+// Page profile image (circular avatar). social_pages.avatar_url has existed
+// in the schema but had no upload endpoint — the owner can now set it.
+router.post("/pages/:id/avatar", authenticateToken, upload.single("avatar"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const loaded = await loadPage(String(req.params.id), req.user!.userId);
+    if (!loaded) return res.status(404).json({ success: false, error: "Page not found" });
+    if (!loaded.isOwner) return res.status(403).json({ success: false, error: "Only the page owner can change the profile image" });
+    const avatar = (req as any).file;
+    if (!avatar) return res.status(400).json({ success: false, error: "Attach a profile image" });
+    const up = await uploadMediaBuffer({ buffer: avatar.buffer, originalname: avatar.originalname, mimeType: avatar.mimetype, folder: "social-covers", userId: req.user!.userId });
+    const r = await query(`UPDATE social_pages SET avatar_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING avatar_url`, [up?.url || null, req.params.id]);
+    res.json({ success: true, data: { avatar_url: r.rows[0]?.avatar_url } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: "Could not upload profile image" });
   }
 });
 

@@ -1140,7 +1140,10 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       const uRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
       const user = uRes.rows[0];
       
-      if (!user.otp_code || user.otp_code !== otp) {
+      // VAPT MF-012: users.otp_code is stored HASHED by /transfers/otp/request
+      // — compare with the hashed-OTP helper (same as /single) instead of the
+      // plaintext compare that made bulk-transfer OTP always fail.
+      if (!user.otp_code || !otpMatches(otp, user.otp_code)) {
           return res.status(400).json({ success: false, error: "Invalid OTP" });
       }
       if (new Date(user.otp_expires_at) < new Date()) {

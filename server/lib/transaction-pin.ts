@@ -10,8 +10,11 @@ import { verifyPassword } from "../services/auth";
  *
  * From now on every user owns their own PIN on users.transaction_pin_hash:
  *   1. The CALLING user's own hash is always tried first.
- *   2. If the caller has no personal PIN yet, the legacy shared business hash
- *      still verifies so PINs created before the per-user rollout keep working.
+ *   2. The legacy shared business hash verifies ONLY for the business OWNER —
+ *      it historically held the owner's own PIN, so the owner keeps working
+ *      seamlessly. INVITED MEMBERS NEVER FALL BACK TO IT: an invited member
+ *      without a personal PIN gets PIN_NOT_SET and is prompted to create
+ *      their own, so every user's Transaction PIN stays fully separate.
  *   3. When the business OWNER sets/updates their PIN, the shared business
  *      hash is re-seeded in the settings routes, keeping legacy clients and
  *      legacy verify paths consistent.
@@ -35,13 +38,26 @@ export async function resolveTransactionPinHash(
   const userHash: string | null = userRes.rows[0]?.transaction_pin_hash || null;
   if (userHash) return { pinHash: userHash, source: "user" };
 
+  // Legacy shared business hash: ONLY the business owner may fall back to it
+  // (it historically stored the owner's own PIN). Invited members must verify
+  // with their OWN pin — if they have none the caller returns PIN_NOT_SET so
+  // the UI can prompt them to create one. This keeps every user's Transaction
+  // PIN fully separate.
   if (businessId) {
-    const bizRes = await query(
-      `SELECT transaction_pin_hash FROM businesses WHERE id = $1`,
-      [businessId],
+    const ownerRes = await query(
+      `SELECT b.transaction_pin_hash AS biz_hash, b.owner_id, u.role
+       FROM businesses b LEFT JOIN users u ON u.id = $1
+       WHERE b.id = $2`,
+      [userId, businessId],
     );
-    const bizHash: string | null = bizRes.rows[0]?.transaction_pin_hash || null;
-    if (bizHash) return { pinHash: bizHash, source: "business" };
+    const row = ownerRes.rows[0];
+    const isOwner =
+      !!row &&
+      (row.owner_id === userId ||
+        String(row.role || "").toLowerCase() === "owner");
+    if (isOwner && row.biz_hash) {
+      return { pinHash: row.biz_hash, source: "business" };
+    }
   }
 
   return { pinHash: null, source: "none" };

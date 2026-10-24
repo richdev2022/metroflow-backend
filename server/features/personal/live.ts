@@ -82,17 +82,33 @@ export async function ensureLiveSchema(): Promise<void> {
 // tray renders instantly and prices can't drift between app versions; admin
 // can kill the whole feature via the Personal Products console.
 // ---------------------------------------------------------------------------
+// LEGACY (unmounted router) — kept in sync with the mounted catalog in
+// routes/live.ts so the two can never silently drift again.
 const LIVE_GIFTS = [
-    { id: "rose", name: "Rose", icon: "🌹", price: 20 },
-    { id: "heart", name: "Heart", icon: "❤️", price: 50 },
-    { id: "star", name: "Star", icon: "⭐", price: 100 },
-    { id: "clap", name: "Applause", icon: "👏", price: 150 },
-    { id: "crown", name: "Crown", icon: "👑", price: 250 },
-    { id: "ring", name: "Ring", icon: "💍", price: 500 },
-    { id: "teddy", name: "Teddy", icon: "🧸", price: 1000 },
-    { id: "rocket", name: "Rocket", icon: "🚀", price: 2000 },
-    { id: "diamond", name: "Diamond", icon: "💎", price: 5000 },
-    { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000 },
+    { id: "rose", name: "Rose", icon: "🌹", price: 20, tier: "starter" },
+    { id: "heart", name: "Heart", icon: "❤️", price: 50, tier: "starter" },
+    { id: "candy", name: "Candy", icon: "🍭", price: 80, tier: "starter" },
+    { id: "star", name: "Star", icon: "⭐", price: 100, tier: "starter" },
+    { id: "clap", name: "Applause", icon: "👏", price: 150, tier: "starter" },
+    { id: "coffee", name: "Coffee", icon: "☕", price: 200, tier: "starter" },
+    { id: "crown", name: "Crown", icon: "👑", price: 250, tier: "classic" },
+    { id: "balloon", name: "Balloon", icon: "🎈", price: 300, tier: "classic" },
+    { id: "tophat", name: "Top Hat", icon: "🎩", price: 400, tier: "classic" },
+    { id: "ring", name: "Ring", icon: "💍", price: 500, tier: "classic" },
+    { id: "bouquet", name: "Bouquet", icon: "💐", price: 600, tier: "classic" },
+    { id: "chocolate", name: "Chocolate", icon: "🍫", price: 700, tier: "classic" },
+    { id: "teddy", name: "Teddy", icon: "🧸", price: 1000, tier: "premium" },
+    { id: "guitar", name: "Guitar", icon: "🎸", price: 1200, tier: "premium" },
+    { id: "rocket", name: "Rocket", icon: "🚀", price: 2000, tier: "premium" },
+    { id: "airplane", name: "Airplane", icon: "✈️", price: 2500, tier: "premium" },
+    { id: "trophy", name: "Trophy", icon: "🏆", price: 3000, tier: "premium" },
+    { id: "diamond", name: "Diamond", icon: "💎", price: 5000, tier: "luxury" },
+    { id: "castle", name: "Castle", icon: "🏰", price: 6000, tier: "luxury" },
+    { id: "racecar", name: "Race Car", icon: "🏎️", price: 7500, tier: "luxury" },
+    { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000, tier: "luxury" },
+    { id: "island", name: "Private Island", icon: "🏝️", price: 15000, tier: "luxury" },
+    { id: "universe", name: "Universe", icon: "🌌", price: 25000, tier: "legendary" },
+    { id: "galaxy", name: "Galaxy", icon: "🌠", price: 50000, tier: "legendary" },
 ] as const;
 
 function findGift(giftId: string) {

@@ -5,6 +5,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus, check
 import { requireTeamPermission } from "../middleware/teamAuth";
 import { validateBody } from "../middleware/validation";
 import { InitiateSingleTransferSchema, InitiateBulkTransferSchema } from "../lib/validation";
+import { verifyTransactionPin } from "../lib/transaction-pin";
 import { accountLookup, processAllPending, reverseFailedTransfer, validateIntlBeneficiary, computeIntlQuote } from "../services/transfer";
 import { getProvider, getActiveProviderName, getActiveTransferProviderName, getAvailableProviders } from "../services/providers/factory";
 import { getFlutterwaveTransferRate } from "../services/providers/flutterwave";
@@ -536,42 +537,24 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     const dbDebitAmount = hasDebit ? Number(debitAmount) : null;
     const dbDebitCurrency = hasDebit ? (debitCurrency || 'NGN').toUpperCase() : null;
 
-    // PIN: business users verify against businesses.transaction_pin_hash;
-    // PERSONAL users (business_id NULL) verify against users.transaction_pin_hash.
-    let pinHash: string | null = null;
+    // PIN: PER-USER — the caller's own users.transaction_pin_hash is tried
+    // first; the legacy shared business hash still verifies for pre-rollout
+    // PINs (see lib/transaction-pin.ts).
     let otpEnabled = false;
     if (businessId) {
       const businessRes = await query(
-        `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+        `SELECT otp_enabled FROM businesses WHERE id = $1`,
         [businessId]
       );
-      pinHash = businessRes.rows[0]?.transaction_pin_hash || null;
       otpEnabled = !!businessRes.rows[0]?.otp_enabled;
-    } else {
-      const personalRes = await query(
-        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
-        [userId]
-      );
-      pinHash = personalRes.rows[0]?.transaction_pin_hash || null;
     }
-
-    // Check if PIN is set
-    if (!pinHash) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "Transaction PIN not set. Please create one first.",
-        code: "PIN_NOT_SET"
+    const pinCheck = await verifyTransactionPin(pin, { userId, businessId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        error: pinCheck.error,
+        code: pinCheck.code,
       });
-    }
-
-    // Validate PIN
-    if (!pin) {
-      return res.status(400).json({ success: false, error: "Transaction PIN is required" });
-    }
-
-    const pinValid = await verifyPassword(pin, pinHash);
-    if (!pinValid) {
-      return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
     }
 
     // Check OTP requirement
@@ -1126,42 +1109,23 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       return res.status(400).json({ success: false, error: "Business ID required" });
     }
 
-    // PIN: business users verify against businesses.transaction_pin_hash;
-    // PERSONAL users (business_id NULL) verify against users.transaction_pin_hash.
-    let pinHash: string | null = null;
+    // PIN: PER-USER — caller's own hash first, legacy shared business hash as
+    // fallback (see lib/transaction-pin.ts).
     let otpEnabled = false;
     if (businessId) {
       const businessRes = await query(
-        `SELECT transaction_pin_hash, otp_enabled FROM businesses WHERE id = $1`,
+        `SELECT otp_enabled FROM businesses WHERE id = $1`,
         [businessId]
       );
-      pinHash = businessRes.rows[0]?.transaction_pin_hash || null;
       otpEnabled = !!businessRes.rows[0]?.otp_enabled;
-    } else {
-      const personalRes = await query(
-        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
-        [(req.user?.userId as string)]
-      );
-      pinHash = personalRes.rows[0]?.transaction_pin_hash || null;
     }
-
-    // Check if PIN is set
-    if (!pinHash) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "Transaction PIN not set. Please create one first.",
-        code: "PIN_NOT_SET"
+    const pinCheck = await verifyTransactionPin(pin, { userId: (req.user?.userId as string), businessId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        error: pinCheck.error,
+        code: pinCheck.code,
       });
-    }
-
-    // Validate PIN
-    if (!pin) {
-      return res.status(400).json({ success: false, error: "Transaction PIN is required" });
-    }
-
-    const pinValid = await verifyPassword(pin, pinHash);
-    if (!pinValid) {
-      return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
     }
 
     // Check OTP requirement

@@ -10,8 +10,34 @@ import {
   UpdateTransactionPinSchema,
   ToggleOtpSchema,
 } from "../lib/validation";
+import { isBusinessOwner } from "../lib/transaction-pin";
+import { claimPhoneForCaller } from "../lib/phone-identity";
 
 const router = express.Router();
+
+/**
+ * Guard used by the BUSINESS contact-change flow (email/phone): only the
+ * business OWNER may move the company's contact details. Invited admins and
+ * managers must keep their own contact details on their personal profile
+ * (PUT /settings/profile, /settings/profile/phone/*, /settings/profile/email/*)
+ * so one invited member can never hijack the business identity.
+ */
+async function requireBusinessOwnerForContact(req: AuthenticatedRequest): Promise<{ ok: boolean; status?: number; body?: Record<string, unknown> }> {
+    const requesterId = req.user!.userId;
+    const { isOwner, isPersonalSpace } = await isBusinessOwner(requesterId);
+    if (!isOwner && !isPersonalSpace) {
+        return {
+            ok: false,
+            status: 403,
+            body: {
+                success: false,
+                error: "Only the business owner can change the business email or phone number. Invited members manage their own contact details from their personal profile instead.",
+                code: "BUSINESS_SETTINGS_FORBIDDEN",
+            },
+        };
+    }
+    return { ok: true };
+}
 
 /**
  * @swagger
@@ -64,7 +90,8 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         const result = await query(
             `SELECT b.id, b.name, b.email, b.phone_number, b.industry, b.logo_url, b.currency,
                     COALESCE(b.timezone, 'UTC') as timezone,
-                    COALESCE(b.time_format, '24h') as time_format
+                    COALESCE(b.time_format, '24h') as time_format,
+                    (b.transaction_pin_hash IS NOT NULL) as "legacyBusinessPinSet"
              FROM businesses b WHERE b.id = $1`,
             [businessId]
         );
@@ -74,7 +101,8 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         }
 
         // The caller's own profile + role so the UI can decide whether business
-        // info is editable (owner/admin) or read-only (invited members).
+        // info is editable (owner) or read-only (invited members), plus the
+        // caller's own per-user PIN state.
         const meRes = await query(
             `SELECT id, name, email, phone_number, avatar_url as "avatarUrl", role, status,
                     salary_amount as "salaryAmount", salary_currency as "salaryCurrency",
@@ -83,12 +111,23 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
                     account_name as "accountName", verification_status as "verificationStatus",
                     verified_account_name as "verifiedAccountName",
                     referral_code as "referralCode",
-                    username, bio, COALESCE(account_privacy, 'public') as "accountPrivacy"
+                    username, bio, COALESCE(account_privacy, 'public') as "accountPrivacy",
+                    (transaction_pin_hash IS NOT NULL) as "transactionPinSet"
              FROM users WHERE id = $1`,
             [userId]
         );
 
-        res.json({ success: true, settings: result.rows[0], profile: meRes.rows[0] || null });
+        // Owner resolution: the businesses row points at the caller, or their
+        // role says owner. Invited admins NEVER pass this check.
+        const { isOwner } = await isBusinessOwner(userId);
+        const profile = meRes.rows[0] || null;
+        if (profile) profile.isOwner = isOwner;
+
+        res.json({
+            success: true,
+            settings: result.rows[0],
+            profile,
+        });
     } catch (error) {
         console.error("Get settings error:", error);
         res.status(500).json({ success: false, error: "Failed to fetch settings" });
@@ -130,14 +169,14 @@ router.put("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         const { currency, name, industry, logo_url, timezone, time_format } = req.body;
 
         // BUSINESS-level fields (name, currency, industry, logo, timezone,
-        // time format) can only be changed by owner/admin. Invited members
-        // see them read-only.
-        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
-        const role = roleRes.rows[0]?.role;
-        if (!['owner', 'admin'].includes(role)) {
+        // time format) are the company's identity — OWNER-ONLY (per-user
+        // identity model). Invited admins/managers see them read-only and
+        // manage their own profile instead.
+        const { isOwner, isPersonalSpace } = await isBusinessOwner(userId);
+        if (!isOwner && !isPersonalSpace) {
             return res.status(403).json({
                 success: false,
-                error: "Only business owners and admins can change business settings. You can edit your personal profile below.",
+                error: "Only the business owner can change business settings. You can edit your personal profile below.",
                 code: "BUSINESS_SETTINGS_FORBIDDEN",
             });
         }
@@ -367,18 +406,12 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
         const businessId = req.user!.businessId;
         const { type, value } = req.body;
 
-        // BUSINESS contact details (email/phone) are business-level fields —
-        // only the owner/admin may change them (parity with PUT /settings).
-        // Invited members edit their OWN profile via /settings/profile/*.
-        const requesterId = req.user!.userId;
-        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [requesterId]);
-        const requesterRole = roleRes.rows[0]?.role;
-        if (!['owner', 'admin'].includes(requesterRole)) {
-            return res.status(403).json({
-                success: false,
-                error: "Only business owners and admins can change the business email or phone. You can edit your personal profile instead.",
-                code: "BUSINESS_SETTINGS_FORBIDDEN",
-            });
+        // BUSINESS contact details (email/phone) are the company's identity —
+        // ONLY the business owner may change them (per-user identity model).
+        // Invited admins/managers edit their OWN profile via /settings/profile*.
+        const ownerGuard = await requireBusinessOwnerForContact(req);
+        if (!ownerGuard.ok) {
+            return res.status(ownerGuard.status).json(ownerGuard.body);
         }
 
         if (!type || !value) {
@@ -395,6 +428,10 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
         // Duplicate protection BEFORE storing/sending the OTP: reject contact
         // details that already belong to another business (email is DB-unique;
         // phones are app-enforced) or another user's profile phone.
+        // PHONE IS IDENTITY-AWARE: the caller's own rows (same email across the
+        // Personal/Business apps) never block, unverified sign-ups never squat,
+        // and a number still held by another business of the SAME owner is
+        // released automatically so the owner can move their number.
         const contactValue = String(value).trim();
         if (type === 'email') {
             const emailDupe = await query(
@@ -409,20 +446,17 @@ router.post("/update-contact/request-otp", authenticateToken, checkSubscriptionS
                 });
             }
         } else if (type === 'phone') {
-            const bizDupe = await query(
-                `SELECT id FROM businesses WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
-                [contactValue, businessId],
-            );
-            const userDupe = await query(
-                `SELECT id FROM users WHERE phone_number = $1
-                   AND business_id <> $2 LIMIT 1`,
-                [contactValue, businessId],
-            );
-            if (bizDupe.rows.length > 0 || userDupe.rows.length > 0) {
+            const meRes = await query(`SELECT email FROM users WHERE id = $1`, [req.user!.userId]);
+            const availability = await claimPhoneForCaller(contactValue, {
+                userId: req.user!.userId,
+                email: meRes.rows[0]?.email || '',
+            });
+            if (!availability.ok) {
                 return res.status(409).json({
                     success: false,
-                    error: "This phone number is already in use by another account. Please use a different number.",
-                    code: "PHONE_ALREADY_EXISTS",
+                    error: availability.error,
+                    code: availability.code,
+                    heldBy: availability.heldBy,
                 });
             }
         }
@@ -491,17 +525,12 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
         const businessId = req.user!.businessId;
         const { otp } = req.body;
 
-        // Same business-level gate as the request step — an invited member
-        // must not be able to complete a queued business contact change.
+        // Same OWNER-ONLY gate as the request step — an invited member must
+        // not be able to complete a queued business contact change.
         const verifierId = req.user!.userId;
-        const verifierRoleRes = await query(`SELECT role FROM users WHERE id = $1`, [verifierId]);
-        const verifierRole = verifierRoleRes.rows[0]?.role;
-        if (!['owner', 'admin'].includes(verifierRole)) {
-            return res.status(403).json({
-                success: false,
-                error: "Only business owners and admins can change the business email or phone.",
-                code: "BUSINESS_SETTINGS_FORBIDDEN",
-            });
+        const ownerGuard = await requireBusinessOwnerForContact(req);
+        if (!ownerGuard.ok) {
+            return res.status(ownerGuard.status).json(ownerGuard.body);
         }
 
         if (!otp) {
@@ -551,19 +580,19 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
                 [businessId]
             );
         } else if (temp_phone) {
-            const bizDupe = await query(
-                `SELECT id FROM businesses WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
-                [temp_phone, businessId],
-            );
-            const userDupe = await query(
-                `SELECT id FROM users WHERE phone_number = $1 AND business_id <> $2 LIMIT 1`,
-                [temp_phone, businessId],
-            );
-            if (bizDupe.rows.length > 0 || userDupe.rows.length > 0) {
+            // Identity-aware re-check at commit time (another account may have
+            // taken the number while the OTP was pending).
+            const verifierMe = await query(`SELECT email FROM users WHERE id = $1`, [verifierId]);
+            const availability = await claimPhoneForCaller(temp_phone, {
+                userId: verifierId,
+                email: verifierMe.rows[0]?.email || '',
+            });
+            if (!availability.ok) {
                 return res.status(409).json({
                     success: false,
-                    error: "This phone number is already in use by another account. Please use a different number.",
-                    code: "PHONE_ALREADY_EXISTS",
+                    error: availability.error,
+                    code: availability.code,
+                    heldBy: availability.heldBy,
                 });
             }
             await query(
@@ -703,37 +732,32 @@ router.post("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Cre
     const userId = req.user!.userId;
     const { pin } = req.body;
 
-    // PERSONAL users keep their PIN on users.transaction_pin_hash.
-    if (!businessId) {
-      const existingUserPin = await query(
-        `SELECT transaction_pin_hash FROM users WHERE id = $1`,
-        [userId]
-      );
-      if (existingUserPin.rows[0]?.transaction_pin_hash) {
-        return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
-      }
-      const pinHash = await hashPassword(pin);
-      await query(`UPDATE users SET transaction_pin_hash = $1 WHERE id = $2`, [pinHash, userId]);
-      return res.json({ success: true, message: "Transaction PIN created successfully" });
-    }
-
-    // Check if PIN already exists
-    const existingPin = await query(
-      `SELECT transaction_pin_hash FROM businesses WHERE id = $1`,
-      [businessId]
+    // PER-USER PIN: every member — owner or invited — stores the PIN on their
+    // OWN user row. No shared business PIN for new creation anymore.
+    const existingUserPin = await query(
+      `SELECT transaction_pin_hash FROM users WHERE id = $1`,
+      [userId]
     );
-
-    if (existingPin.rows[0]?.transaction_pin_hash) {
+    if (existingUserPin.rows[0]?.transaction_pin_hash) {
       return res.status(400).json({ success: false, error: "PIN already exists. Use update endpoint instead." });
     }
-    
-    // Create PIN hash
+
     const pinHash = await hashPassword(pin);
-    await query(
-      `UPDATE businesses SET transaction_pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-      [pinHash, businessId]
-    );
-    
+    await query(`UPDATE users SET transaction_pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [pinHash, userId]);
+
+    // Legacy parity: when the business OWNER creates their PIN, also seed the
+    // shared business hash so older clients and legacy verify paths stay in
+    // step with the owner's PIN. Invited members only ever touch their own.
+    if (businessId) {
+      const { isOwner } = await isBusinessOwner(userId);
+      if (isOwner) {
+        await query(
+          `UPDATE businesses SET transaction_pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+          [pinHash, businessId]
+        );
+      }
+    }
+
     res.json({ success: true, message: "Transaction PIN created successfully" });
   } catch (error) {
     console.error("Create PIN error:", error);
@@ -758,21 +782,19 @@ router.post("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Cre
 router.post("/pin/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const businessId = req.user!.businessId;
+    const businessId = req.user!.businessId || null;
 
-    // Get user email and business phone
+    // PER-USER PIN: the OTP is delivered to the CALLER'S OWN contact points —
+    // their account email and their own profile phone. Never to the shared
+    // business phone (an invited member must not be able to intercept the
+    // owner's PIN OTP, and vice versa).
     const userRes = await query(
-      `SELECT email FROM users WHERE id = $1`,
+      `SELECT email, phone_number FROM users WHERE id = $1`,
       [userId]
     );
 
-    const businessRes = await query(
-      `SELECT phone_number FROM businesses WHERE id = $1`,
-      [businessId]
-    );
-
     const email = userRes.rows[0]?.email;
-    const phone = businessRes.rows[0]?.phone_number;
+    const phone = userRes.rows[0]?.phone_number || null;
 
     if (!email && !phone) {
       return res.status(400).json({
@@ -873,75 +895,62 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
     const userId = req.user!.userId;
     const { newPin, otp } = req.body;
 
-    // PERSONAL users: PIN + OTP both live on the user row.
-    if (!businessId) {
-      const u = await query(
-        `SELECT otp_code, otp_expires_at, otp_type, transaction_pin_hash FROM users WHERE id = $1`,
-        [userId]
-      );
-      const userRow = u.rows[0];
-      if (!userRow) return res.status(404).json({ success: false, error: "User not found" });
-      if (userRow.otp_code) {
-        if (!otp) return res.status(400).json({ success: false, error: "OTP is required to update your PIN" });
-        if (!otpMatches(otp, userRow.otp_code)) return res.status(400).json({ success: false, error: "Invalid OTP" });
-        if (userRow.otp_expires_at && new Date(userRow.otp_expires_at) < new Date()) {
-          return res.status(400).json({ success: false, error: "OTP has expired" });
-        }
-      } else if (otp) {
-        return res.status(400).json({ success: false, error: "No OTP was requested" });
-      }
-      const newHash = await hashPassword(newPin);
-      await query(`UPDATE users SET transaction_pin_hash = $1, otp_code = NULL, otp_expires_at = NULL WHERE id = $2`, [newHash, userId]);
-      return res.json({ success: true, message: "Transaction PIN updated successfully" });
-    }
+    // PER-USER PIN UPDATE: the new hash goes onto the CALLER'S OWN row.
+    // Works when the caller has a personal PIN OR only the legacy shared
+    // business PIN (pre-rollout) — both count as "a PIN exists".
+    const u = await query(
+      `SELECT otp_code, otp_expires_at, otp_type, transaction_pin_hash FROM users WHERE id = $1`,
+      [userId]
+    );
+    const userRow = u.rows[0];
+    if (!userRow) return res.status(404).json({ success: false, error: "User not found" });
 
-    // Get current PIN hash and OTP
-    const [userResult, businessResult] = await Promise.all([
-      query(
-        `SELECT otp_code, otp_expires_at, otp_type FROM users WHERE id = $1`,
-        [userId]
-      ),
-      query(
+    if (!userRow.transaction_pin_hash && businessId) {
+      const legacy = await query(
         `SELECT transaction_pin_hash FROM businesses WHERE id = $1`,
         [businessId]
-      )
-    ]);
-    
-    const currentPinHash = businessResult.rows[0]?.transaction_pin_hash;
-    const storedOtp = userResult.rows[0]?.otp_code;
-    const otpExpiresAt = userResult.rows[0]?.otp_expires_at;
-    const otpType = userResult.rows[0]?.otp_type;
-    
-    if (!currentPinHash) {
+      );
+      if (!legacy.rows[0]?.transaction_pin_hash) {
+        return res.status(400).json({ success: false, error: "PIN not set. Create one first." });
+      }
+    } else if (!userRow.transaction_pin_hash) {
       return res.status(400).json({ success: false, error: "PIN not set. Create one first." });
     }
 
-    // VAPT MF-012: hashed-OTP compare
-    if (!storedOtp || !otpMatches(otp, storedOtp)) {
-      return res.status(400).json({ success: false, error: "Invalid OTP" });
+    // OTP gate (VAPT MF-012: hashed-OTP compare). Required whenever one was
+    // requested via /pin/send-otp; type must be 'pin_update'.
+    if (userRow.otp_code) {
+      if (!otp) return res.status(400).json({ success: false, error: "OTP is required to update your PIN" });
+      if (!otpMatches(otp, userRow.otp_code)) return res.status(400).json({ success: false, error: "Invalid OTP" });
+      if (userRow.otp_type && userRow.otp_type !== "pin_update") {
+        return res.status(400).json({ success: false, error: "Invalid OTP type" });
+      }
+      if (userRow.otp_expires_at && new Date(userRow.otp_expires_at) < new Date()) {
+        return res.status(400).json({ success: false, error: "OTP has expired" });
+      }
+    } else if (otp) {
+      return res.status(400).json({ success: false, error: "No OTP was requested" });
     }
 
-    if (otpType !== "pin_update") {
-      return res.status(400).json({ success: false, error: "Invalid OTP type" });
-    }
-
-    if (new Date(otpExpiresAt) < new Date()) {
-      return res.status(400).json({ success: false, error: "OTP expired" });
-    }
-    
-    // Update with new PIN
-    const newPinHash = await hashPassword(newPin);
+    const newHash = await hashPassword(newPin);
     await query(
-      `UPDATE businesses SET transaction_pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-      [newPinHash, businessId]
+      `UPDATE users SET transaction_pin_hash = $1, otp_code = NULL, otp_expires_at = NULL, otp_type = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [newHash, userId]
     );
 
-    // Clear OTP
-    await query(
-      `UPDATE users SET otp_code = NULL, otp_expires_at = NULL, otp_type = NULL WHERE id = $1`,
-      [userId]
-    );
-    
+    // Legacy parity: the OWNER's new PIN re-seeds the shared business hash so
+    // legacy clients and legacy verify paths stay consistent. Invited members
+    // only ever change their own PIN — never the business's.
+    if (businessId) {
+      const { isOwner } = await isBusinessOwner(userId);
+      if (isOwner) {
+        await query(
+          `UPDATE businesses SET transaction_pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+          [newHash, businessId]
+        );
+      }
+    }
+
     res.json({ success: true, message: "Transaction PIN updated successfully" });
   } catch (error) {
     console.error("Update PIN error:", error);
@@ -1117,15 +1126,23 @@ router.put("/otp-enabled", authenticateToken, checkSubscriptionStatus, validateB
 router.get("/otp-enabled", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const businessId = req.user!.businessId;
+        const userId = req.user!.userId;
+        // PER-USER PIN: "pinCreated" now reflects the CALLER'S own PIN, with the
+        // legacy shared business PIN as fallback so pre-rollout users keep
+        // seeing their existing PIN as set.
         const result = await query(
-            `SELECT otp_enabled, transaction_pin_hash FROM businesses WHERE id = $1`,
-            [businessId]
+            `SELECT b.otp_enabled,
+                    (b.transaction_pin_hash IS NOT NULL) AS business_pin,
+                    (u.transaction_pin_hash IS NOT NULL) AS user_pin
+             FROM businesses b CROSS JOIN (SELECT transaction_pin_hash FROM users WHERE id = $2) u
+             WHERE b.id = $1`,
+            [businessId, userId]
         );
-        
+
         res.json({
             success: true,
             otpEnabled: result.rows[0]?.otp_enabled ?? true,
-            pinCreated: !!result.rows[0]?.transaction_pin_hash
+            pinCreated: !!(result.rows[0]?.user_pin || result.rows[0]?.business_pin)
         });
     } catch (error) {
         console.error("Get OTP status error:", error);
@@ -1198,33 +1215,23 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             const rawPhone = String(phone_number).trim();
             const phone = !rawPhone || ['null', 'undefined'].includes(rawPhone.toLowerCase()) ? null : rawPhone;
 
-            // Duplicate protection: a phone number may only belong to ONE
-            // account. Check other users AND business contact numbers —
-            // without this, profile updates silently created duplicates.
+            // IDENTITY-AWARE duplicate protection: a phone may only belong to
+            // ONE identity — but the caller's own rows (same email across the
+            // Personal/Business apps) never block, unverified sign-ups never
+            // squat, and numbers held by the caller's own other businesses are
+            // released automatically.
             if (phone) {
-                const userDupe = await query(
-                    `SELECT id FROM users WHERE phone_number = $1 AND id <> $2 LIMIT 1`,
-                    [phone, userId],
-                );
-                if (userDupe.rows.length > 0) {
+                const me = await query(`SELECT email FROM users WHERE id = $1`, [userId]);
+                const availability = await claimPhoneForCaller(phone, {
+                    userId,
+                    email: me.rows[0]?.email || '',
+                });
+                if (!availability.ok) {
                     return res.status(409).json({
                         success: false,
-                        error: "This phone number is already in use by another account. Please use a different number.",
-                        code: "PHONE_ALREADY_EXISTS",
-                    });
-                }
-                const businessDupe = await query(
-                    `SELECT b.id FROM businesses b
-                     WHERE b.phone_number = $1
-                       AND b.id <> (SELECT business_id FROM users WHERE id = $2)
-                     LIMIT 1`,
-                    [phone, userId],
-                );
-                if (businessDupe.rows.length > 0) {
-                    return res.status(409).json({
-                        success: false,
-                        error: "This phone number is already in use by another business. Please use a different number.",
-                        code: "PHONE_ALREADY_EXISTS",
+                        error: availability.error,
+                        code: availability.code,
+                        heldBy: availability.heldBy,
                     });
                 }
             }
@@ -1367,6 +1374,22 @@ router.post("/profile/phone/verify-otp", authenticateToken, checkSubscriptionSta
         const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
         if (otpHash !== user.otp_hash) {
             return res.status(400).json({ success: false, error: "Invalid verification code" });
+        }
+
+        // Identity-aware conflict re-check at commit time (another account may
+        // have claimed the number after the code was sent).
+        const me = await query(`SELECT email FROM users WHERE id = $1`, [userId]);
+        const availability = await claimPhoneForCaller(phone, {
+            userId,
+            email: me.rows[0]?.email || '',
+        });
+        if (!availability.ok) {
+            return res.status(409).json({
+                success: false,
+                error: availability.error,
+                code: availability.code,
+                heldBy: availability.heldBy,
+            });
         }
 
         const result = await query(

@@ -1108,5 +1108,73 @@ export async function ensurePersonalSchema(): Promise<void> {
     }),
   ]);
 
-  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations) schema applied");
+  // ------------------------------------------------------------------
+  // 8. SOCIAL GROUPS & PAGES (Facebook-style communities)
+  // ------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_groups (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(120) NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      privacy VARCHAR(20) NOT NULL DEFAULT 'public', -- public | private
+      cover_url TEXT,
+      avatar_url TEXT,
+      creator_id UUID NOT NULL,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',  -- active | removed
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_groups_creator ON social_groups(creator_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_group_members (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      group_id UUID NOT NULL REFERENCES social_groups(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'member',   -- owner | admin | member
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | pending
+      joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(group_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_group_members_user ON social_group_members(user_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_pages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(120) NOT NULL,
+      category VARCHAR(80) NOT NULL DEFAULT 'Business',
+      description TEXT NOT NULL DEFAULT '',
+      cover_url TEXT,
+      avatar_url TEXT,
+      owner_id UUID NOT NULL,
+      follower_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | removed
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_pages_owner ON social_pages(owner_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_page_follows (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      page_id UUID NOT NULL REFERENCES social_pages(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(page_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_page_follows_user ON social_page_follows(user_id)`);
+
+  // Group/page posts reuse the whole social post engine (reactions, comments,
+  // media carousels, reports) via nullable container columns.
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES social_groups(id) ON DELETE CASCADE`);
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS page_id UUID REFERENCES social_pages(id) ON DELETE CASCADE`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_group ON social_posts(group_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_page ON social_posts(page_id, created_at DESC)`);
+
+  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages) schema applied");
 }

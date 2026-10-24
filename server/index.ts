@@ -24,6 +24,7 @@ import { handleDemo } from "./routes/demo";
   // PERSONAL APP — routes + routers (mounted below)
   import personalAuthRouter, { registerPersonal, mintSsoTicket, redeemSsoTicket } from "./features/personal/routes/auth";
   import personalSocialRouter from "./features/personal/routes/social";
+  import personalSocialGroupsRouter from "./features/personal/routes/social-groups";
   import personalSocialGraphRouter from "./features/personal/routes/social-graph";
   import personalLiveRouter from "./features/personal/routes/live";
   import personalMarketplaceRouter from "./features/personal/routes/marketplace";
@@ -1195,6 +1196,8 @@ export async function createServer() {
   // ===================== PERSONAL APP SURFACE =====================
   // Social feed + robust polls + post boost engine
   mainRouter.use("/social", personalSocialRouter);
+  // Facebook-style Groups & Pages (communities end-to-end)
+  mainRouter.use("/social", personalSocialGroupsRouter);
   // TikTok-style follow graph + shareable public profiles (/social/users/*)
   mainRouter.use("/social", personalSocialGraphRouter);
   // Friends: public/private accounts, friend requests (chat gate for private)

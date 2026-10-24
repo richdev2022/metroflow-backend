@@ -6,6 +6,7 @@ import { requirePersonalService, useProvider } from "./flags";
 import { calculateFee, debitPlatformWallet, creditRevenueWallet } from "../../services/fees";
 import { createNotification } from "../../services/notifications";
 import { verifyPassword } from "../../services/auth";
+import { verifyTransactionPin } from "../../lib/transaction-pin";
 import { evaluateOutflow } from "../../services/fraud";
 
 /**
@@ -185,10 +186,10 @@ router.post("/purchase", authenticateToken, checkSubscriptionStatus, async (req:
     if (!pkg) return res.status(400).json({ success: false, error: "Unknown package. Refresh the plans list." });
 
     if (!pin) return res.status(400).json({ success: false, error: "Transaction PIN is required" });
-    const pinRes = await query(`SELECT transaction_pin_hash FROM businesses WHERE id = $1`, [businessId]);
-    if (!pinRes.rows[0]?.transaction_pin_hash) return res.status(400).json({ success: false, error: "Transaction PIN not set. Please create one first.", code: "PIN_NOT_SET" });
-    if (!(await verifyPassword(String(pin), pinRes.rows[0].transaction_pin_hash))) {
-      return res.status(400).json({ success: false, error: "Invalid transaction PIN" });
+    // PER-USER PIN: caller's own hash first, legacy business hash fallback.
+    const pinCheck = await verifyTransactionPin(String(pin), { userId, businessId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
     }
 
     // FRAUD GATE (outflow)

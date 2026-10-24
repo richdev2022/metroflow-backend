@@ -19,7 +19,7 @@ import { getSetting } from "../../../services/app-config";
  * personal and business users — the social graph is user-scoped).
  *
  * Endpoints (contracts the Personal web + mobile clients consume):
- *   GET    /social/feed?filter=all|posts|polls|me&cursor=&limit=
+ *   GET    /social/feed?filter=all|posts|polls|me|video|photo|text&cursor=&limit=
  *   POST   /social/posts                     { body, audience? } | multipart(image)
  *   GET    /social/posts/:id
  *   DELETE /social/posts/:id
@@ -455,6 +455,16 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     if (filter === "polls") items = items.filter((i) => i.kind === "poll");
     if (filter === "posts") items = items.filter((i) => i.kind === "post");
+
+    // MEDIA-TYPE FILTERS — viewers can slice the feed down to just videos,
+    // just photos, or just text-only posts (TikTok/Instagram-style tabs).
+    const hasVideo = (i: any) =>
+      (i.media || []).some((m: any) => m.media_type === "video") || !!i.video_url;
+    const hasImage = (i: any) =>
+      (i.media || []).some((m: any) => m.media_type === "image") || !!i.image_url;
+    if (filter === "video") items = items.filter((i) => i.kind === "post" && hasVideo(i));
+    if (filter === "photo") items = items.filter((i) => i.kind === "post" && !hasVideo(i) && hasImage(i));
+    if (filter === "text") items = items.filter((i) => i.kind === "post" && !hasVideo(i) && !hasImage(i));
 
     // Bookmark state for this page — the card shows a filled bookmark when
     // the viewer saved the post to one of their collections.

@@ -2,6 +2,7 @@ import { Response, NextFunction } from "express";
 import { query } from "../../db";
 import { AuthenticatedRequest } from "../../middleware/auth";
 import { verifyPassword } from "../../services/auth";
+import { verifyTransactionPin as verifyPerUserPin } from "../../lib/transaction-pin";
 
 /**
  * PERSONAL APP — shared helpers.
@@ -63,28 +64,16 @@ export async function isPersonalKycVerified(userId: string): Promise<boolean> {
 }
 
 /**
- * Verify the transaction PIN. Personal users: users.transaction_pin_hash.
- * Business users: businesses.transaction_pin_hash. The wallet row decides
- * which side the caller is on (wallet.user_id / wallet.business_id).
+ * Verify the transaction PIN — PER-USER (see lib/transaction-pin.ts): the
+ * caller's own users.transaction_pin_hash is tried first; the legacy shared
+ * business hash still verifies for pre-rollout PINs. Kept under the original
+ * name because every personal route imports it from here.
  */
 export async function verifyTransactionPin(
   pin: string | undefined,
   opts: { userId: string; businessId?: string | null; wallet?: PersonalWalletRow | null }
 ): Promise<{ ok: boolean; code?: string; error?: string }> {
-  if (!pin) return { ok: false, code: "PIN_REQUIRED", error: "Transaction PIN is required" };
-  const isBusinessWallet = !!opts.wallet?.business_id && opts.wallet.business_id !== opts.userId;
-  if (isBusinessWallet && opts.businessId) {
-    const r = await query(`SELECT transaction_pin_hash FROM businesses WHERE id = $1`, [opts.businessId]);
-    const hash = r.rows[0]?.transaction_pin_hash;
-    if (!hash) return { ok: false, code: "PIN_NOT_SET", error: "Transaction PIN not set. Please create one first." };
-    const ok = await verifyPassword(pin, hash);
-    return ok ? { ok: true } : { ok: false, code: "INVALID_PIN", error: "Incorrect transaction PIN" };
-  }
-  const r = await query(`SELECT transaction_pin_hash FROM users WHERE id = $1`, [opts.userId]);
-  const hash = r.rows[0]?.transaction_pin_hash;
-  if (!hash) return { ok: false, code: "PIN_NOT_SET", error: "Transaction PIN not set. Please create one in Settings → Security." };
-  const ok = await verifyPassword(pin, hash);
-  return ok ? { ok: true } : { ok: false, code: "INVALID_PIN", error: "Incorrect transaction PIN" };
+  return verifyPerUserPin(pin, { userId: opts.userId, businessId: opts.businessId ?? null });
 }
 
 /**

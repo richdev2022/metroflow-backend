@@ -121,6 +121,32 @@ async function bumpViewers(sessionId: string, delta: number) {
   );
 }
 
+/**
+ * REAPER — self-healing presence. A viewer whose client died (tab closed,
+ * crash, network drop) never calls /leave, which used to leave
+ * current_viewers permanently inflated. Any read/heartbeat path calls this:
+ * viewers silent for 45s are marked left and the counter is corrected by
+ * exactly the number of rows reaped. The 45s window is 3× the 15s
+ * heartbeat the clients send.
+ */
+async function reapStaleViewers(sessionId: string) {
+  try {
+    const r = await query(
+      `WITH reaped AS (
+         UPDATE live_viewers
+         SET left_at = CURRENT_TIMESTAMP
+         WHERE session_id = $1 AND left_at IS NULL
+           AND COALESCE(last_seen_at, joined_at) < NOW() - INTERVAL '45 seconds'
+         RETURNING id
+       )
+       SELECT COUNT(*)::int AS n FROM reaped`,
+      [sessionId],
+    );
+    const n = Number(r.rows[0]?.n) || 0;
+    if (n > 0) await bumpViewers(sessionId, -n);
+  } catch { /* cosmetic — counters self-correct on the next reap */ }
+}
+
 // ---------------------------------------------------------------------------
 // Create / wall / mine
 // ---------------------------------------------------------------------------
@@ -696,6 +722,9 @@ router.get("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
   try {
     const s = await sessionById(String(req.params.id));
     if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    // Status polls drive the room's viewer counter — reap silently-dead
+    // viewers here too so the number self-heals without waiting on heartbeats.
+    await reapStaleViewers(s.id);
     const imHost = s.host_id === req.user!.userId || isCohost(s, req.user!.userId);
     const viewers = imHost
       ? await query(
@@ -728,13 +757,34 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
     if (!s || s.status !== "live") return res.status(404).json({ success: false, error: "This stream is not live" });
     const userId = req.user!.userId;
     if (s.host_id !== userId) {
-      await query(
-        `INSERT INTO live_viewers (session_id, user_id) VALUES ($1,$2)
-         ON CONFLICT (session_id, user_id) DO UPDATE SET left_at = NULL, joined_at = CURRENT_TIMESTAMP`,
+      // DEDUPE-FIRST PRESENCE: the conditional upsert only "lands" when the
+      // viewer is brand new (INSERT) or returning from a left state (UPDATE
+      // matched the left_at IS NOT NULL guard). A viewer ALREADY in the room
+      // (double-tap join, retry, re-render) matches nothing → no row returns
+      // → counters are NOT touched. This kills the classic bug where the
+      // watching-count kept climbing because the same person rejoined.
+      //   · first join   → current +1, total_views +1, unique_viewers +1
+      //   · rejoin       → current +1 only (same human, same total)
+      //   · already live → nothing
+      const up = await query(
+        `INSERT INTO live_viewers (session_id, user_id, last_seen_at) VALUES ($1,$2, NOW())
+         ON CONFLICT (session_id, user_id) DO UPDATE
+           SET left_at = NULL, joined_at = CURRENT_TIMESTAMP, last_seen_at = NOW()
+         WHERE live_viewers.left_at IS NOT NULL
+         RETURNING (xmax = 0) AS first_join`,
         [s.id, userId],
       );
-      bumpViewers(s.id, 1).catch(() => {});
-      await query(`UPDATE live_sessions SET total_views = total_views + 1 WHERE id = $1`, [s.id]);
+      if (up.rows.length) {
+        const firstJoin = !!up.rows[0].first_join;
+        bumpViewers(s.id, 1).catch(() => {});
+        await query(
+          `UPDATE live_sessions
+           SET total_views = total_views + 1,
+               unique_viewers = unique_viewers + CASE WHEN $2 THEN 1 ELSE 0 END
+           WHERE id = $1`,
+          [s.id, firstJoin],
+        ).catch(() => {});
+      }
     }
     // Guarantee the backing `calls` row exists (also repairs sessions created
     // before the backing-row fix) and hand the call id to the watch page so it
@@ -747,6 +797,69 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
   } catch (e: any) {
     console.error("live join error:", e?.message);
     res.status(500).json({ success: false, error: "Could not join the stream" });
+  }
+});
+
+/**
+ * POST /:id/heartbeat — viewers (and hosts' rooms) ping every ~15s. Keeps
+ * live_viewers.last_seen_at fresh so the reaper can tell a live watcher from
+ * a dead tab, and opportunistically reaps stale rows for this session.
+ */
+router.post("/:id/heartbeat", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.json({ success: true });
+    const userId = req.user!.userId;
+    if (s.host_id !== userId) {
+      await query(
+        `UPDATE live_viewers SET last_seen_at = NOW()
+         WHERE session_id = $1 AND user_id = $2 AND left_at IS NULL`,
+        [s.id, userId],
+      );
+    }
+    await reapStaleViewers(s.id);
+    const c = await query(`SELECT current_viewers FROM live_sessions WHERE id = $1`, [s.id]);
+    res.json({ success: true, data: { current_viewers: Number(c.rows[0]?.current_viewers) || 0 } });
+  } catch {
+    res.json({ success: true }); // heartbeat must never surface errors
+  }
+});
+
+/**
+ * GET /:id/viewers — the horizontal viewer-avatar strip: everyone currently
+ * in the room (host included first, then newest arrivals), newest 50.
+ */
+router.get("/:id/viewers", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    await reapStaleViewers(s.id);
+    const rows = await query(
+      `SELECT v.user_id, u.name, u.avatar_url, v.joined_at,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS is_verified
+       FROM live_viewers v JOIN users u ON u.id = v.user_id
+       WHERE v.session_id = $1 AND v.left_at IS NULL
+       ORDER BY v.joined_at DESC
+       LIMIT 50`,
+      [s.id],
+    );
+    const host = await query(
+      `SELECT id, name, avatar_url FROM users WHERE id = $1`,
+      [s.host_id],
+    );
+    const c = await query(`SELECT current_viewers, total_views, unique_viewers FROM live_sessions WHERE id = $1`, [s.id]);
+    res.json({
+      success: true,
+      data: {
+        host: host.rows[0] ? { id: host.rows[0].id, name: host.rows[0].name, photo: host.rows[0].avatar_url } : null,
+        viewers: rows.rows.map((r) => ({ user_id: r.user_id, name: r.name, photo: r.avatar_url, is_verified: !!r.is_verified, joined_at: r.joined_at })),
+        current_viewers: Number(c.rows[0]?.current_viewers) || 0,
+        total_views: Number(c.rows[0]?.total_views) || 0,
+        unique_viewers: Number(c.rows[0]?.unique_viewers) || 0,
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load viewers" });
   }
 });
 

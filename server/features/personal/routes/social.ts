@@ -270,9 +270,32 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Posts + polls are anchored on social_posts (polls attach via post_id).
     // Params: $1 = userId (reaction subquery + optional "me" filter),
     //         $2 = limit+1 (hasMore probe), $3 = cursor (when supplied).
+    //
+    // TikTok-style audience tabs (client labels them Discover / Circle /
+    // Following so the branding stays ours):
+    //   for_you|discover — full ranked universe (default ranking engine)
+    //   following        — only authors the viewer actively follows
+    //   friends|circle   — mutuals only (both follow each other)
     let where = `p.status = 'active'`;
     const params: any[] = [userId, limit + 1];
     if (filter === "me") where += ` AND p.user_id = $1`;
+    if (["for_you", "discover"].includes(filter)) {
+      // Discover surfaces public content only — private-audience posts stay
+      // out of the stranger feed even when the author is followed.
+      where += ` AND p.audience = 'public'`;
+    }
+    if (filter === "following") {
+      where += ` AND (p.user_id = $1 OR p.user_id IN (
+        SELECT following_id FROM social_follows WHERE follower_id = $1 AND status = 'active'))`;
+    }
+    if (["friends", "circle"].includes(filter)) {
+      where += ` AND p.user_id IN (
+        SELECT f1.following_id FROM social_follows f1
+        WHERE f1.follower_id = $1 AND f1.status = 'active'
+          AND EXISTS (SELECT 1 FROM social_follows f2
+                      WHERE f2.follower_id = f1.following_id
+                        AND f2.following_id = $1 AND f2.status = 'active'))`;
+    }
     if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $3`; params.push(cursor.toISOString()); }
 
     const postsRes = await query(
@@ -298,20 +321,45 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Ordered media carousels for this page — one batched query, grouped per
     // post. Older posts (created before the multi-media upgrade) have no rows
     // here and fall back to their legacy image_url/video_url columns.
-    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null }>>();
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null }>>();
     if (postIds.length) {
       try {
         const mediaRes = await query(
-          `SELECT post_id, media_type, url, poster_url FROM social_post_media
-           WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+          `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
+                  s.title AS sound_title, s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id
+           FROM social_post_media m
+           LEFT JOIN social_sounds s ON s.id = m.sound_id
+           WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
           [postIds],
         );
         for (const row of mediaRes.rows) {
           const list = mediaByPost.get(String(row.post_id)) || [];
-          list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+          list.push({
+            media_type: row.media_type, url: row.url, poster_url: row.poster_url || null,
+            sound_id: row.sound_id || null,
+            sound_title: row.sound_title || null,
+            sound_audio_url: row.sound_audio_url || null,
+            sound_owner_id: row.sound_owner_id || null,
+          });
           mediaByPost.set(String(row.post_id), list);
         }
       } catch { /* table may not exist yet on a cold deploy — legacy columns still render */ }
+    }
+
+    // Hashtags per post — one batched lookup, grouped per post.
+    const tagsByPost = new Map<string, string[]>();
+    if (postIds.length) {
+      try {
+        const tagsRes = await query(
+          `SELECT post_id, tag FROM social_post_tags WHERE post_id = ANY($1::uuid[]) ORDER BY created_at`,
+          [postIds],
+        );
+        for (const row of tagsRes.rows) {
+          const list = tagsByPost.get(String(row.post_id)) || [];
+          list.push(String(row.tag));
+          tagsByPost.set(String(row.post_id), list);
+        }
+      } catch { /* tags are additive — feed renders without them on cold deploys */ }
     }
 
     // Privacy + friendship context per author — drives the feed's "Message" vs
@@ -426,9 +474,18 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // Ordered multi-media carousel — synthesized from the legacy columns
         // for posts created before social_post_media existed.
         media: mediaByPost.get(String(p.id)) || [
-          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
-          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null } : null,
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null } : null,
         ].filter(Boolean),
+        // TikTok-style sound attribution — the first video's attached sound,
+        // surfaced so clients can render the "Use sound" affordance.
+        sound: (() => {
+          const m = (mediaByPost.get(String(p.id)) || []).find((x: any) => x.sound_id);
+          return m ? { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id } : null;
+        })(),
+        // Hashtags extracted at compose time — clients render them as chips
+        // and deep-link into the tag feed.
+        tags: tagsByPost.get(String(p.id)) || [],
         audience: p.audience,
         like_count: Number(p.like_count) || 0,
         comment_count: Number(p.comment_count) || 0,
@@ -608,6 +665,21 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     if (!body && !mediaRows.length) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
+    // TikTok-style sounds — two paths:
+    //   1. sound_id supplied ("Use this sound" flow): attach it to every video
+    //      row and bump its use_count.
+    //   2. Video(s) uploaded without a sound: the first video becomes an
+    //      ORIGINAL sound owned by the author so others can reuse it later.
+    const requestedSoundId = String(req.body?.sound_id || "").trim();
+    let attachedSoundId: string | null = null;
+    if (requestedSoundId) {
+      const s = await query(
+        `SELECT id, title FROM social_sounds WHERE id = $1 AND status = 'active'`,
+        [requestedSoundId],
+      ).catch(() => ({ rows: [] as any[] }));
+      if (s.rows.length) attachedSoundId = s.rows[0].id;
+    }
+
     const r = await query(
       `INSERT INTO social_posts (user_id, body, image_url, video_url, audience) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [userId, body, imageUrl, videoUrl, audience],
@@ -619,12 +691,58 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     for (let i = 0; i < mediaRows.length; i++) {
       const m = mediaRows[i];
       if (!m.url) continue;
+      const rowSoundId = m.media_type === "video" ? attachedSoundId : null;
       await query(
-        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position) VALUES ($1,$2,$3,$4,$5)`,
-        [postId, m.media_type, m.url, m.poster_url, i],
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId],
       ).catch(() => {});
       savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
     }
+
+    // Sound bookkeeping (best-effort — never fails the post):
+    //  · Using an existing sound → use_count++ (social proof on the sound page).
+    //  · Video post with NO sound → mint the ORIGINAL sound from this post so
+    //    the author owns the audio and "Use this sound" appears for others.
+    let soundPayload: any = null;
+    try {
+      if (attachedSoundId) {
+        const bump = await query(
+          `UPDATE social_sounds SET use_count = use_count + 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 RETURNING id, title, audio_url, owner_id, use_count`,
+          [attachedSoundId],
+        );
+        if (bump.rows.length) soundPayload = bump.rows[0];
+      } else {
+        const firstVideo = savedMedia.find((m) => m.media_type === "video");
+        if (firstVideo) {
+          const ownerName = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+          const minted = await query(
+            `INSERT INTO social_sounds (owner_id, title, source_post_id, source_media_url, source_poster_url)
+             VALUES ($1,$2,$3,$4,$5)
+             RETURNING id, title, audio_url, owner_id, use_count`,
+            [userId, `Original sound — ${ownerName.rows[0]?.name || "Metricorex user"}`, postId, firstVideo.url, firstVideo.poster_url],
+          );
+          if (minted.rows.length) {
+            soundPayload = minted.rows[0];
+            await query(`UPDATE social_post_media SET sound_id = $1 WHERE post_id = $2 AND media_type = 'video'`, [soundPayload.id, postId]).catch(() => {});
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn("social/posts sound attach skipped:", e?.message);
+    }
+
+    // Hashtags — extract #tag tokens from the body and persist them for the
+    // tag feed + trending. Best-effort; extraction is cheap and idempotent.
+    const tagMatches = body.match(/#([\p{L}\p{N}_]{1,60})/gu) || [];
+    const cleanTags = [...new Set(tagMatches.map((t) => t.slice(1).toLowerCase()).filter((t) => t.length >= 1))].slice(0, 20);
+    for (const tag of cleanTags) {
+      await query(
+        `INSERT INTO social_post_tags (post_id, tag) VALUES ($1,$2) ON CONFLICT (post_id, tag) DO NOTHING`,
+        [postId, tag],
+      ).catch(() => {});
+    }
+
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     return res.status(201).json({
       success: true,
@@ -633,7 +751,12 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
           kind: "post", id: postId, author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
           message: r.rows[0].body, body: r.rows[0].body, content: r.rows[0].body,
           image_url: r.rows[0].image_url, video_url: r.rows[0].video_url,
-          media: savedMedia,
+          media: savedMedia.map((m, i) => ({
+            ...m,
+            sound_id: m.media_type === "video" && soundPayload ? soundPayload.id : null,
+          })),
+          sound: soundPayload ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id } : null,
+          tags: cleanTags,
           like_count: 0, comment_count: 0,
           share_count: 0, liked_by_me: false, created_at: r.rows[0].created_at,
         },
@@ -2261,5 +2384,703 @@ router.post("/verification/subscribe", authenticateToken, requirePersonalKyc(), 
   } catch (e: any) {
     console.error("verification subscribe error:", e?.message);
     res.status(500).json({ success: false, error: "Could not subscribe to the verified badge" });
+  }
+});
+
+// ===========================================================================
+// STORIES — TikTok/IG-style 24h stories, multiple per user (unlike chat
+// statuses this is a first-class social surface on the feed + profile).
+// ===========================================================================
+
+/** Shape one story row for client consumption. */
+function shapeStory(row: any, extra: Record<string, unknown> = {}) {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    author: {
+      id: row.user_id,
+      name: row.author_name ?? null,
+      photo: row.author_photo ?? null,
+      username: row.author_username ?? null,
+      is_verified: !!row.author_verified,
+    },
+    media_type: row.media_type,
+    media_url: row.media_url,
+    poster_url: row.poster_url,
+    caption: row.caption,
+    background_color: row.background_color,
+    duration_seconds: row.duration_seconds,
+    audience: row.audience,
+    sound_id: row.sound_id ?? null,
+    view_count: Number(row.view_count) || 0,
+    like_count: Number(row.like_count) || 0,
+    viewed_by_me: !!row.viewed_by_me,
+    liked_by_me: !!row.liked_by_me,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    ...extra,
+  };
+}
+
+const STORY_MAX_MEDIA_BYTES = 200 * 1024 * 1024;
+
+/**
+ * POST /social/stories — create a story (multipart: image | video | poster,
+ * or JSON text story). Users can hold MULTIPLE active stories at once; each
+ * lives for 24h from creation.
+ */
+router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.fields([{ name: "image", maxCount: 1 }, { name: "video", maxCount: 1 }, { name: "poster", maxCount: 1 }]), async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
+    const caption = String(req.body?.caption ?? "").slice(0, 700);
+    const backgroundColor = String(req.body?.background_color ?? "").slice(0, 20) || null;
+    const audience = ["public", "followers"].includes(req.body?.audience) ? req.body.audience : "public";
+    const durationSeconds = Math.min(60, Math.max(3, Number(req.body?.duration_seconds) || 7));
+
+    let mediaType = "text";
+    let mediaUrl: string | null = null;
+    let posterUrl: string | null = null;
+    const imageFile = files.image?.[0];
+    const videoFile = files.video?.[0];
+    if (videoFile) {
+      if (videoFile.size > STORY_MAX_MEDIA_BYTES) return res.status(400).json({ success: false, error: "Story video is too large (max 200MB)" });
+      mediaType = "video";
+      mediaUrl = (await uploadMediaBuffer({ buffer: videoFile.buffer, originalname: videoFile.originalname, mimeType: videoFile.mimetype, folder: "social-stories", userId }))?.url || null;
+      const posterFile = files.poster?.[0];
+      if (posterFile) posterUrl = (await uploadMediaBuffer({ buffer: posterFile.buffer, originalname: posterFile.originalname, mimeType: posterFile.mimetype, folder: "social-stories", userId }))?.url || null;
+      if (!posterUrl) {
+        try {
+          const frame = await extractVideoPosterFrame(videoFile.buffer, { maxWidth: 720 });
+          if (frame) posterUrl = (await uploadMediaBuffer({ buffer: frame, originalname: "story-poster.jpg", mimeType: "image/jpeg", folder: "social-stories", userId }))?.url || null;
+        } catch { /* poster is cosmetic */ }
+      }
+    } else if (imageFile) {
+      if (imageFile.size > 10 * 1024 * 1024) return res.status(400).json({ success: false, error: "Story photo is too large (max 10MB)" });
+      mediaType = "image";
+      mediaUrl = (await uploadMediaBuffer({ buffer: imageFile.buffer, originalname: imageFile.originalname, mimeType: imageFile.mimetype, folder: "social-stories", userId }))?.url || null;
+    }
+    if (mediaType === "text" && !caption) return res.status(400).json({ success: false, error: "Write a caption or attach a photo/video" });
+
+    const r = await query(
+      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, duration_seconds, audience)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience],
+    );
+    const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
+    res.status(201).json({
+      success: true,
+      data: { story: shapeStory({ ...r.rows[0], author_name: u.rows[0]?.name, author_photo: u.rows[0]?.avatar_url }) },
+      message: "Story added",
+    });
+  } catch (e: any) {
+    console.error("social/stories create error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not add your story" });
+  }
+});
+
+/**
+ * GET /social/stories — the feed story rail: active (unexpired) stories from
+ * the viewer + accounts they follow, grouped per author with seen-state so
+ * rings render unseen-first. Never expires rows on read — expiry is a WHERE.
+ */
+router.get("/stories", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const rows = await query(
+      `SELECT s.*, u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              EXISTS (SELECT 1 FROM social_story_views v WHERE v.story_id = s.id AND v.viewer_id = $1) AS viewed_by_me,
+              EXISTS (SELECT 1 FROM social_story_likes l WHERE l.story_id = s.id AND l.user_id = $1) AS liked_by_me,
+              (SELECT COUNT(*)::int FROM social_story_likes l WHERE l.story_id = s.id) AS like_count
+       FROM social_stories s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.status = 'active' AND s.expires_at > NOW()
+         AND (s.user_id = $1
+              OR (s.audience = 'public' AND s.user_id IN (SELECT following_id FROM social_follows WHERE follower_id = $1 AND status = 'active'))
+              OR (s.audience = 'followers' AND s.user_id IN (SELECT following_id FROM social_follows WHERE follower_id = $1 AND status = 'active')))
+       ORDER BY u.name, s.created_at`,
+      [userId],
+    );
+    // Group per author; order authors: self first, then unseen-first.
+    type Bucket = { user_id: string; author: any; stories: any[]; all_seen: boolean; latest_at: string };
+    const byAuthor = new Map<string, Bucket>();
+    for (const row of rows.rows) {
+      const key = String(row.user_id);
+      if (!byAuthor.has(key)) {
+        byAuthor.set(key, {
+          user_id: key,
+          author: { id: key, name: row.author_name, photo: row.author_photo, username: row.author_username, is_verified: !!row.author_verified },
+          stories: [],
+          all_seen: true,
+          latest_at: row.created_at,
+        });
+      }
+      const bucket = byAuthor.get(key)!;
+      bucket.stories.push(shapeStory(row));
+      if (!row.viewed_by_me) bucket.all_seen = false;
+    }
+    const rail = [...byAuthor.values()].sort((a, b) => {
+      if (a.user_id === userId) return -1;
+      if (b.user_id === userId) return 1;
+      if (a.all_seen !== b.all_seen) return a.all_seen ? 1 : -1;
+      return 0;
+    });
+    res.json({ success: true, data: { rail } });
+  } catch (e: any) {
+    console.error("social/stories rail error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load stories" });
+  }
+});
+
+/** GET /social/stories/mine — viewer's own active stories incl. per-story view/like detail. */
+router.get("/stories/mine", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const rows = await query(
+      `SELECT s.*, u.name AS author_name, u.avatar_url AS author_photo,
+              (SELECT COUNT(*)::int FROM social_story_likes l WHERE l.story_id = s.id) AS like_count,
+              FALSE AS viewed_by_me, FALSE AS liked_by_me
+       FROM social_stories s JOIN users u ON u.id = s.user_id
+       WHERE s.user_id = $1 AND s.status = 'active' AND s.expires_at > NOW()
+       ORDER BY s.created_at ASC`,
+      [userId],
+    );
+    const stories = [];
+    for (const row of rows.rows) {
+      const viewers = await query(
+        `SELECT v.viewer_id, u.name, u.avatar_url, v.viewed_at
+         FROM social_story_views v LEFT JOIN users u ON u.id = v.viewer_id
+         WHERE v.story_id = $1 ORDER BY v.viewed_at DESC LIMIT 100`,
+        [row.id],
+      );
+      stories.push(shapeStory(row, { viewers: viewers.rows }));
+    }
+    res.json({ success: true, data: { stories } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: "Could not load your stories" });
+  }
+});
+
+/** GET /social/stories/:userId — one author's active stories (profile ring tap). */
+router.get("/stories/:userId", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const target = String(req.params.userId);
+    const rows = await query(
+      `SELECT s.*, u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              EXISTS (SELECT 1 FROM social_story_views v WHERE v.story_id = s.id AND v.viewer_id = $1) AS viewed_by_me,
+              EXISTS (SELECT 1 FROM social_story_likes l WHERE l.story_id = s.id AND l.user_id = $1) AS liked_by_me,
+              (SELECT COUNT(*)::int FROM social_story_likes l WHERE l.story_id = s.id) AS like_count
+       FROM social_stories s JOIN users u ON u.id = s.user_id
+       WHERE s.user_id = $2 AND s.status = 'active' AND s.expires_at > NOW()
+         AND (s.user_id = $1 OR s.audience = 'public'
+              OR (s.audience = 'followers' AND EXISTS (
+                    SELECT 1 FROM social_follows WHERE follower_id = $1 AND following_id = $2 AND status = 'active')))
+       ORDER BY s.created_at ASC`,
+      [userId, target],
+    );
+    res.json({ success: true, data: { stories: rows.rows.map((row) => shapeStory(row)) } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: "Could not load stories" });
+  }
+});
+
+/** POST /social/stories/:id/view — idempotent per (story, viewer); bumps counter once. */
+router.post("/stories/:id/view", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `INSERT INTO social_story_views (story_id, viewer_id) VALUES ($1,$2)
+       ON CONFLICT (story_id, viewer_id) DO NOTHING
+       RETURNING id`,
+      [req.params.id, req.user!.userId],
+    );
+    if (r.rows.length) {
+      await query(`UPDATE social_stories SET view_count = view_count + 1 WHERE id = $1`, [req.params.id]).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch {
+    res.json({ success: true }); // view tracking must never surface errors
+  }
+});
+
+/** POST /social/stories/:id/like — toggle. */
+router.post("/stories/:id/like", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const existing = await query(`SELECT id FROM social_story_likes WHERE story_id = $1 AND user_id = $2`, [req.params.id, userId]);
+    if (existing.rows.length) {
+      await query(`DELETE FROM social_story_likes WHERE story_id = $1 AND user_id = $2`, [req.params.id, userId]);
+      return res.json({ success: true, liked: false });
+    }
+    await query(`INSERT INTO social_story_likes (story_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, userId]);
+    res.json({ success: true, liked: true });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not like story" });
+  }
+});
+
+/** DELETE /social/stories/:id — author removes their own story early. */
+router.delete("/stories/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(`DELETE FROM social_stories WHERE id = $1 AND user_id = $2 RETURNING id`, [req.params.id, req.user!.userId]);
+    if (!r.rows.length) return res.status(404).json({ success: false, error: "Story not found (or not yours)" });
+    res.json({ success: true, message: "Story deleted" });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not delete story" });
+  }
+});
+
+// ===========================================================================
+// SOUNDS — TikTok-style reusable audio. The sound page shows the ORIGINAL
+// owner pinned at the top + everyone who used the sound (profile links).
+// ===========================================================================
+
+/** GET /social/sounds/trending — most-used sounds for the sound picker. */
+router.get("/sounds/trending", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const rows = await query(
+      `SELECT s.id, s.title, s.audio_url, s.source_post_id, s.source_media_url, s.source_poster_url,
+              s.use_count, s.created_at, s.owner_id,
+              u.name AS owner_name, u.avatar_url AS owner_photo, u.username AS owner_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS owner_verified
+       FROM social_sounds s JOIN users u ON u.id = s.owner_id
+       WHERE s.status = 'active' AND s.use_count > 0
+       ORDER BY s.use_count DESC, s.created_at DESC
+       LIMIT $1`,
+      [limit],
+    );
+    res.json({ success: true, data: { sounds: rows.rows } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: "Could not load trending sounds" });
+  }
+});
+
+/**
+ * GET /social/sounds/:id — sound detail: original owner FIRST, then everyone
+ * whose post uses the sound (newest first), each entry shaped as a profile
+ card + post preview so clients can navigate to profiles from the list.
+ */
+router.get("/sounds/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const soundRes = await query(
+      `SELECT s.*, u.name AS owner_name, u.avatar_url AS owner_photo, u.username AS owner_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS owner_verified
+       FROM social_sounds s JOIN users u ON u.id = s.owner_id
+       WHERE s.id = $1 AND s.status = 'active'`,
+      [req.params.id],
+    );
+    if (!soundRes.rows.length) return res.status(404).json({ success: false, error: "Sound not found" });
+    const sound = soundRes.rows[0];
+
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 30));
+    const cursor = req.query.cursor ? new Date(String(req.query.cursor)) : null;
+    const params: any[] = [req.params.id, limit + 1];
+    let where = `m.sound_id = $1 AND p.status = 'active' AND (p.audience = 'public' OR p.user_id = $2)`;
+    params.push(userId);
+    if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $${params.length + 1}`; params.push(cursor.toISOString()); }
+    const usersRes = await query(
+      `SELECT DISTINCT ON (p.user_id, p.id) p.id AS post_id, p.user_id, p.body, p.video_url, p.image_url, p.created_at,
+              u.name, u.avatar_url, u.username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS is_verified,
+              EXISTS (SELECT 1 FROM social_follows f WHERE f.follower_id = $2 AND f.following_id = p.user_id AND f.status = 'active') AS viewer_follows,
+              (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+              (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
+       FROM social_post_media m
+       JOIN social_posts p ON p.id = m.post_id
+       JOIN users u ON u.id = p.user_id
+       WHERE ${where}
+       ORDER BY p.user_id, p.id, p.created_at DESC
+       LIMIT $${2}`,
+      [req.params.id, userId, limit + 1],
+    );
+    // Distinct-on returns per-author latest; re-sort newest first + paginate.
+    let users = usersRes.rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    const hasMore = users.length > limit;
+    users = users.slice(0, limit);
+    res.json({
+      success: true,
+      data: {
+        sound: {
+          id: sound.id, title: sound.title, audio_url: sound.audio_url,
+          source_post_id: sound.source_post_id, source_media_url: sound.source_media_url,
+          source_poster_url: sound.source_poster_url, use_count: Number(sound.use_count) || 0,
+          created_at: sound.created_at,
+          owner: {
+            id: sound.owner_id, name: sound.owner_name, photo: sound.owner_photo,
+            username: sound.owner_username, is_verified: !!sound.owner_verified,
+            is_original: true,
+          },
+        },
+        users: users.map((u) => ({
+          user_id: u.user_id, post_id: u.post_id, name: u.name, photo: u.avatar_url,
+          username: u.username, is_verified: !!u.is_verified,
+          viewer_follows: !!u.viewer_follows,
+          post_preview: { body: u.body, video_url: u.video_url, image_url: u.image_url, created_at: u.created_at },
+          like_count: Number(u.like_count) || 0, comment_count: Number(u.comment_count) || 0,
+        })),
+        next_cursor: hasMore ? users[users.length - 1]?.created_at : null,
+      },
+    });
+  } catch (e: any) {
+    console.error("social/sounds detail error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load sound" });
+  }
+});
+
+// ===========================================================================
+// HASHTAGS — trending + tag feeds.
+// ===========================================================================
+
+/** GET /social/tags/trending — hottest tags over the last 7 days. */
+router.get("/tags/trending", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 15));
+    const rows = await query(
+      `SELECT t.tag, COUNT(DISTINCT t.post_id)::int AS post_count
+       FROM social_post_tags t
+       JOIN social_posts p ON p.id = t.post_id
+       WHERE p.status = 'active' AND t.created_at >= NOW() - INTERVAL '7 days'
+       GROUP BY t.tag
+       ORDER BY post_count DESC, MAX(t.created_at) DESC
+       LIMIT $1`,
+      [limit],
+    );
+    res.json({ success: true, data: { tags: rows.rows } });
+  } catch {
+    res.json({ success: true, data: { tags: [] } });
+  }
+});
+
+/** GET /social/tags/:tag/posts — full feed-shaped posts for one hashtag. */
+router.get("/tags/:tag/posts", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const tag = String(req.params.tag || "").toLowerCase().slice(0, 80);
+    const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 20));
+    const cursor = req.query.cursor ? new Date(String(req.query.cursor)) : null;
+    const params: any[] = [tag, userId, limit + 1];
+    let where = `t.tag = $1 AND p.status = 'active' AND (p.audience = 'public' OR p.user_id = $2)`;
+    if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $${params.length + 1}`; params.push(cursor.toISOString()); }
+    const postsRes = await query(
+      `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
+              u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+              COALESCE(u.account_privacy, 'public') AS account_privacy,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+              (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $2 LIMIT 1) AS my_reaction,
+              (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
+       FROM social_post_tags t
+       JOIN social_posts p ON p.id = t.post_id
+       JOIN users u ON u.id = p.user_id
+       WHERE ${where}
+       ORDER BY p.created_at DESC
+       LIMIT $3`,
+      params,
+    );
+    const postIds = postsRes.rows.map((r) => r.id);
+    const mediaByPost = new Map<string, any[]>();
+    if (postIds.length) {
+      const mediaRes = await query(
+        `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
+                s.title AS sound_title, s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id
+         FROM social_post_media m LEFT JOIN social_sounds s ON s.id = m.sound_id
+         WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
+        [postIds],
+      ).catch(() => ({ rows: [] as any[] }));
+      for (const row of mediaRes.rows) {
+        const list = mediaByPost.get(String(row.post_id)) || [];
+        list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null, sound_id: row.sound_id || null, sound_title: row.sound_title || null, sound_audio_url: row.sound_audio_url || null, sound_owner_id: row.sound_owner_id || null });
+        mediaByPost.set(String(row.post_id), list);
+      }
+    }
+    const items = postsRes.rows.map((p) => ({
+      kind: "post", id: p.id,
+      author: {
+        id: p.user_id, name: p.author_name, photo: p.author_photo, username: p.author_username,
+        is_verified: !!p.author_verified, is_private: p.account_privacy === "private",
+        viewer_follow_status: p.user_id === userId ? "self" : "none",
+      },
+      body: p.body, content: p.body, message: p.body,
+      image_url: p.image_url, video_url: p.video_url,
+      media: mediaByPost.get(String(p.id)) || [],
+      tags: [tag],
+      like_count: Number(p.like_count) || 0,
+      comment_count: Number(p.comment_count) || 0,
+      share_count: Number(p.share_count) || 0,
+      my_reaction: p.my_reaction || null,
+      liked_by_me: !!p.my_reaction,
+      created_at: p.created_at,
+    }));
+    const hasMore = postsRes.rows.length > limit;
+    res.json({
+      success: true,
+      data: { tag, timeline: items.slice(0, limit), next_cursor: hasMore ? postsRes.rows[limit - 1]?.created_at : null },
+    });
+  } catch (e: any) {
+    console.error("social/tags feed error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load tag feed" });
+  }
+});
+
+// ===========================================================================
+// SEARCH — global feed search (users + posts), dedicated user discovery,
+// and per-post "suggested for you" recommendations.
+// ===========================================================================
+
+/** GET /social/search — unified: matches users (handle/name) + posts (body/tags). */
+router.get("/search", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const type = ["all", "users", "posts"].includes(String(req.query.type)) ? String(req.query.type) : "all";
+    const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 10));
+    if (!q) return res.json({ success: true, data: { users: [], posts: [], tags: [] } });
+    const like = `%${q}%`;
+    const tagQuery = q.replace(/^#/, "").toLowerCase();
+
+    const users = ["all", "users"].includes(type)
+      ? (await query(
+          `SELECT id, name, avatar_url, username, bio,
+                  (verified_badge_status = 'active' AND (verified_until IS NULL OR verified_until > NOW())) AS is_verified,
+                  EXISTS (SELECT 1 FROM social_follows f WHERE f.follower_id = $2 AND f.following_id = users.id AND f.status = 'active') AS viewer_follows
+           FROM users
+           WHERE status = 'active' AND (name ILIKE $1 OR username ILIKE $1)
+           ORDER BY (LOWER(username) = LOWER($3)) DESC, name
+           LIMIT $4`,
+          [like, userId, q, limit],
+        ).catch(() => ({ rows: [] as any[] }))).rows
+      : [];
+
+    const posts = ["all", "posts"].includes(type)
+      ? (await query(
+          `SELECT DISTINCT p.id, p.user_id, p.body, p.image_url, p.video_url, p.created_at,
+                  u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+                  (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+                  (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+                  (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
+           FROM social_posts p
+           JOIN users u ON u.id = p.user_id
+           LEFT JOIN social_post_tags t ON t.post_id = p.id
+           WHERE p.status = 'active' AND (p.audience = 'public' OR p.user_id = $2)
+             AND (p.body ILIKE $1 OR t.tag = $4)
+           ORDER BY p.created_at DESC
+           LIMIT $3`,
+          [like, userId, limit, tagQuery],
+        ).catch(() => ({ rows: [] as any[] }))).rows
+      : [];
+
+    const tags = ["all", "posts"].includes(type)
+      ? (await query(
+          `SELECT t.tag, COUNT(DISTINCT t.post_id)::int AS post_count
+           FROM social_post_tags t JOIN social_posts p ON p.id = t.post_id
+           WHERE p.status = 'active' AND t.tag ILIKE $1
+           GROUP BY t.tag ORDER BY post_count DESC LIMIT 8`,
+          [`${tagQuery}%`],
+        ).catch(() => ({ rows: [] as any[] }))).rows
+      : [];
+
+    res.json({
+      success: true,
+      data: {
+        users: users.map((u) => ({
+          id: u.id, name: u.name, photo: u.avatar_url, username: u.username, bio: u.bio,
+          is_verified: !!u.is_verified, viewer_follows: !!u.viewer_follows,
+        })),
+        posts: posts.map((p) => ({
+          id: p.id, author: { id: p.user_id, name: p.author_name, photo: p.author_photo, username: p.author_username, is_verified: !!p.author_verified },
+          body: p.body, image_url: p.image_url, video_url: p.video_url,
+          like_count: Number(p.like_count) || 0, comment_count: Number(p.comment_count) || 0,
+          created_at: p.created_at,
+        })),
+        tags,
+      },
+    });
+  } catch (e: any) {
+    console.error("social/search error:", e?.message);
+    res.status(500).json({ success: false, error: "Search failed" });
+  }
+});
+
+/**
+ * GET /social/search/users — the user-discovery page. Matches handle, name,
+ * email and phone (prefix on email/phone so partial entries still hit);
+ * returns follow-state so the page can follow inline. Contact fields are
+ * never rendered in the response — discovery only.
+ */
+router.get("/search/users", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const cursor = req.query.cursor ? String(req.query.cursor) : null;
+    if (!q) return res.json({ success: true, data: { users: [], next_cursor: null } });
+    const like = `%${q}%`;
+    const params: any[] = [userId, like];
+    let where = `u.status = 'active' AND u.id <> $1
+      AND (u.name ILIKE $2 OR u.username ILIKE $2 OR u.email ILIKE $2
+           OR (u.phone_number IS NOT NULL AND u.phone_number ILIKE $2))`;
+    if (cursor) { where += ` AND u.name > $3`; params.push(cursor); }
+    params.push(limit + 1);
+    const rows = await query(
+      `SELECT u.id, u.name, u.avatar_url, u.username, u.bio,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS is_verified,
+              EXISTS (SELECT 1 FROM social_follows f WHERE f.follower_id = $1 AND f.following_id = u.id AND f.status = 'active') AS viewer_follows,
+              (SELECT COUNT(*)::int FROM social_follows f WHERE f.following_id = u.id AND f.status = 'active') AS follower_count
+       FROM users u
+       WHERE ${where}
+       ORDER BY u.name
+       LIMIT $${params.length}`,
+      params,
+    );
+    const hasMore = rows.rows.length > limit;
+    res.json({
+      success: true,
+      data: {
+        users: rows.rows.slice(0, limit).map((u) => ({
+          id: u.id, name: u.name, photo: u.avatar_url, username: u.username, bio: u.bio,
+          is_verified: !!u.is_verified, viewer_follows: !!u.viewer_follows,
+          follower_count: Number(u.follower_count) || 0,
+        })),
+        next_cursor: hasMore ? rows.rows[limit - 1]?.name : null,
+      },
+    });
+  } catch (e: any) {
+    console.error("social/search/users error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not search users" });
+  }
+});
+
+/**
+ * GET /social/posts/:id/suggestions — "Suggested for you" rail shown under a
+ * post: same-tag posts first, then same-sound posts, then the author's other
+ * posts, then fresh public content to fill the remainder.
+ */
+router.get("/posts/:id/suggestions", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "social"))) return;
+    const userId = req.user!.userId;
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 6));
+    const postRes = await query(`SELECT id, user_id FROM social_posts WHERE id = $1 AND status = 'active'`, [req.params.id]);
+    if (!postRes.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
+    const post = postRes.rows[0];
+
+    const rows = await query(
+      `SELECT DISTINCT p.id, p.user_id, p.body, p.image_url, p.video_url, p.created_at,
+              u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              GREATEST(
+                CASE WHEN EXISTS (SELECT 1 FROM social_post_tags t1 JOIN social_post_tags t2 ON t2.post_id = $2
+                                  WHERE t1.post_id = p.id AND t1.tag = t2.tag) THEN 3 ELSE 0 END
+                + CASE WHEN EXISTS (SELECT 1 FROM social_post_media m1 JOIN social_post_media m2 ON m2.post_id = $2
+                                    WHERE m1.post_id = p.id AND m1.sound_id IS NOT NULL AND m1.sound_id = m2.sound_id) THEN 2 ELSE 0 END
+                + CASE WHEN p.user_id = (SELECT user_id FROM social_posts WHERE id = $2) THEN 1 ELSE 0 END
+              ) AS relevance
+       FROM social_posts p JOIN users u ON u.id = p.user_id
+       WHERE p.id <> $2 AND p.status = 'active' AND (p.audience = 'public' OR p.user_id = $1)
+       ORDER BY relevance DESC, p.created_at DESC
+       LIMIT $3`,
+      [userId, post.id, limit],
+    );
+    const postIds = rows.rows.map((r) => r.id);
+    const mediaByPost = new Map<string, any[]>();
+    if (postIds.length) {
+      const mediaRes = await query(
+        `SELECT post_id, media_type, url, poster_url FROM social_post_media
+         WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+        [postIds],
+      ).catch(() => ({ rows: [] as any[] }));
+      for (const row of mediaRes.rows) {
+        const list = mediaByPost.get(String(row.post_id)) || [];
+        list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+        mediaByPost.set(String(row.post_id), list);
+      }
+    }
+    res.json({
+      success: true,
+      data: {
+        suggestions: rows.rows.map((p) => ({
+          id: p.id,
+          author: { id: p.user_id, name: p.author_name, photo: p.author_photo, username: p.author_username, is_verified: !!p.author_verified },
+          body: p.body, image_url: p.image_url, video_url: p.video_url,
+          media: mediaByPost.get(String(p.id)) || [],
+          like_count: 0,
+          created_at: p.created_at,
+          relevance: Number(p.relevance) || 0,
+        })),
+      },
+    });
+  } catch (e: any) {
+    console.error("social/posts suggestions error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load suggestions" });
+  }
+});
+
+/**
+ * GET /social/posts/:id/analytics — owner-only deep analytics for ONE post:
+ * views + unique viewers, engagement, and — for original-sound owners — how
+ * many people posted under the sound ("used your sound").
+ */
+router.get("/posts/:id/analytics", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const p = await query(
+      `SELECT id, user_id, view_count, share_count, created_at FROM social_posts WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!p.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
+    if (p.rows[0].user_id !== userId) return res.status(403).json({ success: false, error: "Only the author can view post analytics" });
+
+    const [viewsAgg, reactions, comments, saves, soundUse] = await Promise.all([
+      query(
+        `SELECT COUNT(*)::int AS views, COUNT(DISTINCT viewer_id)::int AS unique_viewers
+         FROM social_post_views WHERE post_id = $1`,
+        [req.params.id],
+      ),
+      query(
+        `SELECT type, COUNT(*)::int AS count FROM social_reactions WHERE post_id = $1 GROUP BY type`,
+        [req.params.id],
+      ),
+      query(`SELECT COUNT(*)::int AS count FROM social_comments WHERE post_id = $1 AND status = 'active'`, [req.params.id]),
+      query(`SELECT COUNT(*)::int AS count FROM social_post_collection_items WHERE post_id = $1`, [req.params.id]),
+      query(
+        `SELECT s.id AS sound_id, s.title AS sound_title, s.use_count::int
+         FROM social_post_media m JOIN social_sounds s ON s.id = m.sound_id
+         WHERE m.post_id = $1 LIMIT 1`,
+        [req.params.id],
+      ),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        post_id: req.params.id,
+        views: Number(viewsAgg.rows[0]?.views) || 0,
+        unique_viewers: Number(viewsAgg.rows[0]?.unique_viewers) || 0,
+        reactions: reactions.rows,
+        total_reactions: reactions.rows.reduce((a, r) => a + (Number(r.count) || 0), 0),
+        comments: Number(comments.rows[0]?.count) || 0,
+        shares: Number(p.rows[0].share_count) || 0,
+        saves: Number(saves.rows[0]?.count) || 0,
+        sound: soundUse.rows.length
+          ? { id: soundUse.rows[0].sound_id, title: soundUse.rows[0].sound_title, uses_by_others: Math.max(0, (Number(soundUse.rows[0].use_count) || 0)) }
+          : null,
+        created_at: p.rows[0].created_at,
+      },
+    });
+  } catch (e: any) {
+    console.error("social/posts analytics error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load analytics" });
   }
 });

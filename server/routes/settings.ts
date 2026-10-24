@@ -606,16 +606,31 @@ router.post("/update-contact/verify-otp", authenticateToken, checkSubscriptionSt
             // mark every member of the business who uses this number as
             // phone_verified, and seed it onto the verifying admin's personal
             // profile when they don't have a personal number yet.
-            await query(
-                `UPDATE users SET phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
-                 WHERE business_id = $1 AND phone_number = $2 AND COALESCE(phone_verified, FALSE) = FALSE`,
-                [businessId, temp_phone]
-            );
-            await query(
-                `UPDATE users SET phone_number = $2, phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $3 AND (phone_number IS NULL OR phone_number = '')`,
-                [businessId, temp_phone, verifierId]
-            );
+            //
+            // The contact commit above is the source of truth — the sync below
+            // is DENORMALIZATION. It must never turn a completed verification
+            // into a 500 (that is the "phone was actually added but the app
+            // said Failed to verify OTP" class of bug), so each statement is
+            // individually fault-isolated.
+            const commitTime = temp_phone; // captured before any await below
+            try {
+                await query(
+                    `UPDATE users SET phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
+                     WHERE business_id = $1 AND phone_number = $2 AND COALESCE(phone_verified, FALSE) = FALSE`,
+                    [businessId, commitTime]
+                );
+            } catch (syncErr) {
+                console.error("Business contact cross-app sync (members) skipped:", syncErr);
+            }
+            try {
+                await query(
+                    `UPDATE users SET phone_number = $2, phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $3 AND (phone_number IS NULL OR phone_number = '')`,
+                    [businessId, commitTime, verifierId]
+                );
+            } catch (syncErr) {
+                console.error("Business contact cross-app sync (verifier) skipped:", syncErr);
+            }
         } else {
             return res.status(400).json({ success: false, error: "No pending update found" });
         }
@@ -1220,26 +1235,37 @@ router.put("/profile", authenticateToken, checkSubscriptionStatus, async (req: A
             // Personal/Business apps) never block, unverified sign-ups never
             // squat, and numbers held by the caller's own other businesses are
             // released automatically.
+            //
+            // VERIFIED-PHONE PRESERVATION: when the submitted phone equals the
+            // caller's CURRENT phone, the claim check and the verified flag
+            // are left untouched. Saving the profile must never silently strip
+            // a verification the user already completed via the OTP flow.
+            let phoneWasVerified = false;
             if (phone) {
-                const me = await query(`SELECT email FROM users WHERE id = $1`, [userId]);
-                const availability = await claimPhoneForCaller(phone, {
-                    userId,
-                    email: me.rows[0]?.email || '',
-                });
-                if (!availability.ok) {
-                    return res.status(409).json({
-                        success: false,
-                        error: availability.error,
-                        code: availability.code,
-                        heldBy: availability.heldBy,
+                const me = await query(`SELECT email, phone_number, COALESCE(phone_verified, FALSE) AS phone_verified FROM users WHERE id = $1`, [userId]);
+                if (me.rows[0]?.phone_number && phone === String(me.rows[0].phone_number).trim()) {
+                    phoneWasVerified = !!me.rows[0].phone_verified;
+                } else {
+                    const availability = await claimPhoneForCaller(phone, {
+                        userId,
+                        email: me.rows[0]?.email || '',
                     });
+                    if (!availability.ok) {
+                        return res.status(409).json({
+                            success: false,
+                            error: availability.error,
+                            code: availability.code,
+                            heldBy: availability.heldBy,
+                        });
+                    }
                 }
             }
 
             updates.push(`phone_number = $${idx}`); values.push(phone); idx++;
             // A hand-typed phone number is UNVERIFIED until confirmed via the
-            // phone-verify OTP flow.
-            updates.push(`phone_verified = FALSE`);
+            // phone-verify OTP flow — EXCEPT the number that was already
+            // verified and is being re-saved unchanged (see above).
+            updates.push(`phone_verified = ${phone ? phoneWasVerified ? 'TRUE' : 'FALSE' : 'FALSE'}`);
         }
         if (username !== undefined) {
             // TikTok-style handle for shareable profile links (/u/:username).
@@ -1361,10 +1387,25 @@ router.post("/profile/phone/verify-otp", authenticateToken, checkSubscriptionSta
         }
 
         const userRes = await query(
-            `SELECT otp_hash, otp_expires_at, otp_type FROM users WHERE id = $1`,
+            `SELECT otp_hash, otp_expires_at, otp_type, phone_number, COALESCE(phone_verified, FALSE) AS phone_verified FROM users WHERE id = $1`,
             [userId],
         );
         const user = userRes.rows[0];
+
+        // IDEMPOTENT RETRY GUARD: a double-tap (or a flaky retry after a
+        // dropped response) lands here AFTER the first request already
+        // committed and cleared the OTP. If the requested phone matches what
+        // was just verified, return success instead of a confusing
+        // "no code was sent" error — the phone IS verified.
+        if ((!user?.otp_hash || user.otp_type !== "phone_verify")
+            && user?.phone_number && String(user.phone_number).trim() === phone && user.phone_verified) {
+            return res.json({
+                success: true,
+                data: { phone_number: user.phone_number, phoneVerified: true },
+                message: "Phone number verified",
+            });
+        }
+
         if (!user?.otp_hash || user.otp_type !== "phone_verify") {
             return res.status(400).json({ success: false, error: "No verification code was sent to this phone. Please request a new one." });
         }

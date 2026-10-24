@@ -1176,5 +1176,104 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_group ON social_posts(group_id, created_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_page ON social_posts(page_id, created_at DESC)`);
 
-  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages) schema applied");
+  // ---------------------------------------------------------------------
+  // STORIES — TikTok/IG-style 24h stories (multiple per user), separate
+  // from the chat statuses engine. Feed story rail + profile rings read
+  // from here; every user can hold N active stories at once.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_stories (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      media_type VARCHAR(10) NOT NULL DEFAULT 'image', -- image | video | text
+      media_url TEXT,
+      poster_url TEXT,
+      caption TEXT,
+      background_color VARCHAR(20),
+      duration_seconds INTEGER NOT NULL DEFAULT 7,
+      audience VARCHAR(20) NOT NULL DEFAULT 'public',  -- public | followers
+      sound_id UUID,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',    -- active | removed
+      expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_stories_user ON social_stories(user_id, expires_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_stories_expiry ON social_stories(expires_at)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_story_views (
+      id BIGSERIAL PRIMARY KEY,
+      story_id UUID NOT NULL REFERENCES social_stories(id) ON DELETE CASCADE,
+      viewer_id UUID,
+      viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(story_id, viewer_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_story_views_story ON social_story_views(story_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_story_likes (
+      id BIGSERIAL PRIMARY KEY,
+      story_id UUID NOT NULL REFERENCES social_stories(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(story_id, user_id)
+    )
+  `);
+
+  // ---------------------------------------------------------------------
+  // SOUNDS — TikTok-style reusable post sounds. The first video that uses
+  // its own audio becomes the "original sound"; later posts attach via
+  // social_post_media.sound_id and the sound's use_count increments.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_sounds (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_id UUID NOT NULL,
+      title VARCHAR(160) NOT NULL,
+      audio_url TEXT,
+      source_post_id UUID,
+      source_media_url TEXT,
+      source_poster_url TEXT,
+      duration_seconds INTEGER,
+      is_original BOOLEAN NOT NULL DEFAULT TRUE,
+      use_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_sounds_owner ON social_sounds(owner_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_sounds_usage ON social_sounds(use_count DESC, created_at DESC)`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_id UUID REFERENCES social_sounds(id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_media_sound ON social_post_media(sound_id)`);
+
+  // ---------------------------------------------------------------------
+  // HASHTAGS — end-to-end tag engine: extracted from post bodies at create
+  // time, with trending + tag-feed reads and per-post tag payloads.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS social_post_tags (
+      id BIGSERIAL PRIMARY KEY,
+      post_id UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      tag VARCHAR(80) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(post_id, tag)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_tags_tag ON social_post_tags(tag, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_tags_post ON social_post_tags(post_id)`);
+
+  // ---------------------------------------------------------------------
+  // LIVE presence hardening — heartbeat tracking so "current viewers" can
+  // self-heal when a client drops without calling /leave (tab close, crash).
+  // ---------------------------------------------------------------------
+  await query(`ALTER TABLE live_viewers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_viewers_active ON live_viewers(session_id, left_at, last_seen_at)`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS unique_viewers INTEGER NOT NULL DEFAULT 0`);
+
+  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages + stories + sounds + tags) schema applied");
 }

@@ -33,6 +33,7 @@ import {
 import { verifyGoogleIdToken } from "../services/googleAuth";
 import { isMaintenanceMode } from "../services/app-config";
 import { attributeReferrer, ensureUserReferralCode } from "../services/referral";
+import { isPhoneHeldByVerifiedAccount } from "../lib/phone-identity";
 import { createWallet } from "../services/wallet";
 import { AuthenticatedRequest } from "../middleware/auth";
 
@@ -425,8 +426,11 @@ export const registerPersonal: RequestHandler = async (req, res) => {
         message: "An account with this email already exists. Please sign in instead.",
       });
     }
-    const existingPhone = await query(`SELECT id FROM users WHERE phone_number = $1 LIMIT 1`, [phoneNumber]);
-    if (existingPhone.rows.length > 0) {
+    // Phone squatting guard: only VERIFIED accounts hold a number. An
+    // abandoned sign-up (email never confirmed, phone never verified) must
+    // not block the number forever.
+    const phoneTaken = await isPhoneHeldByVerifiedAccount(phoneNumber);
+    if (phoneTaken) {
       return res.status(400).json({ success: false, message: "This phone number is already linked to an account." });
     }
 

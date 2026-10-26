@@ -1177,6 +1177,24 @@ router.get("/otp-enabled", authenticateToken, checkSubscriptionStatus, async (re
         // PER-USER PIN: "pinCreated" now reflects the CALLER'S own PIN, with the
         // legacy shared business PIN as fallback so pre-rollout users keep
         // seeing their existing PIN as set.
+        //
+        // PERSONAL ACCOUNTS (businessId IS NULL): the businesses join matches no
+        // row, which used to force otpEnabled=true and silently HIDE the user's
+        // own PIN (pinCreated=false) — that dead-end blocked every personal
+        // transfer behind an OTP flow that could never be completed. Personal
+        // accounts have no business-level OTP policy, so OTP is simply off and
+        // the per-user PIN alone decides pinCreated.
+        if (!businessId) {
+            const personal = await query(
+                `SELECT (transaction_pin_hash IS NOT NULL) AS user_pin FROM users WHERE id = $1`,
+                [userId]
+            );
+            return res.json({
+                success: true,
+                otpEnabled: false,
+                pinCreated: !!personal.rows[0]?.user_pin
+            });
+        }
         const result = await query(
             `SELECT b.otp_enabled,
                     (b.transaction_pin_hash IS NOT NULL) AS business_pin,

@@ -2499,7 +2499,7 @@ router.get("/stories", authenticateToken, checkSubscriptionStatus, async (req: A
        JOIN users u ON u.id = s.user_id
        WHERE s.status = 'active' AND s.expires_at > NOW()
          AND (s.user_id = $1
-              OR (s.audience = 'public' AND s.user_id IN (SELECT following_id FROM social_follows WHERE follower_id = $1 AND status = 'active'))
+              OR (s.audience = 'public')
               OR (s.audience = 'followers' AND s.user_id IN (SELECT following_id FROM social_follows WHERE follower_id = $1 AND status = 'active')))
        ORDER BY u.name, s.created_at`,
       [userId],

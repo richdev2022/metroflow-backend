@@ -137,12 +137,19 @@ export const getCalls: RequestHandler = async (
   try {
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
       });
     }
+
+    // Opportunistic cleanup: finalize long-dead 'ongoing' calls so the list
+    // never renders stale "Join" buttons (the "can't call again" symptom).
+    maybeReapStaleCalls().catch(() => {});
 
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
@@ -151,7 +158,7 @@ export const getCalls: RequestHandler = async (
     const countResult = await query(
       `SELECT COUNT(*) as total
        FROM calls c
-       WHERE c.business_id = $1
+       WHERE c.business_id IS NOT DISTINCT FROM $1
        AND (
          c.created_by = $2
          OR c.host_id = $2
@@ -185,7 +192,7 @@ export const getCalls: RequestHandler = async (
         )) FILTER (WHERE cp.id IS NOT NULL) as participants
       FROM calls c
       LEFT JOIN call_participants cp ON c.id = cp.call_id
-      WHERE c.business_id = $1
+      WHERE c.business_id IS NOT DISTINCT FROM $1
       AND (
         c.created_by = $2
         OR c.host_id = $2
@@ -267,7 +274,10 @@ export const createCall: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -524,7 +534,7 @@ export const getCallByCode: RequestHandler = async (
               co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE call_code = $1 AND business_id = $2`,
+       FROM calls WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`,
       [code, businessId],
     );
 
@@ -603,10 +613,10 @@ export const getCallById: RequestHandler = async (
     // through to the code lookup instead of throwing 22P02 -> 500.
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     let result = UUID_RE.test(id)
-      ? await query(`${baseSelect} WHERE id = $1 AND business_id = $2`, [id, businessId])
+      ? await query(`${baseSelect} WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`, [id, businessId])
       : { rows: [] as any[] };
     if (result.rows.length === 0) {
-      result = await query(`${baseSelect} WHERE call_code = $1 AND business_id = $2`, [id, businessId]);
+      result = await query(`${baseSelect} WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`, [id, businessId]);
     }
 
     if (result.rows.length === 0) {
@@ -688,7 +698,10 @@ export const updateCall: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -716,7 +729,7 @@ export const updateCall: RequestHandler = async (
     let linkedConversationId: string | null | undefined;
     if (isValidUUID(id)) {
       const idResult = await query(
-        `SELECT id, status, conversation_id FROM calls WHERE id = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, status, conversation_id FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (idResult.rows.length > 0) {
@@ -728,7 +741,7 @@ export const updateCall: RequestHandler = async (
 
     if (!actualId) {
       const codeResult = await query(
-        `SELECT id, status, conversation_id FROM calls WHERE call_code = $1 AND business_id = $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
+        `SELECT id, status, conversation_id FROM calls WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2 AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
       if (codeResult.rows.length > 0) {
@@ -778,7 +791,7 @@ export const updateCall: RequestHandler = async (
     const result = await query(
       `UPDATE calls
        SET ${updateFields.join(", ")}
-       WHERE id = $${paramIndex++} AND business_id = $${paramIndex++}
+       WHERE id = $${paramIndex++} AND business_id IS NOT DISTINCT FROM $${paramIndex++}
        AND (created_by = $${paramIndex} OR host_id = $${paramIndex} OR co_host_id = $${paramIndex++})
        RETURNING id, business_id as "businessId", type, status, started_at as "startedAt", 
                  ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
@@ -911,7 +924,10 @@ export const joinCall: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -922,7 +938,7 @@ export const joinCall: RequestHandler = async (
     if (isValidUUID(id)) {
       const idResult = await query(
         `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-         FROM calls WHERE id = $1 AND business_id = $2`,
+         FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [id, businessId],
       );
       if (idResult.rows.length > 0) {
@@ -933,7 +949,7 @@ export const joinCall: RequestHandler = async (
     if (!actualId) {
       const codeResult = await query(
         `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-         FROM calls WHERE call_code = $1 AND business_id = $2`,
+         FROM calls WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [id, businessId],
       );
       if (codeResult.rows.length > 0) {
@@ -952,7 +968,7 @@ export const joinCall: RequestHandler = async (
     const lookupCol = isValidUUID(id) ? 'id' : 'call_code';
     const validationResult = await query(
       `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-       FROM calls WHERE ${lookupCol} = $1 AND business_id = $2`,
+       FROM calls WHERE ${lookupCol} = $1 AND business_id IS NOT DISTINCT FROM $2`,
       [id, businessId],
     );
     const callState = validationResult.rows[0];
@@ -1052,7 +1068,7 @@ export const joinCall: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               max_participants as "maxParticipants",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND business_id = $2`,
+       FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
       [actualId, businessId],
     );
     if (callResult.rows.length === 0) {
@@ -1336,7 +1352,10 @@ export const leaveCall: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -1347,7 +1366,7 @@ export const leaveCall: RequestHandler = async (
     let actualId: string | undefined;
     if (isValidUUID(id)) {
       const idResult = await query(
-        `SELECT id FROM calls WHERE id = $1 AND business_id = $2`,
+        `SELECT id FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [id, businessId],
       );
       if (idResult.rows.length > 0) {
@@ -1357,7 +1376,7 @@ export const leaveCall: RequestHandler = async (
 
     if (!actualId) {
       const codeResult = await query(
-        `SELECT id FROM calls WHERE call_code = $1 AND business_id = $2`,
+        `SELECT id FROM calls WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [id, businessId],
       );
       if (codeResult.rows.length > 0) {
@@ -1386,7 +1405,7 @@ export const leaveCall: RequestHandler = async (
               conversation_id as "conversationId", duration_started_at as "durationStartedAt",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND business_id = $2`,
+       FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
       [actualId, businessId],
     );
     if (callResult.rows.length === 0) {
@@ -1568,7 +1587,10 @@ export const deleteCall: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -1580,7 +1602,7 @@ export const deleteCall: RequestHandler = async (
     if (isValidUUID(id)) {
       const idResult = await query(
         `SELECT id FROM calls
-         WHERE id = $1 AND business_id = $2
+         WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2
          AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
@@ -1592,7 +1614,7 @@ export const deleteCall: RequestHandler = async (
     if (!actualId) {
       const codeResult = await query(
         `SELECT id FROM calls
-         WHERE call_code = $1 AND business_id = $2
+         WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2
          AND (created_by = $3 OR host_id = $3 OR co_host_id = $3)`,
         [id, businessId, userId],
       );
@@ -1615,7 +1637,7 @@ export const deleteCall: RequestHandler = async (
     await query(`DELETE FROM recordings WHERE call_id = $1`, [actualId]);
 
     // Delete call
-    await query(`DELETE FROM calls WHERE id = $1 AND business_id = $2`, [
+    await query(`DELETE FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`, [
       actualId,
       businessId,
     ]);
@@ -1662,7 +1684,10 @@ export const addCallParticipants: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -1689,7 +1714,7 @@ export const addCallParticipants: RequestHandler = async (
       callResult = await query(
         `SELECT id, type, call_code, status, ended_at, created_by, host_id, co_host_id
          FROM calls
-         WHERE id = $1 AND business_id = $2`,
+         WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [callId, businessId],
       );
     }
@@ -1699,7 +1724,7 @@ export const addCallParticipants: RequestHandler = async (
       callResult = await query(
         `SELECT id, type, call_code, status, ended_at, created_by, host_id, co_host_id
          FROM calls
-         WHERE call_code = $1 AND business_id = $2`,
+         WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`,
         [callId, businessId],
       );
     }
@@ -1846,7 +1871,7 @@ export const addCallParticipants: RequestHandler = async (
         let byEmail = new Map<string, CallUserFromDb>();
         try {
           const usersRes = await query(
-            `SELECT id, name, email FROM users WHERE business_id = $1 AND lower(email) = ANY($2::text[])`,
+            `SELECT id, name, email FROM users WHERE business_id IS NOT DISTINCT FROM $1 AND lower(email) = ANY($2::text[])`,
             [businessId, validEmails],
           );
           for (const row of usersRes.rows) byEmail.set(String(row.email).toLowerCase(), row);
@@ -2017,7 +2042,10 @@ export const validateCallAccess: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -2036,7 +2064,7 @@ export const validateCallAccess: RequestHandler = async (
               co_host_id as "coHostId", created_by as "createdById", password,
               recording_enabled as "recordingEnabled", is_group_call as "isGroupCall"
        FROM calls
-       WHERE (call_code = $1 OR id::text = $1) AND business_id = $2`,
+       WHERE (call_code = $1 OR id::text = $1) AND business_id IS NOT DISTINCT FROM $2`,
       [code, businessId],
     );
 
@@ -2164,7 +2192,10 @@ export const generateCallInvite: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -2491,7 +2522,7 @@ async function findSharedDirectConversation(
       `SELECT cc.id FROM chat_conversations cc
        JOIN chat_participants cp1 ON cp1.conversation_id = cc.id AND cp1.user_id = $1
        JOIN chat_participants cp2 ON cp2.conversation_id = cc.id AND cp2.user_id = $2
-       WHERE cc.business_id = $3 AND cc.type = 'direct'
+       WHERE cc.business_id IS NOT DISTINCT FROM $3 AND cc.type = 'direct'
          AND (SELECT COUNT(*) FROM chat_participants cpc WHERE cpc.conversation_id = cc.id) = 2
        LIMIT 1`,
       [pair[0], pair[1], businessId],
@@ -2516,7 +2547,10 @@ export const getCallDetail: RequestHandler = async (req: AuthenticatedRequest, r
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -2618,7 +2652,10 @@ export const getCallTranscript: RequestHandler = async (req: AuthenticatedReques
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users
+      // (userId alone authenticates the caller); the row scoping below is
+      // NULL-safe via IS NOT DISTINCT FROM.
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
 
@@ -2662,3 +2699,61 @@ export const getCallTranscript: RequestHandler = async (req: AuthenticatedReques
     res.status(500).json({ success: false, error: "Failed to load transcript" });
   }
 };
+
+// ===========================================================================
+// STALE-CALL REAPER
+// ---------------------------------------------------------------------------
+// Hangup relies on a socket emit (call:leave / call:end) or the REST leave
+// fallback. If neither lands (app killed, network drop mid-call), the calls
+// row stays 'ongoing' FOREVER — it keeps rendering a dead "Join" button in
+// every calls list, and 1:1 re-dials get confusing. Finalize any call that
+// has been 'ongoing' with zero state changes for long enough to be certainly
+// dead. Idempotent + cheap; safe to run on a timer and before history reads.
+// ===========================================================================
+let lastCallReap = 0;
+export async function reapStaleCalls(minAgeMinutes: number = 120): Promise<number> {
+  try {
+    // Safe by construction:
+    //  - 'missed': nobody is actually in the room (no joined participant) and
+    //    the call has been idle far beyond any ring window.
+    //  - 'completed': someone joined, but the call has outlived even the most
+    //    generous plan duration — the socket room is certainly gone.
+    const result = await query(
+      `UPDATE calls
+         SET status = CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM call_participants cp
+                 WHERE cp.call_id = calls.id AND cp.status = 'joined'
+               ) THEN 'completed'
+               ELSE 'missed'
+             END,
+             ended_at = COALESCE(ended_at, updated_at),
+             updated_at = CURRENT_TIMESTAMP
+       WHERE status = 'ongoing'
+         AND (
+           (
+             updated_at < NOW() - ($1::text || ' minutes')::interval
+             AND NOT EXISTS (
+               SELECT 1 FROM call_participants cp2
+               WHERE cp2.call_id = calls.id AND cp2.status = 'joined'
+             )
+           )
+           OR started_at < NOW() - INTERVAL '8 hours'
+         )
+      `,
+      [String(minAgeMinutes)],
+    );
+    return result.rowCount || 0;
+  } catch (e: any) {
+    console.error("[calls] stale-call reaper failed:", e?.message);
+    return 0;
+  }
+}
+
+/** Throttled lazy reaper for read paths (max once per 5 minutes per instance). */
+export async function maybeReapStaleCalls() {
+  const now = Date.now();
+  if (now - lastCallReap < 5 * 60 * 1000) return;
+  lastCallReap = now;
+  await reapStaleCalls();
+}

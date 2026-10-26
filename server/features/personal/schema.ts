@@ -894,11 +894,18 @@ export async function ensurePersonalSchema(): Promise<void> {
     CREATE TABLE IF NOT EXISTS social_follows (
       follower_id UUID NOT NULL,
       following_id UUID NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (follower_id, following_id),
       CONSTRAINT social_follows_not_self CHECK (follower_id <> following_id)
     )
   `);
+  // PROD FIX: older installs created this table WITHOUT the status column,
+  // while follow-gated queries reference `status`/`f.status` — on those
+  // installs every such query died ("column status does not exist" /
+  // "column reference status is ambiguous"), which took down the whole
+  // stories rail (posts silently "never published") and follow-gated feeds.
+  await query(`ALTER TABLE social_follows ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_following ON social_follows(following_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_follower ON social_follows(follower_id)`);
 

@@ -668,6 +668,7 @@ async function handleSogoCryptoDeposit(tx: any) {
 
 async function handleSogoBillPayment(tx: any) {
   const { sogoStatus } = await import("../services/sogo");
+  const { settleBillCompleted, refundBillRow } = await import("../features/personal/bill-settlement");
   const reference = String(tx?.reference || "");
   if (!reference) return;
   const rows = await query(`SELECT * FROM bill_transactions WHERE reference = $1 OR provider_reference = $1 LIMIT 1`, [reference]);
@@ -676,17 +677,19 @@ async function handleSogoBillPayment(tx: any) {
   const status = sogoStatus(tx);
   const mapped = ["completed", "failed", "refunded", "cancelled"].includes(status) ? status : "processing";
   if (mapped === bill.status) return;
-  // IDEMPOTENCY: claim the status transition FIRST (guarded update), then
-  // refund. The old credit-first order meant a failed refund insert kept the
-  // bill 'processing' and every Sogo retry re-credited the wallet forever.
-  const claim = await query(
-    `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> $2`,
-    [bill.id, mapped, JSON.stringify(tx)],
-  );
-  if (claim.rowCount === 0) return; // someone else already settled this bill
-  if (mapped === "refunded" || mapped === "failed" || mapped === "cancelled") {
-    // Provider-side refund → return the customer's money.
-    await creditUserWallet(bill.user_id, bill.wallet_id, Number(bill.total), `${bill.reference}-REFUND`, "Refund — bill payment reversed", bill.business_id);
+  // Settlement runs through the shared engine (claim-first guarded UPDATEs,
+  // ledger-idempotent refunds, cashback on late completion, notifications).
+  if (mapped === "completed") {
+    await settleBillCompleted(bill, tx);
+  } else if (["refunded", "failed", "cancelled"].includes(mapped)) {
+    await refundBillRow(bill, `Provider reported: ${mapped}`, tx);
+  } else {
+    // Still processing provider-side — keep local state untouched but record
+    // the latest webhook payload for support forensics.
+    await query(
+      `UPDATE bill_transactions SET provider_response = $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
+      [bill.id, JSON.stringify(tx)],
+    );
   }
 }
 

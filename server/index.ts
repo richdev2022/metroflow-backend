@@ -367,6 +367,28 @@ export async function createServer() {
     });
   }
 
+  // Bill-payment settlement reaper (VPS/PM2 only): bills left 'processing'
+  // mean the customer's wallet was debited but the provider outcome was never
+  // recorded (process died mid-provider-call, missed webhook, sandbox
+  // provider that never confirms). Pass 1 asks the provider before refunding
+  // and settles completions (with cashback); pass 2 recovers refund credits
+  // that crashed after the status claim. Both passes are ledger-idempotent.
+  if (!isServerlessEnv) {
+    cron.schedule("*/5 * * * *", async () => {
+      if (!isDbReady) return;
+      try {
+        const settlement = await import("./features/personal/bill-settlement");
+        const settled = await settlement.reconcileProcessingBills(25);
+        const recovered = await settlement.recoverMissedRefunds(25);
+        if (settled > 0 || recovered > 0) {
+          logger.info(`[bills] reaper settled ${settled} pending bill(s), recovered ${recovered} refund(s)`);
+        }
+      } catch (error) {
+        logger.error("Bill settlement reaper error:", error);
+      }
+    });
+  }
+
   // Meeting reminders (push + email at 60/15 minutes before start).
   // VPS/PM2 only — serverless cannot run per-minute crons. Each tick atomically
   // claims due meeting_reminders rows (sent=FALSE) so ticks never double-send.

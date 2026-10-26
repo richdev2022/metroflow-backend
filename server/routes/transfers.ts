@@ -241,9 +241,17 @@ router.post("/otp/request", authenticateToken, checkSubscriptionStatus, requireT
         const { wallet_id, otp_method } = req.body;
 
         // 1. Get Preference & User Info
-        const prefRes = await query(`SELECT otp_preference FROM businesses WHERE id = $1`, [businessId]);
-        const business = prefRes.rows[0];
-        const preference = otp_method || business.otp_preference || 'email';
+        // PERSONAL ACCOUNTS (businessId IS NULL): the businesses lookup used to
+        // crash on `business.otp_preference` (rows[0] undefined → TypeError →
+        // 500 "Failed to request OTP"), permanently blocking personal transfers.
+        // Personal users have no business OTP policy — default to email.
+        let preference: string;
+        if (businessId) {
+            const prefRes = await query(`SELECT otp_preference FROM businesses WHERE id = $1`, [businessId]);
+            preference = otp_method || prefRes.rows[0]?.otp_preference || 'email';
+        } else {
+            preference = otp_method || 'email';
+        }
 
         const userRes = await query(`SELECT email, phone_number FROM users WHERE id = $1`, [userId]);
         const user = userRes.rows[0];
@@ -1683,6 +1691,11 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     const { search, status, startDate, endDate, walletId, direction, type, minAmount, maxAmount, page = 1, limit = 20, format } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
+    // PERSONAL ACCOUNTS (businessId IS NULL): `business_id = $1` never matches
+    // NULL, so personal users used to get an EMPTY ledger here. Scope by the
+    // caller's own user_id in that case instead.
+    const personalScope = !businessId;
+
     // Build query for transfer_queue (existing)
     let tqQueryText = `SELECT 
         id,
@@ -1694,6 +1707,9 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
         recipient_name,
         amount,
         currency,
+        debit_amount,
+        debit_currency,
+        fee,
         remark,
         status,
         failure_reason,
@@ -1707,8 +1723,8 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
         updated_at,
         'transfer' as type
       FROM transfer_queue 
-      WHERE business_id = $1`;
-    let tqParams: any[] = [businessId];
+      WHERE ${personalScope ? 'initiated_by = $1' : 'business_id = $1'}`;
+    let tqParams: any[] = [personalScope ? req.user?.userId : businessId];
     let tqParamIdx = 2;
 
     // Build query for transactions (credits, and other transactions)
@@ -1730,8 +1746,8 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
         updated_at,
         'transaction' as type
       FROM transactions 
-      WHERE business_id = $1`;
-    let txParams: any[] = [businessId];
+      WHERE ${personalScope ? 'user_id = $1' : 'business_id = $1'}`;
+    let txParams: any[] = [personalScope ? req.user?.userId : businessId];
     let txParamIdx = 2;
 
     // Wallet filter: restrict to a specific wallet (credits/debits of that wallet only)
@@ -1830,6 +1846,11 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
 
     // Exclude platform/revenue internal rows - users see their own ledger only
     txQueryText += ` AND transaction_type NOT IN ('platform')`;
+    // Personal scope: also hide internal revenue fee rows that carry no wallet
+    // (they are platform accounting, not user-visible ledger entries).
+    if (personalScope) {
+      txQueryText += ` AND (wallet_id IS NOT NULL OR transaction_type IN ('subscription'))`;
+    }
 
     // Execute both queries
     const [tqResult, txResult] = await Promise.all([

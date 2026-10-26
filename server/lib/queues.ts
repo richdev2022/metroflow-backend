@@ -36,7 +36,8 @@ export const scheduledQueue = connectionInstance
   : null;
 
 export interface TransferJobData {
-  businessId: string;
+  // null => personal-account scope (transfers queued with business_id IS NULL)
+  businessId: string | null;
   transferId?: string;
 }
 

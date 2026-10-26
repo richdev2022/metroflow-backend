@@ -126,7 +126,7 @@ import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByC
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, deleteConversation, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact, addChatParticipants, getChatInvite, rotateChatInvite, joinChatByInvite } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
-import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest } from "./routes/calls";
+import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest, reapStaleCalls } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording, getRecordingById } from "./routes/recordings";
 import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
@@ -349,6 +349,21 @@ export async function createServer() {
   if (!isServerlessEnv) {
     void dbReadyPromise.then(() => {
       startRequestLogRetention();
+    });
+  }
+
+  // Stale-call reaper (VPS/PM2 only): finalize calls left 'ongoing' forever by
+  // a dead socket / missed REST leave. Runs every 10 minutes; the query itself
+  // is idempotent and guarded, so overlap with the lazy per-read reap is safe.
+  if (!isServerlessEnv) {
+    cron.schedule("*/10 * * * *", async () => {
+      if (!isDbReady) return;
+      try {
+        const reaped = await reapStaleCalls();
+        if (reaped > 0) logger.info(`[calls] reaper finalized ${reaped} stale call(s)`);
+      } catch (error) {
+        logger.error("Stale-call reaper error:", error);
+      }
     });
   }
 

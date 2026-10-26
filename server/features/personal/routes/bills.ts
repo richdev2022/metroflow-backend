@@ -353,13 +353,21 @@ router.post("/verify-betting", authenticateToken, checkSubscriptionStatus, async
 // UNIFIED PURCHASE — all 7 categories through one endpoint
 // ---------------------------------------------------------------------------
 router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  // Hoisted so the handler-level catch can run money-safety recovery on a
+  // stranded debit (see catch below).
+  let billId: string | null = null;
+  let wallet: any = null;
+  let total = 0;
+  let reference = "";
+  let category: BillCategory = "" as BillCategory;
+  let userId = "";
   try {
     if (!(await assertPersonalService(res, "bills"))) return;
     await ensureBillTransactionsSchema();
-    const userId = req.user!.userId;
+    userId = req.user!.userId;
     const businessId = req.user!.businessId ?? null;
 
-    const category = String(req.body?.category || "").toLowerCase() as BillCategory;
+    category = String(req.body?.category || "").toLowerCase() as BillCategory;
     if (!CATEGORIES.includes(category)) {
       return res.status(400).json({ success: false, error: `category must be one of: ${CATEGORIES.join(", ")}` });
     }
@@ -454,10 +462,15 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     }
 
     const fee = await billFee();
-    const total = Math.round((amount + fee) * 100) / 100;
+    total = Math.round((amount + fee) * 100) / 100;
 
     // ---- Wallet (NGN) + guarded debit ------------------------------------
-    let wallet = await getOwnedWallet(String(b.wallet_id || ""), userId, businessId);
+    // Empty-string wallet_id used to reach getOwnedWallet as "" → Postgres
+    // uuid cast error → 500 before any fallback could run. Normalize here.
+    const requestedWalletId = String(b.wallet_id || "").trim();
+    let wallet = requestedWalletId
+      ? await getOwnedWallet(requestedWalletId, userId, businessId)
+      : null;
     if (!wallet) {
       const fallback = await query(
         `SELECT id, business_id, balance, currency FROM wallets
@@ -471,7 +484,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     if (String(wallet.currency || "NGN").toUpperCase() !== "NGN") {
       return res.status(400).json({ success: false, error: "Bill payments are charged in NGN — use your Naira wallet." });
     }
-    const reference = genRef("MF-BILL");
+    reference = genRef("MF-BILL");
 
     const insert = await query(
       `INSERT INTO bill_transactions
@@ -483,7 +496,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       [(wallet as any).business_id || businessId || null, userId, (wallet as any).id, reference,
        category, providerSlug, customerRef, amount, fee, total, JSON.stringify(details)],
     );
-    const billId = insert.rows[0].id;
+    billId = insert.rows[0].id;
 
     const fail = async (status: string, message: string, refund = false) => {
       if (refund) {
@@ -513,12 +526,22 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         error: `You need ₦${total.toLocaleString()} for this bill (₦${amount.toLocaleString()} + ₦${fee.toLocaleString()} fee).`,
       });
     }
-    await insertTransaction({
-      userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
-      reference, type: "debit", transactionType: "bill",
-      amount: total, currency: "NGN", fee,
-      description: `Bill payment — ${category}${providerSlug ? ` (${providerSlug.toUpperCase()})` : ""}${customerRef ? ` — ${customerRef}` : ""}`,
-    });
+    // MONEY SAFETY: the wallet is now debited. The ledger insert MUST never be
+    // the reason money vanishes — if it fails, refund immediately instead of
+    // bubbling a 500 with the debit stranded (the "debited but no history"
+    // production bug).
+    try {
+      await insertTransaction({
+        userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
+        reference, type: "debit", transactionType: "bill",
+        amount: total, currency: "NGN", fee,
+        description: `Bill payment — ${category}${providerSlug ? ` (${providerSlug.toUpperCase()})` : ""}${customerRef ? ` — ${customerRef}` : ""}`,
+      });
+    } catch (ledgerErr: any) {
+      console.error("[bills] debit ledger insert failed — refunding:", ledgerErr?.message);
+      await fail("failed", "Could not record the bill payment — refunded", true);
+      return res.status(500).json({ success: false, error: "Could not complete the bill payment — your wallet has been refunded." });
+    }
 
     let status = "completed";
     let providerRef: string | null = null;
@@ -617,6 +640,29 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     });
   } catch (e: any) {
     console.error("[bills] pay error:", e?.message);
+    // MONEY SAFETY: if we got far enough to debit the wallet, make sure a
+    // handler-level crash (unexpected DB error, provider outage) can never
+    // strand the debit silently. Recover best-effort outside the happy path.
+    try {
+      if (billId && wallet?.id) {
+        const existing = await query(`SELECT status FROM bill_transactions WHERE id = $1`, [billId]);
+        const st = existing.rows[0]?.status;
+        if (st === 'processing') {
+          await creditWallet(wallet.id, total);
+          await insertTransaction({
+            userId, businessId: wallet.business_id, walletId: wallet.id,
+            reference: `${reference}-REFUND`, type: "credit", transactionType: "bill_refund",
+            amount: total, currency: "NGN", description: `Refund — bill payment failed (${category})`,
+          }).catch(() => {});
+          await query(
+            `UPDATE bill_transactions SET status = 'refunded', failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
+            [billId, String(e?.message || 'handler error').slice(0, 500)],
+          );
+        }
+      }
+    } catch (sweepErr: any) {
+      console.error("[bills] pay error recovery failed:", sweepErr?.message);
+    }
     return res.status(500).json({ success: false, error: "Could not complete the bill payment" });
   }
 });
@@ -624,9 +670,71 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
 // ---------------------------------------------------------------------------
 // History + detail + sync
 // ---------------------------------------------------------------------------
+// MONEY SAFETY: lazily settle abandoned "processing" bills. A bill left in
+// processing with no provider webhook for over an hour is dead — refund the
+// customer (idempotent: only rows still 'processing' are swept, and the
+// refund reference is derived from the bill reference).
+async function sweepStaleProcessingBills(userId: string) {
+  try {
+    const stale = await query(
+      `SELECT id, reference, wallet_id, total FROM bill_transactions
+        WHERE user_id = $1 AND status = 'processing'
+          AND created_at < NOW() - INTERVAL '60 minutes'
+        ORDER BY created_at ASC LIMIT 25`,
+      [userId],
+    );
+    for (const bill of stale.rows) {
+      if (!bill.wallet_id) continue;
+      const alreadyRefunded = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1`,
+        [`${bill.reference}-REFUND`],
+      );
+      if (alreadyRefunded.rows.length) {
+        await query(
+          `UPDATE bill_transactions SET status = 'refunded', failure_reason = 'Settlement timed out — refunded', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
+          [bill.id],
+        );
+        continue;
+      }
+      await creditWallet(bill.wallet_id, Number(bill.total));
+      await insertTransaction({
+        userId, walletId: bill.wallet_id,
+        reference: `${bill.reference}-REFUND`, type: "credit", transactionType: "bill_refund",
+        amount: Number(bill.total), currency: "NGN",
+        description: "Refund — bill payment timed out before confirmation",
+      }).catch(() => {});
+      await query(
+        `UPDATE bill_transactions SET status = 'refunded', failure_reason = 'Settlement timed out — refunded', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
+        [bill.id],
+      );
+      console.log(`[bills] swept stale processing bill ${bill.reference} → refunded`);
+    }
+  } catch (e: any) {
+    console.error("[bills] stale-processing sweep failed:", e?.message);
+  }
+}
+
 router.get("/history", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     await ensureBillTransactionsSchema();
+    await sweepStaleProcessingBills(req.user!.userId);
+    const rows = await query(
+      `SELECT * FROM bill_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [req.user!.userId],
+    );
+    return res.json({ success: true, transactions: rows.rows.map(publicRow) });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: "Could not load bill history" });
+  }
+});
+
+// LEGACY ALIAS: the Personal mobile app has always polled GET /bills for its
+// history screen — that path no longer exists on the unified router (only
+// /bills/history), so the app's bill history silently failed. Serve it.
+router.get("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    await ensureBillTransactionsSchema();
+    await sweepStaleProcessingBills(req.user!.userId);
     const rows = await query(
       `SELECT * FROM bill_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`,
       [req.user!.userId],

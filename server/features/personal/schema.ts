@@ -257,6 +257,11 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_user ON social_posts(user_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_recent ON social_posts(created_at DESC)`);
+  // TikTok-style rich text styling for TEXT-ONLY posts (mobile composer):
+  // caption color, font key and alignment. Gradients/styling stay story-side.
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS text_color VARCHAR(20)`);
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS font VARCHAR(24) DEFAULT 'default'`);
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS text_align VARCHAR(10) DEFAULT 'center'`);
 
   // Community reports — users flag posts; admins review + decide end-to-end.
   await query(`
@@ -525,6 +530,9 @@ export async function ensurePersonalSchema(): Promise<void> {
     )
   `);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS moderator_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  // TikTok-style share thumbnail: the host's stream frame (or avatar) with the
+  // LIVE pill composited on — used as og:image when a share link unfurls.
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS thumbnail_url TEXT`);
   // TikTok-style tap-to-like counter — incremented in small batches by the
   // room UI as viewers tap the stream (see POST /live/:id/likes).
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS like_count INTEGER NOT NULL DEFAULT 0`);
@@ -894,11 +902,18 @@ export async function ensurePersonalSchema(): Promise<void> {
     CREATE TABLE IF NOT EXISTS social_follows (
       follower_id UUID NOT NULL,
       following_id UUID NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (follower_id, following_id),
       CONSTRAINT social_follows_not_self CHECK (follower_id <> following_id)
     )
   `);
+  // PROD FIX: older installs created this table WITHOUT the status column,
+  // while follow-gated queries reference `status`/`f.status` — on those
+  // installs every such query died ("column status does not exist" /
+  // "column reference status is ambiguous"), which took down the whole
+  // stories rail (posts silently "never published") and follow-gated feeds.
+  await query(`ALTER TABLE social_follows ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_following ON social_follows(following_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_follows_follower ON social_follows(follower_id)`);
 
@@ -940,6 +955,9 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_session_b ON live_battles(session_b_id, status)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_host_a ON live_battles(host_a_id, status)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_live_battles_host_b ON live_battles(host_b_id, status)`);
+  // TikTok-style PK: the host picks the gifting multiplier (x1–x5) when the
+  // battle starts; the HUD shows it and gift scoring multiplies by it.
+  await query(`ALTER TABLE live_battles ADD COLUMN IF NOT EXISTS multiplier NUMERIC(4,1) NOT NULL DEFAULT 2`);
 
   // Per-streamer earnings pocket. available = total_earned − total_withdrawn.
   await query(`
@@ -1202,6 +1220,12 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_stories_user ON social_stories(user_id, expires_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_stories_expiry ON social_stories(expires_at)`);
+  // Rich text styling for TEXT stories: caption color, font key, alignment.
+  // background_color stays VARCHAR(20) — gradients store two hex stops joined
+  // by ',' (e.g. "7C3AED,EC4899", 13 chars).
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS text_color VARCHAR(20)`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS font VARCHAR(24) DEFAULT 'default'`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS text_align VARCHAR(10) DEFAULT 'center'`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_story_views (

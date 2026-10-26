@@ -2052,7 +2052,9 @@ router.get("/beneficiaries", authenticateToken, async (req: AuthenticatedRequest
         accountNumber: r.account_number,
         accountName: r.account_name || '',
         currency: (r.currency || 'NGN').toUpperCase(),
-        recipientCountry: r.recipient_country || null,
+        // Local (NGN) rows always report NG — some legacy rows were saved
+        // with the web form's US default and displayed a US region badge.
+        recipientCountry: ((r.currency || 'NGN').toUpperCase() === 'NGN') ? 'NG' : (r.recipient_country || null),
         routingNumber: r.routing_number || null,
         swiftCode: r.swift_code || null,
         accountType: r.account_type || null,
@@ -2155,7 +2157,19 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
       }
     }
 
-    const finalName = accountName || resolvedName || null;
+    // NAME IS A LOOKUP: the provider-resolved account name is authoritative.
+    // A client-typed name may only fill in when no lookup succeeded (intl
+    // corridors) — never override a verified NGN account name (edit UI keeps
+    // the field read-only; this is the server-side enforcement).
+    const finalName = verification === 'resolved' && resolvedName
+      ? resolvedName
+      : (accountName || resolvedName || null);
+    // Region is derived from the corridor, not the client: NGN beneficiaries
+    // are always NG (the web form's US default used to leak in here and
+    // display a US flag on local Nigerian accounts).
+    const finalCountry = isIntl
+      ? ((b.country || b.recipient_country || (currency === 'GBP' ? 'GB' : currency === 'EUR' ? 'DE' : 'US')) || null)
+      : 'NG';
     const insert = await query(
       `INSERT INTO transfer_beneficiaries
          (user_id, business_id, bank_code, account_number, account_name, currency,
@@ -2185,7 +2199,7 @@ router.post("/beneficiaries", authenticateToken, async (req: AuthenticatedReques
       [
         userId, businessId, bankCode, accountNumber, finalName, currency,
         b.bankName || b.bank_name || null,
-        (b.country || b.recipient_country || (isIntl ? (currency === 'GBP' ? 'GB' : currency === 'EUR' ? 'DE' : 'US') : 'NG')) || null,
+        finalCountry,
         b.routingNumber || b.routing_number || null,
         b.swiftCode || b.swift_code || null,
         b.accountType || b.account_type || null,
@@ -2376,9 +2390,15 @@ router.put("/beneficiaries/:id", authenticateToken, async (req: AuthenticatedReq
        RETURNING *`,
       [
         id, userId, bankCode, accountNumber,
-        accountName || resolvedName || '',
+        // NAME IS A LOOKUP (NGN): a saved NGN beneficiary's account name can
+        // only come from the provider — the edit UI sends it read-only, and
+        // the server ignores any client-typed name. Identity change → fresh
+        // resolvedName; identity unchanged → keep the stored name.
+        isIntl ? (accountName || resolvedName || '') : (identityChanged ? (resolvedName || '') : ''),
         b.bankName ?? b.bank_name ?? null,
-        b.country ?? b.recipient_country ?? null,
+        // Region derived from the corridor — NGN is always NG (the web form's
+        // US default must never leak onto local Nigerian accounts).
+        isIntl ? (b.country ?? b.recipient_country ?? null) : 'NG',
         b.routingNumber ?? b.routing_number ?? null,
         b.swiftCode ? String(b.swiftCode).toUpperCase() : (b.swift_code ? String(b.swift_code).toUpperCase() : null),
         b.accountType ?? b.account_type ?? null,
@@ -2494,7 +2514,13 @@ router.post("/beneficiaries/:id/verify", authenticateToken, async (req: Authenti
       `UPDATE transfer_beneficiaries
        SET verification_status = $3,
            verified_at = CURRENT_TIMESTAMP,
-           account_name = CASE WHEN $4 IS NOT NULL AND COALESCE(account_name, '') = '' THEN $4 ELSE account_name END
+           recipient_country = CASE WHEN UPPER(COALESCE(currency,'NGN')) = 'NGN' THEN 'NG' ELSE recipient_country END,
+           account_name = CASE
+             -- NGN: the resolved name is authoritative — always re-sync
+             -- (heals rows saved with a stale or mistyped name).
+             WHEN $4::text IS NOT NULL AND UPPER(COALESCE(currency,'NGN')) = 'NGN' THEN $4::text
+             WHEN $4::text IS NOT NULL AND COALESCE(account_name, '') = '' THEN $4::text
+             ELSE account_name END
        WHERE id = $1 AND user_id = $2
        RETURNING verification_status, verified_at, account_name`,
       [id, userId, verification, resolvedName],

@@ -676,14 +676,18 @@ async function handleSogoBillPayment(tx: any) {
   const status = sogoStatus(tx);
   const mapped = ["completed", "failed", "refunded", "cancelled"].includes(status) ? status : "processing";
   if (mapped === bill.status) return;
+  // IDEMPOTENCY: claim the status transition FIRST (guarded update), then
+  // refund. The old credit-first order meant a failed refund insert kept the
+  // bill 'processing' and every Sogo retry re-credited the wallet forever.
+  const claim = await query(
+    `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> $2`,
+    [bill.id, mapped, JSON.stringify(tx)],
+  );
+  if (claim.rowCount === 0) return; // someone else already settled this bill
   if (mapped === "refunded" || mapped === "failed" || mapped === "cancelled") {
     // Provider-side refund → return the customer's money.
     await creditUserWallet(bill.user_id, bill.wallet_id, Number(bill.total), `${bill.reference}-REFUND`, "Refund — bill payment reversed", bill.business_id);
   }
-  await query(
-    `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-    [bill.id, mapped, JSON.stringify(tx)],
-  );
 }
 
 async function handleSogoGiftcardBuy(tx: any) {

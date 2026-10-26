@@ -1,4 +1,5 @@
 import express from "express";
+import path from "path";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import { assertPersonalService, genRef, debitWallet, creditWallet, insertTransaction, verifyTransactionPin, requirePersonalKyc } from "../personal-utils";
@@ -234,6 +235,186 @@ router.get("/mine", authenticateToken, async (req: AuthenticatedRequest, res) =>
 });
 
 // ---------------------------------------------------------------------------
+// PUBLIC SHARE LINK (TikTok-style unfurl) — GET /live/share/:idOrCode
+// ---------------------------------------------------------------------------
+// Link previewers (WhatsApp / X / Telegram / iMessage) are anonymous and never
+// execute JS, so the share URL must be a server-rendered page whose og:image
+// is the STREAMER'S thumbnail with a LIVE pill on it — never the generic site
+// image. Precedence:
+//   1. session.thumbnail_url  (host's captured frame / uploaded composite)
+//   2. ffmpeg composite: host avatar centered on a branded canvas + LIVE pill
+//      overlay (server/assets/live-share-overlay.png) — generated once per
+//      session and cached under /uploads/live-share/
+//   3. plain host avatar
+//   4. the default branded og image
+// Browsers/scrapers are then bounced to the watch room.
+const liveShareCacheDir = () => path.join(process.cwd(), "uploads", "live-share");
+
+async function composeLiveShareImage(sessionId: string, avatarSrc: string | null): Promise<string | null> {
+  // Returns an absolute og:image URL for the composited thumbnail, or null
+  // when ffmpeg/the avatar is unavailable (caller falls back).
+  try {
+    const cacheDir = liveShareCacheDir();
+    const fs = await import("fs");
+    if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+    const outFile = path.join(cacheDir, `${sessionId}.jpg`);
+    const overlayPath = path.join(process.cwd(), "assets", "live-share-overlay.png");
+    if (!fs.existsSync(overlayPath)) return null;
+
+    // Resolve the avatar to a local file (or download remote URLs).
+    let avatarFile: string | null = null;
+    if (avatarSrc) {
+      const src = String(avatarSrc);
+      const uploadsMatch = src.match(/\/uploads\/([^/?#]+)/);
+      if (uploadsMatch) {
+        const local = path.join(process.cwd(), "uploads", path.basename(uploadsMatch[1]));
+        if (fs.existsSync(local)) avatarFile = local;
+      }
+      if (!avatarFile && /^https?:\/\//i.test(src)) {
+        try {
+          const resp = await fetch(src, { signal: AbortSignal.timeout(8000) });
+          if (resp.ok) {
+            const buf = Buffer.from(await resp.arrayBuffer());
+            avatarFile = path.join(cacheDir, `${sessionId}-src.img`);
+            fs.writeFileSync(avatarFile, buf);
+          }
+        } catch { /* fall through */ }
+      }
+    }
+
+    const { execFile } = await import("child_process");
+    const run = (args: string[]) => new Promise<boolean>((resolve) => {
+      execFile("ffmpeg", args, { timeout: 15000 }, (err) => resolve(!err));
+    });
+
+    if (avatarFile) {
+      // Avatar (square-cropped, 630px) centered on a branded dark canvas,
+      // LIVE pill + wordmark overlaid.
+      const ok = await run([
+        "-y",
+        "-f", "lavfi", "-i", "color=c=0x140A14:s=1200x630",
+        "-i", avatarFile,
+        "-i", overlayPath,
+        "-filter_complex",
+        "[1:v]scale=630:630:force_original_aspect_ratio=increase,crop=630:630[av];" +
+        "[0:v][av]overlay=(W-w)/2:0[bg];[bg][2:v]overlay=0:0",
+        "-frames:v", "1", "-q:v", "4", outFile,
+      ]);
+      if (ok && fs.existsSync(outFile)) return `/uploads/live-share/${sessionId}.jpg`;
+    }
+    // No avatar: badge over the plain branded canvas (still far better than
+    // the generic site image).
+    const ok2 = await run([
+      "-y", "-i", overlayPath,
+      "-vf", "format=rgba,colorchannelmixer=aa=1.0,pad=1200:630:0:0:color=0x140A14",
+      "-frames:v", "1", "-q:v", "4", outFile,
+    ]);
+    if (ok2 && fs.existsSync(outFile)) return `/uploads/live-share/${sessionId}.jpg`;
+    return null;
+  } catch (e: any) {
+    console.error("[live:share] composite failed:", e?.message);
+    return null;
+  }
+}
+
+router.get("/share/:idOrCode", async (req, res) => {
+  try {
+    const idOrCode = String(req.params.idOrCode || "");
+    const r = await query(
+      `SELECT l.id, l.title, l.description, l.category, l.call_code, l.status, l.started_at, l.thumbnail_url,
+              u.name AS host_name, u.avatar_url AS host_photo
+       FROM live_sessions l JOIN users u ON u.id = l.host_id
+       WHERE (l.id::text = $1 OR l.call_code = $1) LIMIT 1`,
+      [idOrCode],
+    );
+    if (!r.rows.length) return res.status(404).send("<html><body><p>Stream not found</p></body></html>");
+    const s = r.rows[0];
+
+    const apiOrigin = String(
+      process.env.API_PUBLIC_BASE_URL || process.env.APP_BASE_URL || `https://${req.headers.host || "api.metricorex.com"}`,
+    ).replace(/\/$/, "");
+    const appUrl = process.env.PERSONAL_SITE_URL || "https://personal.metricorex.com";
+
+    const abs = (u?: string | null) => {
+      const v = String(u || "").trim();
+      if (!v) return "";
+      if (/^https?:\/\//i.test(v)) return v;
+      if (v.startsWith("/")) return `${apiOrigin}${v}`;
+      return `${apiOrigin}/files/${v}`;
+    };
+
+    let ogImage = abs(s.thumbnail_url);
+    if (!ogImage && s.status === "live") {
+      const composed = await composeLiveShareImage(String(s.id), s.host_photo ? abs(s.host_photo) : null);
+      if (composed) {
+        ogImage = composed;
+        await query(`UPDATE live_sessions SET thumbnail_url = $2 WHERE id = $1 AND thumbnail_url IS NULL`, [s.id, composed]).catch(() => {});
+      }
+    }
+    if (!ogImage) ogImage = abs(s.host_photo);
+    if (!ogImage) ogImage = `${apiOrigin}/og-image.png`;
+
+    const live = String(s.status).toLowerCase() === "live";
+    const title = live
+      ? `🔴 ${s.host_name || "Someone"} is LIVE on MetriCorex: ${s.title}`
+      : `${s.host_name || "Someone"} on MetriCorex: ${s.title}`;
+    const desc = live
+      ? `${s.host_name || "Someone"} is streaming right now — tap to join the room.`
+      : (s.description || "Watch this stream on MetriCorex").slice(0, 160);
+    // Watch room deep link: session id (stable) or call code — both resolve.
+    const target = `${appUrl}/live/watch?code=${encodeURIComponent(s.call_code || s.id)}`;
+    const esc = (x: string) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=120");
+    res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<title>${esc(title)}</title>
+<meta property="og:type" content="video.other" />
+<meta property="og:site_name" content="MetriCorex" />
+<meta property="og:title" content="${esc(title)}" />
+<meta property="og:description" content="${esc(desc)}" />
+<meta property="og:image" content="${esc(ogImage)}" />
+<meta property="og:image:secure_url" content="${esc(ogImage)}" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="${esc(title)}" />
+<meta name="twitter:description" content="${esc(desc)}" />
+<meta name="twitter:image" content="${esc(ogImage)}" />
+<meta http-equiv="refresh" content="0;url=${esc(target)}" />
+</head><body>
+<script>window.location.replace(${JSON.stringify(target)});</script>
+<noscript><p>Opening MetriCorex… <a href="${esc(target)}">Continue</a></p></noscript>
+</body></html>`);
+  } catch {
+    res.status(500).send("<html><body><p>Preview unavailable</p></body></html>");
+  }
+});
+
+// HOST THUMBNAIL UPLOAD — the web studio captures its own stream frame with
+// the LIVE pill drawn on canvas and uploads it (multipart `thumbnail`), giving
+// exactly the TikTok share-card look even without ffmpeg on the API host.
+router.post("/:id/thumbnail", authenticateToken, upload.single("thumbnail"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const s = await sessionById(String(req.params.id));
+    if (!s) return res.status(404).json({ success: false, error: "Stream not found" });
+    if (s.host_id !== req.user!.userId) return res.status(403).json({ success: false, error: "Only the host can set the thumbnail" });
+    const file = (req as any).file;
+    if (!file) return res.status(400).json({ success: false, error: "Attach a thumbnail image (field: thumbnail)" });
+    const up = await uploadMediaBuffer({ buffer: file.buffer, originalname: file.originalname, mimeType: file.mimetype, folder: "live-thumbnails", userId: req.user!.userId });
+    if (!up?.url) return res.status(500).json({ success: false, error: "Could not store the thumbnail" });
+    await query(`UPDATE live_sessions SET thumbnail_url = $2 WHERE id = $1`, [s.id, up.url]);
+    res.json({ success: true, data: { thumbnail_url: up.url } });
+  } catch (e: any) {
+    console.error("live thumbnail error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not save the thumbnail" });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
 // VOD replays — wall + view counting. Registered BEFORE GET /:id so Express
 // does not swallow "/replays" as a session id.
 // ---------------------------------------------------------------------------
@@ -302,6 +483,8 @@ const LIVE_GIFTS = [
   { id: "star", name: "Star", icon: "⭐", price: 100, tier: "starter" },
   { id: "clap", name: "Applause", icon: "👏", price: 150, tier: "starter" },
   { id: "coffee", name: "Coffee", icon: "☕", price: 200, tier: "starter" },
+  { id: "icecream", name: "Ice Cream", icon: "🍦", price: 220, tier: "starter" },
+  { id: "thumbsup", name: "Thumbs Up", icon: "👍", price: 250, tier: "starter" },
   // ---- Classic ----
   { id: "crown", name: "Crown", icon: "👑", price: 250, tier: "classic" },
   { id: "balloon", name: "Balloon", icon: "🎈", price: 300, tier: "classic" },
@@ -309,20 +492,28 @@ const LIVE_GIFTS = [
   { id: "ring", name: "Ring", icon: "💍", price: 500, tier: "classic" },
   { id: "bouquet", name: "Bouquet", icon: "💐", price: 600, tier: "classic" },
   { id: "chocolate", name: "Chocolate", icon: "🍫", price: 700, tier: "classic" },
+  { id: "perfume", name: "Perfume", icon: "🧴", price: 800, tier: "classic" },
+  { id: "cake", name: "Cake", icon: "🎂", price: 900, tier: "classic" },
   // ---- Premium ----
   { id: "teddy", name: "Teddy", icon: "🧸", price: 1000, tier: "premium" },
   { id: "guitar", name: "Guitar", icon: "🎸", price: 1200, tier: "premium" },
+  { id: "handbags", name: "Handbag", icon: "👜", price: 1500, tier: "premium" },
   { id: "rocket", name: "Rocket", icon: "🚀", price: 2000, tier: "premium" },
   { id: "airplane", name: "Airplane", icon: "✈️", price: 2500, tier: "premium" },
   { id: "trophy", name: "Trophy", icon: "🏆", price: 3000, tier: "premium" },
+  { id: "sports_car", name: "Sports Car", icon: "🚗", price: 4000, tier: "premium" },
   // ---- Luxury ----
   { id: "diamond", name: "Diamond", icon: "💎", price: 5000, tier: "luxury" },
   { id: "castle", name: "Castle", icon: "🏰", price: 6000, tier: "luxury" },
   { id: "racecar", name: "Race Car", icon: "🏎️", price: 7500, tier: "luxury" },
   { id: "yacht", name: "Yacht", icon: "🛥️", price: 10000, tier: "luxury" },
+  { id: "jet", name: "Private Jet", icon: "🛩️", price: 12000, tier: "luxury" },
   { id: "island", name: "Private Island", icon: "🏝️", price: 15000, tier: "luxury" },
+  { id: "mansion", name: "Mansion", icon: "🏛️", price: 20000, tier: "luxury" },
   // ---- Legendary ----
   { id: "universe", name: "Universe", icon: "🌌", price: 25000, tier: "legendary" },
+  { id: "phoenix", name: "Phoenix", icon: "🦅", price: 35000, tier: "legendary" },
+  { id: "dragon", name: "Dragon", icon: "🐉", price: 45000, tier: "legendary" },
   { id: "galaxy", name: "Galaxy", icon: "🌠", price: 50000, tier: "legendary" },
 ] as const;
 
@@ -617,7 +808,7 @@ router.post("/:id/gifts", authenticateToken, requirePersonalKyc(), async (req: A
     let battleScored: { battle_id: string; side: "a" | "b"; points: number } | null = null;
     try {
       const battleRes = await query(
-        `SELECT id, session_a_id, session_b_id FROM live_battles
+        `SELECT id, session_a_id, session_b_id, multiplier FROM live_battles
           WHERE status = 'active' AND ends_at > NOW()
             AND (session_a_id = $1 OR session_b_id = $1)
           LIMIT 1`,
@@ -625,7 +816,10 @@ router.post("/:id/gifts", authenticateToken, requirePersonalKyc(), async (req: A
       ).catch(() => ({ rows: [] as any[] }));
       const battle = battleRes.rows[0];
       if (battle) {
-        const points = Math.round(total * (Number(settings.battle_multiplier) || 1) * 100) / 100;
+        // Prefer the battle's own multiplier (host-chosen x1–x5), falling back
+        // to the global live setting for legacy rows.
+        const ownMultiplier = (battle as any).multiplier != null ? Number((battle as any).multiplier) : null;
+        const points = Math.round(total * (ownMultiplier || Number(settings.battle_multiplier) || 1) * 100) / 100;
         const side: "a" | "b" = battle.session_a_id === session.id ? "a" : "b";
         await query(
           `UPDATE live_battles SET score_${side} = score_${side} + $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
@@ -1550,6 +1744,7 @@ function decorateBattle(b: any, viewerId: string) {
     id: b.id,
     status: b.status,
     duration_seconds: b.duration_seconds,
+    multiplier: Number(b.multiplier) || 2,
     started_at: b.started_at,
     ends_at: b.ends_at,
     seconds_left: secondsLeft,
@@ -1594,13 +1789,16 @@ router.post("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, 
     if (clash.rows[0]) return res.status(400).json({ success: false, error: "One of the streams is already in a battle", code: "ALREADY_IN_BATTLE" });
 
     const duration = Math.min(3600, Math.max(60, Number(req.body?.duration_seconds) || settings.battle_duration_seconds));
+    // TikTok-style multiplier (x1–x5): multiplies every gift's points for BOTH
+    // sides while the battle runs — the HUD shows it as the "x2/x3" chip.
+    const multiplier = Math.min(5, Math.max(1, Number(req.body?.multiplier) || settings.battle_multiplier || 2));
     // ONE canonical row binds BOTH sessions from the start: side A = initiator,
     // side B = opponent. Accept flips it active; gift scoring updates score_a
     // or score_b based on which session the gift landed on.
     const ins = await query(
-      `INSERT INTO live_battles (session_a_id, session_b_id, host_a_id, host_b_id, duration_seconds)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [mine.id, opponent.id, userId, opponent.host_id, duration],
+      `INSERT INTO live_battles (session_a_id, session_b_id, host_a_id, host_b_id, duration_seconds, multiplier)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [mine.id, opponent.id, userId, opponent.host_id, duration, multiplier],
     );
 
     createNotification({

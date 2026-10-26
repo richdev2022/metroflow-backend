@@ -981,12 +981,16 @@ export async function reverseFailedTransfer(
   return true;
 }
 
-export async function processAllPending(businessId: string) {
+export async function processAllPending(businessId: string | null) {
   // 1. Fetch pending transfers
+  // PERSONAL ACCOUNTS: personal users queue transfers with business_id IS NULL
+  // (`= $1` never matches NULL in SQL), so their transfers used to sit pending
+  // forever — never debited, never sent, invisible in history. Handle the NULL
+  // scope explicitly.
   const pendingTransfers = await query(
-    `SELECT * FROM transfer_queue 
-     WHERE business_id = $1 AND status = 'pending' 
-     ORDER BY created_at ASC 
+    `SELECT * FROM transfer_queue
+     WHERE business_id IS NOT DISTINCT FROM $1::text AND status = 'pending'
+     ORDER BY created_at ASC
      LIMIT 50`, // Batch size
     [businessId]
   );

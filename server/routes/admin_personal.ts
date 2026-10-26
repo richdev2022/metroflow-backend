@@ -3,7 +3,9 @@ import { query } from "../db";
 import { AuthenticatedAdminRequest } from "../middleware/adminAuth";
 import { requirePermission } from "../middleware/adminAuth";
 import { getSetting, setSetting } from "../services/app-config";
-import { getBadgeCriteria, setBadgeCriteria } from "../services/verification-criteria";
+import { getBadgeCriteria, setBadgeCriteria, reapplyBadgeCriteria } from "../services/verification-criteria";
+import { getAllBillPricingRules, upsertBillPricingRule, BILL_CATEGORIES } from "../features/personal/bill-pricing";
+import { logAuditEvent } from "../services/audit";
 import { getBoostPricing } from "../features/personal/routes/social";
 
 /**
@@ -600,8 +602,9 @@ router.get("/verification-pricing", requirePermission("manage_settings"), async 
   }
 });
 
-// Criteria engine — the auto-grant rules (default: 10,000 followers). Fully
-// admin-manageable from the dashboard's Verifications page.
+// Criteria engine — the auto-grant rules (followers / posts / account age /
+// KYC / phone — at least one must be active). Fully admin-manageable from the
+// dashboard's Verified badge card.
 router.get("/verification-criteria", requirePermission("manage_settings"), async (_req, res) => {
   try {
     const criteria = await getBadgeCriteria();
@@ -613,12 +616,78 @@ router.get("/verification-criteria", requirePermission("manage_settings"), async
 
 router.put("/verification-criteria", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
   try {
-    const enabled = req.body?.enabled !== false;
-    const followers = Math.max(1, Math.round(Number(req.body?.followers) || 10000));
-    const saved = await setBadgeCriteria({ enabled, followers });
+    const saved = await setBadgeCriteria({
+      enabled: req.body?.enabled,
+      followers: req.body?.followers,
+      min_posts: req.body?.min_posts,
+      min_account_age_days: req.body?.min_account_age_days,
+      require_kyc: req.body?.require_kyc,
+      require_phone: req.body?.require_phone,
+    });
+    await logAuditEvent({
+      userId: (req as any).admin?.id || (req as any).adminId || null,
+      action: "verification_criteria_updated",
+      entityType: "system_setting",
+      entityId: "verification_badge_criteria",
+      newValues: saved,
+    }).catch(() => {});
     res.json({ success: true, data: saved });
+  } catch (e: any) {
+    res.status(400).json({ success: false, error: e?.message || "Could not save verification criteria" });
+  }
+});
+
+// FULL RESYNC — re-apply the saved criteria to every account right now
+// (grants + revocations). Paid and admin-granted badges are never touched.
+router.post("/verification-criteria/reapply", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const result = await reapplyBadgeCriteria();
+    await logAuditEvent({
+      userId: (req as any).admin?.id || (req as any).adminId || null,
+      action: "verification_criteria_reapplied",
+      entityType: "system_setting",
+      entityId: "verification_badge_criteria",
+      newValues: result,
+    }).catch(() => {});
+    res.json({ success: true, data: result, message: `Criteria reapplied — ${result.granted} granted, ${result.revoked} revoked of ${result.checked} accounts` });
   } catch {
-    res.status(500).json({ success: false, error: "Could not save verification criteria" });
+    res.status(500).json({ success: false, error: "Could not re-apply verification criteria" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// BILL PROMOTIONS — per-category discount & cashback rules
+// ---------------------------------------------------------------------------
+router.get("/bill-pricing", requirePermission("manage_settings"), async (_req, res) => {
+  try {
+    const rules = await getAllBillPricingRules();
+    res.json({ success: true, data: { rules, categories: BILL_CATEGORIES } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load bill pricing rules" });
+  }
+});
+
+router.put("/bill-pricing/:category", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const rule = await upsertBillPricingRule(
+      String(req.params.category || ""),
+      {
+        discount_percent: req.body?.discount_percent,
+        cashback_percent: req.body?.cashback_percent,
+        enabled: req.body?.enabled,
+      },
+      (req as any).admin?.email || (req as any).admin?.id || null,
+    );
+    await logAuditEvent({
+      userId: (req as any).admin?.id || (req as any).adminId || null,
+      action: "bill_pricing_updated",
+      entityType: "bill_pricing_rule",
+      entityId: rule.category,
+      newValues: rule,
+    }).catch(() => {});
+    res.json({ success: true, data: rule });
+  } catch (e: any) {
+    res.status(400).json({ success: false, error: e?.message || "Could not save the bill pricing rule" });
   }
 });
 

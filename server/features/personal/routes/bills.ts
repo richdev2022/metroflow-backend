@@ -11,6 +11,7 @@ import * as sogo from "../../../services/sogo";
 import { userSafeErr } from "../user-safe-errors";
 import * as flwBills from "../flutterwave-bills";
 import { getActiveProvider, providerLabel } from "../provider-routing";
+import { getBillPricingRule, applyBillPricing, round2, getBillPricingMap, BILL_CATEGORIES } from "../bill-pricing";
 
 /**
  * BILLS HUB — UNIFIED multi-provider bill payments (MetriCorex Personal).
@@ -243,16 +244,44 @@ router.get("/education-plans", authenticateToken, checkSubscriptionStatus, async
 router.get("/discount-rates", authenticateToken, checkSubscriptionStatus, async (_req, res) => {
   try {
     const provider = await getActiveProvider("bills");
+    // Admin-set promotions ride alongside the provider's wholesale rates so
+    // clients can badge categories with "X% off" / "Y% cashback".
+    const adminRules = await getBillPricingMap();
     if (provider === "sogo") {
       const rates = await sogo.billsDiscountRates();
-      return res.json({ success: true, provider, rates });
+      return res.json({ success: true, provider, rates, admin_rules: adminRules });
     }
-    return res.json({ success: true, provider, rates: {} });
+    return res.json({ success: true, provider, rates: {}, admin_rules: adminRules });
   } catch (e: any) {
     // Informational read — degrade gracefully instead of failing the hub
     // (the provider may not expose discounts on every environment).
     console.warn("[bills] discount-rates unavailable:", e?.message);
-    return res.json({ success: true, provider: await getActiveProvider("bills"), rates: {}, warning: "Discount rates are not available right now" });
+    let adminRules: Record<string, unknown> = {};
+    try { adminRules = await getBillPricingMap(); } catch { /* degrade */ }
+    return res.json({ success: true, provider: await getActiveProvider("bills"), rates: {}, admin_rules: adminRules, warning: "Discount rates are not available right now" });
+  }
+});
+
+// PROMOTIONS + FEE preview — what the customer will ACTUALLY be charged.
+// The web Bills page used to hardcode a ₦50 estimated fee in its summary
+// while the API charged whatever fee_configurations held (admin-set 0) —
+// this endpoint is the single source of truth for pre-payment display.
+router.get("/pricing", authenticateToken, checkSubscriptionStatus, async (_req, res) => {
+  try {
+    const fee = await billFee();
+    const rules = await getBillPricingMap();
+    return res.json({
+      success: true,
+      data: {
+        fee,
+        currency: "NGN",
+        categories: BILL_CATEGORIES,
+        rules,
+      },
+    });
+  } catch (e: any) {
+    console.error("[bills] pricing error:", e?.message);
+    return res.json({ success: true, data: { fee: 0, currency: "NGN", categories: BILL_CATEGORIES, rules: {} } });
   }
 });
 
@@ -461,8 +490,21 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       }
     }
 
+    // PROMOTIONS: admin-set per-category discount/cashback (bill_pricing_rules).
+    // The customer pays `face value - discount + fee`; the provider is still
+    // paid the full face value — the platform absorbs the promo as growth cost.
+    // Cashback is credited back to the wallet after a successful payment.
+    const pricingRule = await getBillPricingRule(category);
     const fee = await billFee();
-    total = Math.round((amount + fee) * 100) / 100;
+    const pricing = applyBillPricing(amount, fee, pricingRule);
+    total = pricing.total;
+    if (pricing.discount > 0) {
+      details.discount_amount = pricing.discount;
+      details.discount_percent = pricingRule!.discount_percent;
+    }
+    if (pricing.cashback > 0) {
+      details.cashback_percent = pricingRule!.cashback_percent;
+    }
 
     // ---- Wallet (NGN) + guarded debit ------------------------------------
     // Empty-string wallet_id used to reach getOwnedWallet as "" → Postgres
@@ -523,7 +565,7 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       await fail("failed", "Insufficient wallet balance");
       return res.status(400).json({
         success: false, code: "INSUFFICIENT_BALANCE",
-        error: `You need ₦${total.toLocaleString()} for this bill (₦${amount.toLocaleString()} + ₦${fee.toLocaleString()} fee).`,
+        error: `You need ₦${total.toLocaleString()} for this bill (₦${amount.toLocaleString()}${pricing.discount > 0 ? ` - ₦${pricing.discount.toLocaleString()} discount` : ""} + ₦${fee.toLocaleString()} fee).`,
       });
     }
     // MONEY SAFETY: the wallet is now debited. The ledger insert MUST never be
@@ -606,6 +648,25 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       await creditRevenueWallet(fee, "NGN", reference, "Bill payment convenience fee", "bills").catch(() => {});
     }
 
+    // CASHBACK (admin-set promotions): credit X% of the face value back to
+    // the paying wallet with its own ledger entry. Best-effort — a failed
+    // cashback must never fail an already-completed bill payment; the row's
+    // details keep the rule so support can replay it manually.
+    if (status === "completed" && pricing.cashback > 0) {
+      try {
+        await creditWallet((wallet as any).id, pricing.cashback);
+        await insertTransaction({
+          userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
+          reference: `${reference}-CB`, type: "credit", transactionType: "bill_cashback",
+          amount: pricing.cashback, currency: "NGN",
+          description: `Cashback — ${category} bill payment (${pricingRule?.cashback_percent ?? 0}%)`,
+        });
+        details.cashback_amount = pricing.cashback;
+      } catch (cbErr: any) {
+        console.error("[bills] cashback credit failed:", cbErr?.message);
+      }
+    }
+
     const updated = await query(
       `UPDATE bill_transactions
          SET status = $2, provider_reference = $3, provider_response = $4::jsonb, details = $5::jsonb,
@@ -616,12 +677,15 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     );
 
     if (status === "completed") {
+      const promoBits: string[] = [];
+      if (pricing.discount > 0) promoBits.push(`₦${pricing.discount.toLocaleString()} discount applied`);
+      if (details.cashback_amount > 0) promoBits.push(`₦${details.cashback_amount.toLocaleString()} cashback credited`);
       createNotification({
         businessId: String((wallet as any).business_id || businessId || ""),
         userId,
         type: "system",
         title: "Bill payment successful",
-        message: `Your ${category} payment of ₦${amount.toLocaleString()} was successful. Ref: ${reference}.`,
+        message: `Your ${category} payment of ₦${amount.toLocaleString()} was successful. Ref: ${reference}.${promoBits.length ? ` ${promoBits.join(". ")}.` : ""}`,
         actionUrl: "/bills",
         actionType: "view_transaction",
         metadata: { reference },

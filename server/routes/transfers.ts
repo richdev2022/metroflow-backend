@@ -732,6 +732,17 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
     // Generate transaction hash for integrity
     const transactionHash = generateTransactionHash(reference, amount.toString(), accountNumber, bankCode);
 
+    // Corridor-derived recipient country: NGN payouts are Nigerian domestic
+    // rails, so the stored country is forced to 'NG'. A client-supplied
+    // country (the web transfer form's legacy 'US' default) must never reach
+    // the payout provider — Flutterwave treats any transfer carrying a
+    // beneficiary country as international, strips the top-level account
+    // identifier, and rejects the dispatch with "No account number or
+    // recipient identifier passed" (seen on live NGN→Opay payouts).
+    const storedRecipientCountry = currency === 'NGN'
+      ? 'NG'
+      : ((recipientCountry || '').toUpperCase() || null);
+
     // Queue Transfer — held rows are parked OUTSIDE the payout pipeline
     const initialTransferStatus = fraudResult.decision === 'hold' ? 'held' : 'pending';
     const insertRes = await query(
@@ -741,7 +752,7 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', null, $28, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
       RETURNING *`,
       [businessId, reference, accountNumber, bankCode, accountName, amount, currency, finalDebitAmount, finalDebitCurrency, remark || 'Transfer', walletId, defaultProvider, fee, transactionHash, userId,
-       recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, (recipientCountry || '').toUpperCase() || null, bankName || null, swiftCode || null, routingNumber || null,
+       recipientAddress || null, recipientCity || null, recipientState || null, recipientPostalCode || null, storedRecipientCountry, bankName || null, swiftCode || null, routingNumber || null,
        accountType || (req.body as any)?.account_type || null, beneficiaryEmailNorm, streetNumber, streetName, initialTransferStatus]
     );
 
@@ -1379,7 +1390,12 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           sourceId: u.id,
           adjustments: userAdjustments, // Pass along to mark as processed later
           recipientBankName: u.bank_name || null,
-          recipientCountry: (u.bank_country || u.beneficiary_country || '').toUpperCase() || null,
+          // Corridor-derived: NGN employees are domestic NG rails — a stale
+          // bank_country on the employee row must never flip Flutterwave
+          // dispatch onto international rails (strips the account identifier).
+          recipientCountry: empCurrency === 'NGN'
+            ? 'NG'
+            : ((u.bank_country || u.beneficiary_country || '').toUpperCase() || null),
           recipientSwiftCode: u.swift_code || null,
           recipientRoutingNumber: u.routing_number || null,
           recipientAddress: u.beneficiary_address || null,
@@ -1483,7 +1499,11 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
           t.recipientCity || null,
           t.recipientState || null,
           t.recipientPostalCode || null,
-          t.recipientCountry || null,
+          // Corridor-derived: NGN rows always store NG (payout dispatch is
+          // domestic; a foreign country on an NGN row flips Flutterwave onto
+          // international rails and the payout fails with "No account number
+          // or recipient identifier passed").
+          ((t.currency || 'NGN').toUpperCase() === 'NGN') ? 'NG' : (t.recipientCountry || null),
           t.recipientBankName || null,
           t.recipientSwiftCode || null,
           t.recipientRoutingNumber || null,

@@ -3684,6 +3684,162 @@ protectedRouter.post("/transfers/:id/reverse", requirePermission('manage_busines
     }
 });
 
+// ---------------------------------------------------------------------------
+// PROVIDER SANDBOX STATUS — powers the persistent admin-console warning
+// banner. Production incident (Oct 2026): the bills provider ran with
+// sandbox keys for days; sandbox can never fulfil real airtime and the
+// operator had no surface telling them. This endpoint reports the mode of
+// every ACTIVE money provider (collections / transfers / bills / giftcards
+// / crypto) in one shot.
+// ---------------------------------------------------------------------------
+protectedRouter.get("/providers/sandbox-status", requirePermission('view_dashboard'), async (req, res) => {
+    try {
+        const { buildSandboxReport } = await import("../services/provider-sandbox");
+        const report = await buildSandboxReport();
+        res.json({ success: true, data: report });
+    } catch (error) {
+        console.error("Admin sandbox status error:", error);
+        res.status(500).json({ success: false, error: "Failed to determine provider sandbox status" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// BILL PAYMENTS — admin visibility + click-to-reverse (parity with
+// /admin/transfers/:id/reverse). bill_transactions is a PERSONAL-feature
+// table the legacy Transactions page never surfaced, so stuck or unreversed
+// bill payments were invisible to support.
+// ---------------------------------------------------------------------------
+protectedRouter.get("/bills", requirePermission('view_dashboard'), async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "25"), 10) || 25));
+        const status = String(req.query.status || "").trim();
+        const reference = String(req.query.reference || "").trim();
+        const onlyUnreversed = String(req.query.unreversed || "").toLowerCase() === "true";
+
+        const params: any[] = [];
+        const where: string[] = [];
+        if (status && status !== "all") { params.push(status); where.push(`b.status = $${params.length}`); }
+        if (reference) {
+            params.push(`%${reference}%`);
+            where.push(`(b.reference ILIKE $${params.length} OR b.provider_reference ILIKE $${params.length} OR b.customer_ref ILIKE $${params.length})`);
+        }
+        if (onlyUnreversed) {
+            where.push(`b.status IN ('failed','processing','pending','cancelled')
+                        AND EXISTS (SELECT 1 FROM transactions d WHERE d.reference = b.reference AND d.type = 'debit')
+                        AND NOT EXISTS (SELECT 1 FROM transactions r WHERE r.reference = b.reference || '-REFUND' AND r.type = 'credit')`);
+        }
+        const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+        const countRes = await query(`SELECT COUNT(*)::int AS c FROM bill_transactions b ${whereSql}`, params);
+        params.push(limit, (page - 1) * limit);
+        const rows = await query(
+            `SELECT b.*,
+                    EXISTS (SELECT 1 FROM transactions d WHERE d.reference = b.reference AND d.type = 'debit') AS has_debit,
+                    EXISTS (SELECT 1 FROM transactions r WHERE r.reference = b.reference || '-REFUND' AND r.type = 'credit') AS has_refund,
+                    EXISTS (SELECT 1 FROM transactions c WHERE c.reference = b.reference || '-CB' AND c.type = 'credit') AS has_cashback,
+                    u.email AS user_email, u.name AS user_name,
+                    w.balance AS wallet_balance
+               FROM bill_transactions b
+               LEFT JOIN users u ON u.id = b.user_id
+               LEFT JOIN wallets w ON w.id = b.wallet_id
+               ${whereSql}
+              ORDER BY b.created_at DESC
+              LIMIT $${params.length - 1} OFFSET $${params.length}`,
+            params,
+        );
+
+        await logAuditEvent({
+            action: "admin.bills.list",
+            entityType: "bill_transactions",
+            entityId: `page:${page}`,
+            newValues: { status, reference, onlyUnreversed },
+        }).catch(() => {});
+
+        res.json({
+            success: true,
+            bills: rows.rows,
+            pagination: { page, totalPages: Math.max(1, Math.ceil((countRes.rows[0]?.c || 0) / limit)), total: countRes.rows[0]?.c || 0 },
+        });
+    } catch (error) {
+        console.error("Admin list bills error:", error);
+        res.status(500).json({ success: false, error: "Failed to load bill payments" });
+    }
+});
+
+/**
+ * POST /admin/bills/:reference/reverse — platform-admin "click to reverse"
+ * for BILL PAYMENTS. Same guard rails as /admin/transfers/:id/reverse:
+ *   - the provider is asked first (live Sogo): a bill it DELIVERED is never
+ *     reversed (hard guard, non-overridable);
+ *   - completed bills are only reversible when the provider could NOT have
+ *     delivered (sandbox / simulator / no record / provider-reported failure)
+ *     or with force=true after a failed lookup;
+ *   - the engine (reverseBillPayment) is claim-first + ledger-idempotent, so
+ *     double-clicks and webhook races can never double-credit a wallet.
+ */
+protectedRouter.post("/bills/:reference/reverse", requirePermission('manage_businesses'), async (req, res) => {
+    try {
+        const { reference } = req.params;
+        const body = (req.body || {}) as any;
+        const reason = body.reason;
+        const force = String(body.force ?? "").toLowerCase() === "true" || req.query.force === "true";
+        if (!reference) return res.status(400).json({ success: false, error: "Bill reference is required" });
+
+        const billRes = await query(`SELECT * FROM bill_transactions WHERE reference = $1 OR id::text = $1 LIMIT 1`, [reference]);
+        if (billRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "Bill payment not found" });
+        }
+        const bill = billRes.rows[0];
+
+        if (!bill.wallet_id) {
+            return res.status(409).json({ success: false, error: "This bill is not linked to a wallet — nothing to reverse" });
+        }
+
+        // Already-reversed short circuit (idempotent honesty, mirrors transfers).
+        const refundCheck = await query(
+            `SELECT 1 FROM transactions WHERE reference = $1 AND type = 'credit' LIMIT 1`,
+            [`${bill.reference}-REFUND`],
+        );
+        if (refundCheck.rows.length > 0) {
+            return res.status(409).json({ success: false, error: "This bill payment was already reversed" });
+        }
+
+        const { reverseBillPayment } = await import("../features/personal/bill-settlement");
+        const result = await reverseBillPayment(
+            bill,
+            reason ? `Admin reversal: ${String(reason).slice(0, 200)}` : "Admin reversal from Admin Console",
+            { force, skipProviderCheck: false },
+        );
+
+        if (!result.reversed && !result.alreadyReversed) {
+            const msg = result.notes.length
+                ? `Reversal refused — ${result.notes[0]}`
+                : "Reversal could not be completed — check the server logs";
+            return res.status(409).json({ success: false, error: msg, data: result });
+        }
+
+        await logAuditEvent({
+            action: "admin.bill.reverse",
+            entityType: "bill_transactions",
+            entityId: bill.reference,
+            oldValues: { status: bill.status, total: bill.total, wallet_id: bill.wallet_id },
+            newValues: { status: "refunded", providerVerified: result.providerVerified, force, reason: String(reason || "").slice(0, 200) },
+        }).catch(() => {});
+
+        res.json({
+            success: true,
+            message: result.alreadyReversed
+                ? `Bill ${bill.reference} was already reversed — no funds were moved again.`
+                : `Bill ${bill.reference} reversed — ₦${Number(bill.total).toLocaleString()} is back in the customer's wallet.`,
+            data: result,
+        });
+    } catch (error) {
+        console.error("Admin reverse bill error:", error);
+        res.status(500).json({ success: false, error: "Failed to reverse bill payment" });
+    }
+});
+
 // KYC Management
 /**
  * @swagger

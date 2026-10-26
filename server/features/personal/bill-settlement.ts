@@ -1,6 +1,8 @@
-import { query } from "../../db";
+import { query, pool } from "../../db";
 import { creditWallet, insertTransaction } from "./personal-utils";
 import { createNotification } from "../../services/notifications";
+import { creditPlatformWallet, debitRevenueWallet } from "../../services/fees";
+import { sendPushToUsers } from "../../services/push";
 import * as sogo from "../../services/sogo";
 import { getActiveProvider } from "./provider-routing";
 
@@ -45,6 +47,8 @@ type BillRow = {
   total: string | number;
   status: string;
   details: any;
+  provider_reference?: string | null;
+  settled_at?: Date | string | null;
   created_at: Date | string;
 };
 
@@ -146,43 +150,329 @@ export async function settleBillCompleted(bill: BillRow, providerResponse: any):
 /**
  * Refund a processing bill (provider failed / never received / timed out).
  * Idempotent on the ledger: only credits when the debit exists and the
- * refund row does not.
+ * refund row does not. Thin wrapper over reverseBillPayment — every refund
+ * (auto or admin) now runs the SAME robust reversal core: claim-first
+ * ledger idempotency, platform-vendor re-credit, fee-revenue unwind, the
+ * original debit row flipped to 'failed', and push + in-app notification.
  */
 export async function refundBillRow(bill: BillRow, reason: string, providerResponse?: any): Promise<boolean> {
-  // Claim the transition first so webhook + reaper + syncs never double-refund.
-  const claim = await query(
+  const result = await reverseBillPayment(bill, reason, {
+    fromStatuses: ["processing"],
+    providerResponse,
+    skipProviderCheck: true, // callers (reaper/webhook/sweep) already asked the provider
+  });
+  return result.reversed;
+}
+
+export type BillReverseResult = {
+  /** true when THIS call performed the reversal (won the claim) */
+  reversed: boolean;
+  /** true when a `-REFUND` ledger row already existed (nothing was re-credited) */
+  alreadyReversed: boolean;
+  /** whether money was actually credited to the wallet in this pass */
+  credited: boolean;
+  /** what the provider said, when it was asked */
+  providerVerified?: "completed" | "failed" | "no-record" | "unreachable" | "skipped";
+  /** non-fatal notes (skipped cashback clawback, etc.) */
+  notes: string[];
+};
+
+/**
+ * ROBUST BILL REVERSAL — the bill-payment mirror of TransferService's
+ * reverseFailedTransfer(), with the same guard rails and the same
+ * claim-first idempotency contract:
+ *
+ *   1. The `-REFUND` credit row is the claim gate (INSERT … ON CONFLICT …
+ *      RETURNING id) — webhook, reaper, sync and admin clicks can race
+ *      freely and only ONE wallet credit can ever happen. The claim row and
+ *      the wallet balance credit commit in ONE database transaction, so a
+ *      mid-crash retry can neither double-credit nor lose the credit.
+ *   2. The provider is asked first (live Sogo): a bill the provider
+ *      DELIVERED is never reversed — a hard guard that `force` cannot
+ *      override, mirroring "provider reports SUCCESSFUL → refuse".
+ *   3. Full ledger unwind on reversal:
+ *        - platform vendor hold re-credited (`<ref>-VENDOR-REVERSAL`) —
+ *          the pay flow debits the platform the moment it dispatches, so a
+ *          bill that never completed leaves the pool holding money for a
+ *          vendor that was never paid;
+ *        - fee revenue reversed (`<ref>-REVENUE-DEBIT`) when it was earned;
+ *        - promo cashback clawed back (`<ref>-CB-REVERSAL`) when it was paid
+ *          (best-effort — an already-spent cashback never blocks a refund).
+ *   4. The original `transactions` debit row flips 'success' → 'failed'
+ *      (the display half of reversal: users must not keep a green debit
+ *      for money that came back — the exact gap that made the three
+ *      refunded Oct-2026 bills look unreversed).
+ *   5. The bill row itself lands on 'refunded' via a guarded UPDATE that
+ *      never resurrects a completed row unless the caller explicitly
+ *      allows it (admin override / provider-reported failure).
+ *   6. The customer is TOLD — FCM push + in-app notification, same as
+ *      transfer reversals.
+ */
+export async function reverseBillPayment(
+  bill: BillRow,
+  reason: string,
+  opts: {
+    /** statuses allowed to transition to 'refunded' (default: everything except completed) */
+    fromStatuses?: string[];
+    /** provider payload to store on the row (webhook / poll evidence) */
+    providerResponse?: any;
+    /** caller already asked the provider (reaper/webhook) — don't ask again */
+    skipProviderCheck?: boolean;
+    /** admin override: also allow completed rows whose provider state is UNKNOWN (sandbox/simulator) */
+    force?: boolean;
+    /** provider itself reported the failure — completed rows may then be reversed */
+    providerReportedFailure?: boolean;
+  } = {},
+): Promise<BillReverseResult> {
+  const notes: string[] = [];
+  const out: BillReverseResult = { reversed: false, alreadyReversed: false, credited: false, notes };
+
+  if (!bill || !bill.reference) { notes.push("no bill row"); return out; }
+  if (!bill.wallet_id) { notes.push("bill has no wallet link — nothing to reverse"); return out; }
+
+  const total = Number(bill.total);
+  const amount = Number(bill.amount);
+  const fee = Number(bill.fee || 0);
+  if (!(total > 0)) { notes.push("non-positive total — nothing to reverse"); return out; }
+  const ref = bill.reference;
+
+  // ---- 1. Ask the provider before touching money (live Sogo only) -------
+  let providerVerified: BillReverseResult["providerVerified"] = "skipped";
+  if (!opts.skipProviderCheck && bill.provider === "sogo" && !sogo.isSogoSandbox()) {
+    try {
+      const remote = await sogo.getTransaction(bill.provider_reference || ref).catch((e: any) => {
+        if (e?.response?.status === 404) return null;
+        throw e;
+      });
+      if (remote === null) {
+        providerVerified = "no-record"; // dispatch never landed — safe to reverse
+      } else {
+        const tx = remote?.transaction ?? remote;
+        const st = sogo.sogoStatus(tx || remote);
+        if (["completed", "successful", "success", "delivered"].includes(st)) {
+          providerVerified = "completed";
+        } else if (["failed", "failure", "refunded", "reversed", "cancelled", "canceled"].includes(st)) {
+          providerVerified = "failed";
+          opts.providerReportedFailure = true;
+        } else {
+          providerVerified = "unreachable";
+        }
+      }
+    } catch {
+      providerVerified = "unreachable";
+    }
+  } else if (opts.skipProviderCheck) {
+    providerVerified = "skipped";
+  } else {
+    // sandbox / simulator / flutterwave-sync path — the provider cannot have
+    // delivered a real fulfilment we don't know about.
+    providerVerified = bill.provider === "sogo" ? "no-record" : "skipped";
+  }
+  out.providerVerified = providerVerified;
+
+  // HARD GUARD (mirrors "provider reports SUCCESSFUL → refuse" on transfers):
+  // the provider DELIVERED this bill — the money bought something real.
+  if (providerVerified === "completed" && !opts.force) {
+    notes.push("provider reports the bill was fulfilled — reversal refused");
+    return out;
+  }
+
+  const fromStatuses = opts.fromStatuses || ["processing", "pending", "failed", "cancelled"];
+  if (providerVerified !== "completed" && (opts.force || opts.providerReportedFailure)) {
+    fromStatuses.push("completed");
+  }
+  if (!fromStatuses.includes(String(bill.status))) {
+    notes.push(`row status '${bill.status}' is not reversible in this path`);
+    return out;
+  }
+
+  // ---- 2. Claim + wallet credit in ONE transaction -----------------------
+  // The `${ref}-REFUND` ledger row is the idempotency gate. Claiming it and
+  // crediting the wallet in the same committed transaction means: crash
+  // before commit → nothing happened (retry safe); crash after commit → the
+  // refund row exists so no retry can double-credit.
+  const debitCheck = await query(
+    `SELECT 1 FROM transactions WHERE reference = $1 AND type = 'debit' LIMIT 1`,
+    [ref],
+  );
+  const moneyLeftWallet = debitCheck.rows.length > 0;
+
+  const client = await pool.connect();
+  let claimed = false;
+  try {
+    await client.query("BEGIN");
+    const claim = await client.query(
+      `INSERT INTO transactions
+         (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $2, $3, 'NGN', 'success', $4, 'credit', $5, 'bill_refund', $6, 'credit')
+       ON CONFLICT (reference) DO NOTHING RETURNING id`,
+      [
+        bill.business_id ?? null,
+        bill.user_id ?? null,
+        total,
+        `${ref}-REFUND`,
+        `Bill payment reversal — ${bill.category}${reason ? ` (${String(reason).slice(0, 160)})` : ""}`,
+        bill.wallet_id,
+      ],
+    );
+    if (claim.rows.length === 0) {
+      await client.query("ROLLBACK");
+      out.alreadyReversed = true;
+      return out;
+    }
+    if (moneyLeftWallet) {
+      await client.query(
+        `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [total, bill.wallet_id],
+      );
+      out.credited = true;
+    } else {
+      notes.push("no debit ledger row — closing the bill without a wallet credit");
+    }
+    await client.query("COMMIT");
+    claimed = true;
+  } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+  if (!claimed) return out; // unreachable defensively
+
+  // ---- 3. Ledger unwind (all idempotent by reference) --------------------
+  // 3a. Platform vendor hold: the pay flow debits the platform the instant
+  //     the order dispatches. If the bill never completed, the pool is
+  //     holding money for a vendor that was never paid — give it back.
+  if (amount > 0) {
+    try {
+      const vendorHold = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1 AND transaction_type = 'platform' LIMIT 1`,
+        [`${ref}-VENDOR`],
+      );
+      if (vendorHold.rows.length > 0) {
+        await creditPlatformWallet(
+          amount,
+          "NGN",
+          `${ref}-VENDOR-REVERSAL`,
+          `Reversal of platform vendor debit for uncompleted bill ${ref}`,
+          "bills",
+        );
+      }
+    } catch (e: any) {
+      console.error(`[bill-settlement] vendor re-credit failed for ${ref}:`, e?.message);
+      notes.push("vendor re-credit failed (non-fatal)");
+    }
+  }
+
+  // 3b. Fee revenue: only earned when the bill completed — reverse iff the
+  //     `-REVENUE-CREDIT` row exists.
+  if (fee > 0) {
+    try {
+      const revCredit = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
+        [`${ref}-REVENUE-CREDIT`],
+      );
+      if (revCredit.rows.length > 0) {
+        await debitRevenueWallet(fee, "NGN", ref, `Reversal of bill fee revenue for ${ref}`, "bills");
+      }
+    } catch (e: any) {
+      console.error(`[bill-settlement] fee revenue unwind failed for ${ref}:`, e?.message);
+      notes.push("fee revenue unwind failed (non-fatal)");
+    }
+  }
+
+  // 3c. Promo cashback clawback (completed-bill reversals only): take back
+  //     what was credited IF the wallet still holds it. Best-effort.
+  try {
+    const cbRow = await query(
+      `SELECT amount FROM transactions WHERE reference = $1 AND type = 'credit' LIMIT 1`,
+      [`${ref}-CB`],
+    );
+    const cb = cbRow.rows.length ? Number(cbRow.rows[0].amount) : 0;
+    if (cb > 0) {
+      const claw = await query(
+        `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2 AND balance >= $1 RETURNING id`,
+        [cb, bill.wallet_id],
+      );
+      if (claw.rows.length > 0) {
+        await insertTransaction({
+          userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
+          reference: `${ref}-CB-REVERSAL`, type: "debit", transactionType: "bill_cashback_reversal",
+          amount: cb, currency: "NGN",
+          description: `Cashback reversal — bill ${ref} was reversed`,
+        });
+      } else {
+        notes.push("cashback clawback skipped (wallet balance below cashback)");
+      }
+    }
+  } catch (e: any) {
+    console.error(`[bill-settlement] cashback clawback failed for ${ref}:`, e?.message);
+    notes.push("cashback clawback failed (non-fatal)");
+  }
+
+  // ---- 4. Display flip: the original debit must not stay green -----------
+  try {
+    await query(
+      `UPDATE transactions SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+        WHERE reference = $1 AND type = 'debit' AND status <> 'failed'`,
+      [ref],
+    );
+  } catch (e: any) {
+    console.error(`[bill-settlement] debit display flip failed for ${ref}:`, e?.message);
+  }
+
+  // ---- 5. Bill row → 'refunded' (guarded; never resurrects completed) ----
+  const upd = await query(
     `UPDATE bill_transactions
        SET status = 'refunded', failure_reason = $2,
            provider_response = COALESCE($3::jsonb, provider_response),
            settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1 AND status = 'processing' RETURNING id`,
-    [bill.id, String(reason).slice(0, 500), providerResponse ? JSON.stringify(providerResponse) : null],
+     WHERE id = $1 AND status = ANY($4::varchar[]) RETURNING id`,
+    [
+      bill.id,
+      String(reason || "Reversed").slice(0, 500),
+      opts.providerResponse ? JSON.stringify(opts.providerResponse) : null,
+      fromStatuses,
+    ],
   );
-  if (claim.rowCount === 0) return false;
-
-  const total = Number(bill.total);
-  if (bill.wallet_id && (await hasDebitLedger(bill.reference)) && !(await hasRefundLedger(bill.reference))) {
-    try {
-      await creditWallet(bill.wallet_id, total);
-      await insertTransaction({
-        userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
-        reference: `${bill.reference}-REFUND`, type: "credit", transactionType: "bill_refund",
-        amount: total, currency: "NGN",
-        description: `Refund — bill payment did not complete (${bill.category})`,
-      });
-    } catch (e: any) {
-      // The row is already claimed 'refunded' — recoverMissedRefunds() will
-      // retry the credit until the -REFUND ledger row exists.
-      console.error(`[bill-settlement] refund credit failed for ${bill.reference} (will auto-retry):`, e?.message);
-    }
+  if (upd.rowCount === 0) {
+    // Lost the status race to a concurrent settler — the ledger claim still
+    // makes the money path idempotent; surface honestly.
+    notes.push("row status was settled concurrently");
   }
 
-  await notify(
-    bill,
-    "Bill payment refunded",
-    `Your ${bill.category} payment of ₦${total.toLocaleString()} could not be completed and has been returned to your wallet. Ref: ${bill.reference}.`,
-  );
-  return true;
+  // ---- 6. Tell the customer — push + in-app ------------------------------
+  const pretty = `₦${total.toLocaleString()}`;
+  try {
+    const walletRes = await query(`SELECT user_id, business_id FROM wallets WHERE id = $1`, [bill.wallet_id]);
+    const w = walletRes.rows[0];
+    if (w?.user_id) {
+      await sendPushToUsers(
+        [{ userId: w.user_id, businessId: w.business_id || bill.business_id }],
+        {
+          title: "Bill Payment Reversed",
+          body: `Your ${bill.category} payment of ${pretty} could not be completed. ${pretty} is back in your wallet. Ref: ${ref}.`,
+          data: {
+            type: "transaction",
+            eventType: "reversal",
+            reference: ref,
+            amount: String(total),
+            currency: "NGN",
+            reason: String(reason || "").slice(0, 200),
+          },
+        },
+        { inApp: true, type: "refund", businessId: w.business_id || bill.business_id },
+      ).catch((pushErr: any) => console.error(`[bill-settlement] reversal push failed for ${ref}:`, pushErr?.message));
+    }
+  } catch (e: any) {
+    console.error(`[bill-settlement] reversal push setup failed for ${ref}:`, e?.message);
+  }
+  await notify(bill, "Bill payment refunded",
+    `Your ${bill.category} payment of ${pretty} could not be completed and has been returned to your wallet. Ref: ${ref}.`);
+
+  out.reversed = true;
+  return out;
 }
 
 /** Ask the provider what happened to a processing bill. */
@@ -335,6 +625,12 @@ export async function recoverMissedRefunds(limit = 25): Promise<number> {
         `UPDATE bill_transactions SET failure_reason = COALESCE(failure_reason,'') || ' (refund auto-recovered)', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
         [bill.id],
       );
+      // Display consistency: the original debit must not stay green.
+      await query(
+        `UPDATE transactions SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+          WHERE reference = $1 AND type = 'debit' AND status <> 'failed'`,
+        [bill.reference],
+      );
       await notify(
         bill,
         "Bill payment refunded",
@@ -407,6 +703,12 @@ export async function sweepUserBills(userId: string): Promise<void> {
         description: `Refund — bill payment did not complete (${bill.category})`,
       });
       await notify(bill, "Bill payment refunded", `Your ${bill.category} payment of ₦${total.toLocaleString()} was refunded to your wallet. Ref: ${bill.reference}.`);
+      // Display consistency: the original debit must not stay green.
+      await query(
+        `UPDATE transactions SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+          WHERE reference = $1 AND type = 'debit' AND status <> 'failed'`,
+        [bill.reference],
+      );
       console.log(`[bill-settlement] recovered missing refund for ${bill.reference}`);
     }
   } catch (e: any) {

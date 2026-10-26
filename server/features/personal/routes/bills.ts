@@ -839,20 +839,39 @@ router.post("/transactions/:reference/sync", authenticateToken, checkSubscriptio
 
     const mapped = normalizeStatus(sogo.sogoStatus(remote?.transaction || remote));
     if (mapped !== tx.status) {
-      // Provider-side refunds must return the money we debited.
-      if (mapped === "refunded" || mapped === "failed" || mapped === "cancelled") {
-        await creditWallet(tx.wallet_id, Number(tx.total));
-        await insertTransaction({
-          userId: tx.user_id, businessId: tx.business_id, walletId: tx.wallet_id,
-          reference: `${tx.reference}-REFUND`, type: "credit", transactionType: "bill_refund",
-          amount: Number(tx.total), currency: "NGN", description: `Refund — bill payment ${mapped}`,
-        });
+      // Provider-side refunds/failures must return the money we debited —
+      // through the settlement engine ONLY. The previous inline
+      // creditWallet-then-insertTransaction block could DOUBLE-CREDIT: the
+      // wallet credit ran before the ledger check, and there was no status
+      // guard, so a concurrent reaper refund (or a provider 'failed' report
+      // landing on an already-'refunded' row) credited the wallet a second
+      // time before the duplicate-reference insert threw.
+      if (["refunded", "failed", "cancelled"].includes(mapped)) {
+        const engine = await import("../bill-settlement");
+        if (tx.status === "completed") {
+          // The provider failed a bill we had marked completed — provider
+          // evidence, so the completed row may be reversed.
+          await engine.reverseBillPayment(
+            tx as any,
+            `Provider reported: ${mapped}`,
+            { providerResponse: remote, skipProviderCheck: true, providerReportedFailure: true },
+          );
+        } else {
+          await engine.refundBillRow(tx as any, `Provider reported: ${mapped}`, remote);
+        }
       }
       const upd = await query(
-        `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`,
+        `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> 'refunded' RETURNING *`,
         [tx.id, mapped, JSON.stringify(remote)],
       );
-      return res.json({ success: true, data: { transaction: publicRow(upd.rows[0]), updated: true } });
+      // The engine may have already claimed the row to 'refunded' — re-read
+      // instead of echoing the stale pre-sync status.
+      let row = upd.rows[0];
+      if (!row) {
+        const reread = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
+        row = reread.rows[0] || tx;
+      }
+      return res.json({ success: true, data: { transaction: publicRow(row), updated: true } });
     }
     return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
   } catch (e: any) {

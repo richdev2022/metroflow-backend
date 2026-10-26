@@ -12,6 +12,7 @@ import { userSafeErr } from "../user-safe-errors";
 import * as flwBills from "../flutterwave-bills";
 import { getActiveProvider, providerLabel } from "../provider-routing";
 import { getBillPricingRule, applyBillPricing, round2, getBillPricingMap, BILL_CATEGORIES } from "../bill-pricing";
+import { sweepUserBills } from "../bill-settlement";
 
 /**
  * BILLS HUB — UNIFIED multi-provider bill payments (MetriCorex Personal).
@@ -540,20 +541,34 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     );
     billId = insert.rows[0].id;
 
+    // MONEY SAFETY: the row status is settled FIRST (guarded claim), then the
+    // refund credit runs — a failed credit can no longer strand the row in
+    // 'processing'. If the credit throws, failure_reason is marked so the
+    // bill-settlement reaper retries the credit until the -REFUND ledger row
+    // exists (recoverMissedRefunds / sweepUserBills).
     const fail = async (status: string, message: string, refund = false) => {
-      if (refund) {
-        await creditWallet((wallet as any).id, total);
-        await insertTransaction({
-          userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
-          reference: `${reference}-REFUND`, type: "credit", transactionType: "bill_refund",
-          amount: total, currency: "NGN", description: `Refund — bill payment failed (${category})`,
-        });
-      }
       await query(
         `UPDATE bill_transactions SET status = $2, failure_reason = $3, provider = $4,
-           provider_response = $5::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-        [billId, status, String(message).slice(0, 500), provider, JSON.stringify(refund ? { refunded: true } : {})],
+           provider_response = $5::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND status = 'processing'`,
+        [billId, status, String(message).slice(0, 500), provider, JSON.stringify(refund ? { refund_pending: refund } : {})],
       );
+      if (refund) {
+        try {
+          await creditWallet((wallet as any).id, total);
+          await insertTransaction({
+            userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
+            reference: `${reference}-REFUND`, type: "credit", transactionType: "bill_refund",
+            amount: total, currency: "NGN", description: `Refund — bill payment failed (${category})`,
+          });
+        } catch (refundErr: any) {
+          console.error("[bills] fail() refund credit failed — reaper will retry:", refundErr?.message);
+          await query(
+            `UPDATE bill_transactions SET failure_reason = failure_reason || ' (AUTO-REFUND PENDING)' WHERE id = $1`,
+            [billId],
+          );
+        }
+      }
     };
 
     // ---- Resolve provider + fulfil ----------------------------------------
@@ -589,6 +604,11 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     let providerRef: string | null = null;
     let providerResponse: any = {};
     let delivered: any = null;
+
+    // Stamp the dispatch instant — if the process dies mid-provider-call the
+    // reconciliation engine can tell "dispatched, outcome unknown" from
+    // "never dispatched" (provider 404 vs response parse failure).
+    details.dispatched_at = new Date().toISOString();
 
     if (provider === "sogo") {
       const input = { reference, ...details } as any;
@@ -734,48 +754,14 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
 // ---------------------------------------------------------------------------
 // History + detail + sync
 // ---------------------------------------------------------------------------
-// MONEY SAFETY: lazily settle abandoned "processing" bills. A bill left in
-// processing with no provider webhook for over an hour is dead — refund the
-// customer (idempotent: only rows still 'processing' are swept, and the
-// refund reference is derived from the bill reference).
+// MONEY SAFETY: lazily settle this user's abandoned "processing" bills on
+// history reads. Delegates to the shared settlement engine (bill-settlement.ts)
+// which asks the PROVIDER before refunding — the old blind 60-minute refund
+// could double-give when the provider had actually fulfilled the bill. The
+// same engine runs globally on a 5-minute cron (server/index.ts), so pending
+// bills settle even if the user never opens history again.
 async function sweepStaleProcessingBills(userId: string) {
-  try {
-    const stale = await query(
-      `SELECT id, reference, wallet_id, total FROM bill_transactions
-        WHERE user_id = $1 AND status = 'processing'
-          AND created_at < NOW() - INTERVAL '60 minutes'
-        ORDER BY created_at ASC LIMIT 25`,
-      [userId],
-    );
-    for (const bill of stale.rows) {
-      if (!bill.wallet_id) continue;
-      const alreadyRefunded = await query(
-        `SELECT 1 FROM transactions WHERE reference = $1`,
-        [`${bill.reference}-REFUND`],
-      );
-      if (alreadyRefunded.rows.length) {
-        await query(
-          `UPDATE bill_transactions SET status = 'refunded', failure_reason = 'Settlement timed out — refunded', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
-          [bill.id],
-        );
-        continue;
-      }
-      await creditWallet(bill.wallet_id, Number(bill.total));
-      await insertTransaction({
-        userId, walletId: bill.wallet_id,
-        reference: `${bill.reference}-REFUND`, type: "credit", transactionType: "bill_refund",
-        amount: Number(bill.total), currency: "NGN",
-        description: "Refund — bill payment timed out before confirmation",
-      }).catch(() => {});
-      await query(
-        `UPDATE bill_transactions SET status = 'refunded', failure_reason = 'Settlement timed out — refunded', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
-        [bill.id],
-      );
-      console.log(`[bills] swept stale processing bill ${bill.reference} → refunded`);
-    }
-  } catch (e: any) {
-    console.error("[bills] stale-processing sweep failed:", e?.message);
-  }
+  await sweepUserBills(userId);
 }
 
 router.get("/history", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {

@@ -455,7 +455,14 @@ export const flutterwaveProvider: Provider = {
       // with no routing data and fails with "DISBURSE FAILED: Invalid account
       // number" even when the details are correct (verified against the
       // official reference: developer.flutterwave.com/docs/international-usd-eur-gbp).
-      const isIntl = (data.currencyId || "NGN") !== "NGN" || !!data.beneficiaryCountry;
+      // CORRIDOR RULE: NGN payouts are ALWAYS Nigerian domestic rails
+      // (account_bank + account_number). beneficiaryCountry is client-supplied
+      // metadata and must NEVER flip an NGN transfer onto international rails:
+      // the intl branch deletes the top-level account identifier and Flutterwave
+      // rejects the dispatch with "No account number or recipient identifier
+      // passed" (production: NGN→Opay transfers stamped recipient_country 'US'
+      // by a legacy web-form default). Dispatch routing is currency-derived.
+      const isIntl = String(data.currencyId || "NGN").toUpperCase() !== "NGN";
       if (isIntl) {
         // -----------------------------------------------------------------
         // PER-CURRENCY META CONTRACT (Flutterwave international payout docs,

@@ -300,6 +300,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     const postsRes = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
+              p.text_color, p.font, p.text_align,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
               (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
@@ -469,6 +470,10 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // missing alias is exactly why text-only posts rendered blank.
         body: p.body,
         content: p.body,
+        // Rich text styling for text-only posts (mobile composer parity).
+        text_color: p.text_color ?? null,
+        font: p.font || "default",
+        text_align: p.text_align || "center",
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         video_url: p.video_url || null,
         // Ordered multi-media carousel — synthesized from the legacy columns
@@ -665,6 +670,14 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     if (!body && !mediaRows.length) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
+    // Rich text styling for TEXT-ONLY posts (mobile composer parity): bare-hex
+    // caption color + font/align enums. Ignored for posts that carry media.
+    const rawPostTextColor = String(req.body?.text_color ?? "").replace(/^#/, "").trim();
+    const postTextColor = /^[0-9a-fA-F]{3,8}$/.test(rawPostTextColor) ? rawPostTextColor.slice(0, 20) : null;
+    const postFont = ["default", "playfair", "mono", "hand", "impact", "round"].includes(req.body?.font) ? req.body.font : "default";
+    const postTextAlign = ["left", "center", "right"].includes(req.body?.text_align) ? req.body.text_align : "center";
+    const isTextOnly = mediaRows.length === 0;
+
     // TikTok-style sounds — two paths:
     //   1. sound_id supplied ("Use this sound" flow): attach it to every video
     //      row and bump its use_count.
@@ -681,8 +694,8 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     }
 
     const r = await query(
-      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [userId, body, imageUrl, videoUrl, audience],
+      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, text_color, font, text_align) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [userId, body, imageUrl, videoUrl, audience, isTextOnly ? postTextColor : null, isTextOnly ? postFont : "default", isTextOnly ? postTextAlign : "center"],
     );
     const postId = r.rows[0].id;
     // Persist the ordered carousel (best-effort — a media-row failure must not
@@ -821,6 +834,7 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
   if (!postIds.length) return [];
   const postsRes = await query(
     `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
+            p.text_color, p.font, p.text_align,
             u.name AS author_name, u.avatar_url AS author_photo,
             COALESCE(u.account_privacy, 'public') AS account_privacy,
             (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
@@ -916,6 +930,10 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
         message: poll ? poll.question : p.body,
         body: p.body,
         content: p.body,
+        // Rich text styling for text-only posts (mobile composer parity).
+        text_color: p.text_color ?? null,
+        font: p.font || "default",
+        text_align: p.text_align || "center",
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         video_url: p.video_url || null,
         media: mediaByPost.get(String(p.id)) || [
@@ -2409,6 +2427,11 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
     poster_url: row.poster_url,
     caption: row.caption,
     background_color: row.background_color,
+    // Rich text styling for TEXT stories (mobile composer parity) —
+    // text_color is bare hex, font/text_align fall back to the defaults.
+    text_color: row.text_color ?? null,
+    font: row.font || "default",
+    text_align: row.text_align || "center",
     duration_seconds: row.duration_seconds,
     audience: row.audience,
     sound_id: row.sound_id ?? null,
@@ -2434,8 +2457,14 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     if (!(await assertPersonalService(res, "social"))) return;
     const userId = req.user!.userId;
     const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
-    const caption = String(req.body?.caption ?? "").slice(0, 700);
+    const caption = String(req.body?.caption ?? "").slice(0, 1000);
     const backgroundColor = String(req.body?.background_color ?? "").slice(0, 20) || null;
+    // Rich text styling (TEXT stories): text_color must be bare hex, font and
+    // text_align come from fixed enums so arbitrary strings never reach the DB.
+    const rawTextColor = String(req.body?.text_color ?? "").replace(/^#/, "").trim();
+    const textColor = /^[0-9a-fA-F]{3,8}$/.test(rawTextColor) ? rawTextColor.slice(0, 20) : null;
+    const font = ["default", "playfair", "mono", "hand", "impact", "round"].includes(req.body?.font) ? req.body.font : "default";
+    const textAlign = ["left", "center", "right"].includes(req.body?.text_align) ? req.body.text_align : "center";
     const audience = ["public", "followers"].includes(req.body?.audience) ? req.body.audience : "public";
     const durationSeconds = Math.min(60, Math.max(3, Number(req.body?.duration_seconds) || 7));
 
@@ -2464,9 +2493,9 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     if (mediaType === "text" && !caption) return res.status(400).json({ success: false, error: "Write a caption or attach a photo/video" });
 
     const r = await query(
-      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, duration_seconds, audience)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience],
+      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience],
     );
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     res.status(201).json({
@@ -2866,6 +2895,7 @@ router.get("/search", authenticateToken, checkSubscriptionStatus, async (req: Au
     const posts = ["all", "posts"].includes(type)
       ? (await query(
           `SELECT DISTINCT p.id, p.user_id, p.body, p.image_url, p.video_url, p.created_at,
+                  p.text_color, p.font, p.text_align,
                   u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
                   (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
                   (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
@@ -2901,6 +2931,7 @@ router.get("/search", authenticateToken, checkSubscriptionStatus, async (req: Au
         posts: posts.map((p) => ({
           id: p.id, author: { id: p.user_id, name: p.author_name, photo: p.author_photo, username: p.author_username, is_verified: !!p.author_verified },
           body: p.body, image_url: p.image_url, video_url: p.video_url,
+          text_color: p.text_color ?? null, font: p.font || "default", text_align: p.text_align || "center",
           like_count: Number(p.like_count) || 0, comment_count: Number(p.comment_count) || 0,
           created_at: p.created_at,
         })),

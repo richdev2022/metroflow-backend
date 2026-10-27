@@ -262,6 +262,9 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS text_color VARCHAR(20)`);
   await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS font VARCHAR(24) DEFAULT 'default'`);
   await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS text_align VARCHAR(10) DEFAULT 'center'`);
+  // Text-post background — bare hex, or two hex stops comma-joined (vertical
+  // gradient), matching the story composer's serialization contract.
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS background_color VARCHAR(64)`);
 
   // Community reports — users flag posts; admins review + decide end-to-end.
   await query(`

@@ -53,6 +53,31 @@ const router = express.Router();
 const CATEGORIES = ["general", "chat", "talent", "music", "dance", "food", "fashion", "gaming", "sports", "education", "business", "faith", "comedy"];
 const EMOJIS = new Set(["heart", "fire", "clap", "laugh", "wow", "sad", "party", "star", "money", "100"]);
 
+// ---------------------------------------------------------------------------
+// Authed watch/broadcast URLs for NATIVE clients.
+// The mobile apps resolved the old RELATIVE /live/watch URLs against the API's
+// sibling origin (api.metricorex.com → metricorex.com), which is the BUSINESS
+// web app — it has no live room — and their WebView has no localStorage, so
+// even the right origin would bounce off TokenProtectedRoute to /login.
+// Hand back ABSOLUTE URLs pointing at the personal site carrying the
+// requester's session token as ?token= — the web app adopts it into
+// localStorage at boot and immediately strips it from the address bar
+// (client/App.tsx deep-link token bridge). The personal web builds its own
+// watch URLs client-side and never reads these fields, so absolute values are
+// safe for every consumer.
+// ---------------------------------------------------------------------------
+const personalSiteUrl = (): string =>
+  String(process.env.PERSONAL_SITE_URL || "https://personal.metricorex.com").replace(/\/+$/, "");
+
+const authedWatchUrl = (callCode: string, req: AuthenticatedRequest, host = false): string => {
+  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  return (
+    `${personalSiteUrl()}/live/watch?code=${encodeURIComponent(callCode)}` +
+    `${host ? "&host=1" : ""}` +
+    `${token ? `&token=${encodeURIComponent(token)}` : ""}`
+  );
+};
+
 const isCohost = (session: any, userId: string) =>
   Array.isArray(session.cohost_ids) && session.cohost_ids.includes(userId);
 
@@ -171,7 +196,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
         success: true,
         data: {
           session: existing.rows[0],
-          broadcast_url: `/join-call?code=${existing.rows[0].call_code}&broadcast=1`,
+          broadcast_url: authedWatchUrl(existing.rows[0].call_code, req, true),
           message: "You are already live — reopening your stream.",
         },
       });
@@ -188,7 +213,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
       data: {
         session: r.rows[0],
         call_id: callId,
-        broadcast_url: `/join-call?code=${callCode}&broadcast=1`,
+        broadcast_url: authedWatchUrl(callCode, req, true),
         message: "You are LIVE",
       },
     });
@@ -957,8 +982,10 @@ router.get("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
           // (LiveWatch). The legacy /join-call?watch=1 URL is ignored by
           // JoinCallRing, which dead-ended the mobile WebView on the login
           // page. Broadcast keeps the host flag so the studio controls load.
-          watch_url: `/live/watch?code=${encodeURIComponent(s.call_code)}`,
-          broadcast_url: `/live/watch?code=${encodeURIComponent(s.call_code)}&host=1`,
+          // Absolute + ?token= so the MOBILE WebView (no localStorage, API-
+          // sibling origin) lands in the real personal room — see helper.
+          watch_url: authedWatchUrl(s.call_code, req),
+          broadcast_url: authedWatchUrl(s.call_code, req, true),
         },
         viewers: viewers.rows,
       },
@@ -1011,8 +1038,9 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
       success: true,
       // MODERN ROUTE (see GET /:id): /live/watch?code=… — the mobile WebView
       // and any deep link land on the real watch room instead of the legacy
-      // /join-call URL the web app ignores.
-      data: { watch_url: `/live/watch?code=${encodeURIComponent(s.call_code)}`, call_id: callId, session: s },
+      // /join-call URL the web app ignores. Absolute + ?token= for the native
+      // WebView (see authedWatchUrl helper).
+      data: { watch_url: authedWatchUrl(s.call_code, req), call_id: callId, session: s },
     });
   } catch (e: any) {
     console.error("live join error:", e?.message);

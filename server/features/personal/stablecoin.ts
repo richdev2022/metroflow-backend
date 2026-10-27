@@ -4,6 +4,8 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import { createNotification } from "../../services/notifications";
 import { evaluateOutflow, fraudRejectReason } from "../../services/fraud";
 import * as bitnob from "../../services/providers/bitnob";
+import * as sogo from "../../services/sogo";
+import { getActiveProvider } from "./provider-routing";
 import { requirePersonalService, useProvider, getPercent } from "./flags";
 import { verifyTransactionPin, requirePersonalKyc } from "./personal-utils";
 
@@ -52,6 +54,25 @@ const MAX_ADDRESSES_PER_USER_PER_DAY = 20;
 const FALLBACK_CHAINS: Record<Stablecoin, string[]> = {
     USDT: ["ethereum", "tron", "solana", "polygon", "avalanche", "bsc", "arbitrum", "optimism", "plasma"],
     USDC: ["ethereum", "solana", "polygon", "avalanche", "base", "bsc", "arbitrum", "optimism"],
+};
+
+// SOGO ROUTING — when the Personal provider routing toggles crypto to sogo,
+// deposit-address generation moves off Bitnob. Sogo settles on-chain
+// stablecoin deposits to the user's NGN wallet through /webhook/sogo (the
+// deposit IS the conversion — that is the product the owner wants on Sogo).
+const SOGO_CHAINS: Record<Stablecoin, string[]> = {
+    USDT: ["tron", "ethereum", "bsc"],
+    USDC: ["ethereum", "tron", "bsc"],
+};
+
+/** Our chain names -> Sogo network slugs (their API speaks trc20/erc20/bep20). */
+const SOGO_NETWORK_BY_CHAIN: Record<string, string> = {
+    tron: "trc20",
+    ethereum: "erc20",
+    bsc: "bep20",
+    "bnb-smart-chain": "bep20",
+    polygon: "polygon",
+    solana: "solana",
 };
 
 // Local address format gates — first line of defence before Bitnob validates.
@@ -108,6 +129,16 @@ export async function ensureStablecoinSchema(): Promise<void> {
     )`);
     await query(`CREATE INDEX IF NOT EXISTS idx_sc_addresses_user ON stablecoin_addresses(user_id, currency)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_sc_addresses_lookup ON stablecoin_addresses(address, chain)`);
+
+    // PROVIDER MIGRATION support: the original UNIQUE(user_id, currency,
+    // chain) blocks retiring a legacy Bitnob row and issuing a Sogo row for
+    // the same (user, coin, chain) — the owner directive is exactly that
+    // regeneration. Replace it with a PARTIAL unique index over ACTIVE rows
+    // so retired rows keep their history (and their address stays queryable
+    // for late webhook deposits) without blocking re-issuance.
+    await query(`ALTER TABLE stablecoin_addresses DROP CONSTRAINT IF EXISTS stablecoin_addresses_user_id_currency_chain_key`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_sc_addresses_active ON stablecoin_addresses (user_id, currency, chain) WHERE status = 'active'`);
+    await query(`ALTER TABLE stablecoin_addresses ADD COLUMN IF NOT EXISTS provider_ref VARCHAR(120)`);
 
     await query(`
     CREATE TABLE IF NOT EXISTS stablecoin_deposits (
@@ -437,8 +468,40 @@ export async function settleConversion(ref: string): Promise<any> {
 function publicAddress(row: any) {
     return {
         id: row.id, currency: row.currency, chain: row.chain, address: row.address,
-        label: row.label, status: row.status, created_at: row.created_at,
+        label: row.label, status: row.status, provider: row.provider, created_at: row.created_at,
     };
+}
+
+/**
+ * Create (or fetch) a Sogo deposit address for (user, coin, chain) and
+ * DUAL-REGISTER it in crypto_deposit_addresses — the sogo deposit webhook
+ * resolves address ownership through that table, so a deposit sent to a
+ * hub-issued address settles to the user's NGN wallet end-to-end.
+ */
+async function createSogoDepositAddress(userId: string, currency: Stablecoin, chain: string): Promise<{ address: string; providerRef: string | null }> {
+    const network = SOGO_NETWORK_BY_CHAIN[chain];
+    const reference = randomReference("SOGOADDR");
+    const created = await sogo.cryptoCreateDepositAddress(currency, network, reference);
+    const address = String(created?.address || created?.deposit_address || created?.data?.address || "").trim();
+    if (!address) throw new Error("Sogo returned no deposit address");
+    const providerRef = created?.id != null ? String(created.id) : (created?.reference ? String(created.reference) : null);
+    await query(
+        `INSERT INTO crypto_deposit_addresses (user_id, provider, asset, network, address, extra)
+         VALUES ($1, 'sogo', $2, $3, $4, $5::jsonb)
+         ON CONFLICT (user_id, asset, network, provider)
+         DO UPDATE SET address = EXCLUDED.address, extra = EXCLUDED.extra, updated_at = CURRENT_TIMESTAMP`,
+        [userId, currency, network || chain, address, JSON.stringify({ stablecoin_chain: chain, provider_ref: providerRef })],
+    );
+    return { address, providerRef };
+}
+
+/** Issue a fresh sogo-backed row in stablecoin_addresses. */
+async function insertSogoAddressRow(userId: string, currency: Stablecoin, chain: string, address: string, providerRef: string | null) {
+    return query(
+        `INSERT INTO stablecoin_addresses (user_id, currency, chain, address, label, reference, provider, provider_ref)
+         VALUES ($1, $2, $3, $4, $5, $6, 'sogo', $7) RETURNING *`,
+        [userId, currency, chain, address, `metroflow:${userId.slice(0, 8)}:${currency}`, randomReference("ADDR"), providerRef],
+    );
 }
 function publicConversion(row: any) {
     return {
@@ -470,6 +533,10 @@ function publicDeposit(row: any) {
 
 /** GET /crypto/stablecoin/chains — supported deposit networks per coin. */
 router.get("/chains", authenticateToken, checkSubscriptionStatus, async (_req: AuthenticatedRequest, res) => {
+    const provider = await getActiveProvider("crypto");
+    if (provider === "sogo") {
+        return res.json({ success: true, data: { chains: SOGO_CHAINS, mode: "sogo" } });
+    }
     if (await bitnobLive()) {
         try {
             const r = await bitnob.getSupportedStablecoinChains();
@@ -493,11 +560,36 @@ router.get("/chains", authenticateToken, checkSubscriptionStatus, async (_req: A
 
 /** GET /crypto/stablecoin/addresses — the caller's deposit addresses. */
 router.get("/addresses", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
-    const r = await query(
+    const userId = req.user!.userId;
+    const select = () => query(
         `SELECT * FROM stablecoin_addresses WHERE user_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 60`,
-        [req.user!.userId],
+        [userId],
     );
-    res.json({ success: true, data: { addresses: r.rows.map(publicAddress) } });
+    let rows = (await select()).rows;
+
+    // PROVIDER MIGRATION — when crypto routing flips to sogo, existing active
+    // Bitnob addresses are regenerated on Sogo the first time the wallet is
+    // opened (owner directive: "some wallet addresses were generated using
+    // bitnob, regenerate them as Sogo is toggled ON"). Best-effort per chain:
+    // a Sogo outage keeps the legacy address active rather than stranding the
+    // user with nothing.
+    const provider = await getActiveProvider("crypto");
+    if (provider === "sogo") {
+        const stale = rows.filter((r: any) => r.provider !== "sogo" && (SOGO_CHAINS as Record<string, string[]>)[r.currency]?.includes(r.chain));
+        for (const s of stale.slice(0, 4)) {
+            try {
+                await query(`UPDATE stablecoin_addresses SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [s.id]);
+                const { address, providerRef } = await createSogoDepositAddress(userId, s.currency as Stablecoin, s.chain);
+                await insertSogoAddressRow(userId, s.currency as Stablecoin, s.chain, address, providerRef);
+            } catch (e: any) {
+                console.warn("[stablecoin] sogo regeneration failed, keeping legacy address:", e?.message);
+                await query(`UPDATE stablecoin_addresses SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'retired'`, [s.id]).catch(() => {});
+            }
+        }
+        if (stale.length) rows = (await select()).rows;
+    }
+
+    res.json({ success: true, data: { addresses: rows.map(publicAddress), mode: provider } });
 });
 
 /**
@@ -513,19 +605,25 @@ router.post("/addresses", authenticateToken, requirePersonalKyc(), checkSubscrip
         return res.status(400).json({ success: false, error: "currency must be USDT or USDC" });
     }
 
-    // Chain must be supported for this coin (live list when available).
-    let chains = FALLBACK_CHAINS[currency];
-    let mode = "simulator";
-    if (await bitnobLive()) {
+    // Chain must be supported for this coin — by the ACTIVE provider.
+    const provider = await getActiveProvider("crypto");
+    let chains: string[];
+    let mode = provider;
+    if (provider === "sogo") {
+        chains = SOGO_CHAINS[currency];
+    } else if (provider === "bitnob") {
+        let live: string[] | null = null;
         try {
             const r = await bitnob.getSupportedStablecoinChains();
-            const list = r?.data?.chains || [];
-            const live = list
+            live = (r?.data?.chains || [])
                 .filter((c: any) => c.chain !== "bitcoin")
                 .filter((c: any) => (c.stablecoins || []).some((s: any) => String(s.symbol || "").toUpperCase() === currency))
                 .map((c: any) => String(c.chain));
-            if (live.length) { chains = live; mode = "bitnob"; }
         } catch { /* fallback list */ }
+        if (live && live.length) { chains = live; } else { chains = FALLBACK_CHAINS[currency]; mode = "simulator"; }
+    } else {
+        chains = FALLBACK_CHAINS[currency];
+        mode = "simulator";
     }
     if (!chain || !chains.includes(chain)) {
         return res.status(400).json({ success: false, error: `chain must be one of: ${chains.join(", ")}`, supported: chains });
@@ -541,18 +639,41 @@ router.post("/addresses", authenticateToken, requirePersonalKyc(), checkSubscrip
         return res.status(429).json({ success: false, error: "Too many addresses requested today — try again tomorrow." });
     }
 
-    // Re-use an existing active address for this (user, coin, chain).
+    // Re-use an existing ACTIVE address for this (user, coin, chain) — but
+    // ONLY one issued by the currently active provider. When the routing
+    // toggles (bitnob -> sogo) the legacy row is retired below and a fresh
+    // address is issued, per the owner directive.
     const existing = await query(
-        `SELECT * FROM stablecoin_addresses WHERE user_id = $1 AND currency = $2 AND chain = $3 AND status = 'active' LIMIT 1`,
-        [userId, currency, chain],
+        `SELECT * FROM stablecoin_addresses WHERE user_id = $1 AND currency = $2 AND chain = $3 AND status = 'active' AND provider = $4 LIMIT 1`,
+        [userId, currency, chain, mode],
     );
     if (existing.rows.length) {
         return res.json({ success: true, data: { address: publicAddress(existing.rows[0]), reused: true, mode: existing.rows[0].provider } });
     }
 
+    // Retire cross-provider actives for this (user, coin, chain) — the
+    // regeneration. Retired rows keep their address queryable so a late
+    // deposit to the old Bitnob address still credits its owner.
+    await query(
+        `UPDATE stablecoin_addresses SET status = 'retired', updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND currency = $2 AND chain = $3 AND status = 'active' AND provider <> $4`,
+        [userId, currency, chain, mode],
+    );
+
     const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [userId]);
     const user = userRes.rows[0];
     if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+    if (mode === "sogo") {
+        try {
+            const { address, providerRef } = await createSogoDepositAddress(userId, currency, chain);
+            const ins = await insertSogoAddressRow(userId, currency, chain, address, providerRef);
+            return res.json({ success: true, data: { address: publicAddress(ins.rows[0]), reused: false, mode: "sogo" } });
+        } catch (e: any) {
+            console.error("[stablecoin] sogo address generation failed:", e?.message);
+            return res.status(502).json({ success: false, error: e?.message || "Could not generate a deposit address right now" });
+        }
+    }
 
     if (mode === "bitnob") {
         const reference = randomReference("ADDR");

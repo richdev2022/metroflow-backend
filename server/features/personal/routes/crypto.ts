@@ -60,9 +60,11 @@ export async function ensureCryptoDepositSchema(): Promise<void> {
       address VARCHAR(255) NOT NULL,
       extra JSONB,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE (user_id, asset, network, provider)
     )
   `);
+  await query(`ALTER TABLE crypto_deposit_addresses ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
   await query(`
     CREATE TABLE IF NOT EXISTS crypto_deposit_sales (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

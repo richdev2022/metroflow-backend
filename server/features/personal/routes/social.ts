@@ -300,7 +300,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     const postsRes = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
-              p.text_color, p.font, p.text_align,
+              p.text_color, p.font, p.text_align, p.background_color,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
               (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
@@ -474,6 +474,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         text_color: p.text_color ?? null,
         font: p.font || "default",
         text_align: p.text_align || "center",
+        background_color: p.background_color ?? null,
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         video_url: p.video_url || null,
         // Ordered multi-media carousel — synthesized from the legacy columns
@@ -671,11 +672,16 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
     // Rich text styling for TEXT-ONLY posts (mobile composer parity): bare-hex
-    // caption color + font/align enums. Ignored for posts that carry media.
+    // caption color + font/align enums + background (bare hex or "HEX,HEX"
+    // two-stop vertical gradient — same contract as stories). Ignored for
+    // posts that carry media.
     const rawPostTextColor = String(req.body?.text_color ?? "").replace(/^#/, "").trim();
     const postTextColor = /^[0-9a-fA-F]{3,8}$/.test(rawPostTextColor) ? rawPostTextColor.slice(0, 20) : null;
     const postFont = ["default", "playfair", "mono", "hand", "impact", "round"].includes(req.body?.font) ? req.body.font : "default";
     const postTextAlign = ["left", "center", "right"].includes(req.body?.text_align) ? req.body.text_align : "center";
+    const rawPostBg = String(req.body?.background_color ?? "").replace(/^#/, "").trim();
+    const postBgValid = /^(?:[0-9a-fA-F]{3,8})(?:,(?:[0-9a-fA-F]{3,8}))?$/.test(rawPostBg);
+    const postBackgroundColor = postBgValid ? rawPostBg.slice(0, 64) : null;
     const isTextOnly = mediaRows.length === 0;
 
     // TikTok-style sounds — two paths:
@@ -694,8 +700,8 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     }
 
     const r = await query(
-      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, text_color, font, text_align) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [userId, body, imageUrl, videoUrl, audience, isTextOnly ? postTextColor : null, isTextOnly ? postFont : "default", isTextOnly ? postTextAlign : "center"],
+      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, text_color, font, text_align, background_color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [userId, body, imageUrl, videoUrl, audience, isTextOnly ? postTextColor : null, isTextOnly ? postFont : "default", isTextOnly ? postTextAlign : "center", isTextOnly ? postBackgroundColor : null],
     );
     const postId = r.rows[0].id;
     // Persist the ordered carousel (best-effort — a media-row failure must not
@@ -834,7 +840,7 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
   if (!postIds.length) return [];
   const postsRes = await query(
     `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
-            p.text_color, p.font, p.text_align,
+            p.text_color, p.font, p.text_align, p.background_color,
             u.name AS author_name, u.avatar_url AS author_photo,
             COALESCE(u.account_privacy, 'public') AS account_privacy,
             (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
@@ -934,6 +940,7 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
         text_color: p.text_color ?? null,
         font: p.font || "default",
         text_align: p.text_align || "center",
+        background_color: p.background_color ?? null,
         image_url: poll ? poll.options?.find((o: any) => o.image_url)?.image_url ?? p.image_url : p.image_url,
         video_url: p.video_url || null,
         media: mediaByPost.get(String(p.id)) || [

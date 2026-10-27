@@ -1736,17 +1736,101 @@ router.post("/:id/join-requests/:rid/decline", authenticateToken, respondToJoinR
 // hits zero wins. Win counts are lifetime (across all battles).
 // ---------------------------------------------------------------------------
 
-/** Finalize battles whose clock expired (lazy scheduler — no timers needed). */
+/** Finalize battles whose clock expired (lazy scheduler — no timers needed).
+ *
+ * DETERMINISTIC WINNER — never 'tie'. A PK battle previously ended with
+ * winner='tie' whenever both sides finished level on gifting points (most
+ * visibly 0-0 when nobody gifts), and the room then displayed the dead-end
+ * "Battle tied!" banner users reported as a bug. The result now resolves
+ * through a tie-break chain: gifting points → completed gift count during
+ * the battle window → lifetime battle wins → challenger (side a). */
 async function finalizeExpiredBattles() {
   try {
+    // Tie-break counts per battle row (CTE + lateral subqueries — UPDATE
+    // targets cannot be referenced from UPDATE..FROM LATERAL directly):
+    //   ga/gb = completed gifts sent to each side during the battle window
+    //   wa/wb = each host's lifetime battle wins (battles already ended)
     await query(
-      `UPDATE live_battles
-          SET status = 'ended',
-              winner = CASE WHEN score_a > score_b THEN 'a'
-                            WHEN score_b > score_a THEN 'b'
-                            ELSE 'tie' END,
-              updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'active' AND ends_at IS NOT NULL AND ends_at <= NOW()`,
+      `WITH resolve AS (
+        SELECT b.id,
+          CASE
+            WHEN b.score_a > b.score_b THEN 'a'
+            WHEN b.score_b > b.score_a THEN 'b'
+            WHEN ga.n > gb.n THEN 'a'
+            WHEN gb.n > ga.n THEN 'b'
+            WHEN wa.n > wb.n THEN 'a'
+            WHEN wb.n > wa.n THEN 'b'
+            ELSE 'a' END AS w
+        FROM live_battles b
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_gifts g
+           WHERE g.session_id = b.session_a_id AND g.status = 'completed'
+             AND g.created_at >= COALESCE(b.started_at, b.created_at)
+             AND g.created_at <= b.ends_at
+        ) ga
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_gifts g
+           WHERE g.session_id = b.session_b_id AND g.status = 'completed'
+             AND g.created_at >= COALESCE(b.started_at, b.created_at)
+             AND g.created_at <= b.ends_at
+        ) gb
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_battles x
+           WHERE x.status = 'ended' AND x.id <> b.id
+             AND ((x.winner = 'a' AND x.host_a_id = b.host_a_id) OR (x.winner = 'b' AND x.host_b_id = b.host_a_id))
+        ) wa
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_battles x
+           WHERE x.status = 'ended' AND x.id <> b.id
+             AND ((x.winner = 'a' AND x.host_a_id = b.host_b_id) OR (x.winner = 'b' AND x.host_b_id = b.host_b_id))
+        ) wb
+        WHERE b.status = 'active' AND b.ends_at IS NOT NULL AND b.ends_at <= NOW()
+      )
+      UPDATE live_battles x
+         SET status = 'ended', winner = resolve.w, updated_at = CURRENT_TIMESTAMP
+        FROM resolve WHERE x.id = resolve.id`,
+    );
+    // Retroactive repair — past battles frozen on winner='tie' get the same
+    // deterministic resolution (idempotent: no-op once none remain).
+    await query(
+      `WITH resolve AS (
+        SELECT b.id,
+          CASE
+            WHEN b.score_a > b.score_b THEN 'a'
+            WHEN b.score_b > b.score_a THEN 'b'
+            WHEN ga.n > gb.n THEN 'a'
+            WHEN gb.n > ga.n THEN 'b'
+            WHEN wa.n > wb.n THEN 'a'
+            WHEN wb.n > wa.n THEN 'b'
+            ELSE 'a' END AS w
+        FROM live_battles b
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_gifts g
+           WHERE g.session_id = b.session_a_id AND g.status = 'completed'
+             AND g.created_at >= COALESCE(b.started_at, b.created_at)
+             AND g.created_at <= COALESCE(b.ends_at, NOW())
+        ) ga
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_gifts g
+           WHERE g.session_id = b.session_b_id AND g.status = 'completed'
+             AND g.created_at >= COALESCE(b.started_at, b.created_at)
+             AND g.created_at <= COALESCE(b.ends_at, NOW())
+        ) gb
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_battles x
+           WHERE x.status = 'ended' AND x.id <> b.id
+             AND ((x.winner = 'a' AND x.host_a_id = b.host_a_id) OR (x.winner = 'b' AND x.host_b_id = b.host_a_id))
+        ) wa
+        CROSS JOIN LATERAL (
+          SELECT COUNT(*)::int AS n FROM live_battles x
+           WHERE x.status = 'ended' AND x.id <> b.id
+             AND ((x.winner = 'a' AND x.host_a_id = b.host_b_id) OR (x.winner = 'b' AND x.host_b_id = b.host_b_id))
+        ) wb
+        WHERE b.status = 'ended' AND b.winner = 'tie'
+      )
+      UPDATE live_battles x
+         SET winner = resolve.w, updated_at = CURRENT_TIMESTAMP
+        FROM resolve WHERE x.id = resolve.id`,
     );
   } catch (e: any) {
     console.error("[live:battles] finalize error:", e?.message);

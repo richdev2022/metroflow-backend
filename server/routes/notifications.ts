@@ -66,7 +66,12 @@ export const getNotifications: RequestHandler = async (
   try {
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users.
+    // The old `!businessId` gate made the notifications list 400 for every
+    // personal user even though createNotification() writes rows for them.
+    // Personal notifications are scoped by user_id alone; workspace accounts
+    // keep the stricter business_id + user_id pair.
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -83,21 +88,26 @@ export const getNotifications: RequestHandler = async (
     // every GET — a table-wide write per request per user). It now runs on a
     // boot-time interval; see startNotificationCleanup() in index.ts.
 
+    const scopeClause = businessId
+      ? "business_id = $1 AND user_id = $2"
+      : "user_id = $1";
+    const scopeParams: any[] = businessId ? [businessId, userId] : [userId];
+
     const countResult = await query(
       `SELECT COUNT(*) as total FROM notifications 
-       WHERE business_id = $1 AND user_id = $2 
+       WHERE ${scopeClause}
        ${unreadOnly ? "AND is_read = false" : ""}`,
-      [businessId, userId]
+      scopeParams
     );
     const total = parseInt(countResult.rows[0].total);
 
     const result = await query(
       `SELECT * FROM notifications 
-       WHERE business_id = $1 AND user_id = $2 
+       WHERE ${scopeClause}
        ${unreadOnly ? "AND is_read = false" : ""}
        ORDER BY created_at DESC 
-       LIMIT $3 OFFSET $4`,
-      [businessId, userId, limit, offset]
+       LIMIT $${scopeParams.length + 1} OFFSET $${scopeParams.length + 2}`,
+      [...scopeParams, limit, offset]
     );
 
     const response: ApiResponse<{ notifications: any[]; total: number }> = {
@@ -143,19 +153,22 @@ export const markNotificationAsRead: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
       });
     }
 
+    // Personal users own their rows outright (business_id may be NULL/""),
+    // so scope by user; workspace accounts keep the business pair.
     const result = await query(
       `UPDATE notifications 
        SET is_read = true, updated_at = NOW() 
-       WHERE id = $1 AND business_id = $2 AND user_id = $3 
+       WHERE id = $1 AND user_id = $2 
+         AND ($3::text IS NULL OR business_id = $3) 
        RETURNING *`,
-      [id, businessId, userId]
+      [id, userId, businessId || null]
     );
 
     if (result.rows.length === 0) {
@@ -200,7 +213,7 @@ export const markAllNotificationsAsRead: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -210,8 +223,9 @@ export const markAllNotificationsAsRead: RequestHandler = async (
     await query(
       `UPDATE notifications 
        SET is_read = true, updated_at = NOW() 
-       WHERE business_id = $1 AND user_id = $2 AND is_read = false`,
-      [businessId, userId]
+       WHERE user_id = $1 AND is_read = false 
+         AND ($2::text IS NULL OR business_id = $2)`,
+      [userId, businessId || null]
     );
 
     const response: ApiResponse<null> = {
@@ -269,7 +283,7 @@ export const takeNotificationAction: RequestHandler = async (
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
 
-    if (!businessId || !userId) {
+    if (!userId) {
       return res.status(400).json({
         success: false,
         error: "User authentication required",
@@ -279,9 +293,10 @@ export const takeNotificationAction: RequestHandler = async (
     const result = await query(
       `UPDATE notifications 
        SET is_read = true, action_taken = $1, updated_at = NOW() 
-       WHERE id = $2 AND business_id = $3 AND user_id = $4 AND is_actionable = true
+       WHERE id = $2 AND user_id = $3 
+         AND ($4::text IS NULL OR business_id = $4) AND is_actionable = true
        RETURNING *`,
-      [action, id, businessId, userId]
+      [action, id, userId, businessId || null]
     );
 
     if (result.rows.length === 0) {

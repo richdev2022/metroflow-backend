@@ -45,12 +45,26 @@ async function resolveRoom(roomType: "call" | "meeting", idOrCode: string, busin
   const deadlineCols = roomType === "call"
     ? `ended_at, NULL::timestamptz AS end_time`
     : `NULL::timestamptz AS ended_at, end_time`;
-  const res = await query(
-    `SELECT id, provider, ${deadlineCols}, status, max_participants, password, host_id, co_host_id, created_by
-     FROM ${table} WHERE ${isUuid ? "id" : codeCol} = $1 AND business_id = $2`,
+  const scoped = await query(
+    `SELECT id, provider, ${deadlineCols}, status, max_participants, password, host_id, co_host_id, created_by, type
+     FROM ${table} WHERE ${isUuid ? "id" : codeCol} = $1 AND business_id IS NOT DISTINCT FROM $2`,
     [idOrCode, businessId],
   );
-  return res.rows[0] || null;
+  if (scoped.rows[0]) return scoped.rows[0];
+  // PERSONAL-VIEWER LIVE FIX: LIVE broadcast rooms carry the HOST's
+  // business_id, so a personal user (business_id NULL) got 0 rows here and
+  // /rtc/token 400'd with "User authentication required" — the fallback
+  // credential path for every live viewer was dead. Live rooms are
+  // public-by-design; allow the unscoped match for type='live' only.
+  if (roomType === "call") {
+    const live = await query(
+      `SELECT id, provider, ${deadlineCols}, status, max_participants, password, host_id, co_host_id, created_by, type
+       FROM calls WHERE ${isUuid ? "id" : codeCol} = $1 AND type = 'live' LIMIT 1`,
+      [idOrCode],
+    );
+    return live.rows[0] || null;
+  }
+  return null;
 }
 
 async function isRoomMember(roomType: "call" | "meeting", roomId: string, userId: string): Promise<boolean> {
@@ -78,7 +92,11 @@ const postToken: RequestHandler = async (req: AuthenticatedRequest, res) => {
   try {
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
-    if (!businessId || !userId) {
+    // PERSONAL ACCOUNTS: businessId is legitimately NULL for personal users —
+    // userId alone authenticates the caller. The old `!businessId` check made
+    // /rtc/token 400 for every personal user, killing the credential
+    // fallback path for live viewers.
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     const { roomType, roomId } = req.body || {};
@@ -140,7 +158,9 @@ const postRemoveParticipant: RequestHandler = async (req: AuthenticatedRequest, 
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
     const { roomType, roomId, identity } = req.params as { roomType: any; roomId: string; identity: string };
-    if (!businessId || !userId) {
+    // PERSONAL ACCOUNTS: businessId is legitimately NULL here — userId alone
+    // authenticates the caller (room authorization happens below).
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (roomType !== "call" && roomType !== "meeting") {
@@ -183,7 +203,9 @@ const postMuteParticipant: RequestHandler = async (req: AuthenticatedRequest, re
     const businessId = req.user?.businessId;
     const userId = req.user?.userId;
     const { roomType, roomId, identity } = req.params as { roomType: any; roomId: string; identity: string };
-    if (!businessId || !userId) {
+    // PERSONAL ACCOUNTS: businessId is legitimately NULL here — userId alone
+    // authenticates the caller (room authorization happens below).
+    if (!userId) {
       return res.status(400).json({ success: false, error: "User authentication required" });
     }
     if (roomType !== "call" && roomType !== "meeting") {
@@ -237,7 +259,9 @@ const postRecordingStart: RequestHandler[] = [
       const businessId = req.user?.businessId;
       const userId = req.user?.userId;
       const { roomType, roomId } = req.params as { roomType: any; roomId: string };
-      if (!businessId || !userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL here — userId
+      // alone authenticates the caller (room authorization happens below).
+      if (!userId) {
         return res.status(400).json({ success: false, error: "User authentication required" });
       }
       if (roomType !== "call" && roomType !== "meeting") {
@@ -367,7 +391,9 @@ const postRecordingStop: RequestHandler[] = [
       const businessId = req.user?.businessId;
       const userId = req.user?.userId;
       const { roomType, roomId } = req.params as { roomType: any; roomId: string };
-      if (!businessId || !userId) {
+      // PERSONAL ACCOUNTS: businessId is legitimately NULL here — userId
+      // alone authenticates the caller (room authorization happens below).
+      if (!userId) {
         return res.status(400).json({ success: false, error: "User authentication required" });
       }
       if (roomType !== "call" && roomType !== "meeting") {

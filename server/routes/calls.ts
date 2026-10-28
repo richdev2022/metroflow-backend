@@ -957,6 +957,26 @@ export const joinCall: RequestHandler = async (
       }
     }
 
+    // CROSS-WORKSPACE LIVE FIX: a LIVE broadcast room carries the HOST's
+    // business_id (often a real workspace like MW1THY7), so a PERSONAL viewer
+    // (business_id NULL) failed both scoped lookups above with 404
+    // "Call not found" and never received media credentials — live streams
+    // showed chat but no video for every personal viewer. Live rooms are
+    // public-by-design (any authenticated user may watch via /live/:id/join),
+    // so fall back to an unscoped lookup restricted to type='live'.
+    let liveRoomFallback: { id: string } | undefined;
+    if (!actualId) {
+      const lookupCol = isValidUUID(id) ? "id" : "call_code";
+      const fb = await query(
+        `SELECT id FROM calls WHERE ${lookupCol} = $1 AND type = 'live' LIMIT 1`,
+        [id],
+      );
+      if (fb.rows.length > 0) {
+        liveRoomFallback = fb.rows[0];
+        actualId = liveRoomFallback.id;
+      }
+    }
+
     if (!actualId) {
       return res.status(404).json({
         success: false,
@@ -966,9 +986,12 @@ export const joinCall: RequestHandler = async (
     }
 
     const lookupCol = isValidUUID(id) ? 'id' : 'call_code';
+    // Live-aware re-read: matches the resolver above (own workspace OR any
+    // type='live' room) so the personal viewer who passed the fallback isn't
+    // rejected here with a phantom 404.
     const validationResult = await query(
       `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-       FROM calls WHERE ${lookupCol} = $1 AND business_id IS NOT DISTINCT FROM $2`,
+       FROM calls WHERE ${lookupCol} = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live')`,
       [id, businessId],
     );
     const callState = validationResult.rows[0];
@@ -1068,7 +1091,7 @@ export const joinCall: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               max_participants as "maxParticipants",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
+       FROM calls WHERE id = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live')`,
       [actualId, businessId],
     );
     if (callResult.rows.length === 0) {

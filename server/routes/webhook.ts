@@ -368,7 +368,6 @@ const handleSquadWebhook = async (event: any) => {
             if (txnCheck.rows.length === 0) {
               const fee = await calculateFee(amount, 'funding_account');
               const creditAmount = Math.max(0, amount - fee);
-              const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
 
               // INFLOW LIMIT GATE (Squad virtual account): the sender has
               // already moved money into the VA. Over the tier limit -> do
@@ -399,8 +398,19 @@ const handleSquadWebhook = async (event: any) => {
                 return;
               }
 
-              // Credit user wallet first
-              await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
+              // Credit user wallet — ATOMIC increment (never SET to an
+              // absolutely-computed value). The previous
+              // `SET balance = $newBalance` lost concurrent increments
+              // (webhook-vs-webhook or webhook-vs-debit race): both ledger
+              // rows inserted but one credit silently vanished — the exact
+              // root cause of user balance drift (e.g. a ₦240 deposit −
+              // ₦50 fee = ₦190 that never lands). A single UPDATE with
+              // `balance = balance + $1` is atomic under Postgres
+              // row-level locking.
+              await query(
+                `UPDATE wallets SET balance = COALESCE(balance, 0) + $1 WHERE id = $2`,
+                [creditAmount, wallet.id],
+              );
 
               // Platform ledger (owner invariant): a funding event produces
               // exactly ONE platform-ledger row — a DEBIT of the amount that
@@ -439,6 +449,11 @@ const handleSquadWebhook = async (event: any) => {
               const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
               if (userRes.rows.length > 0) {
                 const user = userRes.rows[0];
+                // Fresh post-credit balance for the alert (the atomic UPDATE
+                // above is the source of truth — never reuse a pre-computed
+                // value).
+                const newBalanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [wallet.id]);
+                const newBalance = newBalanceRes.rows.length > 0 ? parseFloat(newBalanceRes.rows[0].balance) : null;
                 await sendTransactionAlert(
                   user.email,
                   user.name || 'User',
@@ -684,7 +699,6 @@ const handleMonnifyWebhook = async (event: any) => {
                     if (txnCheck.rows.length === 0) {
               const fee = await calculateFee(amount, 'funding_account');
               const creditAmount = Math.max(0, amount - fee);
-              const newBalance = (parseFloat(wallet.balance) || 0) + creditAmount;
 
               // INFLOW LIMIT GATE (Monnify virtual account): over the tier
               // limit -> do not credit; record failed funding + auto-refund
@@ -715,8 +729,15 @@ const handleMonnifyWebhook = async (event: any) => {
                 return;
               }
 
-              // Credit user wallet first
-              await query(`UPDATE wallets SET balance = $1 WHERE id = $2`, [newBalance, wallet.id]);
+              // Credit user wallet — ATOMIC increment (see the Squad path
+              // above for the full rationale). Never SET an absolutely
+              // computed balance: concurrent webhook processing lost
+              // credits while both ledger rows were written (the ₦190-class
+              // drift reports).
+              await query(
+                `UPDATE wallets SET balance = COALESCE(balance, 0) + $1 WHERE id = $2`,
+                [creditAmount, wallet.id],
+              );
 
               // Platform ledger (owner invariant): ONE debit row for the user
               // funding; the gross gateway inflow row was noise.
@@ -755,6 +776,11 @@ const handleMonnifyWebhook = async (event: any) => {
               const userRes = await query(`SELECT email, name FROM users WHERE id = $1`, [wallet.user_id]);
               if (userRes.rows.length > 0) {
                 const user = userRes.rows[0];
+                // Fresh post-credit balance for the alert (the atomic UPDATE
+                // above is the source of truth — never reuse a pre-computed
+                // value).
+                const newBalanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [wallet.id]);
+                const newBalance = newBalanceRes.rows.length > 0 ? parseFloat(newBalanceRes.rows[0].balance) : null;
                 await sendTransactionAlert(
                   user.email,
                   user.name || 'User',

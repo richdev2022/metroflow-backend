@@ -6842,6 +6842,136 @@ protectedRouter.get("/ledger-adjustments/balances", requirePermission("manage_fi
   }
 });
 
+// ===========================================================================
+// USER-WALLET RECONCILIATION — compare a user's (or business') wallet
+// balances against the ledger sum of their transactions, and optionally
+// true-up the balance (one documented 'ledger_adjustment' row + balance set
+// to the ledger truth inside a locked transaction).
+//
+// This is the ops repair for the historical "missing ₦190"-class drift
+// caused by the non-atomic virtual-account funding credit
+// (webhook.ts `SET balance = $precomputed`, fixed to an atomic increment)
+// and by the historical swallowed-transfer-debit bug in services/transfer.ts.
+//
+//   GET  /admin/wallets/reconcile?userId=<uuid>
+//        → per-wallet {walletId, currency, balance, ledgerSum, drift}
+//   POST /admin/wallets/reconcile { userId, walletId? }  (repair, gated by
+//        manage_finance) → repairs every drifted wallet of that owner.
+// ===========================================================================
+
+const n2Round = (x: any): number => Math.round((parseFloat(x) || 0) * 100) / 100;
+
+async function reconcileOwnerWallets(ownerUserId: string | null, ownerBusinessId: string | null) {
+  const params: any[] = [];
+  let cond = "";
+  if (ownerUserId) { params.push(ownerUserId); cond = "w.user_id = $1"; }
+  else { params.push(ownerBusinessId); cond = "w.business_id = $1"; }
+
+  const wallets = await query(
+    `SELECT w.id, w.user_id, w.business_id, w.currency, w.balance, w.wallet_type
+     FROM wallets w WHERE ${cond} ORDER BY w.created_at`,
+    params,
+  );
+
+  const out: any[] = [];
+  for (const w of wallets.rows as any[]) {
+    const sum = await query(
+      `SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) AS ledger_sum,
+              COUNT(*)::int AS txn_rows
+       FROM transactions WHERE wallet_id = $1 AND status = 'success'`,
+      [w.id],
+    );
+    const ledgerSum = n2Round(sum.rows[0].ledger_sum);
+    const balance = n2Round(w.balance);
+    out.push({
+      walletId: w.id,
+      currency: w.currency,
+      walletType: w.wallet_type || null,
+      balance,
+      ledgerSum,
+      drift: n2Round(balance - ledgerSum),
+      txnRows: sum.rows[0].txn_rows,
+      ok: n2Round(balance - ledgerSum) === 0,
+    });
+  }
+  return out;
+}
+
+protectedRouter.get("/wallets/reconcile", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const userId = (req.query.userId as string) || null;
+    const businessId = (req.query.businessId as string) || null;
+    if (!userId && !businessId) {
+      return res.status(400).json({ success: false, error: "userId or businessId required" });
+    }
+    const wallets = await reconcileOwnerWallets(userId, businessId);
+    const drifted = wallets.filter((w) => !w.ok);
+    res.json({ success: true, data: { wallets, driftedCount: drifted.length } });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message || "Reconciliation failed" });
+  }
+});
+
+protectedRouter.post("/wallets/reconcile", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const userId = (req.body?.userId as string) || null;
+    const businessId = (req.body?.businessId as string) || null;
+    const walletId = (req.body?.walletId as string) || null;
+    if (!userId && !businessId) {
+      return res.status(400).json({ success: false, error: "userId or businessId required" });
+    }
+
+    const before = await reconcileOwnerWallets(userId, businessId);
+    const targets = walletId ? before.filter((w) => w.walletId === walletId) : before.filter((w) => !w.ok);
+    const repaired: any[] = [];
+
+    for (const t of targets) {
+      if (t.ok) continue;
+      const ref = `LEDGER-TRUEUP-${t.walletId.slice(0, 8)}-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`;
+      const dup = await query(`SELECT 1 FROM transactions WHERE reference = $1`, [ref]);
+      if (dup.rows.length > 0) { repaired.push({ ...t, skipped: "already repaired today" }); continue; }
+
+      const delta = n2Round(t.ledgerSum - t.balance); // signed adjustment to the balance
+      const direction = delta > 0 ? "credit" : "debit";
+      const ownerRes = await query(`SELECT user_id, business_id FROM wallets WHERE id = $1`, [t.walletId]);
+      const owner = ownerRes.rows[0] || {};
+
+      await query(
+        `INSERT INTO transactions
+           (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+         VALUES ($1,$2,$3,$4,'success',$5,$6,
+           'Balance true-up: ledger reconciliation repair (admin)','ledger_adjustment',$7,$8)`,
+        [owner.user_id ?? userId, owner.business_id ?? businessId, Math.abs(delta), t.currency || "NGN", ref, direction, t.walletId, direction],
+      );
+      await query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2`, [t.ledgerSum, t.walletId]);
+
+      // audit row in ledger_adjustments (same table the UI surfaces)
+      try {
+        await query(
+          `INSERT INTO ledger_adjustments (admin_id, ledger_type, direction, currency, amount, narration, reference, metadata, created_at)
+           VALUES ($1,'user_wallet',$2,$3,$4,$5,$6,$7,NOW())`,
+          [
+            req.admin?.adminId ?? null,
+            direction,
+            t.currency || "NGN",
+            Math.abs(delta),
+            `User-wallet reconciliation: wallet ${t.walletId} balance ${t.balance} -> ${t.ledgerSum}`,
+            ref,
+            JSON.stringify({ walletId: t.walletId, before: t.balance, ledgerSum: t.ledgerSum }),
+          ],
+        );
+      } catch { /* ledger_adjustments schema may vary — the transactions row is the durable record */ }
+
+      repaired.push({ walletId: t.walletId, before: t.balance, after: t.ledgerSum, reference: ref });
+    }
+
+    const after = await reconcileOwnerWallets(userId, businessId);
+    res.json({ success: true, data: { repaired, wallets: after } });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message || "Reconciliation repair failed" });
+  }
+});
+
 protectedRouter.post("/ledger-adjustments", requirePermission("manage_finance"), async (req: AuthenticatedAdminRequest, res) => {
   try {
     const admin = req.admin;

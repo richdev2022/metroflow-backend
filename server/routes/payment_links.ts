@@ -523,18 +523,18 @@ export async function settlePaymentLinkPayment(reference: string, providerName: 
     );
 
     await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [net, walletId]);
+    // ONE ledger row per collection. The original pending row (amount = gross)
+    // becomes the settlement record with amount = NET — matching the wallet
+    // movement and the VA-funding convention (amount = what was credited,
+    // fee = what was taken). The old code ALSO inserted a `${reference}-SETTLED`
+    // net row, so every settled collection showed TWO success credits
+    // (gross + net) against a single +net balance movement — a history that
+    // never reconciles with the balance (the MW1THY7 ₦200 phantom class).
     await query(
         `UPDATE transactions
-         SET status = 'success', fee = $2, updated_at = CURRENT_TIMESTAMP
+         SET status = 'success', fee = $2, amount = $3, updated_at = CURRENT_TIMESTAMP
          WHERE reference = $1`,
-        [reference, fee]
-    );
-    await query(
-        `INSERT INTO transactions
-         (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
-         VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'payment_link', $6, 'credit', $7, $8)
-         ON CONFLICT (reference) DO NOTHING`,
-        [payment.business_id, net, currency, `${reference}-SETTLED`, `Payment Link collection (net of ${fee} ${currency} fee)`, walletId, fee, providerName]
+        [reference, fee, net]
     );
 
     // Pool ledger: the customer's gateway payment IS a real pool inflow.

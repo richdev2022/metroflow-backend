@@ -782,9 +782,25 @@ export async function reverseFailedTransfer(
   // metadata / webhook meta stored on the queue row), reconstruct the missing
   // debit row (labelled as reconciliation) so the refund can proceed.
   let txnCheck = await query(
-    `SELECT id FROM transactions WHERE reference = $1 AND type = 'debit'`,
+    `SELECT id, status FROM transactions WHERE reference = $1 AND type = 'debit'`,
     [transfer.reference]
   );
+  // Phantom-reversal guard: a debit row marked 'failed' means the money never
+  // left the wallet (the transfer was rejected before the wallet debit — or a
+  // previous reversal already flipped it per step 5). Reversing those wrote a
+  // 'success' refund row AND credited the balance for money that never moved,
+  // inflating both the ledger and the balance (the Samuel ₦650 phantom class).
+  // Only a debit row that actually carried funds ('success' live hold, or a
+  // 'pending' hold awaiting settlement) has something to give back.
+  if (
+    txnCheck.rows.length > 0 &&
+    String(txnCheck.rows[0].status || '').toLowerCase() === 'failed'
+  ) {
+    console.warn(
+      `[TransferService] reverseFailedTransfer: debit row for ${transfer.reference} is 'failed' — money never left the wallet, skipping refund (phantom-reversal guard).`
+    );
+    return false;
+  }
   if (txnCheck.rows.length === 0) {
     const providerMeta = transfer.provider_metadata || transfer.meta_data || null;
     const hasProviderEvidence =

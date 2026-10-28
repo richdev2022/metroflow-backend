@@ -8,7 +8,7 @@ import {
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
 import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
-import { upload } from "../../../middleware/upload";
+import { upload, uploadAudio } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
 import { friendshipMap } from "../../../routes/friends";
 import { getSetting } from "../../../services/app-config";
@@ -259,6 +259,53 @@ router.get("/boost-pricing", authenticateToken, async (req: AuthenticatedRequest
 // ---------------------------------------------------------------------------
 // Feed
 // ---------------------------------------------------------------------------
+// REPOST EMBEDDING — batch-load the original posts referenced by a page of
+// reposts (post.repost_of_id) and shape them as compact `repost_of` cards.
+// Authored inline so both the feed and post-detail endpoints share one shape.
+async function loadRepostOfs(repostOfIds: string[]): Promise<Map<string, any>> {
+  const out = new Map<string, any>();
+  const ids = [...new Set(repostOfIds.filter(Boolean).map(String))];
+  if (!ids.length) return out;
+  try {
+    const rows = await query(
+      `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.created_at,
+              u.name AS author_name, u.avatar_url AS author_photo,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
+              (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
+       FROM social_posts p JOIN users u ON u.id = p.user_id
+       WHERE p.id = ANY($1::uuid[])`,
+      [ids],
+    );
+    const mediaRes = await query(
+      `SELECT post_id, media_type, url, poster_url FROM social_post_media WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
+      [ids],
+    );
+    const mediaByPost = new Map<string, any[]>();
+    for (const m of mediaRes.rows) {
+      const list = mediaByPost.get(String(m.post_id)) || [];
+      list.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url || null });
+      mediaByPost.set(String(m.post_id), list);
+    }
+    for (const p of rows.rows) {
+      out.set(String(p.id), {
+        id: p.id,
+        author: { id: p.user_id, name: p.author_name, photo: p.author_photo, is_verified: !!p.author_verified },
+        body: p.body, message: p.body,
+        image_url: p.image_url, video_url: p.video_url,
+        media: mediaByPost.get(String(p.id)) || [
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null } : null,
+        ].filter(Boolean),
+        like_count: Number(p.like_count) || 0,
+        comment_count: Number(p.comment_count) || 0,
+        created_at: p.created_at,
+      });
+    }
+  } catch { /* reposts still render as plain posts if the embed fails */ }
+  return out;
+}
+
 router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "social"))) return;
@@ -300,7 +347,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     const postsRes = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
-              p.text_color, p.font, p.text_align, p.background_color,
+              p.text_color, p.font, p.text_align, p.background_color, p.repost_of_id,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
               (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
@@ -534,6 +581,17 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     try {
       const savedMap = await savedStateForPosts(userId, postIds);
       items = items.map((i) => ({ ...i, saved_collection_ids: savedMap.get(String(i.id)) || [] }));
+    } catch { /* cosmetic */ }
+
+    // Embed repost originals (X-style attribution cards).
+    try {
+      const repostIds = items.map((i: any) => i.repost_of_id).filter(Boolean);
+      if (repostIds.length) {
+        const repostMap = await loadRepostOfs(repostIds);
+        items = items.map((i: any) => (i.repost_of_id && repostMap.has(String(i.repost_of_id))
+          ? { ...i, repost_of: repostMap.get(String(i.repost_of_id)) }
+          : i));
+      }
     } catch { /* cosmetic */ }
 
     items = rankFeed(items, boosts, { affinity, followed: followSet });
@@ -808,6 +866,10 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
       ? m.rows
       : [post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
          post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean);
+    if (post.repost_of_id) {
+      const embed = await loadRepostOfs([post.repost_of_id]);
+      post.repost_of = embed.get(String(post.repost_of_id)) || null;
+    }
     res.json({ success: true, data: { post } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: "Could not load post" });
@@ -1421,6 +1483,7 @@ router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRe
     const isPostAuthor = !!postRow.rows.length && postRow.rows[0].user_id === userId;
     const r = await query(
       `SELECT c.id, c.post_id, c.parent_id, c.user_id, c.body, c.like_count, c.status, c.created_at,
+              c.audio_url, c.audio_duration_ms,
               u.name AS author_name, u.avatar_url AS author_photo,
               EXISTS (SELECT 1 FROM social_comment_likes cl WHERE cl.comment_id = c.id AND cl.user_id = $2) AS liked_by_me
        FROM social_comments c JOIN users u ON u.id = c.user_id
@@ -1436,6 +1499,9 @@ router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRe
       // only `message` made every comment render as username-only.
       message: c.body, body: c.body, content: c.body,
       like_count: c.like_count, liked_by_me: !!c.liked_by_me,
+      // Voice comment payload (null for plain text comments).
+      audio_url: c.audio_url ?? null,
+      audio_duration_ms: c.audio_duration_ms ?? null,
       // Edit = your own comment. Delete = your own comment, any comment on
       // your post, or platform admin.
       can_edit: c.user_id === userId,
@@ -1448,11 +1514,16 @@ router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRe
   }
 });
 
-router.post("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRequest, res) => {
+// Voice comments: multipart POST with an optional `audio` field (15MB cap,
+// m4a/aac/mp3/ogg/wav/webm/opus/amr). Text-only clients keep sending JSON —
+// multer passes text fields through req.body untouched, so the legacy
+// contract is unchanged.
+router.post("/posts/:id/comments", authenticateToken, uploadAudio.single("audio"), async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const body = String(req.body?.body || "").trim();
-    if (!body) return res.status(400).json({ success: false, error: "Comment cannot be empty" });
+    const audioFile = (req as any).file as Express.Multer.File | undefined;
+    if (!body && !audioFile) return res.status(400).json({ success: false, error: "Comment cannot be empty" });
     if (body.length > 2000) return res.status(400).json({ success: false, error: "Comment too long" });
     const post = await query(`SELECT id, user_id FROM social_posts WHERE id = $1 AND status = 'active'`, [req.params.id]);
     if (!post.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
@@ -1461,16 +1532,38 @@ router.post("/posts/:id/comments", authenticateToken, async (req: AuthenticatedR
       const pr = await query(`SELECT id FROM social_comments WHERE id = $1 AND post_id = $2`, [req.body.parent_id, req.params.id]);
       if (pr.rows.length) parentId = req.body.parent_id;
     }
+    // Voice attachment → cloud storage (R2 → Cloudinary → local /uploads).
+    let audioUrl: string | null = null;
+    let audioDurationMs: number | null = null;
+    if (audioFile) {
+      try {
+        const up = await uploadMediaBuffer({
+          buffer: audioFile.buffer,
+          originalname: audioFile.originalname || "voice-note.m4a",
+          mimeType: audioFile.mimetype || "audio/m4a",
+          folder: "social-voice-comments",
+          userId,
+        });
+        audioUrl = up.url;
+      } catch (e: any) {
+        console.error("voice comment upload failed:", e?.message);
+        return res.status(500).json({ success: false, error: "Could not store the voice note" });
+      }
+      const dur = Number(req.body?.duration_ms);
+      audioDurationMs = Number.isFinite(dur) && dur > 0 ? Math.min(Math.round(dur), 10 * 60 * 1000) : null;
+    }
     const r = await query(
-      `INSERT INTO social_comments (post_id, user_id, parent_id, body) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [req.params.id, userId, parentId, body],
+      `INSERT INTO social_comments (post_id, user_id, parent_id, body, audio_url, audio_duration_ms)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.params.id, userId, parentId, body, audioUrl, audioDurationMs],
     );
     if (post.rows[0].user_id !== userId) {
+      const preview = body || (audioUrl ? "Sent a voice note" : "");
       createNotification({
         businessId: (req.user!.businessId ?? "") as string,
         userId: post.rows[0].user_id,
         title: "New comment",
-        message: body.slice(0, 80),
+        message: preview.slice(0, 80),
         type: "social",
       }).catch(() => {});
     }
@@ -1478,7 +1571,9 @@ router.post("/posts/:id/comments", authenticateToken, async (req: AuthenticatedR
     const comment = {
       id: r.rows[0].id, post_id: req.params.id, parent_id: parentId,
       author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
-      body, message: body, content: body, like_count: 0, created_at: r.rows[0].created_at,
+      body, message: body, content: body,
+      audio_url: audioUrl, audio_duration_ms: audioDurationMs,
+      like_count: 0, created_at: r.rows[0].created_at,
     };
     res.status(201).json({ success: true, data: { comment }, comment });
   } catch (e: any) {
@@ -1631,6 +1726,110 @@ router.post("/posts/:id/share", authenticateToken, async (req: AuthenticatedRequ
  * for humans), so chats show the actual post media as the share thumbnail.
  * No auth by design — link previewers are anonymous.
  */
+
+// ---------------------------------------------------------------------------
+// REPOSTS (X-style) — share someone's post into your own feed, optionally
+// with commentary and/or a recorded/uploaded video or photo (video reactions).
+// A repost is a NEW post row with repost_of_id pointing at the original; the
+// feed and post-detail endpoints embed the original as `repost_of`.
+// ---------------------------------------------------------------------------
+router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upload.fields([
+  { name: "image", maxCount: 1 },
+  { name: "video", maxCount: 1 },
+  { name: "poster", maxCount: 1 },
+]), async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const original = await query(
+      `SELECT id, user_id, status, audience FROM social_posts WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!original.rows.length || original.rows[0].status !== "active") {
+      return res.status(404).json({ success: false, error: "Post not found" });
+    }
+    const orig = original.rows[0];
+    // Respect the original's audience: private/followers posts can only be
+    // reposted by their author or (for followers-only) an active follower.
+    if (orig.audience === "private" && orig.user_id !== userId) {
+      return res.status(403).json({ success: false, error: "This post cannot be reposted" });
+    }
+    if (orig.audience === "followers" && orig.user_id !== userId) {
+      const f = await query(
+        `SELECT 1 FROM social_follows WHERE follower_id = $1 AND following_id = $2 AND status = 'active'`,
+        [userId, orig.user_id],
+      );
+      if (!f.rows.length) return res.status(403).json({ success: false, error: "Follow the author to repost this post" });
+    }
+
+    const body = String(req.body?.body || "").trim();
+    const audience = ["public", "followers", "private"].includes(String(req.body?.audience)) ? String(req.body?.audience) : "public";
+    const files = (req as any).files as Record<string, Express.Multer.File[]> | undefined;
+    const image = files?.image?.[0];
+    const video = files?.video?.[0];
+    const poster = files?.poster?.[0];
+    if (body.length > 2000) return res.status(400).json({ success: false, error: "Commentary too long" });
+
+    // Upload any recorded/picked media first (video reactions).
+    let imageUrl: string | null = null;
+    let videoUrl: string | null = null;
+    let posterUrl: string | null = null;
+    try {
+      if (image) {
+        const up = await uploadMediaBuffer({ buffer: image.buffer, originalname: image.originalname, mimeType: image.mimetype, folder: "social-media", userId });
+        imageUrl = up.url;
+      }
+      if (video) {
+        const up = await uploadMediaBuffer({ buffer: video.buffer, originalname: video.originalname, mimeType: video.mimetype, folder: "social-media", userId });
+        videoUrl = up.url;
+      }
+      if (poster) {
+        const up = await uploadMediaBuffer({ buffer: poster.buffer, originalname: poster.originalname, mimeType: poster.mimetype, folder: "social-media", userId });
+        posterUrl = up.url;
+      } else if (videoUrl) {
+        posterUrl = await extractVideoPosterFrame(video.buffer).catch(() => null);
+      }
+    } catch (e: any) {
+      console.error("repost media upload failed:", e?.message);
+      return res.status(500).json({ success: false, error: "Could not store the media" });
+    }
+
+    if (!body && !imageUrl && !videoUrl) {
+      // Plain repost — allowed (X-style), commentary optional.
+    }
+
+    const r = await query(
+      `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, repost_of_id)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [userId, body, imageUrl, videoUrl, audience, orig.id],
+    );
+    const post = r.rows[0];
+    if (videoUrl || imageUrl) {
+      await query(
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position)
+         VALUES ($1, $2, $3, $4, 0)`,
+        [post.id, videoUrl ? "video" : "image", videoUrl || imageUrl, posterUrl],
+      ).catch(() => {});
+    }
+
+    if (orig.user_id !== userId) {
+      const u = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      createNotification({
+        businessId: (req.user!.businessId ?? "") as string,
+        userId: orig.user_id,
+        title: "New repost",
+        message: `${u.rows[0]?.name || "Someone"} reposted your post`,
+        type: "social",
+        actionUrl: `/post/${post.id}`,
+      }).catch(() => {});
+    }
+
+    res.status(201).json({ success: true, data: { post, repost_of_id: orig.id } });
+  } catch (e: any) {
+    console.error("repost error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not repost" });
+  }
+});
+
 router.get("/share/post/:id", async (req, res) => {
   try {
     const r = await query(
@@ -2637,6 +2836,23 @@ router.post("/stories/:id/view", authenticateToken, async (req: AuthenticatedReq
     );
     if (r.rows.length) {
       await query(`UPDATE social_stories SET view_count = view_count + 1 WHERE id = $1`, [req.params.id]).catch(() => {});
+      // Tell the author someone new watched (first view only — the upsert's
+      // RETURNING guarantees dedupe). Self-views never notify.
+      try {
+        const s = await query(`SELECT user_id FROM social_stories WHERE id = $1`, [req.params.id]);
+        const authorId = s.rows[0]?.user_id;
+        if (authorId && authorId !== req.user!.userId) {
+          const v = await query(`SELECT name FROM users WHERE id = $1`, [req.user!.userId]);
+          createNotification({
+            businessId: (req.user!.businessId ?? "") as string,
+            userId: authorId,
+            title: "Story view",
+            message: `${v.rows[0]?.name || "Someone"} viewed your story`,
+            type: "social",
+            actionUrl: `/profile/${req.user!.userId}`,
+          }).catch(() => {});
+        }
+      } catch { /* notification is best-effort — view tracking still succeeded */ }
     }
     res.json({ success: true });
   } catch {
@@ -2657,6 +2873,40 @@ router.post("/stories/:id/like", authenticateToken, async (req: AuthenticatedReq
     res.json({ success: true, liked: true });
   } catch {
     res.status(500).json({ success: false, error: "Could not like story" });
+  }
+});
+
+/** GET /social/stories/:id/viewers — author-only viewer list with full profiles. */
+router.get("/stories/:id/viewers", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const story = await query(`SELECT user_id FROM social_stories WHERE id = $1`, [req.params.id]);
+    if (!story.rows.length) return res.status(404).json({ success: false, error: "Story not found" });
+    if (story.rows[0].user_id !== req.user!.userId) {
+      return res.status(403).json({ success: false, error: "Only the story author can see viewers" });
+    }
+    const r = await query(
+      `SELECT v.viewer_id, u.name, u.username, u.avatar_url, u.verified_badge_status,
+              COALESCE(u.account_privacy, 'public') AS account_privacy, v.viewed_at
+       FROM social_story_views v
+       JOIN users u ON u.id = v.viewer_id
+       WHERE v.story_id = $1
+       ORDER BY v.viewed_at DESC
+       LIMIT 200`,
+      [req.params.id],
+    );
+    const viewers = r.rows.map((v) => ({
+      id: v.viewer_id,
+      name: v.name,
+      username: v.username ?? null,
+      photo: v.avatar_url ?? null,
+      is_verified: v.verified_badge_status === "active",
+      is_private: v.account_privacy === "private",
+      viewed_at: v.viewed_at,
+      profile_url: `/profile/${v.viewer_id}`,
+    }));
+    res.json({ success: true, data: { viewers, total: viewers.length } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load viewers" });
   }
 });
 

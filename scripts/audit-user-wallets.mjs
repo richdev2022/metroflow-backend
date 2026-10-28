@@ -19,6 +19,14 @@
 //        the principal row — both reconcile correctly here because we sum the
 //        principal `amount` which already includes the fee).
 //
+//   PHANTOM-REFUND EXCLUSION (the ADJ-RECON-V2-SAMUEL-NGN-20261027 lesson):
+//     pre-fix reversal code also inserted refund rows for validation-failure
+//     debits that never moved the balance — those credits inflate the ledger
+//     truth, and repairing against it pushes money that was never lost INTO
+//     the balance. Refund rows whose parent debit rows are all 'failed' are
+//     excluded from the ledger truth; manual refunds with no parent row
+//     still count.
+//
 // REPAIR MODE (--repair):
 //   - Step 1: reconstruct missing transfer debit rows (transfer_queue rows
 //     whose platform hold exists but the user debit row was swallowed), then
@@ -60,16 +68,46 @@ await client.connect();
 
 const n2 = (x) => Math.round((parseFloat(x) || 0) * 100) / 100;
 
+// Ledger-truth sum with PHANTOM-REFUND exclusion (single source used by the
+// scan, the under-lock re-read and the post-repair invariant check):
+// refund rows whose parent debit rows are ALL 'failed' credit money the user
+// never lost (pre-fix reversal code inserted both rows, neither moved the
+// balance). Manual refunds with no parent row still count.
+const ledgerSumFor = async (walletId) => {
+  const r = await client.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE -t.amount END), 0)
+         - COALESCE(SUM(CASE WHEN t.direction='credit' AND t.reference LIKE '%-REFUND'
+                             AND EXISTS (SELECT 1 FROM transactions p
+                                         WHERE p.reference = regexp_replace(t.reference, '-(FEE-)?REFUND$', '')
+                                           AND p.wallet_id IS NOT DISTINCT FROM t.wallet_id
+                                         GROUP BY p.reference
+                                         HAVING COUNT(*) FILTER (WHERE p.status='success' AND p.direction='debit') = 0)
+                            THEN t.amount ELSE 0 END), 0) AS ledger_sum
+     FROM transactions t
+     WHERE t.wallet_id = $1 AND t.status = 'success'`,
+    [walletId],
+  );
+  return n2(r.rows[0].ledger_sum);
+};
+
 // ---------------------------------------------------------------- step 1
 // Reconstruct swallowed transfer debit rows (platform hold exists, user
 // debit row missing). Insert the missing rows so the ledger tells the truth,
 // then the drift computation in step 2 becomes exact.
 let reconstructed = 0;
 if (APPLY) {
+  // Schema-drift guard: production transfer_queue predates user_id —
+  // resolve the owner from the wallet row instead when the column is absent.
+  const tqCols = (await client.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = 'transfer_queue'`,
+  )).rows.map((r) => r.column_name);
+  const hasUserId = tqCols.includes("user_id");
   const q = `
-    SELECT tq.id, tq.reference, tq.user_id, tq.business_id, tq.wallet_id,
+    SELECT tq.id, tq.reference, ${hasUserId ? "tq.user_id," : "w.user_id,"} tq.business_id, tq.wallet_id,
            tq.amount, tq.fee, tq.currency, tq.status, tq.created_at
     FROM transfer_queue tq
+    LEFT JOIN wallets w ON w.id = tq.wallet_id
     WHERE EXISTS (SELECT 1 FROM transactions ht
                   WHERE ht.reference = tq.reference || '-PLATFORM')
       AND tq.status = 'success'
@@ -130,27 +168,65 @@ const params = [];
 let where = "";
 if (ONLY_USER) { params.push(ONLY_USER); where = "WHERE w.user_id = $1"; }
 
+// Production schema drift guard: older/production wallets tables may not
+// have wallet_type (or even currency) — SELECT only the columns that exist
+// so the audit still runs everywhere.
+const wcols = (await client.query(
+  `SELECT column_name FROM information_schema.columns WHERE table_name = 'wallets'`,
+)).rows.map((r) => r.column_name);
+const wSelect = ["id", "user_id", "business_id", "balance",
+  ...(wcols.includes("currency") ? ["currency"] : []),
+  ...(wcols.includes("wallet_type") ? ["wallet_type"] : []),
+].join(", ");
 const wallets = await client.query(
-  `SELECT w.id, w.user_id, w.business_id, w.currency, w.balance, w.wallet_type
-   FROM wallets w ${where} ORDER BY w.created_at`,
+  `SELECT ${wSelect} FROM wallets w ${where} ORDER BY w.created_at`,
   params,
 );
 
 const drifted = [];
 for (const w of wallets.rows) {
-  const sum = await client.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END), 0) AS ledger_sum,
-       COUNT(*)::int AS rows
-     FROM transactions
-     WHERE wallet_id = $1 AND status = 'success'`,
+  const ledgerSumFull = n2((await client.query(
+    `SELECT COALESCE(SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE -t.amount END), 0) AS s
+     FROM transactions t WHERE t.wallet_id = $1 AND t.status = 'success'`,
     [w.id],
-  );
-  const ledgerSum = n2(sum.rows[0].ledger_sum);
+  )).rows[0].s);
+  const ledgerSum = await ledgerSumFor(w.id);
+  const phantom = n2(ledgerSumFull - ledgerSum);
+  // PHANTOM-REFUND EXCLUSION (the ADJ-RECON-V2-SAMUEL-NGN-20261027 lesson):
+  // a refund row whose parent debit rows are ALL 'failed' credits money the
+  // user never lost — pre-fix reversal code inserted both rows but neither
+  // moved the balance. Including them inflates the ledger truth and makes
+  // every audit flag the wallet (and a --repair would push the phantom
+  // amount INTO the balance, undoing the documented V2 correction).
+  // Refunds with NO parent row (manual refunds e.g. LGFT-COMBO-REFUND-*)
+  // still count: EXISTS+HAVING only excludes rows whose parent is all-failed.
+  const effectiveSum = ledgerSum;
   const balance = n2(w.balance);
-  const drift = n2(balance - ledgerSum);
+  const drift = n2(balance - effectiveSum);
   if (drift !== 0) {
-    drifted.push({ ...w, ledgerSum, balance, drift, rows: sum.rows[0].rows });
+    // E2E-CLEANUP SENTINELS: the E2E suite zeroes test wallets by setting
+    // balance=0 and inserting an ADJ-CLEANUP-<case>-<currency>-<date>
+    // adjustment row ("E2E test-data cleanup — wallet zeroed") against a
+    // ledger that never held the test funding rows (E2E credits the balance
+    // directly). That mismatch is BY DESIGN — "repairing" it would
+    // fabricate ₦10k/₦20k credit rows inside TEST wallets. Any wallet with
+    // a sentinel cleanup row and a zero balance is E2E-cleaned: skip it.
+    // (ADJ-CLEANUP rows are only ever written by the E2E cleanup script
+    // against its probe accounts — real user wallets never carry one.)
+    const hasCleanup = (await client.query(
+      `SELECT 1 FROM transactions t
+       WHERE t.wallet_id = $1 AND t.status = 'success'
+         AND t.reference LIKE 'ADJ-CLEANUP-%' LIMIT 1`,
+      [w.id],
+    )).rows.length > 0;
+    if (hasCleanup && balance === 0) {
+      console.log(`  skip (E2E-cleaned test wallet) ${w.id} — sentinel cleanup row present, balance zeroed`);
+      continue;
+    }
+    const nRows = (await client.query(
+      `SELECT COUNT(*)::int AS n FROM transactions WHERE wallet_id = $1 AND status = 'success'`, [w.id],
+    )).rows[0].n;
+    drifted.push({ ...w, ledgerSum: effectiveSum, balance, drift, rows: nRows, phantom });
   }
 }
 
@@ -165,8 +241,10 @@ if (drifted.length === 0) {
 for (const d of drifted) {
   const owner = d.user_id || d.business_id || "?";
   console.log(
-    `  wallet ${d.id} (${d.wallet_type || d.currency}) owner ${owner}\n` +
-    `    balance=${d.balance}  ledger_sum=${d.ledgerSum}  drift=${d.drift > 0 ? "+" : ""}${d.drift}`,
+    `  wallet ${d.id} (${d.wallet_type || d.currency || "NGN"}) owner ${owner}\n` +
+    `    balance=${d.balance}  ledger_sum=${d.ledgerSum}` +
+    (d.phantom ? `  (phantom refunds excluded: ${d.phantom})` : "") +
+    `  drift=${d.drift > 0 ? "+" : ""}${d.drift}`,
   );
 }
 
@@ -204,14 +282,10 @@ for (const d of drifted) {
     if (lock.rows.length === 0) { await client.query("ROLLBACK"); continue; }
 
     // Re-read under the row lock — the pre-scan numbers may be stale.
-    const live = await client.query(
-      `SELECT
-         COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END), 0) AS ledger_sum
-       FROM transactions WHERE wallet_id = $1 AND status = 'success'`,
-      [d.id],
-    );
+    // Uses the SAME phantom-refund-aware sum as the scan (ledgerSumFor), so
+    // a repair can never push phantom refund rows into the balance.
     const balance = n2(lock.rows[0].balance);
-    const ledgerSum = n2(live.rows[0].ledger_sum);
+    const ledgerSum = await ledgerSumFor(d.id);
     const drift = n2(balance - ledgerSum);
     if (drift === 0) {
       await client.query("COMMIT"); // fixed by a concurrent repair — nothing to do
@@ -243,13 +317,12 @@ for (const d of drifted) {
       console.log(`  repairing ${d.id}: documented unrecorded inflow of +${delta} (balance ${balance} unchanged, ledger now sums to it; ${ref})`);
     }
 
-    // invariant: ledger sum must now equal balance — verified INSIDE the
-    // transaction, BEFORE the commit.
-    const chk = await client.query(
-      `SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) AS s
-       FROM transactions WHERE wallet_id = $1 AND status='success'`, [d.id]);
+    // invariant: ledger sum (phantom-refund-aware, same as every other
+    // computation) must now equal balance — verified INSIDE the transaction,
+    // BEFORE the commit.
+    const finalLedgerSum = await ledgerSumFor(d.id);
     const finalBalance = drift < 0 ? ledgerSum : balance;
-    if (n2(chk.rows[0].s) !== finalBalance) {
+    if (finalLedgerSum !== finalBalance) {
       await client.query("ROLLBACK");
       console.warn(`  ! invariant failed for ${d.id}; rolled back`);
       continue;

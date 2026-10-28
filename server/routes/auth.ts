@@ -1414,6 +1414,11 @@ export const login: RequestHandler = async (req, res) => {
 export const googleAuth: RequestHandler = async (req, res) => {
   try {
     const { credential, businessName, businessIndustry, referralCode } = req.body || {};
+    // mode:"personal" — the Personal apps send this so brand-new Google users
+    // become PERSONAL accounts (no workspace, personal wallets, personal
+    // profile flow). Previously every Google signup created a BUSINESS
+    // workspace, which stranded personal-app users in the wrong product.
+    const signupMode = String((req.body as any)?.mode || "").toLowerCase();
 
     // MAINTENANCE GATE: Google SSO must not bypass the maintenance window.
     if (await rejectIfUnderMaintenance(res)) return;
@@ -1483,6 +1488,89 @@ export const googleAuth: RequestHandler = async (req, res) => {
     // 3) Brand-new user: create business + admin user (Google-verified email, no password)
     if (!user) {
       isNewUser = true;
+
+      // 3a) PERSONAL MODE — parity with /auth/register/personal: account_type
+      // 'personal', business_id NULL, NGN + USDT + USDC wallets, no password
+      // (Google IS the credential), personal profile-completion flow.
+      if (signupMode === "personal") {
+        const personalResult = await query(
+          `INSERT INTO users
+            (business_id, email, name, role, account_type, email_verified, verified_at,
+             google_id, auth_provider, avatar_url, profile_completed, profile_prompt_dismissed)
+           VALUES (NULL, $1, $2, 'owner', 'personal', TRUE, CURRENT_TIMESTAMP,
+                   $3, 'google', $4, FALSE, FALSE)
+           RETURNING id, email, name`,
+          [googleUser.email, googleUser.name, googleUser.googleId, googleUser.picture || null],
+        );
+        const newPersonal = personalResult.rows[0];
+
+        // Personal wallets: NGN (primary) + stablecoin (USDT + USDC).
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'NGN', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'USDT', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'USDC', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+
+        try {
+          if (referralCode) {
+            await attributeReferrer(newPersonal.id, referralCode);
+          }
+          await ensureUserReferralCode(newPersonal.id);
+        } catch (refErr: any) {
+          console.warn("Referral attribution skipped (google personal):", refErr?.message);
+        }
+
+        await logActivity({
+          businessId: null,
+          userId: newPersonal.id,
+          action: "register",
+          actionType: "personal",
+          description: "Personal account registered via Google SSO",
+          metadata: { authProvider: "google", mode: "personal" },
+        });
+
+        const token = await generateToken(newPersonal.id, null);
+
+        return res.json({
+          success: true,
+          token,
+          userId: newPersonal.id,
+          businessId: null,
+          accountType: "personal",
+          isNewUser,
+          // Google users never set a password to use the app — the old
+          // business flow forced requiresPasswordSetup, which pushed personal
+          // users into password screens they do not need.
+          requiresPasswordSetup: false,
+          requiresProfileCompletion: true,
+          profileCompleted: false,
+          profilePromptDismissed: false,
+          phoneVerified: false,
+          message: "Google sign-up successful",
+          role: "owner",
+          isBusinessAdmin: false,
+          user: {
+            id: newPersonal.id,
+            name: newPersonal.name,
+            email: newPersonal.email,
+            avatarUrl: googleUser.picture || null,
+            authProvider: "google",
+            hasPassword: false,
+            accountType: "personal",
+          },
+        });
+      }
+
       const derivedBusinessName =
         (businessName && String(businessName).trim()) ||
         `${googleUser.name.split(" ")[0]}'s Workspace`;

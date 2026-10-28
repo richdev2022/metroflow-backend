@@ -265,6 +265,16 @@ export async function ensurePersonalSchema(): Promise<void> {
   // Text-post background — bare hex, or two hex stops comma-joined (vertical
   // gradient), matching the story composer's serialization contract.
   await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS background_color VARCHAR(64)`);
+  // Voice comments — audio attachment (R2/Cloudinary/local URL) + duration in
+  // ms so players can render a waveform/progress without loading the file.
+  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_url TEXT`);
+  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_duration_ms INTEGER`);
+
+  // Feed reposts (X-style): a repost is a NEW post row referencing the
+  // original. Commentary lives in `body`; any recorded/uploaded media rides
+  // social_post_media as usual. Originals are embedded by the API responses.
+  await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS repost_of_id UUID REFERENCES social_posts(id) ON DELETE CASCADE`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_posts_repost_of ON social_posts(repost_of_id)`);
 
   // Community reports — users flag posts; admins review + decide end-to-end.
   await query(`

@@ -20,6 +20,7 @@ import { roomManager } from "./roomManager";
 import { verifyToken } from "../services/auth";
 import { verifyGuestToken, guestCanAccessRoom } from "../utils/guestTokens";
 import { isCorsOriginAllowed } from "../cors";
+import { liveStageForCallRoom } from "./live-stage";
 import crypto from "crypto";
 import { glmChat, isGlmConfigured } from "./glm";
 import { lightClean, aiCleanCaption } from "./caption-clean";
@@ -1019,13 +1020,27 @@ export function initSocketServer(server: http.Server): void {
         let calling: CallingCredentials | undefined;
         try {
           const provider = await resolveProviderForRoom(isCall ? "call" : "meeting", resolvedRoomId, roomProvider);
+          // LIVE broadcast room? Derive publish rights server-side from the
+          // live stage (host + cohosts only) instead of trusting the client's
+          // isHost flag — the socket-minted token previously granted
+          // canPublish to EVERY viewer because canPublish was never passed.
+          let canPublish: boolean | undefined;
+          let stageIsHost = !!data.isHost;
+          if (isCall) {
+            const liveStage = await liveStageForCallRoom(resolvedRoomId, data.userId);
+            if (liveStage.isLiveSession) {
+              canPublish = liveStage.canPublish;
+              stageIsHost = liveStage.isHost || liveStage.isStage;
+            }
+          }
           calling = await buildCallingCredentials(provider, {
             roomType: isCall ? "call" : "meeting",
             roomId: resolvedRoomId,
             title: "",
             identity: data.userId,
             displayName: data.userName || "User",
-            isHost: !!data.isHost,
+            isHost: stageIsHost,
+            canPublish,
             remainingSeconds: computeRemainingSeconds(endsAt),
             maxParticipants: roomMaxParticipants,
           });

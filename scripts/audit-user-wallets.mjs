@@ -22,12 +22,21 @@
 // REPAIR MODE (--repair):
 //   - Step 1: reconstruct missing transfer debit rows (transfer_queue rows
 //     whose platform hold exists but the user debit row was swallowed), then
-//     recompute.
-//   - Step 2: any remaining drift is written as ONE documented adjustment
-//     ledger row (direction = sign of drift, transaction_type
-//     'ledger_adjustment', reference LEDGER-TRUEUP-<wallet8>-<yyyymmdd>) and
-//     the wallet balance is SET to the true ledger sum inside the same
-//     transaction (row locked FOR UPDATE).
+//     recompute. The reconstructed MAIN row carries the PRINCIPAL and the
+//     separate <ref>-FEE row carries the fee (mirroring services/transfer.ts).
+//   - Step 2: the invariant restored is wallets.balance == Σ(success rows).
+//     Two drift directions, two different repairs:
+//       · balance < ledger_sum (the "Samuel ₦190" webhook race): the credit
+//         rows already exist in the ledger but the old non-atomic balance
+//         write lost the increment — the repair APPLIES the recorded
+//         movement (SET balance = ledger_sum). No adjustment row: adding a
+//         credit row would double-count a credit the ledger already has.
+//       · balance > ledger_sum (movement with no ledger row): ONE documented
+//         credit ledger_adjustment row (reference
+//         LEDGER-TRUEUP-<wallet8>-<yyyymmdd>) is written so the ledger
+//         explains the balance; the balance itself is unchanged.
+//     Both paths re-verify the invariant inside the transaction before
+//     committing, and dump the full ledger to backups/ for forensics.
 //
 // Usage:
 //   DATABASE_URL='postgresql://...' node scripts/audit-user-wallets.mjs
@@ -72,7 +81,6 @@ if (APPLY) {
   for (const t of missing.rows) {
     const amt = n2(t.amount);
     const fee = n2(t.fee || 0);
-    const total = n2(amt + fee);
     try {
       await client.query("BEGIN");
       if (fee > 0) {
@@ -83,15 +91,21 @@ if (APPLY) {
           [t.user_id, t.business_id, fee, `${t.reference}-FEE`, t.wallet_id, fee, t.created_at],
         );
       }
+      // The live transfer path debits amount+fee from the balance but writes
+      // the MAIN row with the PRINCIPAL only (services/transfer.ts L1096: the
+      // separate <ref>-FEE row carries the fee). Mirroring that shape here —
+      // main row = principal, fee row = fee — keeps Σ rows == balance.
+      // (The old code wrote the main row as amt+fee AND a fee row, which
+      // double-counted the fee and made every reconstruction drift by +fee.)
       await client.query(
         `INSERT INTO transactions (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, created_at, updated_at)
          VALUES ($1,$2,$3,$4,'success',$5,'debit','Transfer (debit row reconstructed by ledger audit)','transfer',$6,'debit',$7,$8, NOW())
          ON CONFLICT (reference) DO NOTHING`,
-        [t.user_id, t.business_id, total, t.currency || "NGN", t.reference, t.wallet_id, fee, t.created_at],
+        [t.user_id, t.business_id, amt, t.currency || "NGN", t.reference, t.wallet_id, fee, t.created_at],
       );
       await client.query("COMMIT");
       reconstructed += 1;
-      console.log(`  reconstructed missing debit row for transfer ${t.reference} (₦${total})`);
+      console.log(`  reconstructed missing debit row for transfer ${t.reference} (₦${n2(amt + fee)} = principal ${amt} + fee ${fee})`);
     } catch (e) {
       await client.query("ROLLBACK");
       console.warn(`  ! failed to reconstruct ${t.reference}: ${e.message}`);
@@ -163,42 +177,79 @@ if (!APPLY) {
 }
 
 // ---------------------------------------------------------------- repair
+// THE LEDGER IS THE TRUTH, and the invariant we restore is
+//   wallets.balance == Σ(successful ledger rows for the wallet).
+// Two drift directions, two DIFFERENT repairs (the old code applied the SAME
+// insert-and-set to both, which double-counted one side and tripped its own
+// invariant check — every --repair rolled back and repaired nothing):
+//
+//   balance < ledger_sum  (Samuel's case): the credit rows ALREADY exist in
+//     the ledger (₦240 deposit − ₦50 fee) but the old non-atomic webhook
+//     `SET balance = <precomputed>` lost the balance increment. Adding
+//     ANOTHER credit row would double-count; the correct repair is to APPLY
+//     the already-recorded movement: SET balance = ledger_sum. No new row —
+//     the audit trail is the backup JSON + this log.
+//
+//   balance > ledger_sum: the balance moved without a ledger row explaining
+//     it (step 1 already reconstructed every transfer_queue-backed debit).
+//     Document the movement with ONE credit ledger_adjustment row of
+//     (balance − ledger_sum); the balance itself is CORRECT and unchanged —
+//     after the insert the ledger explains it exactly.
 const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
 let repaired = 0;
 for (const d of drifted) {
-  const ref = `LEDGER-TRUEUP-${d.id.slice(0, 8)}-${today}`;
-  const dup = await client.query(`SELECT 1 FROM transactions WHERE reference = $1`, [ref]);
-  if (dup.rows.length > 0) { console.log(`  skip ${d.id} (already repaired today: ${ref})`); continue; }
-
-  const target = d.ledgerSum; // the ledger is the truth
-  const delta = n2(target - d.balance); // signed adjustment to apply to balance
-
   try {
     await client.query("BEGIN");
     const lock = await client.query(`SELECT balance FROM wallets WHERE id = $1 FOR UPDATE`, [d.id]);
     if (lock.rows.length === 0) { await client.query("ROLLBACK"); continue; }
 
-    if (delta > 0) {
-      await client.query(
-        `INSERT INTO transactions (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-         VALUES ($1,$2,$3,$4,'success',$5,'credit','Balance true-up: credits lost by historical webhook race (audit repair)','ledger_adjustment',$6,'credit')`,
-        [d.user_id, d.business_id, delta, d.currency || "NGN", ref, d.id],
-      );
-    } else {
-      await client.query(
-        `INSERT INTO transactions (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-         VALUES ($1,$2,$3,$4,'success',$5,'debit','Balance true-up: debits missing from ledger (audit repair)','ledger_adjustment',$6,'debit')`,
-        [d.user_id, d.business_id, Math.abs(delta), d.currency || "NGN", ref, d.id],
-      );
+    // Re-read under the row lock — the pre-scan numbers may be stale.
+    const live = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END), 0) AS ledger_sum
+       FROM transactions WHERE wallet_id = $1 AND status = 'success'`,
+      [d.id],
+    );
+    const balance = n2(lock.rows[0].balance);
+    const ledgerSum = n2(live.rows[0].ledger_sum);
+    const drift = n2(balance - ledgerSum);
+    if (drift === 0) {
+      await client.query("COMMIT"); // fixed by a concurrent repair — nothing to do
+      console.log(`  skip ${d.id} (no longer drifted under lock)`);
+      continue;
     }
 
-    await client.query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2`, [target, d.id]);
+    if (drift < 0) {
+      // balance < ledger_sum: recorded-but-unapplied credits (the webhook
+      // race). Apply them — no adjustment row, the rows already exist.
+      await client.query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2`, [ledgerSum, d.id]);
+      console.log(`  repairing ${d.id}: balance ${balance} -> ${ledgerSum} (recorded-but-unapplied credits applied; ledger rows already present, no adjustment row written)`);
+    } else {
+      // balance > ledger_sum: unrecorded inflow. One documented credit row.
+      const delta = drift;
+      const ref = `LEDGER-TRUEUP-${d.id.slice(0, 8)}-${today}`;
+      const dup = await client.query(`SELECT 1 FROM transactions WHERE reference = $1`, [ref]);
+      if (dup.rows.length > 0) {
+        await client.query("ROLLBACK");
+        console.log(`  skip ${d.id} (already repaired today: ${ref})`);
+        continue;
+      }
+      await client.query(
+        `INSERT INTO transactions (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+         VALUES ($1,$2,$3,$4,'success',$5,'credit','Balance true-up: balance movement with no ledger row, documented by ledger audit (audit repair)','ledger_adjustment',$6,'credit')`,
+        [d.user_id, d.business_id, delta, d.currency || "NGN", ref, d.id],
+      );
+      // Balance is already correct — the ledger now explains it.
+      console.log(`  repairing ${d.id}: documented unrecorded inflow of +${delta} (balance ${balance} unchanged, ledger now sums to it; ${ref})`);
+    }
 
-    // invariant: ledger sum must now equal balance
+    // invariant: ledger sum must now equal balance — verified INSIDE the
+    // transaction, BEFORE the commit.
     const chk = await client.query(
       `SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) AS s
        FROM transactions WHERE wallet_id = $1 AND status='success'`, [d.id]);
-    if (n2(chk.rows[0].s) !== target) {
+    const finalBalance = drift < 0 ? ledgerSum : balance;
+    if (n2(chk.rows[0].s) !== finalBalance) {
       await client.query("ROLLBACK");
       console.warn(`  ! invariant failed for ${d.id}; rolled back`);
       continue;
@@ -206,7 +257,6 @@ for (const d of drifted) {
 
     await client.query("COMMIT");
     repaired += 1;
-    console.log(`  repaired ${d.id}: balance ${d.balance} -> ${target} (${ref})`);
 
     // backup trail for forensics
     try {

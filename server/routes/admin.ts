@@ -6928,41 +6928,73 @@ protectedRouter.post("/wallets/reconcile", requirePermission("manage_finance"), 
     for (const t of targets) {
       if (t.ok) continue;
       const ref = `LEDGER-TRUEUP-${t.walletId.slice(0, 8)}-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`;
-      const dup = await query(`SELECT 1 FROM transactions WHERE reference = $1`, [ref]);
-      if (dup.rows.length > 0) { repaired.push({ ...t, skipped: "already repaired today" }); continue; }
-
-      const delta = n2Round(t.ledgerSum - t.balance); // signed adjustment to the balance
-      const direction = delta > 0 ? "credit" : "debit";
       const ownerRes = await query(`SELECT user_id, business_id FROM wallets WHERE id = $1`, [t.walletId]);
       const owner = ownerRes.rows[0] || {};
-
-      await query(
-        `INSERT INTO transactions
-           (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-         VALUES ($1,$2,$3,$4,'success',$5,$6,
-           'Balance true-up: ledger reconciliation repair (admin)','ledger_adjustment',$7,$8)`,
-        [owner.user_id ?? userId, owner.business_id ?? businessId, Math.abs(delta), t.currency || "NGN", ref, direction, t.walletId, direction],
+      // Re-read live — the pre-scan may be stale.
+      const liveSum = await query(
+        `SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) AS ledger_sum
+         FROM transactions WHERE wallet_id = $1 AND status = 'success'`,
+        [t.walletId],
       );
-      await query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2`, [t.ledgerSum, t.walletId]);
+      const ledgerSum = n2Round(liveSum.rows[0].ledger_sum);
+      const liveBalanceRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [t.walletId]);
+      const balance = n2Round(liveBalanceRes.rows[0]?.balance ?? t.balance);
+      const drift = n2Round(balance - ledgerSum);
+      if (drift === 0) { repaired.push({ walletId: t.walletId, skipped: "no longer drifted" }); continue; }
 
-      // audit row in ledger_adjustments (same table the UI surfaces)
-      try {
+      // THE LEDGER IS THE TRUTH; the invariant restored is
+      //   wallets.balance == Σ(successful ledger rows).
+      // Two drift directions, two DIFFERENT repairs (inserting an adjustment
+      // row for the balance<ledger case double-counts a credit the ledger
+      // already has and leaves the wallet drifted by −drift after the
+      // balance set — the old behaviour).
+      if (drift < 0) {
+        // balance < ledger_sum: recorded-but-unapplied credits (the webhook
+        // race — Samuel's ₦190). APPLY the recorded movement; no new row.
+        await query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2`, [ledgerSum, t.walletId]);
+        try {
+          await query(
+            `INSERT INTO ledger_adjustments (admin_id, ledger_type, direction, currency, amount, narration, reference, metadata, created_at)
+             VALUES ($1,'user_wallet','credit',$2,$3,$4,$5,$6,NOW())`,
+            [
+              req.admin?.adminId ?? null,
+              t.currency || "NGN",
+              Math.abs(drift),
+              `User-wallet reconciliation: wallet ${t.walletId} balance ${balance} -> ${ledgerSum} (recorded-but-unapplied credits applied; no transactions row written — the credits already exist in the ledger)`,
+              ref,
+              JSON.stringify({ walletId: t.walletId, before: balance, ledgerSum, mode: "apply-recorded-credits" }),
+            ],
+          );
+        } catch { /* ledger_adjustments schema may vary — the wallets update is the durable record */ }
+        repaired.push({ walletId: t.walletId, before: balance, after: ledgerSum, mode: "apply-recorded-credits", reference: ref });
+      } else {
+        // balance > ledger_sum: movement with no ledger row. Document it with
+        // ONE credit adjustment row; the balance is correct and unchanged.
+        const dup = await query(`SELECT 1 FROM transactions WHERE reference = $1`, [ref]);
+        if (dup.rows.length > 0) { repaired.push({ ...t, skipped: "already repaired today" }); continue; }
         await query(
-          `INSERT INTO ledger_adjustments (admin_id, ledger_type, direction, currency, amount, narration, reference, metadata, created_at)
-           VALUES ($1,'user_wallet',$2,$3,$4,$5,$6,$7,NOW())`,
-          [
-            req.admin?.adminId ?? null,
-            direction,
-            t.currency || "NGN",
-            Math.abs(delta),
-            `User-wallet reconciliation: wallet ${t.walletId} balance ${t.balance} -> ${t.ledgerSum}`,
-            ref,
-            JSON.stringify({ walletId: t.walletId, before: t.balance, ledgerSum: t.ledgerSum }),
-          ],
+          `INSERT INTO transactions
+             (user_id, business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+           VALUES ($1,$2,$3,$4,'success',$5,'credit',
+             'Balance true-up: balance movement with no ledger row, documented by ledger reconciliation (admin)','ledger_adjustment',$6,'credit')`,
+          [owner.user_id ?? userId, owner.business_id ?? businessId, drift, t.currency || "NGN", ref, t.walletId],
         );
-      } catch { /* ledger_adjustments schema may vary — the transactions row is the durable record */ }
-
-      repaired.push({ walletId: t.walletId, before: t.balance, after: t.ledgerSum, reference: ref });
+        try {
+          await query(
+            `INSERT INTO ledger_adjustments (admin_id, ledger_type, direction, currency, amount, narration, reference, metadata, created_at)
+             VALUES ($1,'user_wallet','credit',$2,$3,$4,$5,$6,NOW())`,
+            [
+              req.admin?.adminId ?? null,
+              t.currency || "NGN",
+              drift,
+              `User-wallet reconciliation: wallet ${t.walletId} documented unrecorded inflow of ${drift} (balance ${balance} unchanged; ledger now sums to it)`,
+              ref,
+              JSON.stringify({ walletId: t.walletId, before: balance, ledgerSumBefore: ledgerSum, mode: "document-unrecorded-inflow" }),
+            ],
+          );
+        } catch { /* ledger_adjustments schema may vary — the transactions row is the durable record */ }
+        repaired.push({ walletId: t.walletId, before: balance, after: balance, mode: "document-unrecorded-inflow", reference: ref });
+      }
     }
 
     const after = await reconcileOwnerWallets(userId, businessId);

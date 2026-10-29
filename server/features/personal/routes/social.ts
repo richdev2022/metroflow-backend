@@ -1832,6 +1832,12 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
 
 router.get("/share/post/:id", async (req, res) => {
   try {
+    // Non-UUID keys (truncated links, /share/post/test probes) would hit the
+    // uuid-typed SQL compare and throw a 500 — answer 404 like the not-found
+    // path instead of a Sentry exception per scrape attempt.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(req.params.id || ""))) {
+      return res.status(404).send("<html><body><p>Post not found</p></body></html>");
+    }
     const r = await query(
       `SELECT p.id, p.body, p.image_url, p.video_url, p.created_at, u.name AS author_name, u.avatar_url AS author_photo
        FROM social_posts p JOIN users u ON u.id = p.user_id

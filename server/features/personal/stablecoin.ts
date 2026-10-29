@@ -740,6 +740,14 @@ router.post("/convert/quote", authenticateToken, checkSubscriptionStatus, async 
     try {
         const quote = await createConversionQuote(direction as any, currency, amount);
         const credit = await receiveAfterSpread(quote.receive_amount);
+        // WEB/UI PARITY: both clients render "Conversion fee" and "Limits"
+        // rows when these fields are present (Convert.tsx L330–345,
+        // convert_screen.dart) — they were never returned, so the rows never
+        // appeared and the enforced limits surfaced only as error toasts.
+        const spreadPercent = await getPercent("crypto_spread_percent", 1);
+        const feeAmount = n2(quote.receive_amount - credit);
+        const minAmount = direction === "stable_to_naira" ? MIN_CONVERT_CRYPTO : MIN_CONVERT_NGN;
+        const maxAmount = direction === "stable_to_naira" ? MAX_CONVERT_CRYPTO : MAX_CONVERT_NGN;
         return res.json({
             success: true,
             data: {
@@ -750,6 +758,11 @@ router.post("/convert/quote", authenticateToken, checkSubscriptionStatus, async 
                 receive_currency: quote.receive_currency,
                 expires_at: quote.expires_at,
                 mode: quote.mode,
+                fee_amount: feeAmount,
+                fee_currency: quote.receive_currency,
+                spread_percent: spreadPercent,
+                min_amount: minAmount,
+                max_amount: maxAmount,
             },
         });
     } catch (e: any) {

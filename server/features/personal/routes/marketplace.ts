@@ -153,7 +153,18 @@ router.get("/categories", authenticateToken, async (_req, res) => {
 // ---------------------------------------------------------------------------
 // Create / mine / detail / edit / delete
 // ---------------------------------------------------------------------------
-router.post("/", authenticateToken, checkSubscriptionStatus, upload.array("images", 10), async (req: AuthenticatedRequest, res) => {
+// Multer field contract: the WEB historically sends files under "media" and
+// the personal MOBILE app under "images". Upload.array("images") rejects the
+// other name with LIMIT_UNEXPECTED_FILE ("Unexpected file field" — Sentry
+// aea8b1cb, POST /api/store/marketplace), which surfaced as a generic
+// "Internet service error" in the mobile sell sheet. Accept BOTH names (10
+// files each) and merge below.
+const marketUpload = upload.fields([
+  { name: "images", maxCount: 10 },
+  { name: "media", maxCount: 10 },
+]);
+
+router.post("/", authenticateToken, checkSubscriptionStatus, marketUpload, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "marketplace"))) return;
     const userId = req.user!.userId;
@@ -180,7 +191,19 @@ router.post("/", authenticateToken, checkSubscriptionStatus, upload.array("image
     if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ success: false, error: "Set a valid price" });
     if (price > 100000000) return res.status(400).json({ success: false, error: "Price too high" });
 
-    const files = (req.files as any[]) || [];
+    // upload.fields() yields an OBJECT keyed by field name; the legacy
+    // .array() shape was a flat array. Normalize both here.
+    const rawFiles = req.files as
+      | unknown
+      | { [field: string]: Express.Multer.File[] };
+    const files: Express.Multer.File[] = Array.isArray(rawFiles)
+      ? (rawFiles as Express.Multer.File[])
+      : [
+          ...((rawFiles as { [field: string]: Express.Multer.File[] })
+            ?.images ?? []),
+          ...((rawFiles as { [field: string]: Express.Multer.File[] })
+            ?.media ?? []),
+        ];
     const images: string[] = [];
     for (const f of files.slice(0, 10)) {
       try {

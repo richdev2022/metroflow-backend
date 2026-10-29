@@ -53,6 +53,58 @@ async function getBusinessRow(businessId: string) {
 }
 
 /**
+ * PERSONAL-APP UPGRADE SUPPORT.
+ *
+ * Personal accounts are created with `business_id NULL`
+ * (features/personal/routes/auth.ts), so GET /business-kyc/status and
+ * POST /business-kyc/submit 401'd for every Personal-app user — the upgrade
+ * CTA navigated fine but submission died with "Unauthorized".
+ *
+ * Fix: lazily provision the caller's business scope. The row id IS the
+ * user's uuid (mirrors /wallet/limits' `businessId || userId` fallback), so
+ * the mapping is deterministic and idempotent — no users.business_id or
+ * session mutation, and admin approval later flips
+ * businesses.registration_category on this same row.
+ */
+async function ensureBusinessScope(
+  req: AuthenticatedRequest,
+): Promise<{ id: string | null; error?: string }> {
+  const linked = req.user?.businessId;
+  if (linked) return { id: linked };
+  const userId = req.user?.userId;
+  if (!userId) return { id: null, error: "Unauthorized" };
+  const u = await query(
+    `SELECT name, email FROM users WHERE id = $1 LIMIT 1`,
+    [userId],
+  );
+  const user = u.rows[0];
+  if (!user) return { id: null, error: "Unauthorized" };
+  const conflict = await query(
+    `SELECT id FROM businesses WHERE email = $1 AND id <> $2 LIMIT 1`,
+    [user.email, userId],
+  );
+  if (conflict.rows.length) {
+    return {
+      id: null,
+      error:
+        "A business account already uses this email — contact support to upgrade.",
+    };
+  }
+  try {
+    await query(
+      `INSERT INTO businesses (id, name, email, timezone, registration_category, owner_id)
+       VALUES ($1, $2, $3, $4, 'non_registered', $1)
+       ON CONFLICT (id) DO NOTHING`,
+      [userId, user.name, user.email, "Africa/Lagos"],
+    );
+  } catch (err: any) {
+    console.error("[business-kyc] scope provisioning failed:", err?.message);
+    return { id: null, error: "Could not prepare the upgrade — try again." };
+  }
+  return { id: userId };
+}
+
+/**
  * @swagger
  * /business-kyc/config:
  *   get:
@@ -94,8 +146,11 @@ router.get("/config", async (_req: Request, res: Response) => {
  */
 router.get("/status", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const businessId = req.user?.businessId;
-    if (!businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+    // Personal users (businessId NULL) get a lazily-provisioned scope —
+    // see ensureBusinessScope(). Previously a hard 401 for ALL of them.
+    const scope = await ensureBusinessScope(req);
+    if (!scope.id) return res.status(401).json({ success: false, error: scope.error || "Unauthorized" });
+    const businessId = scope.id;
 
     const business = await getBusinessRow(businessId);
     if (!business) return res.status(404).json({ success: false, error: "Business not found" });
@@ -179,8 +234,11 @@ router.post(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user?.userId;
-      const businessId = req.user?.businessId;
-      if (!userId || !businessId) return res.status(401).json({ success: false, error: "Unauthorized" });
+      // Personal users (businessId NULL) get a lazily-provisioned scope —
+      // see ensureBusinessScope(). Previously a hard 401 for ALL of them.
+      const scope = await ensureBusinessScope(req);
+      const businessId = scope.id;
+      if (!userId || !businessId) return res.status(401).json({ success: false, error: scope.error || "Unauthorized" });
 
       const registrationType = String((req.body as any).registrationType || "").trim();
       const businessDescription = String((req.body as any).businessDescription || "").trim();

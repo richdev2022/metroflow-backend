@@ -608,6 +608,10 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     // Stamp the dispatch instant — if the process dies mid-provider-call the
     // reconciliation engine can tell "dispatched, outcome unknown" from
     // "never dispatched" (provider 404 vs response parse failure).
+    // MONEY SAFETY: the marker is PERSISTED BEFORE the provider call, so the
+    // handler-level catch can see "money left for the provider" even if this
+    // process dies a millisecond from now. A crash after this point must
+    // NEVER auto-refund — only the provider's own verdict may settle the row.
     details.dispatched_at = new Date().toISOString();
     // Persist BEFORE the provider call — the stamp is only useful for crash
     // forensics if it survives the crash itself.
@@ -636,6 +640,28 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         delivered = tx.token || tx.tokens || tx.epin_cards || tx.pin || tx.voucher || providerResponse?.token || null;
         if (delivered) details.delivered = delivered;
       } catch (e: any) {
+        // MONEY SAFETY: only refund when Sogo DEFINITIVELY rejected the order
+        // (4xx). Timeouts / 5xx / network errors are AMBIGUOUS — the provider
+        // may have fulfilled the bill anyway (that is exactly how "successful
+        // bill + refunded wallet" happened before). Ambiguous failures leave
+        // the row 'processing': the Sogo webhook and the settlement reaper
+        // ask the provider and settle the truth.
+        if (sogo.isAmbiguousProviderError(e)) {
+          console.error("[bills] sogo dispatch outcome unknown — leaving row for reconciliation:", sogo.sogoErr(e));
+          await query(
+            `UPDATE bill_transactions
+               SET failure_reason = $2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status = 'processing'`,
+            [billId, `Dispatch outcome unknown (${String(sogo.sogoErr(e)).slice(0, 180)}) — awaiting provider webhook/reconciliation`.slice(0, 500)],
+          ).catch(() => {});
+          return res.status(202).json({
+            success: true,
+            pending: true,
+            provider,
+            message: "Payment received — the provider is fulfilling this bill. Track it in your history.",
+            data: { reference, status: "processing" },
+          });
+        }
         await fail("failed", sogo.sogoErr(e), true);
         return res.status(502).json({ success: false, error: `${userSafeErr(sogo.sogoErr(e))} — your wallet has been refunded.` });
       }
@@ -693,14 +719,39 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       }
     }
 
-    const updated = await query(
-      `UPDATE bill_transactions
-         SET status = $2, provider_reference = $3, provider_response = $4::jsonb, details = $5::jsonb,
-             settled_at = CASE WHEN $2 IN ('completed','failed','refunded','cancelled') THEN CURRENT_TIMESTAMP ELSE settled_at END,
-             updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 RETURNING *`,
-      [billId, status, providerRef, JSON.stringify(providerResponse), JSON.stringify(details)],
-    );
+    // MONEY SAFETY: this UPDATE is the settlement moment. A client-side
+    // timeout here can leave the row COMMITTED server-side while the handler
+    // sees a thrown error — re-read before doing anything drastic, and never
+    // turn a post-dispatch hiccup into a refund (the provider already has the
+    // money and the customer is already served).
+    let updated: { rows: any[] };
+    try {
+      updated = await query(
+        `UPDATE bill_transactions
+           SET status = $2, provider_reference = $3, provider_response = $4::jsonb, details = $5::jsonb,
+               settled_at = CASE WHEN $2 IN ('completed','failed','refunded','cancelled') THEN CURRENT_TIMESTAMP ELSE settled_at END,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 RETURNING *`,
+        [billId, status, providerRef, JSON.stringify(providerResponse), JSON.stringify(details)],
+      );
+    } catch (settleErr: any) {
+      console.error("[bills] settlement UPDATE failed — re-reading row state:", settleErr?.message);
+      const re = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [billId]).catch(() => null);
+      const row = re?.rows?.[0];
+      if (row && ["completed", "failed", "refunded", "cancelled"].includes(String(row.status))) {
+        updated = re as { rows: any[] }; // committed server-side after all — respond normally
+      } else {
+        // Genuinely unsettled: the provider call already went out, so the
+        // webhook / settlement engine will land the outcome. Never 500-refund here.
+        return res.status(202).json({
+          success: true,
+          pending: true,
+          provider,
+          message: "Payment received — the provider is fulfilling this bill. Track it in your history.",
+          data: { reference, status: "processing" },
+        });
+      }
+    }
 
     if (status === "completed") {
       const promoBits: string[] = [];
@@ -730,14 +781,21 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     });
   } catch (e: any) {
     console.error("[bills] pay error:", e?.message);
-    // MONEY SAFETY: if we got far enough to debit the wallet, make sure a
-    // handler-level crash (unexpected DB error, provider outage) can never
-    // strand the debit silently. Recover best-effort outside the happy path.
+    // MONEY SAFETY: recovery is decided by DISPATCH STATE, not by optimism.
+    //   - Provider call never went out (no persisted dispatched_at) → the
+    //     debit is stranded; refund it here (safe — nothing was bought).
+    //   - Provider call DID go out → the money belongs to the provider now;
+    //     NEVER auto-refund on a guess. Leave the row 'processing' for the
+    //     webhook + settlement reaper, and answer 202 (accepted, pending).
+    //     This is the fix for "bill successful to the recipient yet the API
+    //     500'd and the wallet was refunded".
+    let dispatched = false;
     try {
       if (billId && wallet?.id) {
-        const existing = await query(`SELECT status FROM bill_transactions WHERE id = $1`, [billId]);
-        const st = existing.rows[0]?.status;
-        if (st === 'processing') {
+        const existing = await query(`SELECT status, details FROM bill_transactions WHERE id = $1`, [billId]);
+        const row = existing.rows[0];
+        dispatched = !!(row?.details?.dispatched_at);
+        if (row?.status === 'processing' && !dispatched) {
           await creditWallet(wallet.id, total);
           await insertTransaction({
             userId, businessId: wallet.business_id, walletId: wallet.id,
@@ -746,12 +804,26 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
           }).catch(() => {});
           await query(
             `UPDATE bill_transactions SET status = 'refunded', failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
-            [billId, String(e?.message || 'handler error').slice(0, 500)],
+            [billId, String(e?.message || 'handler error (pre-dispatch)').slice(0, 500)],
+          );
+        } else if (row?.status === 'processing' && dispatched) {
+          await query(
+            `UPDATE bill_transactions SET failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'processing'`,
+            [billId, `Handler error after dispatch — left in processing for provider reconciliation (${String(e?.message || 'unknown').slice(0, 150)})`.slice(0, 500)],
           );
         }
+        // Rows already settled (completed/failed/refunded) need no recovery.
       }
     } catch (sweepErr: any) {
       console.error("[bills] pay error recovery failed:", sweepErr?.message);
+    }
+    if (dispatched) {
+      return res.status(202).json({
+        success: true,
+        pending: true,
+        message: "Payment received — the provider is fulfilling this bill. Track it in your history.",
+        data: { reference, status: "processing" },
+      });
     }
     return res.status(500).json({ success: false, error: "Could not complete the bill payment" });
   }

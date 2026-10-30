@@ -104,6 +104,22 @@ export function sogoErr(e: any): string {
   return String(msg).slice(0, 500);
 }
 
+/**
+ * MONEY SAFETY: classify a Sogo call failure as DEFINITIVE (the provider
+ * explicitly rejected the order — nothing was dispatched) or AMBIGUOUS (the
+ * order may still have landed and been fulfilled). Only DEFINITIVE failures
+ * may trigger an immediate refund; AMBIGUOUS ones must leave the bill row in
+ * 'processing' so the webhook / settlement engine can ask the provider and
+ * settle the truth — refunding on a timeout is how customers got free
+ * airtime (refund issued, bill delivered anyway).
+ */
+export function isAmbiguousProviderError(e: any): boolean {
+  const status = Number(e?.response?.status || 0);
+  if (status >= 500) return true;              // gateway/server error — the write may have landed
+  if (status >= 400) return false;             // explicit provider rejection (400/401/403/404/422/429)
+  return true;                                 // no HTTP response: timeout, DNS, connection reset, …
+}
+
 function client(): AxiosInstance {
   if (!isSogoConfigured()) {
     throw new Error("Sogo is not configured (SOGO_SECRET_KEY missing)");

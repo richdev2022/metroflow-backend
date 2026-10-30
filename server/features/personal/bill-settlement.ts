@@ -1,7 +1,7 @@
 import { query, pool } from "../../db";
 import { creditWallet, insertTransaction } from "./personal-utils";
 import { createNotification } from "../../services/notifications";
-import { creditPlatformWallet, debitRevenueWallet } from "../../services/fees";
+import { creditPlatformWallet, creditRevenueWallet, debitRevenueWallet } from "../../services/fees";
 import { sendPushToUsers } from "../../services/push";
 import * as sogo from "../../services/sogo";
 import { getActiveProvider } from "./provider-routing";
@@ -171,6 +171,186 @@ export async function settleBillCompleted(bill: BillRow, providerResponse: any):
     `Your ${bill.category} payment of ₦${amount.toLocaleString()} was confirmed. Ref: ${bill.reference}.`,
   );
   return true;
+}
+
+/**
+ * REFUND CORRECTION — a refund was issued while the provider actually
+ * fulfilled the bill (an ambiguous dispatch error refunded on a guess, or an
+ * old blind-refund row that the webhook reached too late to save). The
+ * customer ended up with the service AND their money back; the platform is
+ * owed `total`.
+ *
+ * Webhook-driven: only runs when the provider itself reports COMPLETED.
+ * Atomic core (ONE database transaction):
+ *   claim bill row (refunded|failed|cancelled → completed) +
+ *   guarded wallet re-debit (only when a `-REFUND` credit exists AND the
+ *   balance still covers it) + idempotent `${ref}-REFUND-REVERSAL` debit
+ *   ledger row + the original debit row flipped back to 'success'.
+ * If the wallet can no longer cover the re-debit the whole correction rolls
+ * back and support is flagged — a surprise negative balance is worse than a
+ * visible pending correction.
+ * Non-fatal unwinds after the commit: fee revenue re-earned and promo
+ * cashback restored when the reversal had taken them away.
+ */
+export async function correctWrongRefund(
+  bill: BillRow,
+  providerResponse: any,
+): Promise<{ corrected: boolean; reDebited: boolean; note: string }> {
+  const ref = bill.reference;
+  const total = Number(bill.total);
+  const out = { corrected: false, reDebited: false, note: "" };
+  if (!ref || !bill.wallet_id || !(total > 0)) {
+    out.note = "missing wallet link or non-positive total";
+    return out;
+  }
+
+  const refundLedger = await query(
+    `SELECT 1 FROM transactions WHERE reference = $1 AND type = 'credit' LIMIT 1`,
+    [`${ref}-REFUND`],
+  );
+  const wasRefunded = refundLedger.rows.length > 0;
+
+  const client = await pool.connect();
+  let claimed = false;
+  try {
+    await client.query("BEGIN");
+    const claim = await client.query(
+      `UPDATE bill_transactions
+         SET status = 'completed', provider_response = COALESCE($2::jsonb, provider_response),
+             failure_reason = NULL,
+             settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND status = ANY($3::varchar[]) RETURNING id`,
+      [bill.id, providerResponse ? JSON.stringify(providerResponse) : null, ["refunded", "failed", "cancelled"]],
+    );
+    if (claim.rows.length === 0) {
+      await client.query("ROLLBACK");
+      out.note = "row no longer correctable (already settled)";
+      return out;
+    }
+    if (wasRefunded) {
+      const reDebit = await client.query(
+        `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2 AND balance >= $1 RETURNING id`,
+        [total, bill.wallet_id],
+      );
+      if (reDebit.rows.length === 0) {
+        await client.query("ROLLBACK");
+        out.note = "wallet can no longer cover the re-debit — needs support action";
+        console.error(`[bill-settlement] refund correction blocked for ${ref}: ${out.note}`);
+        await notify(
+          bill,
+          "Bill correction pending",
+          `Provider confirmed your ${bill.category} payment of ₦${total.toLocaleString()} was fulfilled, but the earlier refund has already been spent. Please top up ₦${total.toLocaleString()} or contact support to settle. Ref: ${ref}.`,
+        );
+        return out;
+      }
+      await client.query(
+        `INSERT INTO transactions
+           (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+         VALUES ($1, $2, $3, 'NGN', 'success', $4, 'debit', $5, 'bill_refund_reversal', $6, 'debit')
+         ON CONFLICT (reference) DO NOTHING`,
+        [
+          bill.business_id ?? null,
+          bill.user_id ?? null,
+          total,
+          `${ref}-REFUND-REVERSAL`,
+          `Refund correction — ${bill.category} bill ${ref} was fulfilled by the provider; the earlier refund is re-debited`,
+          bill.wallet_id,
+        ],
+      );
+      out.reDebited = true;
+    }
+    // The reversal's display flip must undo too — the original debit is green again.
+    await client.query(
+      `UPDATE transactions SET status = 'success', updated_at = CURRENT_TIMESTAMP
+        WHERE reference = $1 AND type = 'debit' AND status <> 'success'`,
+      [ref],
+    );
+    await client.query("COMMIT");
+    claimed = true;
+    out.corrected = true;
+  } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+  if (!claimed) return out;
+
+  // ---- Post-commit unwinds (best-effort, idempotent) ---------------------
+  if (Number(bill.fee) > 0) {
+    try {
+      const revDebited = await query(
+        `SELECT 1 FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
+        [`${ref}-REVENUE-DEBIT`],
+      );
+      if (revDebited.rows.length > 0) {
+        await creditRevenueWallet(
+          Number(bill.fee),
+          "NGN",
+          `${ref}-CORRECTION`,
+          `Fee re-earned — bill ${ref} confirmed after refund correction`,
+          "bills",
+        );
+      }
+    } catch (e: any) {
+      console.error(`[bill-settlement] fee re-earn failed for ${ref}:`, e?.message);
+    }
+  }
+  try {
+    const cbReversed = await query(
+      `SELECT amount FROM transactions WHERE reference = $1 AND type = 'debit' LIMIT 1`,
+      [`${ref}-CB-REVERSAL`],
+    );
+    const cb = cbReversed.rows.length ? Number(cbReversed.rows[0].amount) : 0;
+    if (cb > 0 && bill.wallet_id) {
+      await creditWallet(bill.wallet_id, cb);
+      await insertTransaction({
+        userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
+        reference: `${ref}-CB-REDO`, type: "credit", transactionType: "bill_cashback",
+        amount: cb, currency: "NGN",
+        description: `Cashback restored — bill ${ref} confirmed after correction`,
+      });
+    }
+  } catch (e: any) {
+    console.error(`[bill-settlement] cashback restore failed for ${ref}:`, e?.message);
+  }
+
+  // ---- Tell the customer (push + in-app) ---------------------------------
+  const pretty = `₦${total.toLocaleString()}`;
+  try {
+    const walletRes = await query(`SELECT user_id, business_id FROM wallets WHERE id = $1`, [bill.wallet_id]);
+    const w = walletRes.rows[0];
+    if (w?.user_id) {
+      await sendPushToUsers(
+        [{ userId: w.user_id, businessId: w.business_id || bill.business_id }],
+        {
+          title: "Bill Payment Confirmed",
+          body: wasRefunded
+            ? `Your ${bill.category} payment of ${pretty} was fulfilled by the provider. The earlier refund was corrected (${pretty} re-debited). Ref: ${ref}.`
+            : `Your ${bill.category} payment of ${pretty} was fulfilled by the provider. Ref: ${ref}.`,
+          data: {
+            type: "transaction",
+            eventType: "bill_correction",
+            reference: ref,
+            amount: String(total),
+            currency: "NGN",
+          },
+        },
+        { inApp: false, type: "transaction", businessId: w.business_id || bill.business_id },
+      ).catch((pushErr: any) => console.error(`[bill-settlement] correction push failed for ${ref}:`, pushErr?.message));
+    }
+  } catch (e: any) {
+    console.error(`[bill-settlement] correction push setup failed for ${ref}:`, e?.message);
+  }
+  await notify(
+    bill,
+    "Bill payment confirmed",
+    wasRefunded
+      ? `Your ${bill.category} payment of ${pretty} was fulfilled by the provider — it is now marked successful. The earlier refund was corrected (${pretty} re-debited). Ref: ${ref}.`
+      : `Your ${bill.category} payment of ${pretty} was fulfilled by the provider — it is now marked successful. Ref: ${ref}.`,
+  );
+  return out;
 }
 
 /**

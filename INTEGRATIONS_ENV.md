@@ -372,6 +372,24 @@ Every received webhook (accepted **and** signature-rejected) is recorded for
 the Admin Console → **Webhooks** screen (provider `sogo`) with the event,
 reference, full payload, signature verdict and processing outcome.
 
+#### Live webhook shape (observed 2026-10-30, livemode) — read before debugging
+
+- `data.object` is the **discriminator string** `"transaction"`; the real
+  transaction fields sit directly in `data` (`data.reference`,
+  `data.status: {value, is_final}`, `data.type: {value, is_credit}`,
+  `data.amount: {raw, currency, formatted}`, `data.metadata`, `data.timestamps`).
+- `data.reference` is **Sogo's own `BILL…` reference** — Sogo does not echo our
+  Idempotency-Key in webhooks. Our row's `provider_reference` is captured from
+  the purchase response (or backfilled from the webhook by amount + customer
+  ref + category + creation window) and is the reconciliation key.
+- Statuses use their own vocabulary (`successful`/`delivered`/`failure`/
+  `canceled`) — all normalized to `completed|failed|refunded|cancelled`.
+- Bill events are **reconfirmed** against `GET /transactions/{ref}` before
+  settlement; on contradiction the row is left untouched for reconciliation.
+- Dropped/acknowledged events can be re-driven after a fix with
+  `POST /api/admin/webhooks/sogo/{squad_webhooks.id}/replay` (Admin token) —
+  Sogo never resends events that were ACKed 200.
+
 ---
 
 ## Deployment checklist

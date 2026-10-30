@@ -114,7 +114,10 @@ const handleFlutterwaveBillWebhook = async (event: any): Promise<boolean> => {
  * @swagger
  * tags:
  *   name: Webhooks
- *   description: Webhook endpoints for payment providers (Squad and Monnify)
+ *   description: >
+ *     Public provider webhook endpoints — Squad/Monnify, Sogo (bills, gift
+ *     cards, RMB, crypto deposits), Prestmit (gift cards) and Bitnob
+ *     (deposits, withdrawals, stablecoin). All signature-verified inside.
  */
 
 /**

@@ -157,6 +157,7 @@
   }
   .chip:hover { background: #f9fafb; }
   .chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip.live-on { color: #0e9f6e; border-color: rgba(14,159,110,.45); background: rgba(14,159,110,.07); }
 
   /* ---------- Tables ---------- */
   .table-wrap { overflow-x: auto; }
@@ -346,9 +347,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <span class="txt">Transfers</span>
       </button>
-      <button class="nav-item" data-page="webhooks">
+      <button class="nav-item" data-page="webhooks" style="position:relative">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
         <span class="txt">Webhooks</span>
+        <span class="nav-badge" id="whBadge" style="display:none">0</span>
       </button>
       <button class="nav-item" data-page="kyc">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -495,11 +497,13 @@ function showApp() {
   $("whoAmI").textContent = localStorage.getItem(NAME_KEY) || "Admin";
   route();
   refreshBadges();
+  whLiveStart();
 }
 function logout(expired) {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(NAME_KEY);
   closeDrawer(); closeModal();
+  whLiveStop();
   showLogin();
   if (expired) toast("Session expired — please sign in again", "err");
 }
@@ -543,6 +547,8 @@ function route() {
   var page = (location.hash || "#/dashboard").replace(/^#\/?/, "") || "dashboard";
   if (!PAGES[page]) page = "dashboard";
   currentPage = page;
+  /* Opening the Webhooks screen acknowledges the live alarm badge. */
+  if (page === "webhooks" && whLive.unseen > 0) { whLive.unseen = 0; whBadgeUpdate(); }
   var meta = PAGES[page];
   $("pageTitle").textContent = meta.title;
   $("pageSub").textContent = meta.sub;
@@ -953,12 +959,20 @@ function renderWebhooks() {
       '<div class="chips" id="whStatuses"></div>' +
       '<div class="search"><input id="whSearch" placeholder="Search reference or payload…" /></div>' +
       '<button class="btn btn-ghost btn-sm" id="whGo">Search</button>' +
+      '<span class="chip' + (whLive.timer ? " live-on" : "") + '" id="whLivePill" title="Rejected/failed callbacks are polled every 10s and toasted anywhere in the console">● Live</span>' +
+      '<button class="btn btn-ghost btn-sm" id="whMute">' + (whLive.muted ? "Unmute alarms" : "Mute alarms") + "</button>" +
     "</div>" +
     '<div id="whSummary"></div>' +
     '<div id="whTable"><div class="skel" style="height:260px"></div></div>';
   renderWhChips();
   $("whGo").onclick = function () { whState.search = $("whSearch").value.trim(); whState.page = 1; loadWebhooks(); };
   $("whSearch").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("whGo").onclick(); } });
+  $("whMute").onclick = function () {
+    whLive.muted = !whLive.muted;
+    try { localStorage.setItem("mf_wh_mute", whLive.muted ? "1" : "0"); } catch (e) {}
+    this.textContent = whLive.muted ? "Unmute alarms" : "Mute alarms";
+    toast(whLive.muted ? "Live webhook alarms muted — the nav badge keeps counting" : "Live webhook alarms unmuted", whLive.muted ? "info" : "ok");
+  };
   loadWebhooks();
 }
 function renderWhChips() {
@@ -1051,6 +1065,120 @@ function openWhDrawer(w) {
     '<div class="section-title">Payload</div>' +
     '<pre class="mono" style="background:#fafbfc;border:1px solid var(--line);border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:46vh;overflow-y:auto">' + esc(pretty) + "</pre>");
 }
+
+/* ===================== live webhook alarms (rejected / failed) =====================
+   Polls GET /admin/webhooks/live every 10s and toasts every provider callback that
+   was REJECTED (bad/missing signature, forgery) or FAILED (processing error) —
+   squad, monnify, flutterwave, prestmit, bitnob, stablecoin, sogo — no matter which
+   console screen is open. Clicking a toast jumps to the Webhooks screen pre-filtered
+   to that provider + status. */
+var whLive = {
+  timer: null,      // 10s poll interval handle
+  booting: false,   // baseline request in flight
+  watermark: null,  // ISO stamp of the newest alarm already picked up
+  seen: {},         // event ids already toasted (bounded map)
+  unseen: 0,        // alarms not yet acknowledged on the Webhooks screen
+  muted: (function () { try { return localStorage.getItem("mf_wh_mute") === "1"; } catch (e) { return false; } })(),
+};
+var BASE_TITLE = document.title;
+
+function whBadgeUpdate() {
+  var b = $("whBadge");
+  if (b) {
+    b.style.display = whLive.unseen > 0 ? "inline" : "none";
+    b.textContent = whLive.unseen > 99 ? "99+" : String(whLive.unseen);
+  }
+  document.title = whLive.unseen > 0 ? "(" + whLive.unseen + ") " + BASE_TITLE : BASE_TITLE;
+}
+
+function whLiveStart() {
+  if (whLive.timer || whLive.booting) return;
+  whLive.booting = true;
+  api("/webhooks/live").then(function (j) {
+    /* Baseline — start from the newest existing alarm so the backlog is never
+       toasted on login; only callbacks landing from now on alarm. */
+    whLive.watermark = (j && j.watermark) || new Date(0).toISOString();
+    whLive.timer = setInterval(whLivePoll, 10000);
+    var pill = $("whLivePill");
+    if (pill) pill.classList.add("live-on");
+  }).catch(function () {
+    /* Backend build without /webhooks/live yet — retry quietly. */
+    setTimeout(whLiveStart, 30000);
+  }).then(function () { whLive.booting = false; });
+}
+
+function whLiveStop() {
+  if (whLive.timer) { clearInterval(whLive.timer); whLive.timer = null; }
+  whLive.watermark = null;
+  whLive.unseen = 0;
+  whLive.seen = {};
+  whBadgeUpdate();
+  var pill = $("whLivePill");
+  if (pill) pill.classList.remove("live-on");
+}
+
+function whToastAlarm(ev) {
+  var p = String(ev.provider || "unknown");
+  var label = p.charAt(0).toUpperCase() + p.slice(1);
+  var isRejected = ev.status === "rejected";
+  var head = (isRejected ? "Webhook rejected — " : "Webhook failed — ") + label;
+  var line = (ev.error || (isRejected ? "invalid signature" : "processing error")) +
+    (ev.reference ? " · ref " + ev.reference : "") + " · " + dt(ev.created_at);
+  var t = document.createElement("div");
+  t.className = "toast err";
+  t.style.cursor = "pointer";
+  t.title = "Open in Webhooks";
+  t.innerHTML = "<b>" + esc(head) + "</b><div style=\"font-size:12px;opacity:.85;margin-top:2px\">" + esc(line) + "</div>";
+  t.onclick = function () { t.remove(); whJumpTo(ev); };
+  $("toasts").appendChild(t);
+  setTimeout(function () { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, 8000);
+  setTimeout(function () { t.remove(); }, 8350);
+}
+
+function whJumpTo(ev) {
+  whState.provider = String(ev.provider || "");
+  whState.status = String(ev.status || "");
+  whState.search = "";
+  whState.page = 1;
+  if (currentPage === "webhooks") {
+    var inp = $("whSearch");
+    if (inp) inp.value = "";
+    renderWhChips();
+    loadWebhooks();
+  } else {
+    location.hash = "#/webhooks";
+  }
+}
+
+function whLivePoll() {
+  if (!whLive.watermark) return;
+  api("/webhooks/live?after=" + encodeURIComponent(whLive.watermark)).then(function (j) {
+    var ev = (j && j.events) || [];
+    var fresh = [];
+    for (var i = 0; i < ev.length; i++) {
+      if (!whLive.seen[ev[i].id]) { whLive.seen[ev[i].id] = 1; fresh.push(ev[i]); }
+    }
+    var ids = Object.keys(whLive.seen);
+    if (ids.length > 500) { for (var d = 0; d < 250; d++) delete whLive.seen[ids[d]]; }
+    if (j && j.watermark) whLive.watermark = j.watermark;
+    if (fresh.length) {
+      whLive.unseen += fresh.length;
+      whBadgeUpdate();
+      if (!whLive.muted) {
+        var head = fresh.slice(0, 3);
+        for (var a = 0; a < head.length; a++) whToastAlarm(head[a]);
+        if (fresh.length > head.length) toast((fresh.length - head.length) + " more rejected/failed webhook(s) — open Webhooks", "err", 8000);
+      }
+      /* Watching the feed right now? Pull the new rows straight into the table. */
+      if (currentPage === "webhooks" && !$("drawer").classList.contains("on")) loadWebhooks();
+    }
+  }).catch(function () { /* transient network/auth blip — next tick retries */ });
+}
+
+document.addEventListener("visibilitychange", function () {
+  /* Fire an instant poll when the tab wakes up instead of waiting a full cycle. */
+  if (!document.hidden && whLive.timer) whLivePoll();
+});
 
 /* ===================== kyc ===================== */
 function renderKyc() {

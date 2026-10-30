@@ -3170,6 +3170,115 @@ protectedRouter.get("/webhooks", async (req, res) => {
     }
 });
 
+/**
+ * @swagger
+ * /admin/webhooks/live:
+ *   get:
+ *     summary: Live alarm feed for rejected & failed webhooks
+ *     description: |
+ *       Lightweight polling endpoint that powers the Admin Console's real-time
+ *       webhook alarms. Every rejected (bad/missing signature, forgery attempt)
+ *       or failed (processing error) provider callback — squad, monnify,
+ *       flutterwave, prestmit, bitnob, stablecoin, sogo — is returned here the
+ *       moment it is logged, so the console can toast it within seconds.
+ *
+ *       Usage: call once with no `after` to baseline (returns only the current
+ *       watermark, never history), then re-call with `after=<watermark>` every
+ *       ~10s. Deliver the returned `events` as toasts and advance the stored
+ *       watermark to the response's `watermark`. Same-millisecond events are
+ *       re-delivered with `>=` semantics — dedupe client-side by `id`.
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: after
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: ISO watermark from the previous poll. Omit to baseline.
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           maximum: 25
+ *         description: Max events per poll (1-25).
+ *     responses:
+ *       200:
+ *         description: |
+ *           New rejected/failed events since the watermark plus the watermark to
+ *           store. `events` is empty on a baseline call.
+ */
+protectedRouter.get("/webhooks/live", liveWebhookFeed);
+
+export async function liveWebhookFeed(req: any, res: any) {
+    try {
+        const afterRaw = typeof req.query.after === "string" ? req.query.after.trim() : "";
+        const limitRaw = parseInt(String(req.query.limit ?? "10"), 10);
+        const limit = Math.min(Math.max(Number.isNaN(limitRaw) ? 10 : limitRaw, 1), 25);
+
+        // An unparseable `after` is treated as a baseline rather than an error —
+        // a stale console should never get stuck alarming on its own bad state.
+        const afterDate = afterRaw ? new Date(afterRaw) : null;
+        const after = afterDate && !isNaN(afterDate.getTime()) ? afterDate : null;
+
+        // Baseline call (no valid `after`): answer with the newest alarm stamp so
+        // the console starts from "now" instead of toasting the whole backlog —
+        // and skip the events query entirely, there is nothing to deliver.
+        if (!after) {
+            const head = await query(
+                `SELECT MAX(created_at) AS m FROM squad_webhooks WHERE status IN ('rejected', 'failed')`,
+            );
+            return res.json({
+                success: true,
+                watermark: head.rows[0]?.m ? new Date(head.rows[0].m).toISOString() : new Date(0).toISOString(),
+                events: [],
+            });
+        }
+
+        // Events are returned oldest-first so toasts appear in the order the
+        // callbacks actually landed. Payload is deliberately excluded — the
+        // toast needs provider/event/reference only, and the full payload stays
+        // one click away on the Webhooks screen.
+        const params: any[] = [after.toISOString(), limit];
+        const result = await query(
+            `SELECT id, event_type, provider, reference, status, signature_valid, error, created_at
+             FROM squad_webhooks
+             WHERE status IN ('rejected', 'failed') AND created_at >= $1
+             ORDER BY created_at ASC
+             LIMIT $2`,
+            params,
+        );
+
+        // Watermark follows the LAST returned row — never the table max — so a
+        // burst larger than `limit` is picked up in full on the next poll.
+        let maxTs: Date | null = null;
+        for (const row of result.rows) {
+            const ts = row.created_at ? new Date(row.created_at) : null;
+            if (ts && (!maxTs || ts > maxTs)) maxTs = ts;
+        }
+
+        res.json({
+            success: true,
+            watermark: maxTs ? maxTs.toISOString() : after.toISOString(),
+            events: result.rows.map((r: any) => ({
+                id: r.id,
+                provider: r.provider || "unknown",
+                event_type: r.event_type || "unknown",
+                reference: r.reference || null,
+                status: r.status,
+                signature_valid: r.signature_valid,
+                error: r.error || null,
+                created_at: r.created_at,
+            })),
+        });
+    } catch (error) {
+        console.error("Live webhooks error:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch live webhooks" });
+    }
+}
+
 // Export Transactions (Admin)
 /**
  * @swagger

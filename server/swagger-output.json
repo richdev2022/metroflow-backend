@@ -12577,6 +12577,46 @@
         }
       }
     },
+    "/api/admin/webhooks/live": {
+      "get": {
+        "summary": "Live alarm feed for rejected & failed webhooks",
+        "description": "Lightweight polling endpoint that powers the Admin Console's real-time\nwebhook alarms. Every rejected (bad/missing signature, forgery attempt)\nor failed (processing error) provider callback — squad, monnify,\nflutterwave, prestmit, bitnob, stablecoin, sogo — is returned here the\nmoment it is logged, so the console can toast it within seconds.\n\nUsage: call once with no `after` to baseline (returns only the current\nwatermark, never history), then re-call with `after=<watermark>` every\n~10s. Deliver the returned `events` as toasts and advance the stored\nwatermark to the response's `watermark`. Same-millisecond events are\nre-delivered with `>=` semantics — dedupe client-side by `id`.\n",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "ISO watermark from the previous poll. Omit to baseline."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "maximum": 25
+            },
+            "description": "Max events per poll (1-25)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "New rejected/failed events since the watermark plus the watermark to\nstore. `events` is empty on a baseline call.\n"
+          }
+        }
+      }
+    },
     "/api/admin/reports/transactions/export": {
       "get": {
         "summary": "Export transactions to CSV",

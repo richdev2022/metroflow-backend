@@ -331,6 +331,49 @@ Calling provider selection lives in `server/lib/calling/factory.ts`
 
 ---
 
+## 14. Sogo — bills · gift cards · RMB · crypto off-ramp
+
+**Files**: `server/services/sogo.ts` (service client + webhook verification) ·
+`server/routes/personal-webhooks.ts` (`POST /webhook/sogo`) ·
+`server/features/personal/provider-routing.ts` (routing defaults).
+
+**Auth**: `Authorization: Bearer $SOGO_SECRET_KEY` (key prefix
+`sogo_sk_test_` → sandbox, `sogo_sk_live_` → live; the base URL auto-routes on
+the prefix unless `SOGO_BASE_URL` overrides it).
+
+### Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SOGO_SECRET_KEY` | ✅ | Secret API key — Sogo developer profile. Decides sandbox vs live. |
+| `SOGO_PUBLIC_KEY` | optional | Public key flag surfaced by the admin Personal Products console. |
+| `SOGO_WEBHOOK_SECRET` | ✅ for webhooks | The endpoint **signing secret** Sogo shows when you register the webhook ("copy this signing secret"). Verifies `X-Sogo-Signature-256: sha256= + HMAC-SHA256(raw body, secret)` timing-safely. **Fail closed**: without it every Sogo webhook is answered `401` and nothing settles. |
+| `SOGO_BASE_URL` | optional | Override (`https://sandbox.sogo.africa/v1` / `https://api.sogo.africa/v1`); the key prefix decides otherwise. |
+
+### Where to put the signing secret
+
+It is a **server environment variable, not code**: paste
+`SOGO_WEBHOOK_SECRET=<the secret from the Sogo dashboard>` into the backend
+hosting provider's environment (droplet `.env` / Render → service →
+Environment) and restart/redeploy so `process.env` picks it up. Never commit
+the real value — `.env` is gitignored and CI must not see it.
+
+Local verification without waiting for Sogo traffic (signed curl, exit 0 +
+`{"success":true}` means the secret matches):
+
+```bash
+BODY='{"event":"ping","data":{}}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SOGO_WEBHOOK_SECRET" -hex | sed 's/^.* //')"
+curl -s -X POST https://api.metricorex.com/api/webhook/sogo \
+  -H "Content-Type: application/json" -H "X-Sogo-Signature-256: $SIG" -d "$BODY"
+```
+
+Every received webhook (accepted **and** signature-rejected) is recorded for
+the Admin Console → **Webhooks** screen (provider `sogo`) with the event,
+reference, full payload, signature verdict and processing outcome.
+
+---
+
 ## Deployment checklist
 
 1. **Droplet `.env`** — mirror every section above; the file is gitignored, so
@@ -348,5 +391,7 @@ Calling provider selection lives in `server/lib/calling/factory.ts`
    - Bitnob → `https://api.metricorex.com/api/personal/webhooks/bitnob`
    - Prestmit → same handler family (`personal-webhooks.ts`), signed with
      `PRESTMIT_WEBHOOK_SIGNING_KEY`
+   - Sogo → `https://api.metricorex.com/api/webhook/sogo`, and store the
+     signing secret it shows as `SOGO_WEBHOOK_SECRET` (see §14)
    - Flutterwave → backend `/api/webhook` with `verif-hash` = `FLW_SECRET_HASH`
    - Monnify → backend monnify webhook route

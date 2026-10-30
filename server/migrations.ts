@@ -93,6 +93,21 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureGiftcardRoutesSchema", ensureGiftcardRoutesSchema); // giftcard trades + provider columns (Sogo/Prestmit)
   await step("ensureRmbSchema", ensureRmbSchema); // RMB purchase orders (Sogo)
   await step("ensureCryptoDepositSchema", ensureCryptoDepositSchema); // Sogo crypto deposit addresses + deposit sales
+  // Admin webhook screen: extend the webhook notification log so EVERY
+  // provider (squad, monnify, flutterwave, prestmit, bitnob, stablecoin,
+  // sogo) records the business reference, the signature verdict and the
+  // processing error — not just the raw payload. All additive/idempotent.
+  await step("webhook-log-columns", async () => {
+    await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS reference VARCHAR(160)`);
+    await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS signature_valid BOOLEAN`);
+    await query(`ALTER TABLE squad_webhooks ADD COLUMN IF NOT EXISTS error TEXT`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_squad_webhooks_created_at ON squad_webhooks(created_at DESC)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_squad_webhooks_provider ON squad_webhooks(provider)`);
+    // Legacy rows were verified squad/monnify/flutterwave calls (the router
+    // rejects before inserting) — record that so the admin screen never
+    // shows them as "unverified".
+    await query(`UPDATE squad_webhooks SET signature_valid = TRUE WHERE signature_valid IS NULL`);
+  });
   // Chat for PERSONAL users: conversations + blocks are no longer business-
   // bound. business_id becomes optional — personal users (business_id NULL)
   // create platform-wide direct chats/groups, and in-app chat notifications

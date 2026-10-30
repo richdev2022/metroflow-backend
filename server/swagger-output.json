@@ -12504,7 +12504,8 @@
     },
     "/api/admin/webhooks": {
       "get": {
-        "summary": "Get webhook notifications",
+        "summary": "Get webhook notifications (all providers)",
+        "description": "Unified webhook feed for the Admin Console \"Webhooks\" screen. Every\nprovider callback is recorded here — squad, monnify, flutterwave\n(generic router) plus prestmit, bitnob, stablecoin and sogo\n(personal webhooks) — including signature-REJECTED attempts and\nfailed processing runs.\n\n`status` ∈ processed | duplicate | ignored | rejected | failed.\n`signature_valid` = true/false/null (null = unverified, e.g. the\nprovider secret was not configured on the server).\n",
         "tags": [
           "Admin"
         ],
@@ -12533,14 +12534,16 @@
             "name": "provider",
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "squad | monnify | flutterwave | prestmit | bitnob | stablecoin | sogo | unknown"
           },
           {
             "in": "query",
             "name": "status",
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "processed | duplicate | ignored | rejected | failed"
           },
           {
             "in": "query",
@@ -12563,12 +12566,13 @@
             "name": "search",
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "Matches the business reference OR any payload text."
           }
         ],
         "responses": {
           "200": {
-            "description": "Webhook notifications"
+            "description": "Webhook notifications with per-provider status report"
           }
         }
       }

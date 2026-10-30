@@ -346,6 +346,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <span class="txt">Transfers</span>
       </button>
+      <button class="nav-item" data-page="webhooks">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+        <span class="txt">Webhooks</span>
+      </button>
       <button class="nav-item" data-page="kyc">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span class="txt">KYC</span>
@@ -529,6 +533,7 @@ var PAGES = {
   disputes:     { title: "Disputes",     sub: "Transaction dispute desk",         render: renderDisputes },
   transactions: { title: "Transactions", sub: "All wallet transactions",          render: renderTransactions },
   transfers:    { title: "Transfers",    sub: "Outbound transfer queue",          render: renderTransfers },
+  webhooks:     { title: "Webhooks",     sub: "Provider callback feed — all gateways", render: renderWebhooks },
   kyc:          { title: "KYC",          sub: "Identity verifications",           render: renderKyc },
   notifications:{ title: "Notifications",sub: "Internal admin alert feed",        render: renderNotifications },
   settings:     { title: "Settings",     sub: "Platform configuration",           render: renderSettings },
@@ -908,6 +913,143 @@ function openDispute(id) {
   }).catch(function (e) {
     openDrawer("Dispute", '<div class="empty">' + esc(e.message) + "</div>");
   });
+}
+
+/* ===================== webhooks (provider callback feed) ===================== */
+var whState = { provider: "", status: "", search: "", page: 1 };
+var WH_PROVIDERS = [
+  { id: "", label: "All providers" },
+  { id: "squad", label: "Squad" },
+  { id: "monnify", label: "Monnify" },
+  { id: "flutterwave", label: "Flutterwave" },
+  { id: "prestmit", label: "Prestmit" },
+  { id: "bitnob", label: "Bitnob" },
+  { id: "stablecoin", label: "Stablecoin" },
+  { id: "sogo", label: "Sogo" },
+  { id: "unknown", label: "Unattributed" },
+];
+var WH_STATUSES = ["", "processed", "duplicate", "ignored", "rejected", "failed"];
+function whBadge(status) {
+  var s = String(status || "").toLowerCase();
+  var map = {
+    processed: "b-resolved",
+    duplicate: "b-closed",
+    ignored: "b-closed",
+    rejected: "b-rejected",
+    failed: "b-failed",
+  };
+  return '<span class="badge ' + (map[s] || "b-neutral") + '">' + esc(s || "—") + "</span>";
+}
+function whSigBadge(v) {
+  if (v === true) return '<span class="badge b-resolved">signed</span>';
+  if (v === false) return '<span class="badge b-rejected">bad signature</span>';
+  return '<span class="badge b-neutral">unverified</span>';
+}
+function renderWebhooks() {
+  whState.page = 1;
+  $("content").innerHTML =
+    '<div class="toolbar">' +
+      '<div class="chips" id="whProviders"></div>' +
+      '<div class="chips" id="whStatuses"></div>' +
+      '<div class="search"><input id="whSearch" placeholder="Search reference or payload…" /></div>' +
+      '<button class="btn btn-ghost btn-sm" id="whGo">Search</button>' +
+    "</div>" +
+    '<div id="whSummary"></div>' +
+    '<div id="whTable"><div class="skel" style="height:260px"></div></div>';
+  renderWhChips();
+  $("whGo").onclick = function () { whState.search = $("whSearch").value.trim(); whState.page = 1; loadWebhooks(); };
+  $("whSearch").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("whGo").onclick(); } });
+  loadWebhooks();
+}
+function renderWhChips() {
+  $("whProviders").innerHTML = WH_PROVIDERS.map(function (p) {
+    return '<button class="chip' + (whState.provider === p.id ? " active" : "") + '" data-p="' + p.id + '">' + esc(p.label) + "</button>";
+  }).join("");
+  $("whStatuses").innerHTML = WH_STATUSES.map(function (s) {
+    return '<button class="chip' + (whState.status === s ? " active" : "") + '" data-s="' + s + '">' + (s ? esc(s) : "Any status") + "</button>";
+  }).join("");
+  var ps = $("whProviders").querySelectorAll(".chip");
+  for (var i = 0; i < ps.length; i++) ps[i].onclick = function () { whState.provider = this.getAttribute("data-p"); whState.page = 1; renderWhChips(); loadWebhooks(); };
+  var ss = $("whStatuses").querySelectorAll(".chip");
+  for (var j = 0; j < ss.length; j++) ss[j].onclick = function () { whState.status = this.getAttribute("data-s"); whState.page = 1; renderWhChips(); loadWebhooks(); };
+}
+function loadWebhooks() {
+  $("whTable").innerHTML = '<div class="skel" style="height:260px"></div>';
+  var qs = "?page=" + whState.page + "&limit=20";
+  if (whState.provider) qs += "&provider=" + encodeURIComponent(whState.provider);
+  if (whState.status) qs += "&status=" + encodeURIComponent(whState.status);
+  if (whState.search) qs += "&search=" + encodeURIComponent(whState.search);
+  api("/webhooks" + qs).then(function (j) {
+    var rows = j.webhooks || [];
+    /* Per-provider summary strip (from provider_reports) */
+    var reports = j.provider_reports || [];
+    var byP = {};
+    for (var r = 0; r < reports.length; r++) {
+      var p = reports[r].provider || "unknown";
+      byP[p] = byP[p] || {};
+      byP[p][reports[r].status || "processed"] = (byP[p][reports[r].status || "processed"] || 0) + (Number(reports[r].count) || 0);
+    }
+    var keys = Object.keys(byP).sort();
+    var strip = "";
+    if (keys.length) {
+      strip = '<div class="stat-grid" style="grid-template-columns:repeat(' + Math.min(keys.length, 4) + ',1fr);margin-bottom:14px">';
+      for (var k = 0; k < keys.length; k++) {
+        var st = byP[keys[k]], total = 0, bits = [];
+        for (var s2 in st) total += st[s2];
+        if (st.processed) bits.push(num(st.processed) + " ok");
+        if (st.failed) bits.push(num(st.failed) + " failed");
+        if (st.rejected) bits.push(num(st.rejected) + " rejected");
+        if (st.duplicate) bits.push(num(st.duplicate) + " dup");
+        if (st.ignored) bits.push(num(st.ignored) + " ignored");
+        strip += '<div class="stat-card" style="padding:13px 16px"><div class="lbl" style="text-transform:capitalize">' + esc(keys[k]) + '</div><div class="val" style="font-size:20px">' + num(total) + '</div><div class="hint">' + esc(bits.join(" · ") || "—") + "</div></div>";
+      }
+      strip += "</div>";
+    }
+    $("whSummary").innerHTML = strip;
+    if (!rows.length) { $("whTable").innerHTML = emptyBox("No webhook events match this filter"); return; }
+    $("whTable").innerHTML =
+      '<div class="card"><div class="card-head"><h3>Webhook events</h3><span class="muted">Every provider callback — accepted, duplicate and signature-rejected. Click a row for the full payload.</span></div>' +
+      '<div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Time</th><th>Provider</th><th>Event</th><th>Reference</th><th>Status</th><th>Signature</th></tr></thead><tbody>" +
+      rows.map(function (w) {
+        return '<tr class="clickable" data-id="' + esc(w.id) + '">' +
+          '<td class="cell-sub">' + dt(w.created_at) + "</td>" +
+          '<td><b style="text-transform:capitalize">' + esc(w.provider || "—") + "</b></td>" +
+          '<td class="mono">' + esc(w.event_type || "—") + "</td>" +
+          '<td class="mono">' + esc(w.reference || "—") + "</td>" +
+          "<td>" + whBadge(w.status) + "</td>" +
+          "<td>" + whSigBadge(w.signature_valid) + (w.error ? '<div class="cell-sub" style="color:var(--bad);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(w.error) + "</div>" : "") + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>" +
+      pagerHtml(j.pagination ? j.pagination.page : whState.page, j.pagination ? j.pagination.pages : 1, j.pagination ? j.pagination.total : rows.length) +
+      "</div>";
+    var trs = $("whTable").querySelectorAll("tr[data-id]");
+    var _rows = rows;
+    for (var t = 0; t < trs.length; t++) trs[t].onclick = function () {
+      var id = this.getAttribute("data-id"), row = null;
+      for (var q = 0; q < _rows.length; q++) if (_rows[q].id === id) row = _rows[q];
+      if (row) openWhDrawer(row);
+    };
+    $("pgPrev").onclick = function () { whState.page--; loadWebhooks(); };
+    $("pgNext").onclick = function () { whState.page++; loadWebhooks(); };
+  }).catch(function (e) { $("whTable").innerHTML = emptyBox(e.message); });
+}
+function openWhDrawer(w) {
+  var pretty = "";
+  try { pretty = JSON.stringify(w.payload, null, 2); } catch (e) { pretty = String(w.payload); }
+  openDrawer("Webhook — " + String(w.provider || "unknown").replace(/^./, function (c) { return c.toUpperCase(); }),
+    '<div class="kv">' +
+      '<div class="k">Event</div><div class="v mono">' + esc(w.event_type || "—") + "</div>" +
+      '<div class="k">Provider</div><div class="v">' + esc(w.provider || "—") + "</div>" +
+      '<div class="k">Reference</div><div class="v mono">' + esc(w.reference || "—") + "</div>" +
+      '<div class="k">Status</div><div class="v">' + whBadge(w.status) + "</div>" +
+      '<div class="k">Signature</div><div class="v">' + whSigBadge(w.signature_valid) + "</div>" +
+      '<div class="k">Received</div><div class="v">' + dt(w.created_at) + "</div>" +
+      (w.error ? '<div class="k">Error</div><div class="v" style="color:var(--bad)">' + esc(w.error) + "</div>" : "") +
+    "</div>" +
+    '<div class="section-title">Payload</div>' +
+    '<pre class="mono" style="background:#fafbfc;border:1px solid var(--line);border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:46vh;overflow-y:auto">' + esc(pretty) + "</pre>");
 }
 
 /* ===================== kyc ===================== */

@@ -659,12 +659,15 @@ model PaymentCard {
 
 // Webhook & System Models
 model SquadWebhook {
-  id        String   @id @default(uuid())
-  eventType String?  @map("event_type")
-  payload   Json?
-  status    String   @default("processed")
-  provider  String   @default("squad")
-  createdAt DateTime @default(now()) @map("created_at")
+  id             String   @id @default(uuid())
+  eventType      String?  @map("event_type")
+  payload        Json?
+  status         String   @default("processed")
+  provider       String   @default("squad")
+  reference      String?
+  signatureValid Boolean? @map("signature_valid")
+  error          String?
+  createdAt      DateTime @default(now()) @map("created_at")
 
   @@map("squad_webhooks")
 }

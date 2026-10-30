@@ -23,6 +23,7 @@ import { invalidateActiveProviderCache, getActiveTransferProviderName } from "..
 import { reverseFailedTransfer } from "../services/transfer";
 import { invalidatePlanLimitsCache } from "../lib/ai-usage";
 import { verifyPayment } from "../services/squad";
+import { processSogoEvent } from "./personal-webhooks";
 import { AVAILABLE_PERMISSIONS } from "../config/permissions";
 import {
   creditPlatformWallet,
@@ -3211,6 +3212,68 @@ protectedRouter.get("/webhooks", async (req, res) => {
  *           store. `events` is empty on a baseline call.
  */
 protectedRouter.get("/webhooks/live", liveWebhookFeed);
+
+/**
+ * @swagger
+ * /admin/webhooks/sogo/{id}/replay:
+ *   post:
+ *     summary: Replay a stored Sogo webhook event through the current handler
+ *     description: |
+ *       Re-drives a previously received Sogo event (stored in squad_webhooks)
+ *       through the CURRENT processing logic. This is the recovery path for
+ *       events that were ACKed 200 by an older, buggy handler — Sogo never
+ *       resends acknowledged events, so the only way to settle the affected
+ *       transaction is to replay the stored payload.
+ *
+ *       Example: the 2026-10-30 live `transaction.completed` bill event was
+ *       logged "processed" but silently dropped (data.object extraction bug);
+ *       replaying it reconciles the stranded 'processing' bill via the
+ *       webhook backfill matcher and settles it through the bill settlement
+ *       engine (idempotent — replaying twice is safe).
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: squad_webhooks.id of the stored event.
+ *     responses:
+ *       200:
+ *         description: Replay outcome (processed | ignored)
+ *       404:
+ *         description: Event not found or not a Sogo event
+ *       500:
+ *         description: Processing error — the stored event can be replayed again
+ */
+protectedRouter.post("/webhooks/sogo/:id/replay", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const row = await query(`SELECT * FROM squad_webhooks WHERE id = $1 LIMIT 1`, [id]);
+        if (!row.rows.length || String(row.rows[0].provider || "").toLowerCase() !== "sogo") {
+            return res.status(404).json({ success: false, error: "Sogo webhook event not found" });
+        }
+        const payload = row.rows[0].payload;
+        if (!payload || typeof payload !== "object") {
+            return res.status(400).json({ success: false, error: "Stored payload is not a Sogo event object" });
+        }
+        const outcome = await processSogoEvent(payload);
+        // Audit the replay; the event core logs its own webhook trail.
+        logAuditEvent({
+            action: "admin.sogo_webhook.replay",
+            entityType: "squad_webhooks",
+            entityId: id,
+            newValues: { event_type: row.rows[0].event_type, outcome },
+        }).catch(() => {});
+        return res.json({ success: true, id, event_type: row.rows[0].event_type, outcome });
+    } catch (error: any) {
+        console.error("Sogo webhook replay error:", error?.message);
+        return res.status(500).json({ success: false, error: "Replay failed — the event can be retried" });
+    }
+});
 
 export async function liveWebhookFeed(req: any, res: any) {
     try {

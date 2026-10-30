@@ -12617,6 +12617,43 @@
         }
       }
     },
+    "/api/admin/webhooks/sogo/{id}/replay": {
+      "post": {
+        "summary": "Replay a stored Sogo webhook event through the current handler",
+        "description": "Re-drives a previously received Sogo event (stored in squad_webhooks)\nthrough the CURRENT processing logic. This is the recovery path for\nevents that were ACKed 200 by an older, buggy handler — Sogo never\nresends acknowledged events, so the only way to settle the affected\ntransaction is to replay the stored payload.\n\nExample: the 2026-10-30 live `transaction.completed` bill event was\nlogged \"processed\" but silently dropped (data.object extraction bug);\nreplaying it reconciles the stranded 'processing' bill via the\nwebhook backfill matcher and settles it through the bill settlement\nengine (idempotent — replaying twice is safe).\n",
+        "tags": [
+          "Admin"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "squad_webhooks.id of the stored event."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Replay outcome (processed | ignored)"
+          },
+          "404": {
+            "description": "Event not found or not a Sogo event"
+          },
+          "500": {
+            "description": "Processing error — the stored event can be replayed again"
+          }
+        }
+      }
+    },
     "/api/admin/reports/transactions/export": {
       "get": {
         "summary": "Export transactions to CSV",

@@ -3022,7 +3022,17 @@ const sendCSV = (res: any, data: any[], filename: string) => {
  * @swagger
  * /admin/webhooks:
  *   get:
- *     summary: Get webhook notifications
+ *     summary: Get webhook notifications (all providers)
+ *     description: |
+ *       Unified webhook feed for the Admin Console "Webhooks" screen. Every
+ *       provider callback is recorded here — squad, monnify, flutterwave
+ *       (generic router) plus prestmit, bitnob, stablecoin and sogo
+ *       (personal webhooks) — including signature-REJECTED attempts and
+ *       failed processing runs.
+ *
+ *       `status` ∈ processed | duplicate | ignored | rejected | failed.
+ *       `signature_valid` = true/false/null (null = unverified, e.g. the
+ *       provider secret was not configured on the server).
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
@@ -3039,10 +3049,12 @@ const sendCSV = (res: any, data: any[], filename: string) => {
  *         name: provider
  *         schema:
  *           type: string
+ *         description: "squad | monnify | flutterwave | prestmit | bitnob | stablecoin | sogo | unknown"
  *       - in: query
  *         name: status
  *         schema:
  *           type: string
+ *         description: "processed | duplicate | ignored | rejected | failed"
  *       - in: query
  *         name: startDate
  *         schema:
@@ -3057,9 +3069,10 @@ const sendCSV = (res: any, data: any[], filename: string) => {
  *         name: search
  *         schema:
  *           type: string
+ *         description: Matches the business reference OR any payload text.
  *     responses:
  *       200:
- *         description: Webhook notifications
+ *         description: Webhook notifications with per-provider status report
  */
 protectedRouter.get("/webhooks", async (req, res) => {
     try {
@@ -3095,7 +3108,7 @@ protectedRouter.get("/webhooks", async (req, res) => {
         }
 
         if (search) {
-            queryStr += ` AND payload::text ILIKE $${paramCount}`;
+            queryStr += ` AND (payload::text ILIKE $${paramCount} OR COALESCE(reference, '') ILIKE $${paramCount})`;
             params.push(`%${search}%`);
             paramCount++;
         }
@@ -3127,7 +3140,7 @@ protectedRouter.get("/webhooks", async (req, res) => {
         }
 
         if (search) {
-            reportQuery += ` AND payload::text ILIKE $${reportParamCount}`;
+            reportQuery += ` AND (payload::text ILIKE $${reportParamCount} OR COALESCE(reference, '') ILIKE $${reportParamCount})`;
             reportParams.push(`%${search}%`);
             reportParamCount++;
         }

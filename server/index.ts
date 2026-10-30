@@ -1265,6 +1265,11 @@ export async function createServer() {
 
   // Provider webhooks (public, signature-verified inside). These were
   // previously imported but never mounted — gift-card + Bitnob callbacks 404'd.
+  // NOTE: keep the @swagger annotation blocks for these endpoints in
+  // server/routes/personal-webhooks.ts (above each handler), NOT here —
+  // the string literal "://***@" in this file (URL-scrubbing regex, ~L876)
+  // contains "/**" and breaks swagger-jsdoc's comment pairing for every
+  // annotation placed after it in this file.
   mainRouter.post("/webhook/prestmit", prestmitWebhookHandler);
   mainRouter.post("/webhook/bitnob", bitnobWebhookHandler);
   // Stablecoin deposits/withdrawals (deposit.success / transfer.*) — stricter

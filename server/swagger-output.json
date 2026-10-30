@@ -6322,6 +6322,231 @@
         }
       }
     },
+    "/api/webhook/prestmit": {
+      "post": {
+        "summary": "Prestmit webhook (gift card trades + withdrawals)",
+        "description": "Public callback for Prestmit gift-card outcomes — sell approved / rejected (user trade settlement), buy outcomes (order codes) and withdrawal approved / rejected (partner-wallet payouts, reconciliation only). Signature-verified against the captured raw request body.\n",
+        "tags": [
+          "Webhooks"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "description": "Prestmit event name"
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Trade/order payload incl. uniqueId or reference"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event processed (or logged for an unknown reference)"
+          },
+          "401": {
+            "description": "Invalid webhook signature"
+          }
+        }
+      }
+    },
+    "/api/webhook/bitnob": {
+      "post": {
+        "summary": "Bitnob webhook (deposits, withdrawals, transfers)",
+        "description": "Public callback for Bitnob events. Signed with the `x-bitnob-signature` header (HMAC-SHA512 hex over the raw body, shared secret `BITNOB_WEBHOOK_SECRET`) and de-duplicated by event id. `deposit.success` events are matched by deposit address and credited to the owning user's wallet.\n",
+        "tags": [
+          "Webhooks"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "description": "e.g. deposit.success, transfer.completed"
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Bitnob event payload"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event processed / de-duplicated / acknowledged"
+          },
+          "401": {
+            "description": "Invalid webhook signature"
+          }
+        }
+      }
+    },
+    "/api/webhook/bitnob/stablecoin": {
+      "post": {
+        "summary": "Bitnob stablecoin webhook (USDT/USDC deposits + withdrawals)",
+        "description": "Dedicated stablecoin callback — stricter verification than the legacy Bitnob webhook: HMAC-SHA512/256 signature, per-event de-duplication and strict deposit-address binding before any wallet credit.\n",
+        "tags": [
+          "Webhooks"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "description": "deposit.success / transfer.*"
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Deposit/withdrawal payload (address, amount, chain)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event processed or de-duplicated"
+          },
+          "401": {
+            "description": "Invalid webhook signature"
+          }
+        }
+      }
+    },
+    "/api/webhook/sogo": {
+      "post": {
+        "summary": "Sogo partner webhook (bills, gift cards, RMB, crypto deposits)",
+        "description": "Public callback for the Sogo provider. Signature-verified with the\n`X-Sogo-Signature-256` header — `sha256=` + HMAC-SHA256 hex digest of\nthe RAW request body keyed by `SOGO_WEBHOOK_SECRET` (timing-safe).\nSettlement is idempotent per reference.\n\nEvents: `ping` (handshake probe — replies `{ success: true }`),\n`transaction.completed`, `transaction.failed`,\n`transaction.cancelled`, `transaction.refunded`. Any other event is\nacknowledged and ignored.\n\nRouting by `data.type`:\n- crypto deposit — matched by `metadata.deposit_address` /\n  `deposit_address` (or a pre-recorded sale by `reference`); NGN is\n  settled to the Sogo wallet and the user's wallet is credited net\n  of the configured crypto spread.\n- giftcard + buy — codes fetched via GET /transactions/{ref}; order\n  completed.\n- giftcard (sell) — wallet credited with payout minus sell fee.\n- rmb — order status mapped; wallet refund on cancelled/refunded.\n- anything else — treated as a bill payment status update (with\n  provider-side refund handling).\n",
+        "tags": [
+          "Webhooks"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Sogo-Signature-256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "\"sha256=\" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET)"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "event",
+                  "data"
+                ],
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "enum": [
+                      "ping",
+                      "transaction.completed",
+                      "transaction.failed",
+                      "transaction.cancelled",
+                      "transaction.refunded"
+                    ]
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Sogo transaction object (data.object or data)",
+                    "properties": {
+                      "reference": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string",
+                        "description": "bill_payment | buy_giftcard | sell_giftcard | rmb | crypto deposit (fuzzy-matched)"
+                      },
+                      "amount": {
+                        "type": "number"
+                      },
+                      "crypto_amount": {
+                        "type": "number"
+                      },
+                      "payout_amount": {
+                        "type": "number",
+                        "description": "Net NGN payout used for crypto-deposit settlement"
+                      },
+                      "net_amount": {
+                        "type": "number"
+                      },
+                      "rate": {
+                        "type": "number"
+                      },
+                      "metadata": {
+                        "type": "object",
+                        "properties": {
+                          "deposit_address": {
+                            "type": "string"
+                          },
+                          "deposit_tx_hash": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event acknowledged and processed (or intentionally ignored)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing webhook signature"
+          },
+          "500": {
+            "description": "Processing error (event should be retried by the provider)"
+          }
+        }
+      }
+    },
     "/api/payroll/adjustments": {
       "post": {
         "summary": "Add a payroll adjustment (bonus or deduction)",
@@ -12866,7 +13091,7 @@
   "tags": [
     {
       "name": "Webhooks",
-      "description": "Webhook endpoints for payment providers (Squad and Monnify)"
+      "description": "Public provider webhook endpoints — Squad/Monnify, Sogo (bills, gift cards, RMB, crypto deposits), Prestmit (gift cards) and Bitnob (deposits, withdrawals, stablecoin). All signature-verified inside.\n"
     },
     {
       "name": "Wallet",

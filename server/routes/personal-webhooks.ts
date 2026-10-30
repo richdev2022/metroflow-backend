@@ -148,6 +148,37 @@ async function handlePrestmitWithdrawal(payload: any, approved: boolean) {
   console.log(`[prestmit webhook] withdrawal ${approved ? "approved" : "rejected"}: ${amount} ${wallet} — ${d.rejectReason || "ok"}`);
 }
 
+/**
+ * @swagger
+ * /webhook/prestmit:
+ *   post:
+ *     summary: Prestmit webhook (gift card trades + withdrawals)
+ *     description: >
+ *       Public callback for Prestmit gift-card outcomes — sell approved /
+ *       rejected (user trade settlement), buy outcomes (order codes) and
+ *       withdrawal approved / rejected (partner-wallet payouts, reconciliation
+ *       only). Signature-verified against the captured raw request body.
+ *     tags: [Webhooks]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               event:
+ *                 type: string
+ *                 description: "Prestmit event name"
+ *               data:
+ *                 type: object
+ *                 description: "Trade/order payload incl. uniqueId or reference"
+ *     responses:
+ *       200:
+ *         description: Event processed (or logged for an unknown reference)
+ *       401:
+ *         description: Invalid webhook signature
+ */
 export async function prestmitWebhookHandler(req: Request, res: Response) {
   try {
     const raw = rawBody(req);
@@ -189,6 +220,38 @@ export async function prestmitWebhookHandler(req: Request, res: Response) {
   }
 }
 
+/**
+ * @swagger
+ * /webhook/bitnob:
+ *   post:
+ *     summary: Bitnob webhook (deposits, withdrawals, transfers)
+ *     description: >
+ *       Public callback for Bitnob events. Signed with the
+ *       `x-bitnob-signature` header (HMAC-SHA512 hex over the raw body,
+ *       shared secret `BITNOB_WEBHOOK_SECRET`) and de-duplicated by event id.
+ *       `deposit.success` events are matched by deposit address and credited
+ *       to the owning user's wallet.
+ *     tags: [Webhooks]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               event:
+ *                 type: string
+ *                 description: "e.g. deposit.success, transfer.completed"
+ *               data:
+ *                 type: object
+ *                 description: "Bitnob event payload"
+ *     responses:
+ *       200:
+ *         description: Event processed / de-duplicated / acknowledged
+ *       401:
+ *         description: Invalid webhook signature
+ */
 export async function bitnobWebhookHandler(req: Request, res: Response) {
   try {
     // Bitnob signs webhooks with a shared secret (BITNOB_WEBHOOK_SECRET).
@@ -536,6 +599,36 @@ async function finalizeStablecoinWithdrawal(event: string, payload: any): Promis
  * Same verification ladder as the general handler, but ONLY stablecoin events
  * are processed — anything else is acknowledged and ignored.
  */
+/**
+ * @swagger
+ * /webhook/bitnob/stablecoin:
+ *   post:
+ *     summary: Bitnob stablecoin webhook (USDT/USDC deposits + withdrawals)
+ *     description: >
+ *       Dedicated stablecoin callback — stricter verification than the legacy
+ *       Bitnob webhook: HMAC-SHA512/256 signature, per-event de-duplication
+ *       and strict deposit-address binding before any wallet credit.
+ *     tags: [Webhooks]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               event:
+ *                 type: string
+ *                 description: "deposit.success / transfer.*"
+ *               data:
+ *                 type: object
+ *                 description: "Deposit/withdrawal payload (address, amount, chain)"
+ *     responses:
+ *       200:
+ *         description: Event processed or de-duplicated
+ *       401:
+ *         description: Invalid webhook signature
+ */
 export async function stablecoinWebhookHandler(req: Request, res: Response) {
   try {
     const raw = rawBody(req);
@@ -794,6 +887,96 @@ async function handleSogoRmb(tx: any) {
   );
 }
 
+/**
+ * @swagger
+ * /webhook/sogo:
+ *   post:
+ *     summary: Sogo partner webhook (bills, gift cards, RMB, crypto deposits)
+ *     description: |
+ *       Public callback for the Sogo provider. Signature-verified with the
+ *       `X-Sogo-Signature-256` header — `sha256=` + HMAC-SHA256 hex digest of
+ *       the RAW request body keyed by `SOGO_WEBHOOK_SECRET` (timing-safe).
+ *       Settlement is idempotent per reference.
+ *
+ *       Events: `ping` (handshake probe — replies `{ success: true }`),
+ *       `transaction.completed`, `transaction.failed`,
+ *       `transaction.cancelled`, `transaction.refunded`. Any other event is
+ *       acknowledged and ignored.
+ *
+ *       Routing by `data.type`:
+ *       - crypto deposit — matched by `metadata.deposit_address` /
+ *         `deposit_address` (or a pre-recorded sale by `reference`); NGN is
+ *         settled to the Sogo wallet and the user's wallet is credited net
+ *         of the configured crypto spread.
+ *       - giftcard + buy — codes fetched via GET /transactions/{ref}; order
+ *         completed.
+ *       - giftcard (sell) — wallet credited with payout minus sell fee.
+ *       - rmb — order status mapped; wallet refund on cancelled/refunded.
+ *       - anything else — treated as a bill payment status update (with
+ *         provider-side refund handling).
+ *     tags: [Webhooks]
+ *     security: []
+ *     parameters:
+ *       - in: header
+ *         name: X-Sogo-Signature-256
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: '"sha256=" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET)'
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [event, data]
+ *             properties:
+ *               event:
+ *                 type: string
+ *                 enum: [ping, transaction.completed, transaction.failed, transaction.cancelled, transaction.refunded]
+ *               data:
+ *                 type: object
+ *                 description: "Sogo transaction object (data.object or data)"
+ *                 properties:
+ *                   reference:
+ *                     type: string
+ *                   type:
+ *                     type: string
+ *                     description: "bill_payment | buy_giftcard | sell_giftcard | rmb | crypto deposit (fuzzy-matched)"
+ *                   amount:
+ *                     type: number
+ *                   crypto_amount:
+ *                     type: number
+ *                   payout_amount:
+ *                     type: number
+ *                     description: "Net NGN payout used for crypto-deposit settlement"
+ *                   net_amount:
+ *                     type: number
+ *                   rate:
+ *                     type: number
+ *                   metadata:
+ *                     type: object
+ *                     properties:
+ *                       deposit_address:
+ *                         type: string
+ *                       deposit_tx_hash:
+ *                         type: string
+ *     responses:
+ *       200:
+ *         description: Event acknowledged and processed (or intentionally ignored)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *       401:
+ *         description: Invalid or missing webhook signature
+ *       500:
+ *         description: Processing error (event should be retried by the provider)
+ */
 export async function sogoWebhookHandler(req: Request, res: Response) {
   try {
     const raw = rawBody(req);

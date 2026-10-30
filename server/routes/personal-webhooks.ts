@@ -37,6 +37,58 @@ function asJson(req: Request): any {
   }
 }
 
+// ===========================================================================
+// Webhook notification log — every personal webhook (accepted AND
+// signature-rejected) is recorded into squad_webhooks so the Admin Console
+// "Webhooks" screen shows ONE unified feed across squad / monnify /
+// flutterwave / prestmit / bitnob / stablecoin / sogo. Logging must never
+// break webhook processing, so every failure is swallowed with a warn.
+// ===========================================================================
+
+const WEBHOOK_LOG_STATUSES = ["processed", "duplicate", "ignored", "rejected", "failed"] as const;
+type WebhookLogStatus = (typeof WEBHOOK_LOG_STATUSES)[number];
+
+async function logWebhookEvent(input: {
+  provider: string;
+  eventType?: string | null;
+  reference?: string | null;
+  payload?: any;
+  status?: WebhookLogStatus;
+  signatureValid?: boolean | null;
+  error?: string | null;
+}): Promise<void> {
+  try {
+    const reference = String(input.reference || "").slice(0, 160) || null;
+    await query(
+      `INSERT INTO squad_webhooks (event_type, payload, status, provider, reference, signature_valid, error)
+       VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7)`,
+      [
+        String(input.eventType || "unknown").slice(0, 160),
+        JSON.stringify(input.payload ?? {}),
+        WEBHOOK_LOG_STATUSES.includes((input.status || "processed") as WebhookLogStatus) ? input.status || "processed" : "processed",
+        String(input.provider || "unknown").slice(0, 40),
+        reference,
+        input.signatureValid === undefined ? null : input.signatureValid,
+        input.error ? String(input.error).slice(0, 2000) : null,
+      ],
+    );
+  } catch (e: any) {
+    console.warn(`[webhook log] failed to record ${input.provider} event:`, e?.message);
+  }
+}
+
+/** Best-effort business reference from any provider payload shape. */
+function webhookReference(payload: any): string | null {
+  const d = payload?.data || {};
+  const ref =
+    d.reference || d.tx_ref || d.transactionReference || d.reference_number ||
+    d.uniqueIdentifier || d.unique_identifier || d.hash || d.tx_hash ||
+    d.transactionId || d.transaction_id || d.order_id ||
+    payload?.reference || payload?.event_id || payload?.id ||
+    d.address || d.deposit_address || null;
+  return ref ? String(ref) : null;
+}
+
 async function handleSellApproved(payload: any) {
   const uniqueId = payload?.data?.uniqueIdentifier || payload?.uniqueIdentifier;
   const reference = payload?.data?.reference || payload?.reference;
@@ -180,14 +232,21 @@ async function handlePrestmitWithdrawal(payload: any, approved: boolean) {
  *         description: Invalid webhook signature
  */
 export async function prestmitWebhookHandler(req: Request, res: Response) {
+  let payload: any = null;
+  let event = "";
+  let signatureValid: boolean | null = true;
   try {
     const raw = rawBody(req);
     const signature = req.headers["x-prestmit-signature"] as string | undefined;
     if (!verifyPrestmitWebhook(raw, signature)) {
+      signatureValid = false;
+      payload = asJson(req);
+      console.warn("[prestmit webhook] signature verification failed");
+      await logWebhookEvent({ provider: "prestmit", eventType: String(payload?.event || payload?.type || "unknown"), payload, status: "rejected", signatureValid, error: "Invalid webhook signature" });
       return res.status(401).json({ success: false, error: "Invalid webhook signature" });
     }
-    const payload = asJson(req);
-    const event = String(payload?.event || payload?.type || "");
+    payload = asJson(req);
+    event = String(payload?.event || payload?.type || "");
     console.log(`[prestmit webhook] ${event}`);
     switch (event) {
       case "giftcard-trade.sell.approved":
@@ -213,9 +272,18 @@ export async function prestmitWebhookHandler(req: Request, res: Response) {
       default:
         console.log("[prestmit webhook] unhandled event:", event);
     }
+    await logWebhookEvent({
+      provider: "prestmit",
+      eventType: event || "unknown",
+      reference: webhookReference(payload),
+      payload,
+      status: "processed",
+      signatureValid,
+    });
     res.json({ success: true });
   } catch (e: any) {
     console.error("[prestmit webhook] error:", e?.message);
+    await logWebhookEvent({ provider: "prestmit", eventType: event || "unknown", payload, status: "failed", signatureValid, error: e?.message });
     res.status(500).json({ success: false });
   }
 }
@@ -253,6 +321,9 @@ export async function prestmitWebhookHandler(req: Request, res: Response) {
  *         description: Invalid webhook signature
  */
 export async function bitnobWebhookHandler(req: Request, res: Response) {
+  let payload: any = null;
+  let event = "";
+  let signatureValid: boolean | null = null; // null = unverified (no secret configured)
   try {
     // Bitnob signs webhooks with a shared secret (BITNOB_WEBHOOK_SECRET).
     // Stablecoin webhooks: x-bitnob-signature = HMAC-SHA512 hex over the raw
@@ -273,24 +344,32 @@ export async function bitnobWebhookHandler(req: Request, res: Response) {
         try { return crypto.timingSafeEqual(Buffer.from(h), Buffer.from(sig)); } catch { return false; }
       });
       if (!ok) {
+        signatureValid = false;
+        payload = asJson(req);
         console.warn("[bitnob webhook] signature mismatch");
+        await logWebhookEvent({ provider: "bitnob", eventType: String(payload?.event || payload?.type || "unknown"), payload, status: "rejected", signatureValid, error: "Invalid webhook signature" });
         return res.status(401).json({ success: false, error: "Invalid webhook signature" });
       }
+      signatureValid = true;
     } else if (!secret) {
       console.warn("[bitnob webhook] BITNOB_WEBHOOK_SECRET not set — signature NOT verified");
     }
 
-    const payload = asJson(req);
-    const event = String(payload?.event || payload?.type || "");
+    payload = asJson(req);
+    event = String(payload?.event || payload?.type || "");
     console.log(`[bitnob webhook] event: ${event || "unknown"}`);
+    let outcome: WebhookLogStatus = "processed";
 
     // ---- Stablecoin lifecycle (deposits + withdrawals + trades) ----
     if (/^deposit\.success$/i.test(event)) {
-      await processStablecoinDeposit(payload);
+      const r = await processStablecoinDeposit(payload);
+      if (r.action === "duplicate") outcome = "duplicate";
+      await logWebhookEvent({ provider: "bitnob", eventType: event || "unknown", reference: webhookReference(payload), payload, status: outcome, signatureValid });
       return res.json({ success: true });
     }
     if (/^transfer\.(success|failed|expired)$/i.test(event)) {
       await finalizeStablecoinWithdrawal(event, payload);
+      await logWebhookEvent({ provider: "bitnob", eventType: event || "unknown", reference: webhookReference(payload), payload, status: outcome, signatureValid });
       return res.json({ success: true });
     }
     if (/trade[s]?\.|^order/i.test(event) && (payload?.data?.reference || payload?.data?.order?.reference || payload?.data?.order_id)) {
@@ -298,6 +377,7 @@ export async function bitnobWebhookHandler(req: Request, res: Response) {
       const ref = payload?.data?.reference || payload?.data?.order?.reference || payload?.data?.order_id;
       const { settleConversion } = await import("../features/personal/stablecoin");
       await settleConversion(String(ref));
+      await logWebhookEvent({ provider: "bitnob", eventType: event || "unknown", reference: webhookReference(payload), payload, status: outcome, signatureValid });
       return res.json({ success: true });
     }
 
@@ -359,9 +439,11 @@ export async function bitnobWebhookHandler(req: Request, res: Response) {
         }
       }
     }
+    await logWebhookEvent({ provider: "bitnob", eventType: event || "unknown", reference: webhookReference(payload), payload, status: outcome, signatureValid });
     res.json({ success: true });
   } catch (e: any) {
     console.error("[bitnob webhook] error:", e?.message);
+    await logWebhookEvent({ provider: "bitnob", eventType: event || "unknown", payload, status: "failed", signatureValid, error: e?.message });
     res.status(500).json({ success: false });
   }
 }
@@ -630,6 +712,9 @@ async function finalizeStablecoinWithdrawal(event: string, payload: any): Promis
  *         description: Invalid webhook signature
  */
 export async function stablecoinWebhookHandler(req: Request, res: Response) {
+  let payload: any = null;
+  let event = "";
+  let signatureValid: boolean | null = null; // null = unverified (no secret configured)
   try {
     const raw = rawBody(req);
     const secret = process.env.BITNOB_WEBHOOK_SECRET || "";
@@ -646,21 +731,34 @@ export async function stablecoinWebhookHandler(req: Request, res: Response) {
         try { return crypto.timingSafeEqual(Buffer.from(h), Buffer.from(sig)); } catch { return false; }
       });
       if (!ok) {
+        signatureValid = false;
+        payload = asJson(req);
         console.warn("[bitnob stablecoin webhook] signature mismatch");
+        await logWebhookEvent({ provider: "stablecoin", eventType: String(payload?.event || payload?.type || "unknown"), payload, status: "rejected", signatureValid, error: "Invalid webhook signature" });
         return res.status(401).json({ success: false, error: "Invalid webhook signature" });
       }
+      signatureValid = true;
     } else if (!secret) {
       console.warn("[bitnob stablecoin webhook] BITNOB_WEBHOOK_SECRET not set — signature NOT verified");
     }
-    const payload = asJson(req);
-    const event = String(payload?.event || payload?.type || "");
+    payload = asJson(req);
+    event = String(payload?.event || payload?.type || "");
     console.log(`[bitnob stablecoin webhook] event: ${event || "unknown"}`);
-    if (/^deposit\.success$/i.test(event)) await processStablecoinDeposit(payload);
-    else if (/^transfer\.(success|failed|expired)$/i.test(event)) await finalizeStablecoinWithdrawal(event, payload);
-    else console.log(`[bitnob stablecoin webhook] ignored event: ${event}`);
+    let outcome: WebhookLogStatus = "processed";
+    if (/^deposit\.success$/i.test(event)) {
+      const r = await processStablecoinDeposit(payload);
+      if (r.action === "duplicate") outcome = "duplicate";
+    } else if (/^transfer\.(success|failed|expired)$/i.test(event)) {
+      await finalizeStablecoinWithdrawal(event, payload);
+    } else {
+      console.log(`[bitnob stablecoin webhook] ignored event: ${event}`);
+      outcome = "ignored";
+    }
+    await logWebhookEvent({ provider: "stablecoin", eventType: event || "unknown", reference: webhookReference(payload), payload, status: outcome, signatureValid });
     res.json({ success: true });
   } catch (e: any) {
     console.error("[bitnob stablecoin webhook] error:", e?.message);
+    await logWebhookEvent({ provider: "stablecoin", eventType: event || "unknown", payload, status: "failed", signatureValid, error: e?.message });
     res.status(500).json({ success: false });
   }
 }
@@ -978,19 +1076,29 @@ async function handleSogoRmb(tx: any) {
  *         description: Processing error (event should be retried by the provider)
  */
 export async function sogoWebhookHandler(req: Request, res: Response) {
+  let payload: any = null;
+  let event = "";
+  let signatureValid: boolean | null = true;
   try {
     const raw = rawBody(req);
     const signature = (req.headers["x-sogo-signature-256"] as string) || "";
     if (!verifySogoWebhook(raw, signature)) {
+      signatureValid = false;
+      payload = asJson(req);
       console.warn("[sogo webhook] signature verification failed");
+      await logWebhookEvent({ provider: "sogo", eventType: String(payload?.event || "unknown"), payload, status: "rejected", signatureValid, error: "Invalid webhook signature" });
       return res.status(401).json({ success: false, error: "Invalid webhook signature" });
     }
-    const payload = asJson(req);
-    const event = String(payload?.event || "");
+    payload = asJson(req);
+    event = String(payload?.event || "");
     const tx = payload?.data?.object || payload?.data || {};
     console.log(`[sogo webhook] event: ${event || "unknown"} ref=${tx?.reference || "n/a"}`);
-    if (event === "ping") return res.json({ success: true });
+    if (event === "ping") {
+      await logWebhookEvent({ provider: "sogo", eventType: "ping", reference: tx?.reference || null, payload, status: "processed", signatureValid });
+      return res.json({ success: true });
+    }
     if (!["transaction.completed", "transaction.failed", "transaction.cancelled", "transaction.refunded"].includes(event)) {
+      await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", reference: tx?.reference || null, payload, status: "ignored", signatureValid });
       return res.json({ success: true });
     }
     const type = String(tx?.type || "").toLowerCase();
@@ -1006,9 +1114,11 @@ export async function sogoWebhookHandler(req: Request, res: Response) {
     } else {
       await handleSogoBillPayment(tx);
     }
+    await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", reference: tx?.reference || null, payload, status: "processed", signatureValid });
     return res.json({ success: true });
   } catch (e: any) {
     console.error("[sogo webhook] error:", e?.message);
+    await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", payload, status: "failed", signatureValid, error: e?.message });
     return res.status(500).json({ success: false });
   }
 }

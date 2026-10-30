@@ -778,6 +778,7 @@ export async function stablecoinWebhookHandler(req: Request, res: Response) {
 // ===========================================================================
 
 import { verifySogoWebhook } from "../services/sogo";
+import * as sogo from "../services/sogo";
 import { getPercent } from "../features/personal/flags";
 
 async function creditUserWallet(userId: string | null, walletId: string | null, amount: number, reference: string, description: string, businessId?: string | null) {
@@ -825,7 +826,7 @@ async function handleSogoCryptoDeposit(tx: any) {
          (user_id, wallet_id, address, reference, provider, asset, network, crypto_amount, status, provider_response)
        VALUES ($1,$2,$3,$4,'sogo',$5,$6,$7,'processing',$8::jsonb) RETURNING *`,
       [owner.user_id, wallet.rows[0]?.id || null, address, String(tx.reference || `SO-${Date.now()}`),
-       owner.asset, owner.network, Number(tx.crypto_amount || tx.amount || 0) || null, JSON.stringify(tx)],
+       owner.asset, owner.network, sogo.sogoAmount(tx.crypto_amount) || sogo.sogoAmount(tx.amount) || null, JSON.stringify(tx)],
     );
     sale = insert.rows[0];
   }
@@ -835,7 +836,8 @@ async function handleSogoCryptoDeposit(tx: any) {
   }
   if (sale.status === "completed") return; // idempotent
 
-  const gross = Number(tx?.payout_amount ?? tx?.net_amount ?? tx?.amount ?? sale.ngn_gross ?? 0);
+  const gross = sogo.sogoAmount(tx?.payout_amount) || sogo.sogoAmount(tx?.net_amount) ||
+    sogo.sogoAmount(tx?.amount) || Number(sale.ngn_gross || 0);
   const spreadPct = await getPercent("crypto_spread_percent", 1);
   const fee = Math.round(gross * (spreadPct / 100) * 100) / 100;
   const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
@@ -858,16 +860,60 @@ async function handleSogoCryptoDeposit(tx: any) {
 }
 
 async function handleSogoBillPayment(tx: any) {
-  const { sogoStatus } = await import("../services/sogo");
   const { settleBillCompleted, refundBillRow } = await import("../features/personal/bill-settlement");
-  const reference = String(tx?.reference || "");
-  if (!reference) return;
-  const rows = await query(`SELECT * FROM bill_transactions WHERE reference = $1 OR provider_reference = $1 LIMIT 1`, [reference]);
-  const bill = rows.rows[0];
-  if (!bill) return;
-  const status = sogoStatus(tx);
-  const mapped = ["completed", "failed", "refunded", "cancelled"].includes(status) ? status : "processing";
-  if (mapped === bill.status) return;
+  const sogoRef = String(tx?.reference || "");
+  if (!sogoRef) return;
+
+  // ---- 1. Direct match -------------------------------------------------
+  // Sogo echoes OUR reference when the purchase flow recorded it, and
+  // provider_reference holds Sogo's own BILL… reference once captured.
+  const rows = await query(
+    `SELECT * FROM bill_transactions WHERE reference = $1 OR provider_reference = $1 LIMIT 1`,
+    [sogoRef],
+  );
+  let bill = rows.rows[0] || null;
+
+  // ---- 2. Backfill reconciliation ---------------------------------------
+  // LIVE Sogo assigns its OWN reference (BILL…) and never echoes our
+  // Idempotency-Key in webhooks. When the purchase response never landed
+  // (timeout / process death mid-call) provider_reference is NULL and the
+  // direct match misses — the exact production incident of 2026-10-30.
+  // Reconcile by the event's bill signature: amount + customer ref + category
+  // + creation window around the provider transaction, then CLAIM the match
+  // by storing the provider reference so retries/replays hit path 1.
+  if (!bill) {
+    bill = await backfillSogoBill(sogoRef, tx);
+  }
+  if (!bill) {
+    console.warn("[sogo webhook] bill payment for unknown reference:", sogoRef);
+    return;
+  }
+
+  // ---- 3. Normalize Sogo's status vocabulary ----------------------------
+  // Live events say "successful" / "delivered" / "failure" / "canceled" (and
+  // status itself is a {value, is_final} object) — the old strict
+  // ["completed","failed",…] equality mapped ALL of those to "processing".
+  let mapped = sogo.normalizeSogoStatus(sogo.sogoStatus(tx));
+
+  // ---- 4. Reconfirm with the provider before moving money ---------------
+  // The webhook is signed evidence; the lookup is belt-and-braces. When the
+  // API is unreachable / has no record we still trust the signed webhook.
+  // On a CONTRADICTION (webhook says completed, provider says failed — or
+  // vice versa) we refuse to settle and leave the row for the reaper +
+  // support instead of acting on conflicting evidence.
+  if (["completed", "failed", "refunded", "cancelled"].includes(mapped) && bill.provider === "sogo" && !sogo.isSogoSandbox()) {
+    const remoteStatus = await reconfirmSogoBillStatus(sogoRef);
+    if (remoteStatus && remoteStatus !== mapped && ["completed", "failed", "refunded", "cancelled"].includes(remoteStatus)) {
+      console.error(`[sogo webhook] reconfirm mismatch for ${sogoRef}: webhook=${mapped} provider=${remoteStatus} — leaving for reconciliation`);
+      await query(
+        `UPDATE bill_transactions SET provider_response = $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [bill.id, JSON.stringify({ webhook: tx, reconfirm: remoteStatus, conflict: true })],
+      );
+      return;
+    }
+  }
+
+  if (mapped === bill.status && mapped !== "processing") return; // idempotent
   // Settlement runs through the shared engine (claim-first guarded UPDATEs,
   // ledger-idempotent refunds, cashback on late completion, notifications).
   if (mapped === "completed") {
@@ -884,14 +930,108 @@ async function handleSogoBillPayment(tx: any) {
   }
 }
 
+/**
+ * Reconfirm a bill webhook against GET /transactions/{reference} (short
+ * timeout — webhooks must answer fast). Returns the normalized provider
+ * status, or null when the API is unreachable / has no record (in which case
+ * the signed webhook remains the evidence of record).
+ */
+async function reconfirmSogoBillStatus(sogoRef: string): Promise<string | null> {
+  try {
+    const remote = await sogo.getTransaction(sogoRef, 10_000);
+    const rtx = remote?.transaction ?? remote;
+    const st = sogo.normalizeSogoStatus(sogo.sogoStatus(rtx || remote));
+    return st === "processing" ? null : st;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find the bill_transactions row a live Sogo webhook belongs to when no
+ * reference match exists, by matching the event's bill signature. Only rows
+ * that are still 'processing' with a NULL provider_reference are eligible,
+ * and the match is claimed by storing Sogo's reference. Conservative: no
+ * unique, confident match → no guess (the reaper/support handle it instead).
+ */
+async function backfillSogoBill(sogoRef: string, tx: any): Promise<any | null> {
+  try {
+    const meta = tx?.metadata || {};
+    const faceValue = sogo.sogoAmount(meta.face_value);
+    const eventAmount = sogo.sogoAmount(tx?.amount);
+    const amounts = [faceValue, eventAmount].filter((n) => n > 0);
+    if (!amounts.length) return null;
+
+    const customer = String(
+      meta.phone_number || meta.customer_ref || meta.meter_number ||
+        meta.smartcard_number || meta.account_id || "",
+    ).trim();
+
+    // Category hint from metadata.bill_type ("Airtime", "Cable TV", …).
+    const billType = String(meta.bill_type || "").toLowerCase();
+    const categoryHint = ["airtime", "data", "electricity", "cable", "education", "epin", "betting"]
+      .find((c) => billType.startsWith(c)) || null;
+
+    // Creation window around the provider transaction timestamp (clock skew
+    // observed: Sogo's created_at can precede our row by a few hundred ms).
+    const tsRaw = String(tx?.timestamps?.created_at || tx?.created_at || "");
+    const ts = tsRaw ? new Date(tsRaw) : null;
+    const windowFrom = ts && !isNaN(ts.getTime())
+      ? new Date(ts.getTime() - 10 * 60_000)
+      : new Date(Date.now() - 24 * 3600_000);
+    const windowTo = ts && !isNaN(ts.getTime())
+      ? new Date(ts.getTime() + 10 * 60_000)
+      : new Date(Date.now() + 5 * 60_000);
+
+    const params: any[] = [windowFrom.toISOString(), windowTo.toISOString()];
+    const conds = [
+      `provider = 'sogo'`, `status = 'processing'`,
+      `(provider_reference IS NULL OR provider_reference = '')`,
+      `created_at >= $1::timestamptz`, `created_at <= $2::timestamptz`,
+    ];
+    // amount: match the bill face value OR the charged total (discount/fee).
+    params.push(amounts);
+    conds.push(`(amount = ANY($${params.length}::numeric[]) OR total = ANY($${params.length}::numeric[]))`);
+    if (customer) {
+      params.push(customer);
+      conds.push(`customer_ref = $${params.length}`);
+    }
+    if (categoryHint) {
+      params.push(categoryHint);
+      conds.push(`category = $${params.length}`);
+    }
+
+    const rows = await query(
+      `SELECT * FROM bill_transactions WHERE ${conds.join(" AND ")} ORDER BY created_at DESC LIMIT 5`,
+      params,
+    );
+    if (rows.rows.length !== 1) {
+      if (rows.rows.length > 1) console.warn(`[sogo webhook] backfill for ${sogoRef}: ${rows.rows.length} ambiguous candidates — skipping`);
+      return null;
+    }
+    const claim = await query(
+      `UPDATE bill_transactions SET provider_reference = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND (provider_reference IS NULL OR provider_reference = '') RETURNING *`,
+      [rows.rows[0].id, sogoRef],
+    );
+    if (claim.rows[0]) {
+      console.log(`[sogo webhook] backfilled ${rows.rows[0].reference} ← Sogo ${sogoRef}`);
+      return claim.rows[0];
+    }
+    return null;
+  } catch (e: any) {
+    console.warn("[sogo webhook] backfill match failed:", e?.message);
+    return null;
+  }
+}
+
 async function handleSogoGiftcardBuy(tx: any) {
-  const { sogoStatus } = await import("../services/sogo");
   const reference = String(tx?.reference || "");
   if (!reference) return;
   const rows = await query(`SELECT * FROM giftcard_buy_orders WHERE provider = 'sogo' AND (reference = $1 OR provider_reference = $1) LIMIT 1`, [reference]);
   const order = rows.rows[0];
   if (!order) return;
-  const status = sogoStatus(tx);
+  const status = sogo.normalizeSogoStatus(sogo.sogoStatus(tx));
   if (status === "completed") {
     let codes = order.card_codes;
     if (!codes) {
@@ -935,10 +1075,9 @@ async function handleSogoGiftcardSell(tx: any) {
   );
   const trade = rows.rows[0];
   if (!trade || trade.status === "settled") return;
-  const { sogoStatus } = await import("../services/sogo");
-  const status = sogoStatus(tx);
+  const status = sogo.normalizeSogoStatus(sogo.sogoStatus(tx));
   if (status === "completed") {
-    const gross = Number(tx?.payout_amount ?? tx?.amount ?? 0);
+    const gross = sogo.sogoAmount(tx?.payout_amount) || sogo.sogoAmount(tx?.amount) || 0;
     const feePct = await getPercent("giftcard_sell_fee_percent", 5);
     const fee = Math.round(gross * (feePct / 100) * 100) / 100;
     const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
@@ -972,10 +1111,9 @@ async function handleSogoRmb(tx: any) {
   const rows = await query(`SELECT * FROM rmb_orders WHERE reference = $1 OR provider_reference = $1 LIMIT 1`, [reference]);
   const order = rows.rows[0];
   if (!order) return;
-  const { sogoStatus } = await import("../services/sogo");
-  const status = sogoStatus(tx);
-  const mapped = ["completed", "refunded", "cancelled", "failed"].includes(status) ? status : null;
-  if (!mapped || mapped === order.status) return;
+  const mapped = sogo.normalizeSogoStatus(sogo.sogoStatus(tx));
+  if (!["completed", "refunded", "cancelled", "failed"].includes(mapped)) return;
+  if (mapped === order.status) return; // idempotent
   if (mapped === "refunded" || mapped === "cancelled" || mapped === "failed") {
     await creditUserWallet(order.user_id, order.wallet_id, Number(order.ngn_total), `${order.reference}-REFUND`, "Refund — RMB order failed", order.business_id);
   }
@@ -1075,6 +1213,37 @@ async function handleSogoRmb(tx: any) {
  *       500:
  *         description: Processing error (event should be retried by the provider)
  */
+/** Event names Sogo actually delivers for transaction outcomes. */
+const SOGO_EVENTS = ["transaction.completed", "transaction.failed", "transaction.cancelled", "transaction.refunded"] as const;
+
+/**
+ * Event-processing core, shared by the HTTP webhook and the admin replay
+ * endpoint (which re-drives a stored squad_webhooks payload — e.g. an event
+ * that was dropped by an earlier handler bug and already ACKed 200, so Sogo
+ * will never resend it). Returns how the event was dispositioned.
+ */
+export async function processSogoEvent(payload: any): Promise<"processed" | "ignored"> {
+  const event = String(payload?.event || "");
+  const tx = sogo.sogoTx(payload); // FIX: data.object is a discriminator string in live webhooks
+  console.log(`[sogo webhook] event: ${event || "unknown"} ref=${tx?.reference || "n/a"}`);
+  if (event === "ping") return "processed";
+  if (!SOGO_EVENTS.includes(event as any)) return "ignored";
+  const type = sogo.sogoType(tx); // FIX: type arrives as {value, is_credit}
+  // Crypto deposits carry a deposit hash + address and no bill/giftcard type.
+  if (type.includes("crypto") || tx?.metadata?.deposit_tx_hash || type.includes("deposit")) {
+    await handleSogoCryptoDeposit(tx);
+  } else if (type.includes("gift") && type.includes("buy")) {
+    await handleSogoGiftcardBuy(tx);
+  } else if (type.includes("gift")) {
+    await handleSogoGiftcardSell(tx);
+  } else if (type.includes("rmb")) {
+    await handleSogoRmb(tx);
+  } else {
+    await handleSogoBillPayment(tx);
+  }
+  return "processed";
+}
+
 export async function sogoWebhookHandler(req: Request, res: Response) {
   let payload: any = null;
   let event = "";
@@ -1091,30 +1260,17 @@ export async function sogoWebhookHandler(req: Request, res: Response) {
     }
     payload = asJson(req);
     event = String(payload?.event || "");
-    const tx = payload?.data?.object || payload?.data || {};
-    console.log(`[sogo webhook] event: ${event || "unknown"} ref=${tx?.reference || "n/a"}`);
+    const tx = sogo.sogoTx(payload);
     if (event === "ping") {
       await logWebhookEvent({ provider: "sogo", eventType: "ping", reference: tx?.reference || null, payload, status: "processed", signatureValid });
       return res.json({ success: true });
     }
-    if (!["transaction.completed", "transaction.failed", "transaction.cancelled", "transaction.refunded"].includes(event)) {
+    if (!SOGO_EVENTS.includes(event as any)) {
       await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", reference: tx?.reference || null, payload, status: "ignored", signatureValid });
       return res.json({ success: true });
     }
-    const type = String(tx?.type || "").toLowerCase();
-    // Crypto deposits carry a deposit hash + address and no bill/giftcard type.
-    if (type.includes("crypto") || tx?.metadata?.deposit_tx_hash || type.includes("deposit")) {
-      await handleSogoCryptoDeposit(tx);
-    } else if (type.includes("gift") && type.includes("buy")) {
-      await handleSogoGiftcardBuy(tx);
-    } else if (type.includes("gift")) {
-      await handleSogoGiftcardSell(tx);
-    } else if (type.includes("rmb")) {
-      await handleSogoRmb(tx);
-    } else {
-      await handleSogoBillPayment(tx);
-    }
-    await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", reference: tx?.reference || null, payload, status: "processed", signatureValid });
+    const outcome = await processSogoEvent(payload);
+    await logWebhookEvent({ provider: "sogo", eventType: event || "unknown", reference: tx?.reference || null, payload, status: outcome, signatureValid });
     return res.json({ success: true });
   } catch (e: any) {
     console.error("[sogo webhook] error:", e?.message);

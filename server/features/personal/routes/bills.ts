@@ -609,6 +609,12 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     // reconciliation engine can tell "dispatched, outcome unknown" from
     // "never dispatched" (provider 404 vs response parse failure).
     details.dispatched_at = new Date().toISOString();
+    // Persist BEFORE the provider call — the stamp is only useful for crash
+    // forensics if it survives the crash itself.
+    await query(
+      `UPDATE bill_transactions SET details = $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [billId, JSON.stringify(details)],
+    );
 
     if (provider === "sogo") {
       const input = { reference, ...details } as any;

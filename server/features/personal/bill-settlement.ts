@@ -55,10 +55,35 @@ type BillRow = {
 const MIN_AGE_MINUTES = Number(process.env.BILL_RECONCILE_MIN_AGE_MINUTES || 10);
 const REFUND_AFTER_MINUTES = Number(process.env.BILL_REFUND_AFTER_MINUTES || 30);
 const PENDING_REFUND_HOURS = Number(process.env.BILL_PENDING_REFUND_HOURS || 24);
-const UNREACHABLE_REFUND_HOURS = Number(process.env.BILL_UNREACHABLE_REFUND_HOURS || 6);
 
 function ageMinutes(bill: BillRow): number {
   return (Date.now() - new Date(bill.created_at as any).getTime()) / 60_000;
+}
+
+/**
+ * Deduped console alarm for processing bills we refuse to auto-refund.
+ * Money-safety: a bill whose provider state is AMBIGUOUS must never be
+ * refunded on a timer — the provider may have delivered it (the 2026-10-30
+ * incident refunded a delivered airtime bill because a 404 on our fallback
+ * reference was misread as "no record"). Rows hold in 'processing' and the
+ * operator is alerted once per reference until the row settles.
+ */
+const alertedUnsettled = new Set<string>();
+function alertUnsettled(bill: BillRow, why: string) {
+  if (alertedUnsettled.has(bill.reference)) return;
+  alertedUnsettled.add(bill.reference);
+  if (alertedUnsettled.size > 500) {
+    const oldest = alertedUnsettled.values().next().value;
+    if (oldest) alertedUnsettled.delete(oldest);
+  }
+  console.error(
+    `[bill-settlement] HOLD — ${bill.reference} left in 'processing': ${why}. ` +
+    `Auto-refund REFUSED — the provider may have delivered this bill. ` +
+    `Resolution: signed webhook backfill, user-side transaction sync, or admin review.`,
+  );
+}
+function clearUnsettledAlert(reference: string) {
+  alertedUnsettled.delete(reference);
 }
 
 async function hasDebitLedger(reference: string): Promise<boolean> {
@@ -116,6 +141,7 @@ export async function settleBillCompleted(bill: BillRow, providerResponse: any):
     [bill.id, providerResponse ? JSON.stringify(providerResponse) : null],
   );
   if (claim.rowCount === 0) return false;
+  clearUnsettledAlert(bill.reference);
 
   const amount = Number(bill.amount);
   const details = bill.details || {};
@@ -172,7 +198,7 @@ export type BillReverseResult = {
   /** whether money was actually credited to the wallet in this pass */
   credited: boolean;
   /** what the provider said, when it was asked */
-  providerVerified?: "completed" | "failed" | "no-record" | "unreachable" | "skipped";
+  providerVerified?: "completed" | "failed" | "no-record" | "unverifiable" | "skipped";
   /** non-fatal notes (skipped cashback clawback, etc.) */
   notes: string[];
 };
@@ -189,7 +215,11 @@ export type BillReverseResult = {
  *      mid-crash retry can neither double-credit nor lose the credit.
  *   2. The provider is asked first (live Sogo): a bill the provider
  *      DELIVERED is never reversed — a hard guard that `force` cannot
- *      override, mirroring "provider reports SUCCESSFUL → refuse".
+ *      override, mirroring "provider reports SUCCESSFUL → refuse". When the
+ *      provider state is merely AMBIGUOUS (404 on our fallback reference,
+ *      auth failure, outage, still-pending) the reversal is also refused
+ *      without `force` — ambiguity is not proof of non-delivery (the
+ *      2026-10-30 false refund).
  *   3. Full ledger unwind on reversal:
  *        - platform vendor hold re-credited (`<ref>-VENDOR-REVERSAL`) —
  *          the pay flow debits the platform the moment it dispatches, so a
@@ -239,27 +269,35 @@ export async function reverseBillPayment(
   // ---- 1. Ask the provider before touching money (live Sogo only) -------
   let providerVerified: BillReverseResult["providerVerified"] = "skipped";
   if (!opts.skipProviderCheck && bill.provider === "sogo" && !sogo.isSogoSandbox()) {
-    try {
-      const remote = await sogo.getTransaction(bill.provider_reference || ref).catch((e: any) => {
-        if (e?.response?.status === 404) return null;
-        throw e;
-      });
-      if (remote === null) {
-        providerVerified = "no-record"; // dispatch never landed — safe to reverse
-      } else {
-        const tx = remote?.transaction ?? remote;
-        const st = sogo.sogoStatus(tx || remote);
-        if (["completed", "successful", "success", "delivered"].includes(st)) {
-          providerVerified = "completed";
-        } else if (["failed", "failure", "refunded", "reversed", "cancelled", "canceled"].includes(st)) {
-          providerVerified = "failed";
-          opts.providerReportedFailure = true;
+    if (!sogo.isSogoConfigured()) {
+      providerVerified = "unverifiable"; // cannot ask — never proof of non-delivery
+    } else {
+      // A 404 only proves "dispatch never landed" when the lookup used
+      // Sogo's OWN reference. Our MF-BILL reference is the Idempotency-Key;
+      // live Sogo does not index it, so a 404 on the fallback is ambiguous.
+      const hasTrustedKey = !!bill.provider_reference && bill.provider_reference !== bill.reference;
+      try {
+        const remote = await sogo.getTransaction(bill.provider_reference || ref).catch((e: any) => {
+          if (e?.response?.status === 404) return null;
+          throw e;
+        });
+        if (remote === null) {
+          providerVerified = hasTrustedKey ? "no-record" : "unverifiable";
         } else {
-          providerVerified = "unreachable";
+          const tx = remote?.transaction ?? remote;
+          const st = sogo.sogoStatus(tx || remote);
+          if (["completed", "successful", "success", "delivered"].includes(st)) {
+            providerVerified = "completed";
+          } else if (["failed", "failure", "refunded", "reversed", "cancelled", "canceled"].includes(st)) {
+            providerVerified = "failed";
+            opts.providerReportedFailure = true;
+          } else {
+            providerVerified = "unverifiable"; // provider still working — not proof of anything
+          }
         }
+      } catch {
+        providerVerified = "unverifiable"; // auth failure / outage — never proof of non-delivery
       }
-    } catch {
-      providerVerified = "unreachable";
     }
   } else if (opts.skipProviderCheck) {
     providerVerified = "skipped";
@@ -274,6 +312,14 @@ export async function reverseBillPayment(
   // the provider DELIVERED this bill — the money bought something real.
   if (providerVerified === "completed" && !opts.force) {
     notes.push("provider reports the bill was fulfilled — reversal refused");
+    return out;
+  }
+  // AMBIGUITY GUARD: fallback-reference 404 / auth failure / outage /
+  // still-pending are NOT proof the bill went unfulfilled. Refuse without an
+  // explicit admin force — this is the guard that would have stopped the
+  // 2026-10-30 "delivered bill auto-refunded" incident.
+  if (providerVerified === "unverifiable" && !opts.force) {
+    notes.push("provider state could not be verified — reversal refused (resolve the provider lookup, or retry with force after manual review)");
     return out;
   }
 
@@ -338,6 +384,7 @@ export async function reverseBillPayment(
     client.release();
   }
   if (!claimed) return out; // unreachable defensively
+  clearUnsettledAlert(ref);
 
   // ---- 3. Ledger unwind (all idempotent by reference) --------------------
   // 3a. Platform vendor hold: the pay flow debits the platform the instant
@@ -475,12 +522,32 @@ export async function reverseBillPayment(
   return out;
 }
 
-/** Ask the provider what happened to a processing bill. */
+/**
+ * Ask the provider what happened to a processing bill.
+ *
+ * EVIDENCE RULES (money-safe — a refund needs POSITIVE failure evidence):
+ *   - A 404 only proves "dispatch never landed" when the lookup used Sogo's
+ *     OWN reference (bill.provider_reference). Live Sogo assigns its own
+ *     BILL… reference and does NOT index our MF-BILL… Idempotency-Key, so a
+ *     404 against the fallback reference is AMBIGUOUS — the order may be
+ *     sitting there under Sogo's own reference. That ambiguity refunds a
+ *     DELIVERED bill (the 2026-10-30 incident) — it must never auto-refund.
+ *   - 401/403 means the API key is broken: EVERY lookup would fail, so the
+ *     answer says nothing about any individual bill. Never auto-refund.
+ *   - Network/5xx/429 outages: wait for connectivity; no timed refund.
+ */
 type Verdict =
   | { kind: "completed"; providerResponse: any }
   | { kind: "failed"; reason: string; providerResponse: any }
   | { kind: "pending" }
-  | { kind: "unknown"; transient: boolean; providerResponse?: any };
+  | {
+      kind: "unknown";
+      transient: boolean;
+      providerResponse?: any;
+      /** "no-record" = trusted lookup 404; "unverifiable" = ambiguous — never enough to move money */
+      trust: "no-record" | "unverifiable";
+      why: string;
+    };
 
 async function askProvider(bill: BillRow): Promise<Verdict> {
   const provider = bill.provider || (await getActiveProvider("bills"));
@@ -493,17 +560,21 @@ async function askProvider(bill: BillRow): Promise<Verdict> {
   if (provider === "flutterwave") {
     // FLW bills settle synchronously in the pay handler. A processing row is
     // a crash remnant — no async outcome will ever arrive.
-    return { kind: "unknown", transient: false };
+    return { kind: "unknown", transient: false, trust: "unverifiable", why: "flutterwave settles synchronously — no async outcome expected" };
   }
 
   // Sogo: sandbox never persists or confirms anything — treat as unknown.
-  if (sogo.isSogoSandbox()) return { kind: "unknown", transient: false };
+  if (sogo.isSogoSandbox()) return { kind: "unknown", transient: false, trust: "no-record", why: "sogo sandbox cannot confirm" };
+
+  if (!sogo.isSogoConfigured()) {
+    return { kind: "unknown", transient: false, trust: "unverifiable", why: "SOGO_SECRET_KEY is not configured — provider cannot be asked" };
+  }
+
+  // A trusted lookup key is Sogo's OWN reference, captured from the purchase
+  // response or webhook backfill — distinct from our MF-BILL reference.
+  const hasTrustedKey = !!bill.provider_reference && bill.provider_reference !== bill.reference;
 
   try {
-    // Sogo live assigns its OWN reference (BILL…) — our MF-BILL… reference is
-    // only the Idempotency-Key and is NOT a valid lookup key on their API.
-    // provider_reference is captured from the purchase response / webhook
-    // backfill; fall back to our reference for older rows.
     const remote = await sogo.getTransaction(bill.provider_reference || bill.reference);
     const tx = remote?.transaction ?? remote;
     const st = sogo.sogoStatus(tx || remote);
@@ -517,12 +588,21 @@ async function askProvider(bill: BillRow): Promise<Verdict> {
   } catch (e: any) {
     const status = e?.response?.status;
     if (status === 404) {
-      // Provider has no record — the dispatch never reached it (crash before
-      // send) or it dropped the order. Either way it will never fulfil.
-      return { kind: "unknown", transient: false };
+      if (hasTrustedKey) {
+        // Sogo has no transaction under ITS OWN reference — the dispatch
+        // never reached it (crash before send) or it dropped the order.
+        return { kind: "unknown", transient: false, trust: "no-record", why: "404 on Sogo's own reference" };
+      }
+      return {
+        kind: "unknown", transient: false, trust: "unverifiable",
+        why: "404 on the fallback MF-BILL reference — live Sogo does not index it, so this proves nothing",
+      };
     }
-    // Network/5xx/429 — do not refund on a transient blip.
-    return { kind: "unknown", transient: true, providerResponse: undefined };
+    if (status === 401 || status === 403) {
+      return { kind: "unknown", transient: false, trust: "unverifiable", why: `Sogo rejected the API key (HTTP ${status})` };
+    }
+    // Network/5xx/429 — an outage says nothing about this bill.
+    return { kind: "unknown", transient: true, trust: "unverifiable", why: `provider unreachable (HTTP ${status || "network"})`, providerResponse: undefined };
   }
 }
 
@@ -568,7 +648,8 @@ export async function reconcileProcessingBills(limit = 25): Promise<number> {
       const sandbox = provider === "sogo" && sogo.isSogoSandbox();
       if (sandbox) {
         // Sandbox can NEVER confirm (all polls 404, no webhooks) — refund
-        // once the crash-window (REFUND_AFTER_MINUTES) has passed.
+        // once the crash-window (REFUND_AFTER_MINUTES) has passed. Sandbox
+        // money is fake, so a timed refund is safe here.
         if (age >= REFUND_AFTER_MINUTES) {
           settled += (await refundBillRow(bill, "Provider (Sogo sandbox) never confirmed — auto-refunded")) ? 1 : 0;
         }
@@ -580,13 +661,23 @@ export async function reconcileProcessingBills(limit = 25): Promise<number> {
         }
         continue;
       }
-      // sogo live: 404 ⇒ dispatch never landed → refund after the grace
-      // window; transient errors ⇒ wait, refund only after hours of silence.
+      // Sogo LIVE — money moves ONLY on positive provider evidence:
+      //   completed → settled above; failed → refunded above (provider said so);
+      //   pending   → 24 h timeout above (provider still says it has not
+      //               fulfilled — far beyond any bill delivery SLA);
+      //   no-record → 404 on Sogo's OWN reference ⇒ dispatch never landed.
+      // Everything else is AMBIGUOUS (fallback-reference 404, auth failure,
+      // outage): the bill may have been delivered, so the row HOLDS in
+      // 'processing' and the operator is alerted — never auto-refunded.
+      if (verdict.trust === "unverifiable") {
+        alertUnsettled(bill, verdict.why);
+        continue;
+      }
       if (verdict.transient) {
-        if (age >= UNREACHABLE_REFUND_HOURS * 60) {
-          settled += (await refundBillRow(bill, "Provider unreachable — auto-refunded")) ? 1 : 0;
-        }
-      } else if (age >= REFUND_AFTER_MINUTES) {
+        alertUnsettled(bill, verdict.why);
+        continue;
+      }
+      if (age >= REFUND_AFTER_MINUTES) {
         settled += (await refundBillRow(bill, "Provider has no record of this payment — auto-refunded")) ? 1 : 0;
       }
     } catch (e: any) {
@@ -673,15 +764,25 @@ export async function sweepUserBills(userId: string): Promise<void> {
       }
       if (verdict.kind === "unknown") {
         const sandbox = (bill.provider || "sogo") === "sogo" && sogo.isSogoSandbox();
-        const grace = sandbox || bill.provider === "flutterwave" ? REFUND_AFTER_MINUTES
-          : verdict.transient ? UNREACHABLE_REFUND_HOURS * 60 : REFUND_AFTER_MINUTES;
-        if (age >= grace) {
-          await refundBillRow(
-            bill,
-            sandbox ? "Provider (Sogo sandbox) never confirmed — auto-refunded"
-              : verdict.transient ? "Provider unreachable — auto-refunded"
-              : "Provider has no record of this payment — auto-refunded",
-          );
+        if (sandbox || bill.provider === "flutterwave") {
+          if (age >= REFUND_AFTER_MINUTES) {
+            await refundBillRow(
+              bill,
+              sandbox ? "Provider (Sogo sandbox) never confirmed — auto-refunded"
+                : "Provider never confirmed the payment — auto-refunded",
+            );
+          }
+          continue;
+        }
+        // Sogo live: ambiguous evidence (fallback-reference 404, auth
+        // failure, outage) never auto-refunds — see askProvider's evidence
+        // rules. Only a trusted-key 404 refunds after the grace window.
+        if (verdict.trust === "unverifiable" || verdict.transient) {
+          alertUnsettled(bill, verdict.why);
+          continue;
+        }
+        if (age >= REFUND_AFTER_MINUTES) {
+          await refundBillRow(bill, "Provider has no record of this payment — auto-refunded");
         }
       }
     }

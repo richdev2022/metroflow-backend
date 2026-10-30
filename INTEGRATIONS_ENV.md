@@ -347,7 +347,7 @@ the prefix unless `SOGO_BASE_URL` overrides it).
 |----------|----------|-------------|
 | `SOGO_SECRET_KEY` | ✅ | Secret API key — Sogo developer profile. Decides sandbox vs live. |
 | `SOGO_PUBLIC_KEY` | optional | Public key flag surfaced by the admin Personal Products console. |
-| `SOGO_WEBHOOK_SECRET` | ✅ for webhooks | The endpoint **signing secret** Sogo shows when you register the webhook ("copy this signing secret"). Verifies `X-Sogo-Signature-256: sha256= + HMAC-SHA256(raw body, secret)` timing-safely. **Fail closed**: without it every Sogo webhook is answered `401` and nothing settles. |
+| `SOGO_WEBHOOK_SECRET` | ✅ for webhooks | The endpoint **signing secret** Sogo shows when you register the webhook ("copy this signing secret"). Verifies `X-Sogo-Signature-256: sha256= + HMAC-SHA256(raw body, secret)` timing-safely (the `sha256=` prefix is optional on the received header — bare hex and uppercase are accepted; the HMAC must still cover the exact raw bytes). **Fail closed**: without it every Sogo webhook is answered `503 Webhook secret not configured` — a 401 therefore always means a genuinely bad signature — and nothing settles. |
 | `SOGO_BASE_URL` | optional | Override (`https://sandbox.sogo.africa/v1` / `https://api.sogo.africa/v1`); the key prefix decides otherwise. |
 
 ### Where to put the signing secret

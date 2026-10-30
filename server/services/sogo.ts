@@ -759,19 +759,33 @@ export async function verifyTransaction(input: { reference: string; amount?: num
 /**
  * Verify X-Sogo-Signature-256: "sha256=" + HMAC_SHA256(rawBody, secret),
  * timing-safe. Requires SOGO_WEBHOOK_SECRET in the server env.
+ *
+ * Liberal on the RECEIVED format, strict on the HMAC itself:
+ *   - the "sha256=" scheme prefix is OPTIONAL (Swagger UI, curl one-liners
+ *     and some gateways send the bare hex digest);
+ *   - hex is case-insensitive.
+ * The digest must still be the HMAC-SHA256 of the EXACT raw request bytes —
+ * re-serialized JSON will never match.
  */
 export function verifySogoWebhook(rawBody: Buffer | string, signature: string | undefined | null): boolean {
   const secret = webhookSecret();
   if (!secret || !signature) return false;
-  const expected = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody as any).digest("hex");
-  const received = String(signature);
-  try {
-    const a = Buffer.from(expected);
-    const b = Buffer.from(received);
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
+  const expected = crypto.createHmac("sha256", secret).update(rawBody as any).digest("hex");
+  const received = String(signature).trim().replace(/^sha256=/i, "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(received)) return false; // not a sha-256 hex digest
+  const a = Buffer.from(expected, "hex");
+  const b = Buffer.from(received, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * True only when the server actually has a signing secret configured. The
+ * webhook handler uses this to answer 503 (misconfiguration) instead of 401
+ * (bad signature) — otherwise an unconfigured secret is indistinguishable
+ * from a wrong signature and sends the operator debugging the wrong thing.
+ */
+export function sogoWebhookSecretConfigured(): boolean {
+  return !!webhookSecret();
 }
 
 /** Normalize the sandbox environment for tests that need the sandbox host. */

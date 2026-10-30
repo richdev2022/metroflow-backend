@@ -1521,21 +1521,37 @@ router.post("/", async (req, res) => {
             // request. Previously these fell through and were processed as
             // Squad webhooks with zero validation.
             console.warn("Webhook rejected: no provider signature header present");
+            // Record the forgery attempt on the admin webhook feed.
+            try {
+                await query(
+                    `INSERT INTO squad_webhooks (event_type, payload, status, provider, reference, signature_valid, error)
+                     VALUES ('unknown', $1::jsonb, 'rejected', 'unknown', NULL, FALSE, 'Missing signature header')`,
+                    [JSON.stringify(req.body ?? {})],
+                );
+            } catch (logErr: any) {
+                console.warn("webhook log insert failed:", logErr?.message);
+            }
             return res.status(401).send('Missing signature');
         }
-        
+
         const event = req.body;
 
         // Save to DB
         const eventType = providerName === 'squad' ? event.Event : (providerName === 'flutterwave' ? event.event : event.eventType);
+        const eventReference = String(
+            event?.data?.tx_ref || event?.data?.reference || event?.data?.id ||
+            event?.eventData?.transactionReference || event?.eventData?.reference ||
+            event?.Data?.reference || ""
+        ).slice(0, 160) || null;
 
         // Compact single-line log (full payload is persisted in squad_webhooks)
         const flwRef = event?.data?.tx_ref || event?.data?.reference;
         console.log(`${providerName} webhook: ${eventType || 'unknown'} | ref: ${flwRef || 'n/a'} | status: ${event?.data?.status || 'n/a'}`);
 
         await query(
-            `INSERT INTO squad_webhooks (event_type, payload, provider) VALUES ($1, $2, $3)`,
-            [eventType, event, providerName]
+            `INSERT INTO squad_webhooks (event_type, payload, provider, reference, signature_valid)
+             VALUES ($1, $2, $3, $4, TRUE)`,
+            [eventType, event, providerName, eventReference]
         );
 
         if (providerName === 'squad') {
@@ -1547,8 +1563,19 @@ router.post("/", async (req, res) => {
         }
 
         res.sendStatus(200);
-    } catch (error) {
+    } catch (error: any) {
         console.error("Webhook processing error:", error);
+        // Record the processing failure on the admin webhook feed so the
+        // provider retry is visible in the console.
+        try {
+            await query(
+                `INSERT INTO squad_webhooks (event_type, payload, status, provider, reference, signature_valid, error)
+                 VALUES ('unknown', $1::jsonb, 'failed', 'unknown', NULL, NULL, $2)`,
+                [JSON.stringify(req?.body ?? {}), String(error?.message || error).slice(0, 2000)],
+            );
+        } catch (logErr: any) {
+            console.warn("webhook failure log insert failed:", logErr?.message);
+        }
         res.sendStatus(500);
     }
 });

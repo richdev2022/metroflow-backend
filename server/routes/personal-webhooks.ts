@@ -1251,6 +1251,17 @@ export async function sogoWebhookHandler(req: Request, res: Response) {
   try {
     const raw = rawBody(req);
     const signature = (req.headers["x-sogo-signature-256"] as string) || "";
+    // Fail closed on a missing signing secret, but answer 503 — NOT 401.
+    // With no secret configured EVERY signature fails, and a 401 would send
+    // the operator debugging their own signature when the fix is a server
+    // env change (SOGO_WEBHOOK_SECRET).
+    if (!sogo.sogoWebhookSecretConfigured()) {
+      console.error("[sogo webhook] SOGO_WEBHOOK_SECRET is not configured on this server — rejecting (fail-closed). Every webhook will 503 until the secret is set in the server env.");
+      payload = asJson(req);
+      signatureValid = false;
+      await logWebhookEvent({ provider: "sogo", eventType: String(payload?.event || "unknown"), payload, status: "rejected", signatureValid, error: "SOGO_WEBHOOK_SECRET not configured on server" });
+      return res.status(503).json({ success: false, error: "Webhook secret not configured" });
+    }
     if (!verifySogoWebhook(raw, signature)) {
       signatureValid = false;
       payload = asJson(req);

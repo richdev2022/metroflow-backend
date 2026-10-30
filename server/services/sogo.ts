@@ -228,9 +228,62 @@ export function sogoStatus(tx: any): string {
   return String(raw || "").toLowerCase();
 }
 
-/** Sogo transaction reference from any response shape. */
+/**
+ * The transaction object out of ANY Sogo shape — purchase responses
+ * ({transaction: {...}} or the tx itself), and webhook events.
+ *
+ * LIVE WEBHOOK SHAPE (observed 2026-10-30, livemode):
+ *   { id: "evt_…", event: "transaction.completed",
+ *     data: { id, object: "transaction", reference: "BILL…", status: {value,is_final},
+ *             type: {value, is_credit}, amount: {raw, currency, formatted}, metadata, timestamps } }
+ *
+ * `data.object` is a Stripe-style DISCRIMINATOR STRING ("transaction"), NOT a
+ * nested object — the old `payload?.data?.object || payload?.data` extraction
+ * turned every live bill webhook into the literal string "transaction" and
+ * silently dropped it (the "webhook arrived but bill stayed processing" bug).
+ */
+export function sogoTx(payload: any): any {
+  if (!payload || typeof payload !== "object") return payload ?? {};
+  const data = payload.data;
+  if (data && typeof data === "object" && !Array.isArray(data)) return data;
+  return payload;
+}
+
+/** Sogo `type` arrives as a string OR {value, is_credit} — normalize to lowercase string. */
+export function sogoType(tx: any): string {
+  const raw = tx?.type ?? tx;
+  const v = raw && typeof raw === "object" ? (raw.value ?? "") : raw;
+  return String(v || "").toLowerCase();
+}
+
+/** Sogo money fields arrive as numbers OR {raw, currency, formatted} — extract the number. */
+export function sogoAmount(v: any): number {
+  if (v == null) return 0;
+  const n = typeof v === "object" ? Number(v.raw ?? v.value ?? v.amount) : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Sogo status vocabulary → OUR canonical statuses. Live webhooks/polling use
+ * "successful" / "delivered" / "failure" / "canceled" — the webhook handlers
+ * previously did a strict ["completed","failed",…] equality and silently
+ * mapped every one of those to "processing".
+ */
+export function normalizeSogoStatus(raw: any): string {
+  const s = String((raw && typeof raw === "object" ? raw.value : raw) ?? "").toLowerCase();
+  if (["completed", "successful", "success", "delivered"].includes(s)) return "completed";
+  if (["failed", "failure"].includes(s)) return "failed";
+  if (["refunded", "reversed"].includes(s)) return "refunded";
+  if (["cancelled", "canceled"].includes(s)) return "cancelled";
+  return "processing";
+}
+
+/** Sogo transaction reference from any response shape (envelope-aware). */
 export function sogoReference(tx: any): string {
-  return String(tx?.transaction?.reference || tx?.reference || tx?.order?.reference || "");
+  return String(
+    tx?.transaction?.reference || tx?.data?.transaction?.reference ||
+      tx?.reference || tx?.order?.reference || "",
+  );
 }
 
 /** Unwrap the {data: ...} envelope (Sogo responses) with graceful fallbacks. */
@@ -682,8 +735,8 @@ export async function giftcardSell(input: {
 // ===========================================================================
 
 /** Fetch a Sogo transaction by reference (404 in sandbox — not persisted). */
-export async function getTransaction(reference: string): Promise<any> {
-  const body = await sogoRequest<any>("GET", `/transactions/${encodeURIComponent(reference)}`);
+export async function getTransaction(reference: string, timeoutMs = 60_000): Promise<any> {
+  const body = await sogoRequest<any>("GET", `/transactions/${encodeURIComponent(reference)}`, { timeoutMs });
   return unwrap(body, {});
 }
 

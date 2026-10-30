@@ -500,7 +500,11 @@ async function askProvider(bill: BillRow): Promise<Verdict> {
   if (sogo.isSogoSandbox()) return { kind: "unknown", transient: false };
 
   try {
-    const remote = await sogo.getTransaction(bill.reference);
+    // Sogo live assigns its OWN reference (BILL…) — our MF-BILL… reference is
+    // only the Idempotency-Key and is NOT a valid lookup key on their API.
+    // provider_reference is captured from the purchase response / webhook
+    // backfill; fall back to our reference for older rows.
+    const remote = await sogo.getTransaction(bill.provider_reference || bill.reference);
     const tx = remote?.transaction ?? remote;
     const st = sogo.sogoStatus(tx || remote);
     if (["completed", "successful", "success", "delivered"].includes(st)) {

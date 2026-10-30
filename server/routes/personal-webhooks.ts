@@ -860,7 +860,7 @@ async function handleSogoCryptoDeposit(tx: any) {
 }
 
 async function handleSogoBillPayment(tx: any) {
-  const { settleBillCompleted, refundBillRow } = await import("../features/personal/bill-settlement");
+  const { settleBillCompleted, refundBillRow, correctWrongRefund } = await import("../features/personal/bill-settlement");
   const sogoRef = String(tx?.reference || "");
   if (!sogoRef) return;
 
@@ -917,7 +917,13 @@ async function handleSogoBillPayment(tx: any) {
   // Settlement runs through the shared engine (claim-first guarded UPDATEs,
   // ledger-idempotent refunds, cashback on late completion, notifications).
   if (mapped === "completed") {
-    await settleBillCompleted(bill, tx);
+    const settled = await settleBillCompleted(bill, tx);
+    if (!settled && String(bill.status) !== "completed") {
+      // Provider says COMPLETED but the row was already refunded/failed — a
+      // refund raced (and lost against) the provider. Correct the money:
+      // re-debit the wallet, restore the ledger, land the row on completed.
+      await correctWrongRefund(bill, tx);
+    }
   } else if (["refunded", "failed", "cancelled"].includes(mapped)) {
     await refundBillRow(bill, `Provider reported: ${mapped}`, tx);
   } else {

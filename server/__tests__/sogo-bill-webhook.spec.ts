@@ -32,6 +32,7 @@ vi.mock("../features/personal/personal-utils", () => ({
 vi.mock("../features/personal/bill-settlement", () => ({
   settleBillCompleted: vi.fn(async () => true),
   refundBillRow: vi.fn(async () => true),
+  correctWrongRefund: vi.fn(async () => ({ corrected: true, reDebited: true, note: "" })),
   reverseBillPayment: vi.fn(async () => ({ reversed: true, alreadyReversed: false, credited: true, notes: [] })),
 }));
 vi.mock("../services/app-config", () => ({
@@ -41,7 +42,7 @@ vi.mock("../services/app-config", () => ({
 import { query } from "../db";
 import { processSogoEvent } from "../routes/personal-webhooks";
 import * as sogo from "../services/sogo";
-import { settleBillCompleted, refundBillRow } from "../features/personal/bill-settlement";
+import { settleBillCompleted, refundBillRow, correctWrongRefund } from "../features/personal/bill-settlement";
 
 const OLD_ENV = process.env;
 
@@ -101,6 +102,7 @@ beforeEach(() => {
   (query as any).mockImplementation(async () => ({ rows: [], rowCount: 0 }));
   vi.mocked(settleBillCompleted).mockClear();
   vi.mocked(refundBillRow).mockClear();
+  vi.mocked(correctWrongRefund).mockClear();
   // Default: sandbox OFF so the reconfirm path is exercised; tests override.
   vi.spyOn(sogo, "isSogoSandbox").mockReturnValue(true);
   vi.restoreAllMocks?.();
@@ -296,5 +298,29 @@ describe("sogo bill webhook pipeline (live payload)", () => {
     const outcome = await processSogoEvent({ event: "bill.exploded", data: { reference: "BILL-1" } });
     expect(outcome).toBe("ignored");
     expect(calls.length).toBe(0);
+  });
+
+  it("corrects the money when a completed webhook reaches an already-refunded bill", async () => {
+    // The 2026-10-30 class: the row was auto-refunded while the provider had
+    // already delivered. settleBillCompleted can only claim 'processing'
+    // rows — the correction engine must take over for a refunded one.
+    vi.spyOn(sogo, "isSogoSandbox").mockReturnValue(true);
+    mockDb((sql) => {
+      if (sql.includes("FROM bill_transactions WHERE reference = $1 OR provider_reference = $1")) {
+        return { rows: [{ ...STRANDED_ROW, status: "refunded", failure_reason: "auto-refunded in error" }], rowCount: 1 };
+      }
+      return undefined;
+    });
+    // the engine's claim only covers 'processing' rows — for a refunded one it
+    // loses, so the real flow falls through to the correction engine.
+    vi.mocked(settleBillCompleted).mockResolvedValue(false);
+    await processSogoEvent(LIVE_COMPLETED_EVENT);
+    expect(settleBillCompleted).toHaveBeenCalledTimes(1);
+    expect(correctWrongRefund).toHaveBeenCalledTimes(1);
+    expect(correctWrongRefund).toHaveBeenCalledWith(
+      expect.objectContaining({ reference: "MF-BILL-MVV2PRHWECRO4Y", status: "refunded" }),
+      expect.anything(),
+    );
+    expect(refundBillRow).not.toHaveBeenCalled();
   });
 });

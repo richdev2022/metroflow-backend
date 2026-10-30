@@ -6439,7 +6439,7 @@
     "/api/webhook/sogo": {
       "post": {
         "summary": "Sogo partner webhook (bills, gift cards, RMB, crypto deposits)",
-        "description": "Public callback for the Sogo provider. Signature-verified with the\n`X-Sogo-Signature-256` header — `sha256=` + HMAC-SHA256 hex digest of\nthe RAW request body keyed by `SOGO_WEBHOOK_SECRET` (timing-safe).\nSettlement is idempotent per reference.\n\nEvents: `ping` (handshake probe — replies `{ success: true }`),\n`transaction.completed`, `transaction.failed`,\n`transaction.cancelled`, `transaction.refunded`. Any other event is\nacknowledged and ignored.\n\nRouting by `data.type`:\n- crypto deposit — matched by `metadata.deposit_address` /\n  `deposit_address` (or a pre-recorded sale by `reference`); NGN is\n  settled to the Sogo wallet and the user's wallet is credited net\n  of the configured crypto spread.\n- giftcard + buy — codes fetched via GET /transactions/{ref}; order\n  completed.\n- giftcard (sell) — wallet credited with payout minus sell fee.\n- rmb — order status mapped; wallet refund on cancelled/refunded.\n- anything else — treated as a bill payment status update (with\n  provider-side refund handling).\n",
+        "description": "Public callback for the Sogo provider. Signature-verified with the\n`X-Sogo-Signature-256` header — `sha256=` + HMAC-SHA256 hex digest of\nthe RAW request body keyed by `SOGO_WEBHOOK_SECRET` (timing-safe).\nSettlement is idempotent per reference.\n\nEvents: `ping` (handshake probe — replies `{ success: true }`),\n`transaction.completed`, `transaction.failed`,\n`transaction.cancelled`, `transaction.refunded`. Any other event is\nacknowledged and ignored.\n\nRouting by `data.type`:\n- crypto deposit — matched by `metadata.deposit_address` /\n  `deposit_address` (or a pre-recorded sale by `reference`); NGN is\n  settled to the Sogo wallet and the user's wallet is credited net\n  of the configured crypto spread.\n- giftcard + buy — codes fetched via GET /transactions/{ref}; order\n  completed.\n- giftcard (sell) — wallet credited with payout minus sell fee.\n- rmb — order status mapped; wallet refund on cancelled/refunded.\n- anything else — treated as a bill payment status update (with\n  provider-side refund handling).\n\nTesting the signature manually (Swagger UI cannot compute HMACs):\n1. Copy the EXACT request body Swagger will send (use the cURL command\n   below — the header must be an HMAC of those byte-for-byte bytes).\n2. Sign it:  printf '%s' \"$BODY\" | openssl dgst -sha256 -hmac \"$SOGO_WEBHOOK_SECRET\"\n3. Paste  sha256=<hex>  into the X-Sogo-Signature-256 field (the bare\n   hex digest is accepted too; case-insensitive).\nOr run scripts/sogo-webhook-test.sh — it signs and sends a probe for\nyou and prints the HTTP status.\nResponse codes: 200 = verified; 401 = signature does not match the\nbody (or is malformed); 503 = the SERVER has no SOGO_WEBHOOK_SECRET\nconfigured — a deployment env fix, not a client mistake.\n",
         "tags": [
           "Webhooks"
         ],
@@ -6452,7 +6452,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "\"sha256=\" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET)"
+            "description": "\"sha256=\" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET). The \"sha256=\" prefix is optional — a bare hex digest is accepted."
           }
         ],
         "requestBody": {
@@ -6543,6 +6543,9 @@
           },
           "500": {
             "description": "Processing error (event should be retried by the provider)"
+          },
+          "503": {
+            "description": "Server has no SOGO_WEBHOOK_SECRET configured (fail closed — set the env, then retry)"
           }
         }
       }

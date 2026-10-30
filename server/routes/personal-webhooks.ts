@@ -1150,6 +1150,18 @@ async function handleSogoRmb(tx: any) {
  *       - rmb — order status mapped; wallet refund on cancelled/refunded.
  *       - anything else — treated as a bill payment status update (with
  *         provider-side refund handling).
+ *
+ *       Testing the signature manually (Swagger UI cannot compute HMACs):
+ *       1. Copy the EXACT request body Swagger will send (use the cURL command
+ *          below — the header must be an HMAC of those byte-for-byte bytes).
+ *       2. Sign it:  printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SOGO_WEBHOOK_SECRET"
+ *       3. Paste  sha256=<hex>  into the X-Sogo-Signature-256 field (the bare
+ *          hex digest is accepted too; case-insensitive).
+ *       Or run scripts/sogo-webhook-test.sh — it signs and sends a probe for
+ *       you and prints the HTTP status.
+ *       Response codes: 200 = verified; 401 = signature does not match the
+ *       body (or is malformed); 503 = the SERVER has no SOGO_WEBHOOK_SECRET
+ *       configured — a deployment env fix, not a client mistake.
  *     tags: [Webhooks]
  *     security: []
  *     parameters:
@@ -1158,7 +1170,7 @@ async function handleSogoRmb(tx: any) {
  *         required: true
  *         schema:
  *           type: string
- *         description: '"sha256=" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET)'
+ *         description: '"sha256=" + HMAC-SHA256 hex of the raw body (SOGO_WEBHOOK_SECRET). The "sha256=" prefix is optional — a bare hex digest is accepted.'
  *     requestBody:
  *       required: true
  *       content:
@@ -1210,6 +1222,8 @@ async function handleSogoRmb(tx: any) {
  *                   example: true
  *       401:
  *         description: Invalid or missing webhook signature
+ *       503:
+ *         description: Server has no SOGO_WEBHOOK_SECRET configured (fail closed — set the env, then retry)
  *       500:
  *         description: Processing error (event should be retried by the provider)
  */

@@ -40,6 +40,7 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
   import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
   import adminPrestmitRouter from "./routes/admin_prestmit";
+  import adminProvidersRouter from "./routes/admin_providers";
   import personalProductsAdminRouter from "./features/personal/admin";
 import {
   registerBusiness,
@@ -1041,6 +1042,9 @@ export async function createServer() {
   // ops router (boosts, moderation, ledgers, boost pricing) coexists below
   // with distinct subpaths.
   mainRouter.use("/admin/personal/prestmit", adminPrestmitRouter);
+  // "Provider's Balance" treasury desk — provider wallets, history, low-
+  // balance thresholds and the per-app "Coming soon" feature toggles.
+  mainRouter.use("/admin/personal/providers", adminProvidersRouter);
   mainRouter.use("/admin/personal", personalProductsAdminRouter);
   mainRouter.use("/admin/personal", adminPersonalRouter);
 

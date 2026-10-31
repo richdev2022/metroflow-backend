@@ -847,3 +847,31 @@ export function sogoWebhookSecretConfigured(): boolean {
 export function sandboxInfo(): { base_url: string; key_kind: string; sandbox: boolean } {
   return { base_url: sogoBaseUrl(), key_kind: sogoKeyKind(), sandbox: isSogoSandbox() };
 }
+
+// ---------------------------------------------------------------------------
+// Platform wallet + transactions (GET /v1/wallet, GET /v1/transactions)
+// Powers the admin "Provider's Balance" desk: platform float visibility,
+// low-balance alerting and reconciliation against provider statements.
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /wallet — one object per wallet currency: balance and
+ * withdrawable_balance in major units plus formatted display strings.
+ * Sandbox always returns a fixed NGN 1,000,000.00 balance.
+ */
+export async function wallet(): Promise<any> {
+  return sogoRequest("GET", "/wallet");
+}
+
+/**
+ * GET /transactions — paginated partner transactions with optional filters
+ * (status, type, currency, from, to, per_page, page). Used for the provider
+ * history view so reconciliation can match platform ledger rows 1:1.
+ */
+export async function transactions(params: Record<string, any> = {}): Promise<any> {
+  const clean: Record<string, any> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") clean[k] = v;
+  }
+  return sogoRequest("GET", "/transactions", { params: clean });
+}

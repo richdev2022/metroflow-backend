@@ -347,6 +347,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <span class="txt">Transfers</span>
       </button>
+      <button class="nav-item" data-page="providers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        <span class="txt">Provider&#39;s Balance</span>
+      </button>
       <button class="nav-item" data-page="webhooks" style="position:relative">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
         <span class="txt">Webhooks</span>
@@ -355,6 +359,14 @@
       <button class="nav-item" data-page="kyc">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span class="txt">KYC</span>
+      </button>
+      <button class="nav-item" data-page="virtualcards">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+        <span class="txt">Virtual Cards</span>
+      </button>
+      <button class="nav-item" data-page="features">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+        <span class="txt">Feature Toggles</span>
       </button>
       <button class="nav-item" data-page="notifications" style="position:relative">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
@@ -537,8 +549,11 @@ var PAGES = {
   disputes:     { title: "Disputes",     sub: "Transaction dispute desk",         render: renderDisputes },
   transactions: { title: "Transactions", sub: "All wallet transactions",          render: renderTransactions },
   transfers:    { title: "Transfers",    sub: "Outbound transfer queue",          render: renderTransfers },
+  providers:    { title: "Provider's Balance", sub: "Provider float — balances, low alerts, history", render: renderProviders },
   webhooks:     { title: "Webhooks",     sub: "Provider callback feed — all gateways", render: renderWebhooks },
   kyc:          { title: "KYC",          sub: "Identity verifications",           render: renderKyc },
+  virtualcards: { title: "Virtual Cards", sub: "Bitnob card desk — float, fees, KYC queue", render: renderVirtualCards },
+  features:     { title: "Feature Toggles", sub: "Per-app Coming soon switches",     render: renderFeatures },
   notifications:{ title: "Notifications",sub: "Internal admin alert feed",        render: renderNotifications },
   settings:     { title: "Settings",     sub: "Platform configuration",           render: renderSettings },
 };
@@ -1394,6 +1409,632 @@ function renderTestResults(results) {
     return '<div class="test-row">' + (r.sent ? "✅" : "❌") + " <span>" + esc(r.email) + "</span>" +
       (r.sent ? '<span class="cell-sub">sent</span>' : '<span class="cell-sub" style="color:var(--bad)">' + esc(r.error || "failed") + "</span>") + "</div>";
   }).join("");
+}
+
+/* ===================== providers ("Provider's Balance") =====================
+   Treasury desk for Flutterwave / Sogo / Prestmit / Bitnob: per-provider wallet
+   balances (ledger / available / withdrawable + LOW flags), low-balance
+   thresholds and provider-native transaction history for reconciliation. */
+var PROV_META = [
+  { id: "flutterwave", label: "Flutterwave", env: "FLW_SECRET_KEY" },
+  { id: "sogo", label: "Sogo", env: "SOGO_SECRET_KEY / SOGO_PUBLIC_KEY" },
+  { id: "prestmit", label: "Prestmit", env: "PRESTMIT_API_KEY / PRESTMIT_API_SECRET" },
+  { id: "bitnob", label: "Bitnob", env: "BITNOB_SECRET_KEY + BITNOB_CLIENT_ID" },
+];
+var provState = { provider: "flutterwave", currencies: [], page: 1, currency: "", hist: [], histSeen: {}, hasMore: false, thresholds: {} };
+function provMeta(id) {
+  for (var i = 0; i < PROV_META.length; i++) if (PROV_META[i].id === id) return PROV_META[i];
+  return { id: id, label: id, env: "the provider env keys" };
+}
+function renderProviders() {
+  $("content").innerHTML =
+    '<div class="note-box" style="margin-bottom:14px"><b>Ops hint:</b> Flutterwave is the collections float — sweep to Sogo/Prestmit for service operations and to Bitnob for virtual cards + stablecoin.</div>' +
+    '<div class="toolbar">' +
+      '<div class="chips" id="provChips"></div>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-ghost btn-sm" id="provLoadAll">Load all balances</button>' +
+    "</div>" +
+    '<div id="provBalBox"><div class="skel" style="height:180px"></div></div>' +
+    '<div class="card"><div class="card-head"><h3>Low balance thresholds</h3><span class="muted">Flag a wallet as LOW when its available balance drops to or below these values</span></div>' +
+      '<div class="card-body" id="provThrBox"><div class="skel" style="height:90px"></div></div></div>' +
+    '<div class="card"><div class="card-head"><h3 id="provHistTitle">History</h3><span class="muted">Provider-native transaction feed for reconciliation</span></div>' +
+      '<div class="card-body">' +
+        '<div class="toolbar" style="margin-bottom:10px">' +
+          '<select id="provHistCur" class="chip" style="border-radius:10px;padding:8px 12px"></select>' +
+          '<span class="cell-sub" id="provHistInfo"></span>' +
+        "</div>" +
+        '<div id="provHistBox"><div class="skel" style="height:180px"></div></div>' +
+      "</div></div>";
+  provState.page = 1; provState.hist = []; provState.histSeen = {};
+  renderProvChips();
+  renderProvHistCurOptions();
+  loadProvidersBalance();
+  loadProvThresholds();
+  loadProvHistory(false);
+  $("provLoadAll").onclick = loadAllProviderBalances;
+}
+function selectProvider(id) {
+  provState.provider = id;
+  provState.currency = "";
+  provState.page = 1; provState.hist = []; provState.histSeen = {};
+  renderProvChips();
+  renderProvHistCurOptions();
+  loadProvidersBalance();
+  loadProvHistory(false);
+}
+function renderProvChips() {
+  var box = $("provChips");
+  if (!box) return;
+  box.innerHTML = PROV_META.map(function (p) {
+    return '<button class="chip' + (provState.provider === p.id ? " active" : "") + '" data-p="' + p.id + '">' + esc(p.label) + "</button>";
+  }).join("");
+  var chips = box.querySelectorAll(".chip");
+  for (var i = 0; i < chips.length; i++) {
+    chips[i].onclick = function () { selectProvider(this.getAttribute("data-p")); };
+  }
+}
+function walletCurrencies(snap) {
+  var out = [];
+  var ws = Array.isArray(snap && snap.wallets) ? snap.wallets : [];
+  for (var i = 0; i < ws.length; i++) {
+    var c = String((ws[i] && ws[i].currency) || "").toUpperCase();
+    if (c && out.indexOf(c) < 0) out.push(c);
+  }
+  return out;
+}
+function loadProvidersBalance() {
+  var box = $("provBalBox");
+  if (!box) return;
+  box.innerHTML = '<div class="skel" style="height:180px"></div>';
+  api("/personal/providers/" + encodeURIComponent(provState.provider) + "/balance").then(function (j) {
+    var snap = j.data || {};
+    provState.currencies = walletCurrencies(snap);
+    renderProvBalance(snap);
+    renderProvHistCurOptions();
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+function renderProvBalance(snap) {
+  var box = $("provBalBox");
+  if (!box) return;
+  snap = snap || {};
+  var meta = provMeta(snap.provider || provState.provider);
+  var wallets = Array.isArray(snap.wallets) ? snap.wallets : [];
+  var stateBadge = snap.configured === false
+    ? '<span class="badge b-pending">not configured</span>'
+    : (snap.ok === false ? '<span class="badge b-failed">degraded</span>' : '<span class="badge b-resolved">live</span>');
+  var body = "";
+  if (snap.configured === false) {
+    body = '<div class="note-box"><b>' + esc(meta.label) + "</b> is not configured — add <b class=\"mono\">" + esc(meta.env) + "</b> to the server environment and restart. Balances, history and low-balance alerts for this provider stay empty until then.</div>";
+  } else {
+    if (snap.error) {
+      body += '<div class="note-box" style="background:var(--bad-soft);border-color:#fecdca;color:var(--bad);margin-bottom:12px"><b>Provider error (degraded):</b> ' + esc(snap.error) + " — the balances below may be partial or stale.</div>";
+    }
+    if (!wallets.length) {
+      body += '<div class="empty"><div class="big">🏦</div>' + esc(meta.label) + " returned no wallet balances" + (snap.error ? "" : " — the provider holds no platform float yet.") + "</div>";
+    } else {
+      body += '<div class="stat-grid" style="margin-bottom:0">';
+      for (var i = 0; i < wallets.length; i++) body += provWalletCard(wallets[i]);
+      body += "</div>";
+    }
+  }
+  box.innerHTML =
+    '<div class="card"><div class="card-head">' +
+      "<h3>" + esc(meta.label) + " balance</h3>" +
+      (snap.role ? '<span class="muted">' + esc(snap.role) + "</span>" : "") +
+      '<span class="spacer"></span>' + stateBadge +
+      (snap.fetched_at ? '<span class="muted">as of ' + dt(snap.fetched_at) + "</span>" : "") +
+    '</div><div class="card-body">' + body + "</div></div>";
+}
+function provWalletCard(w) {
+  var cur = String((w && w.currency) || "").toUpperCase();
+  var avail = (w && w.formatted != null && w.formatted !== "") ? w.formatted : money(w && w.available_balance, cur || undefined);
+  var sec = function (v) { return (v == null || v === "") ? "—" : money(v, cur || undefined); };
+  return '<div class="stat-card">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><div class="lbl">' + esc(cur || "—") + " wallet</div>" +
+      (w && w.low ? '<span class="badge b-failed">LOW — fund soon</span>' : "") + "</div>" +
+    '<div class="val" style="font-size:22px">' + esc(avail) + "</div>" +
+    '<div class="hint">Ledger ' + esc(sec(w && w.ledger_balance)) + " · Withdrawable " + esc(sec(w && w.withdrawable_balance)) + "</div>" +
+    "</div>";
+}
+function loadAllProviderBalances() {
+  var box = $("provBalBox");
+  if (!box) return;
+  var btn = $("provLoadAll");
+  if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
+  box.innerHTML = '<div class="skel" style="height:260px"></div>';
+  api("/personal/providers/balances").then(function (j) {
+    if (btn) { btn.disabled = false; btn.textContent = "Load all balances"; }
+    var d = j.data || {};
+    var providers = Array.isArray(d.providers) ? d.providers : [];
+    var lows = Array.isArray(d.any_low) ? d.any_low : [];
+    var strip = "";
+    if (lows.length) {
+      strip = '<div class="note-box" style="background:var(--warn-soft);border-color:#fedf89;color:var(--warn);margin-bottom:12px"><b>Low balance:</b> ' +
+        lows.map(function (w) { return esc(String(w && w.provider ? w.provider + " " : "") + String((w && w.currency) || "?")); }).join(", ") +
+        " — fund soon.</div>";
+    }
+    var grid = "";
+    for (var i = 0; i < providers.length; i++) grid += provAllCard(providers[i]);
+    box.innerHTML = strip + (grid
+      ? '<div class="stat-grid">' + grid + "</div>"
+      : '<div class="empty"><div class="big">🏦</div>No provider snapshots returned — none of the providers is configured yet.</div>');
+    var cards = box.querySelectorAll("[data-p]");
+    for (var c = 0; c < cards.length; c++) {
+      cards[c].onclick = function () { selectProvider(this.getAttribute("data-p")); };
+    }
+  }).catch(function (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Load all balances"; }
+    box.innerHTML = emptyBox(e.message);
+  });
+}
+function provAllCard(p) {
+  var wallets = Array.isArray(p && p.wallets) ? p.wallets : [];
+  var rows = "";
+  for (var i = 0; i < wallets.length; i++) {
+    var w = wallets[i];
+    var fmt = (w && w.formatted != null && w.formatted !== "") ? w.formatted : money(w && w.available_balance, (w && w.currency) || undefined);
+    rows += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:7px;font-size:12.5px">' +
+      "<span>" + esc(String((w && w.currency) || "—")) + (w && w.low ? ' <span class="badge b-failed" style="padding:1px 7px;font-size:10px">LOW</span>' : "") + "</span>" +
+      "<b>" + esc(fmt) + "</b></div>";
+  }
+  var state = (p && p.configured === false)
+    ? '<span class="badge b-pending">not configured</span>'
+    : (p && p.ok === false ? '<span class="badge b-failed">error</span>' : '<span class="badge b-resolved">ok</span>');
+  return '<div class="stat-card" data-p="' + esc((p && p.provider) || "") + '" style="cursor:pointer" title="Click to open ' + esc((p && p.label) || (p && p.provider) || "") + '">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><div class="lbl" style="font-size:13px">' + esc((p && p.label) || (p && p.provider) || "—") + "</div>" + state + "</div>" +
+    (p && p.role ? '<div class="hint">' + esc(p.role) + "</div>" : "") +
+    (p && p.error ? '<div class="hint" style="color:var(--bad)">' + esc(p.error) + "</div>" : "") +
+    (rows || '<div class="hint" style="margin-top:7px">' + (p && p.configured === false ? "Not configured — set the env keys" : "No wallets reported") + "</div>") +
+    "</div>";
+}
+/* --- low-balance thresholds --- */
+function loadProvThresholds() {
+  var box = $("provThrBox");
+  if (!box) return;
+  api("/personal/providers/thresholds").then(function (j) {
+    var d = j.data || {};
+    provState.thresholds = (d.thresholds && typeof d.thresholds === "object") ? d.thresholds : {};
+    renderProvThresholds();
+  }).catch(function (e) { box.innerHTML = '<div class="note-box">' + esc(e.message) + "</div>"; });
+}
+function provThresholdCurrencies() {
+  var seen = [], out = [];
+  function add(c) { if (c && seen.indexOf(c) < 0) { seen.push(c); out.push(c); } }
+  add("NGN"); add("USD"); add("GHS");
+  var keys = Object.keys(provState.thresholds || {}).sort();
+  for (var i = 0; i < keys.length; i++) add(String(keys[i]).toUpperCase());
+  var ws = provState.currencies || [];
+  for (var k = 0; k < ws.length; k++) add(ws[k]);
+  return out;
+}
+function renderProvThresholds() {
+  var box = $("provThrBox");
+  if (!box) return;
+  var curs = provThresholdCurrencies();
+  var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;align-items:end">';
+  for (var i = 0; i < curs.length; i++) {
+    var c = curs[i];
+    var v = provState.thresholds[c];
+    var t = provState.thresholds[String(c).toLowerCase()];
+    html += '<div class="field" style="margin-bottom:0"><label>' + esc(c) + " threshold</label>" +
+      '<input id="thr_' + esc(c) + '" type="number" min="0" step="1" placeholder="e.g. ' + (c === "NGN" ? "100000" : "500") + '" value="' + (v == null ? (t == null ? "" : esc(t)) : esc(v)) + '" /></div>';
+  }
+  html += "</div>" +
+    '<div class="actions-row"><button class="btn btn-primary btn-sm" id="thrSave">Save thresholds</button>' +
+    '<span class="cell-sub">Leave a field blank to unset it. Used to flag wallets as LOW above and in "Load all balances".</span></div>';
+  box.innerHTML = html;
+  $("thrSave").onclick = function () {
+    var obj = {};
+    for (var i = 0; i < curs.length; i++) {
+      var el = $("thr_" + curs[i]);
+      if (!el) continue;
+      var raw = el.value.trim();
+      if (raw === "") continue;
+      var n = Number(raw);
+      if (!isFinite(n) || n < 0) { toast(curs[i] + " threshold must be a non-negative number", "err"); return; }
+      obj[curs[i]] = n;
+    }
+    if (!Object.keys(obj).length) { toast("Fill at least one currency threshold", "info"); return; }
+    var btn = $("thrSave");
+    btn.disabled = true; btn.textContent = "Saving…";
+    api("/personal/providers/thresholds", { method: "PUT", body: { thresholds: obj } }).then(function () {
+      provState.thresholds = obj;
+      btn.disabled = false; btn.textContent = "Save thresholds";
+      toast("Low-balance thresholds saved", "ok");
+      loadProvidersBalance(); /* re-fetch the snapshot so LOW badges re-flag */
+    }).catch(function (e) {
+      btn.disabled = false; btn.textContent = "Save thresholds";
+      toast(e.message, "err");
+    });
+  };
+}
+/* --- provider history --- */
+function renderProvHistCurOptions() {
+  var sel = $("provHistCur");
+  if (!sel) return;
+  var opts = ['<option value="">All currencies</option>'];
+  var ws = provState.currencies || [];
+  for (var i = 0; i < ws.length; i++) {
+    opts.push('<option value="' + esc(ws[i]) + '"' + (provState.currency === ws[i] ? " selected" : "") + ">" + esc(ws[i]) + "</option>");
+  }
+  sel.innerHTML = opts.join("");
+  sel.value = ws.indexOf(provState.currency) >= 0 ? provState.currency : "";
+  sel.onchange = function () {
+    provState.currency = this.value;
+    provState.page = 1; provState.hist = []; provState.histSeen = {};
+    loadProvHistory(false);
+  };
+}
+function provHistKey(it) {
+  var t = (it && it.type && typeof it.type === "object") ? it.type.value : (it && it.type) || "";
+  var s = (it && it.status && typeof it.status === "object") ? it.status.value : (it && it.status) || "";
+  var c = (it && it.timestamps && it.timestamps.created_at) || (it && it.created_at) || "";
+  return [it && (it.reference || it.ref || it.tx_ref || it.provider_txn_id || it.id), t, s, it && it.amount, c].join("|");
+}
+function loadProvHistory(append) {
+  var box = $("provHistBox");
+  if (!box) return;
+  if (!append) box.innerHTML = '<div class="skel" style="height:180px"></div>';
+  var meta = provMeta(provState.provider);
+  var title = $("provHistTitle");
+  if (title) title.textContent = meta.label + " history";
+  var q = "?page=" + provState.page + (provState.currency ? "&currency=" + encodeURIComponent(provState.currency) : "");
+  api("/personal/providers/" + encodeURIComponent(provState.provider) + "/history" + q).then(function (j) {
+    var d = j.data || {};
+    var items = Array.isArray(d.items) ? d.items : [];
+    var m = (d.meta && typeof d.meta === "object") ? d.meta : {};
+    var inner = (m.meta && typeof m.meta === "object") ? m.meta : {};
+    var hasMore;
+    if (typeof m.has_more === "boolean") hasMore = m.has_more;
+    else if (inner.current_page != null && inner.last_page != null) hasMore = Number(inner.current_page) < Number(inner.last_page);
+    else if (inner.page != null && inner.total_pages != null) hasMore = Number(inner.page) < Number(inner.total_pages);
+    else hasMore = items.length > 0;
+    if (!append) { provState.hist = []; provState.histSeen = {}; }
+    var fresh = 0;
+    for (var i = 0; i < items.length; i++) {
+      var k = provHistKey(items[i]);
+      if (provState.histSeen[k]) continue;
+      provState.histSeen[k] = 1;
+      provState.hist.push(items[i]);
+      fresh++;
+    }
+    if (append && items.length > 0 && fresh === 0) hasMore = false; /* provider repeats the page — feed exhausted */
+    var info = $("provHistInfo");
+    if (info) info.textContent = "Page " + provState.page + " · showing " + provState.hist.length + " row(s)" + (provState.currency ? " · " + provState.currency : "");
+    provState.hasMore = hasMore;
+    renderProvHistory();
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+function renderProvHistory() {
+  var box = $("provHistBox");
+  if (!box) return;
+  var rows = provState.hist;
+  var meta = provMeta(provState.provider);
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty"><div class="big">🧾</div>No ' + esc(meta.label) + " history rows" + (provState.currency ? " for " + esc(provState.currency) : "") + " yet — withdrawals, trades and float movements appear here as the provider reports them.</div>";
+    return;
+  }
+  var body = "";
+  for (var i = 0; i < rows.length; i++) body += provHistRow(rows[i]);
+  box.innerHTML =
+    '<div class="table-wrap"><table class="data"><thead><tr>' +
+    "<th>Reference</th><th>Type</th><th>Amount</th><th>Status</th><th>Description</th><th>Date</th>" +
+    "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+    '<div class="pager"><span class="pg-info">Showing ' + num(rows.length) + " row(s) — page " + provState.page + "</span>" +
+    (provState.hasMore ? '<button class="pg-btn" id="provHistMore">Load more</button>' : '<span class="pg-info">End of feed</span>') +
+    "</div>";
+  var more = $("provHistMore");
+  if (more) more.onclick = function () { provState.page++; loadProvHistory(true); };
+}
+function provHistRow(it) {
+  if (!it || typeof it !== "object") return "";
+  /* Shapes differ per provider (Sogo wraps values, Flutterwave is balance
+     history, Prestmit is withdrawals/trades, Bitnob is a local mirror) —
+     normalize the common fields, fall back to a JSON blob row otherwise. */
+  var type = (it.type && typeof it.type === "object") ? (it.type.value || it.type.name || "") : (it.type != null ? it.type : (it.transaction_type || it.tx_type || ""));
+  var status = (it.status && typeof it.status === "object") ? (it.status.value || it.status.name || "") : (it.status != null ? it.status : (it.state || ""));
+  var cur = it.currency || "";
+  var amtTxt = "";
+  if (it.amount && typeof it.amount === "object") {
+    cur = it.amount.currency || cur;
+    amtTxt = it.amount.formatted || (it.amount.raw != null ? money(it.amount.raw, cur || undefined) : (it.amount.value != null ? money(it.amount.value, cur || undefined) : ""));
+  } else if (it.amount != null && it.amount !== "") {
+    amtTxt = money(it.amount, cur || undefined);
+  }
+  var ref = it.reference || it.ref || it.tx_ref || it.transaction_reference || it.provider_txn_id || it.id || "";
+  var desc = it.description || it.narration || it.remarks || it.note || "";
+  var created = (it.timestamps && it.timestamps.created_at) || it.created_at || it.createdAt || it.date || "";
+  if (!amtTxt && !ref) {
+    var pretty = "";
+    try { pretty = JSON.stringify(it, null, 2); } catch (e) { pretty = String(it); }
+    return '<tr><td colspan="6"><pre class="mono" style="background:#fafbfc;border:1px solid var(--line);border-radius:10px;padding:10px;white-space:pre-wrap;word-break:break-word;margin:0">' + esc(pretty) + "</pre></td></tr>";
+  }
+  return "<tr>" +
+    '<td class="mono">' + esc(ref) + "</td>" +
+    "<td>" + esc(String(type == null || type === "" ? "—" : type).replace(/_/g, " ")) + "</td>" +
+    "<td><b>" + esc(amtTxt || "—") + "</b></td>" +
+    "<td>" + (status ? Badge(status) : '<span class="cell-sub">—</span>') + "</td>" +
+    '<td class="cell-sub" style="max-width:260px">' + esc(desc || "—") + "</td>" +
+    '<td class="cell-sub">' + dt(created) + "</td>" +
+    "</tr>";
+}
+
+/* ===================== feature toggles ("Coming soon") ===================== */
+var FEAT_APPS = {
+  personal: ["bills", "savings", "giftcards", "esim", "virtualcards", "crypto", "social", "live", "swap", "rmb"],
+  business: ["transfers", "payroll", "invoices", "meetings", "cards", "international"],
+};
+var FEAT_LABELS = {
+  bills: "Bills", savings: "Savings", giftcards: "Gift cards", esim: "eSIM", virtualcards: "Virtual cards",
+  crypto: "Crypto", social: "Social", live: "Live", swap: "Swap", rmb: "RMB",
+  transfers: "Transfers", payroll: "Payroll", invoices: "Invoices", meetings: "Meetings", cards: "Cards", international: "International",
+};
+function renderFeatures() {
+  $("content").innerHTML =
+    '<div class="note-box" style="margin-bottom:14px">When a feature is OFF, tapping the feature&#39;s entrance in the mobile/web apps shows a <b>Coming soon</b> modal. Missing entries default to ON.</div>' +
+    '<div id="featGrid"><div class="skel" style="height:260px"></div></div>';
+  loadFeatures();
+}
+function loadFeatures() {
+  var box = $("featGrid");
+  if (!box) return;
+  api("/personal/providers/feature-toggles").then(function (j) {
+    var d = j.data || {};
+    var toggles = (d.toggles && typeof d.toggles === "object") ? d.toggles : {};
+    var apps = Object.keys(FEAT_APPS);
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;align-items:start">';
+    for (var a = 0; a < apps.length; a++) {
+      var app = apps[a];
+      var feats = FEAT_APPS[app];
+      var appToggles = (toggles[app] && typeof toggles[app] === "object") ? toggles[app] : {};
+      var onCount = 0;
+      for (var c = 0; c < feats.length; c++) if (appToggles[feats[c]] !== false) onCount++;
+      html += '<div class="card"><div class="card-head"><h3>' + (app === "personal" ? "Personal app" : "Business app") + "</h3>" +
+        '<span class="muted">' + onCount + " of " + feats.length + " live</span></div>" +
+        '<div class="card-body"><div class="email-list" style="margin-bottom:0">';
+      for (var f = 0; f < feats.length; f++) {
+        var feat = feats[f];
+        var on = appToggles[feat] !== false; /* missing key = ON */
+        var label = FEAT_LABELS[feat] || feat;
+        html += '<div class="email-row"><div style="min-width:0">' +
+          '<span class="em" style="font-weight:600">' + esc(label) + '</span><div class="cell-sub">' + esc(feat) + (on ? "" : " · Coming soon") + "</div></div>" +
+          '<span style="flex:1"></span>' +
+          '<label class="switch"><input type="checkbox" data-app="' + esc(app) + '" data-feat="' + esc(feat) + '"' + (on ? " checked" : "") + ' /><span class="track"></span></label></div>';
+      }
+      html += "</div></div></div>";
+    }
+    html += "</div>";
+    box.innerHTML = html;
+    var boxes = box.querySelectorAll("input[data-feat]");
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].addEventListener("change", function () {
+        setFeatureToggle(this.getAttribute("data-app"), this.getAttribute("data-feat"), this.checked);
+      });
+    }
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+function setFeatureToggle(app, feature, enabled) {
+  var label = FEAT_LABELS[feature] || feature;
+  api("/personal/providers/feature-toggles", { method: "PUT", body: { app: app, feature: feature, enabled: enabled } })
+    .then(function () {
+      toast(label + " set to Coming soon (" + (enabled ? "ON" : "OFF") + ")", enabled ? "ok" : "info");
+      loadFeatures();
+    })
+    .catch(function (e) { toast(e.message, "err"); loadFeatures(); });
+}
+
+/* ===================== virtual cards ===================== */
+var vcState = { page: 1, status: "", q: "" };
+var VC_STATUSES = ["", "active", "frozen", "terminated", "failed"];
+var VC_FEE_FIELDS = [
+  { key: "virtualcard_issuance_fee_usd", label: "Issuance fee (USD flat)", ph: "e.g. 1.00", step: "0.01" },
+  { key: "virtualcard_funding_fee_percent", label: "Funding fee (%)", ph: "e.g. 2.5", step: "0.01" },
+  { key: "virtualcard_conversion_fee_percent", label: "Conversion fee (%)", ph: "e.g. 1.5", step: "0.01" },
+  { key: "virtualcard_ngn_usd_rate_override", label: "NGN→USD rate override (0 = live Bitnob rate)", ph: "e.g. 1650", step: "0.01" },
+];
+function vcStatusBadge(status) {
+  var s = String(status || "").toLowerCase();
+  var map = { active: "b-resolved", frozen: "b-pending", terminated: "b-closed", failed: "b-failed" };
+  return '<span class="badge ' + (map[s] || "b-neutral") + '">' + esc(s || "—") + "</span>";
+}
+function vcKycBadge(status) {
+  var s = String(status || "").toLowerCase();
+  var map = { approved: "b-resolved", pending: "b-pending", submitted: "b-pending", rejected: "b-rejected" };
+  return '<span class="badge ' + (map[s] || "b-neutral") + '">' + esc(s || "—") + "</span>";
+}
+function renderVirtualCards() {
+  $("content").innerHTML =
+    '<div id="vcKpis" class="stat-grid"><div class="skel" style="height:90px"></div></div>' +
+    '<div class="card"><div class="card-head"><h3>Fee configuration</h3><span class="muted">Applies to new issuances and funding runs</span></div>' +
+      '<div class="card-body" id="vcFeeBox"><div class="skel" style="height:90px"></div></div></div>' +
+    '<div class="toolbar">' +
+      '<div class="search">🔍<input id="vcSearch" placeholder="Search user, email, card name, PAN…" value="' + esc(vcState.q) + '" /></div>' +
+      '<div class="chips" id="vcChips"></div>' +
+    "</div>" +
+    '<div id="vcTable"><div class="skel" style="height:220px"></div></div>' +
+    '<div class="card"><div class="card-head"><h3>Card KYC queue</h3><span class="muted">Enhanced-limit submissions awaiting review</span></div>' +
+      '<div class="card-body" id="vcKycBox"><div class="skel" style="height:120px"></div></div></div>';
+  renderVcChips();
+  $("vcSearch").addEventListener("input", debounce(function () { vcState.q = $("vcSearch").value.trim(); vcState.page = 1; loadVcCards(); }, 400));
+  loadVcStats();
+  loadVcConfig();
+  loadVcCards();
+  loadVcKyc();
+}
+function renderVcChips() {
+  var box = $("vcChips");
+  if (!box) return;
+  box.innerHTML = VC_STATUSES.map(function (s) {
+    return '<button class="chip' + (vcState.status === s ? " active" : "") + '" data-s="' + s + '">' + (s ? esc(s) : "All statuses") + "</button>";
+  }).join("");
+  var chips = box.querySelectorAll(".chip");
+  for (var i = 0; i < chips.length; i++) {
+    chips[i].onclick = function () { vcState.status = this.getAttribute("data-s"); vcState.page = 1; renderVcChips(); loadVcCards(); };
+  }
+}
+function loadVcStats() {
+  var box = $("vcKpis");
+  if (!box) return;
+  api("/personal/virtualcards/stats").then(function (j) {
+    var d = j.data || {};
+    box.innerHTML =
+      statCard("Active cards", num(d.active_cards)) +
+      '<div class="stat-card"><div class="lbl">Total float</div><div class="val">' + esc(money(d.total_float_usd, "USD")) + '</div><div class="hint">Sum of active + frozen card balances</div></div>' +
+      statCard("Spend — 30 days", money(d.spend_30d_usd, "USD")) +
+      statCard("Failed creations", num(d.failed_creations)) +
+      '<div class="stat-card"><div class="lbl">Card provider</div><div class="val" style="font-size:18px">' + (d.provider_configured ? "Bitnob ✓" : "Bitnob ✕") + '</div><div class="hint">' + (d.provider_configured ? "Configured — issuance is live" : "Not configured — add BITNOB_SECRET_KEY + BITNOB_CLIENT_ID") + "</div></div>";
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+}
+function loadVcConfig() {
+  var box = $("vcFeeBox");
+  if (!box) return;
+  api("/personal/virtualcards/config").then(function (j) {
+    var cfg = (j.data && j.data.config) || {};
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;align-items:end">';
+    for (var i = 0; i < VC_FEE_FIELDS.length; i++) {
+      var f = VC_FEE_FIELDS[i];
+      var v = cfg[f.key];
+      html += '<div class="field" style="margin-bottom:0"><label>' + esc(f.label) + "</label>" +
+        '<input id="' + f.key + '" type="number" step="' + f.step + '" min="0" placeholder="' + f.ph + '" value="' + (v == null ? "" : esc(v)) + '" /></div>';
+    }
+    html += "</div>" +
+      '<div class="actions-row"><button class="btn btn-primary" id="vcFeeSave">Save fee configuration</button></div>';
+    box.innerHTML = html;
+    $("vcFeeSave").onclick = function () {
+      var config = {};
+      for (var i = 0; i < VC_FEE_FIELDS.length; i++) {
+        var el = $(VC_FEE_FIELDS[i].key);
+        var n = Number(el && el.value);
+        config[VC_FEE_FIELDS[i].key] = isFinite(n) && n >= 0 ? n : 0;
+      }
+      var btn = $("vcFeeSave");
+      btn.disabled = true; btn.textContent = "Saving…";
+      api("/personal/virtualcards/config", { method: "PUT", body: { config: config } }).then(function () {
+        btn.disabled = false; btn.textContent = "Save fee configuration";
+        toast("Virtual card fee configuration saved", "ok");
+      }).catch(function (e) {
+        btn.disabled = false; btn.textContent = "Save fee configuration";
+        toast(e.message, "err");
+      });
+    };
+  }).catch(function (e) { box.innerHTML = '<div class="note-box">' + esc(e.message) + "</div>"; });
+}
+function loadVcCards() {
+  var box = $("vcTable");
+  if (!box) return;
+  box.innerHTML = '<div class="skel" style="height:220px"></div>';
+  var q = "?page=" + vcState.page + "&limit=25" +
+    (vcState.status ? "&status=" + encodeURIComponent(vcState.status) : "") +
+    (vcState.q ? "&q=" + encodeURIComponent(vcState.q) : "");
+  api("/personal/virtualcards" + q).then(function (j) {
+    var d = j.data || {};
+    var rows = Array.isArray(d.cards) ? d.cards : [];
+    var total = d.total != null ? d.total : rows.length;
+    var pages = d.pages != null ? d.pages : Math.max(1, Math.ceil(total / 25));
+    if (!rows.length) { box.innerHTML = emptyBox("No virtual cards match this filter" + (vcState.q ? " — try a different search" : "")); return; }
+    box.innerHTML =
+      '<div class="card"><div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Card</th><th>User</th><th>Brand</th><th>Category</th><th>Balance</th><th>Status</th><th>Created</th><th style=\"width:200px\">Actions</th>" +
+      "</tr></thead><tbody>" +
+      rows.map(function (c) {
+        var actions = "";
+        if (c.status === "active") actions += '<button class="btn btn-ghost btn-sm" data-act="freeze" data-id="' + esc(c.id) + '">Freeze</button> ';
+        if (c.status === "frozen") actions += '<button class="btn btn-ok btn-sm" data-act="unfreeze" data-id="' + esc(c.id) + '">Unfreeze</button> ';
+        if (c.status === "active" || c.status === "frozen") actions += '<button class="btn btn-danger btn-sm" data-act="terminate" data-id="' + esc(c.id) + '">Terminate</button>';
+        return "<tr>" +
+          "<td><b>" + esc(c.card_name || "—") + '</b><div class="cell-sub mono">' + esc(c.masked_pan || "") + "</div>" +
+            (c.failure_reason ? '<div class="cell-sub" style="color:var(--bad)">' + esc(c.failure_reason) + "</div>" : "") + "</td>" +
+          "<td>" + esc(c.user_name || "—") + '<div class="cell-sub">' + esc(c.user_email || "") + "</div></td>" +
+          '<td class="cell-sub">' + esc(c.card_brand || "—") + "</td>" +
+          '<td class="cell-sub">' + esc(c.category || "—") + "</td>" +
+          "<td><b>" + money(c.balance, c.currency) + "</b></td>" +
+          "<td>" + vcStatusBadge(c.status) + "</td>" +
+          '<td class="cell-sub">' + dt(c.created_at) + "</td>" +
+          "<td>" + (actions || '<span class="cell-sub">—</span>') + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>" + pagerHtml(vcState.page, pages, total) + "</div>";
+    $("pgPrev").onclick = function () { vcState.page--; loadVcCards(); };
+    $("pgNext").onclick = function () { vcState.page++; loadVcCards(); };
+  }).catch(function (e) { box.innerHTML = emptyBox(e.message); });
+  box.onclick = function (e) {
+    var b = e.target.closest("button[data-act]");
+    if (!b) return;
+    vcCardAction(b.getAttribute("data-act"), b.getAttribute("data-id"));
+  };
+}
+function vcCardAction(act, id) {
+  if (!act || !id) return;
+  if (act === "terminate") {
+    confirmModal({
+      title: "Terminate this card?",
+      danger: true,
+      sub: "Termination is permanent — the card is cancelled at Bitnob and cannot be undone. Any remaining balance is handled by the provider sweep.",
+      okText: "Terminate card",
+      onOk: function () { closeModal(); vcCardStatus(id, "terminate"); },
+    });
+    return;
+  }
+  vcCardStatus(id, act);
+}
+function vcCardStatus(id, action) {
+  api("/personal/virtualcards/" + encodeURIComponent(id) + "/status", { method: "POST", body: { action: action } })
+    .then(function (r) {
+      var st = (r.data && r.data.status) ? String(r.data.status) : action;
+      toast("Card status updated — " + st.replace(/_/g, " "), "ok");
+      loadVcCards();
+      loadVcStats();
+    })
+    .catch(function (e) { toast(e.message, "err"); });
+}
+function loadVcKyc() {
+  var box = $("vcKycBox");
+  if (!box) return;
+  api("/personal/virtualcards/kyc").then(function (j) {
+    var d = j.data || {};
+    var rows = Array.isArray(d.submissions) ? d.submissions : [];
+    if (!rows.length) { box.innerHTML = '<div class="empty"><div class="big">🪪</div>Card KYC queue is empty — no enhanced-limit submissions waiting for review.</div>'; return; }
+    box.innerHTML =
+      '<div class="table-wrap"><table class="data"><thead><tr>' +
+      "<th>Applicant</th><th>ID</th><th>Occupation</th><th>Salary</th><th>Monthly volume</th><th>Status</th><th>Updated</th><th>Actions</th>" +
+      "</tr></thead><tbody>" +
+      rows.map(function (s, i) {
+        var acts = "";
+        if (s.completion_link) acts += '<a href="' + esc(s.completion_link) + '" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Open form</a> ';
+        if (s.rejection) acts += '<button class="btn btn-ghost btn-sm" data-kyc="' + i + '">Rejection JSON</button>';
+        return "<tr>" +
+          "<td><b>" + esc(s.user_name || "—") + '</b><div class="cell-sub">' + esc(s.user_email || "") + "</div></td>" +
+          '<td class="cell-sub">' + esc(s.id_type || "—") + '<div class="mono">' + esc(s.id_number_masked || "") + "</div></td>" +
+          '<td class="cell-sub">' + esc(s.occupation || "—") + (s.employment_status ? '<div>' + esc(s.employment_status) + "</div>" : "") + "</td>" +
+          '<td class="cell-sub">' + esc(s.annual_salary != null ? String(s.annual_salary) : "—") + "</td>" +
+          '<td class="cell-sub">' + esc(s.expected_monthly_volume != null ? String(s.expected_monthly_volume) : "—") + "</td>" +
+          "<td>" + vcKycBadge(s.status) + "</td>" +
+          '<td class="cell-sub">' + dt(s.updated_at) + "</td>" +
+          "<td>" + (acts || '<span class="cell-sub">—</span>') + "</td>" +
+          "</tr>";
+      }).join("") +
+      "</tbody></table></div>";
+    var btns = box.querySelectorAll("button[data-kyc]");
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function () { openVcKycRejection(rows[parseInt(this.getAttribute("data-kyc"), 10)]); };
+    }
+  }).catch(function (e) { box.innerHTML = '<div class="note-box">' + esc(e.message) + "</div>"; });
+}
+function openVcKycRejection(s) {
+  if (!s) return;
+  var pretty = "";
+  try { pretty = JSON.stringify(s.rejection, null, 2); } catch (e) { pretty = String(s.rejection); }
+  openDrawer("KYC submission — " + String(s.user_name || s.user_email || "applicant"),
+    '<div class="kv">' +
+      '<div class="k">Applicant</div><div class="v">' + esc(s.user_name || "—") + "</div>" +
+      '<div class="k">Email</div><div class="v">' + esc(s.user_email || "—") + "</div>" +
+      '<div class="k">ID</div><div class="v">' + esc(s.id_type || "—") + ' <span class="mono">' + esc(s.id_number_masked || "") + "</span></div>" +
+      '<div class="k">Status</div><div class="v">' + vcKycBadge(s.status) + "</div>" +
+      '<div class="k">Updated</div><div class="v">' + dt(s.updated_at) + "</div>" +
+      (s.completion_link ? '<div class="k">Completion link</div><div class="v"><a href="' + esc(s.completion_link) + '" target="_blank" rel="noopener">Open submission form</a></div>' : "") +
+    "</div>" +
+    '<div class="section-title">Rejection payload</div>' +
+    '<pre class="mono" style="background:#fafbfc;border:1px solid var(--line);border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:46vh;overflow-y:auto">' + esc(pretty) + "</pre>");
 }
 
 /* ===================== boot ===================== */

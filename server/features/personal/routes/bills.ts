@@ -374,6 +374,73 @@ router.get("/cashback", authenticateToken, checkSubscriptionStatus, async (req: 
   }
 });
 
+// GET /bills/cashback/history?page=1&limit=20
+//   → paginated cashback activity for the paying wallet (earned / reversed /
+//     spent on bills) — powers the Rewards page history list.
+router.get("/cashback/history", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    // Same NGN personal wallet the cashback balance lives on (mirrors /cashback).
+    const wallets = await query(
+      `SELECT id, COALESCE(cashback_balance, 0) AS cashback_balance FROM wallets
+        WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+        ORDER BY created_at ASC LIMIT 1`,
+      [userId],
+    );
+    const walletId = wallets.rows[0]?.id || null;
+    if (!walletId) {
+      return res.json({ success: true, data: { items: [], page, limit, total: 0, pages: 0, cashback_balance: 0, currency: "NGN" } });
+    }
+
+    // Activity = cashback earned (bill_cashback credits), reversals, and the
+    // part of a bill payment that was covered by the cashback balance (the
+    // bill debit row narrates it as "(₦X cashback used)").
+    const countRes = await query(
+      `SELECT COUNT(*)::int AS total
+         FROM transactions
+        WHERE wallet_id = $1
+          AND (
+            transaction_type IN ('bill_cashback', 'bill_cashback_reversal')
+            OR (transaction_type = 'bill' AND description LIKE '%cashback used%')
+          )`,
+      [walletId],
+    );
+    const total = Number(countRes.rows[0]?.total || 0);
+    const itemsRes = await query(
+      `SELECT id, reference, type, amount, currency, description, transaction_type, status, created_at
+         FROM transactions
+        WHERE wallet_id = $1
+          AND (
+            transaction_type IN ('bill_cashback', 'bill_cashback_reversal')
+            OR (transaction_type = 'bill' AND description LIKE '%cashback used%')
+          )
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3`,
+      [walletId, limit, offset],
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        items: itemsRes.rows,
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+        cashback_balance: Number(wallets.rows[0]?.cashback_balance || 0),
+        currency: "NGN",
+      },
+    });
+  } catch (e: any) {
+    console.error("[bills] cashback history error:", e?.message);
+    return res.status(500).json({ success: false, error: "Could not load cashback history" });
+  }
+});
+
 router.get("/cashback/preview", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const category = String(req.query.category || "").toLowerCase();

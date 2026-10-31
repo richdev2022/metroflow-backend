@@ -88,7 +88,28 @@ export function isSogoSandbox(): boolean {
 /** Actionable error text for operator surfaces (admin console, 502 bodies). */
 export function sogoErr(e: any): string {
   const d = e?.response?.data;
-  let msg = d?.message || d?.error || d?.details || e?.message || "Sogo request failed";
+  // Sogo error envelopes vary: {message}, {error:{code,message}}, {details:{...}}.
+  // Objects must be JSON-stringified — coercing them to string produced the
+  // "[object Object]" failure_reasons seen on production bill rows.
+  const pick = (v: any): string | null => {
+    if (v == null) return null;
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    if (typeof v === "object") {
+      // {code, message} shape (e.g. ip_not_whitelisted)
+      if (typeof v.message === "string" && v.message.trim()) {
+        return typeof v.code === "string" ? `${v.message} (${v.code})` : v.message;
+      }
+      return JSON.stringify(v).slice(0, 300);
+    }
+    return null;
+  };
+  let msg =
+    pick(d?.message) ||
+    pick(d?.error) ||
+    pick(d?.details) ||
+    pick(e?.message) ||
+    "Sogo request failed";
   if (d?.errors && typeof d.errors === "object") {
     const first = Object.values(d.errors)[0];
     if (Array.isArray(first) && first.length) msg = String(first[0]);
@@ -98,6 +119,8 @@ export function sogoErr(e: any): string {
     msg = `${msg} — Sogo rejected the API key. Check SOGO_SECRET_KEY (sogo_sk_test_ keys only work against sandbox.sogo.africa, sogo_sk_live_ against api.sogo.africa).`;
   } else if (status === 403 && /environment_mismatch/i.test(String(d?.code || d?.message || ""))) {
     msg = `${msg} — key/environment mismatch: a sogo_sk_test_ key must be used against sandbox.sogo.africa and sogo_sk_live_ against api.sogo.africa.`;
+  } else if (status === 403 && /ip_not_whitelisted/i.test(String(pick(d?.code) || msg))) {
+    msg = `${msg} — the server egress IP is not on the Sogo key's IP allowlist. Update the allowlist in the Sogo dashboard.`;
   } else if (status === 429) {
     msg = `${msg} — Sogo rate limit reached (sandbox allows 10 requests/min). Retry shortly.`;
   }
@@ -754,6 +777,22 @@ export async function giftcardSell(input: {
 export async function getTransaction(reference: string, timeoutMs = 60_000): Promise<any> {
   const body = await sogoRequest<any>("GET", `/transactions/${encodeURIComponent(reference)}`, { timeoutMs });
   return unwrap(body, {});
+}
+
+/**
+ * List transactions filtered by on-chain deposit hash — Sogo's documented
+ * fallback when a webhook is missed
+ * (GET /v1/transactions?deposit_tx_hash=0x4f8a9...).
+ */
+export async function getTransactionsByDepositHash(depositTxHash: string): Promise<any[]> {
+  const body = await sogoRequest<any>("GET", "/transactions", {
+    params: { deposit_tx_hash: depositTxHash },
+  });
+  const data = unwrap<any>(body, []);
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.transactions)) return data.transactions;
+  if (Array.isArray(data?.data)) return data.data;
+  return [];
 }
 
 /** Payment verification (verified:false + reason on mismatch). */

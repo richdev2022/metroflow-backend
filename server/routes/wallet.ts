@@ -524,7 +524,13 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         let sql = `SELECT t.*, w.currency AS wallet_currency, w.balance AS wallet_balance
                    FROM transactions t
                    LEFT JOIN wallets w ON w.id = t.wallet_id
-                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))`;
+                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))
+                     -- Fee mirror rows (ref-FEE, wallet-scoped) are NOT
+                     -- standalone history entries: the fee displays on its
+                     -- parent transaction's detail row (owner directive).
+                     -- Revenue-ledger fee rows (wallet_id IS NULL, business
+                     -- admin view above) are unaffected.
+                     AND NOT (t.transaction_type = 'fee' AND t.wallet_id IS NOT NULL)`;
         params.push(walletIds, businessId);
         let idx = params.length + 1;
 

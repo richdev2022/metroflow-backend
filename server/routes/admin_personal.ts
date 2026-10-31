@@ -760,3 +760,100 @@ router.post("/verifications/:userId/:action", requirePermission("manage_settings
     res.status(500).json({ success: false, error: "Could not update verification" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Crypto → Cash deposits (Sogo rails) — ops desk for the tx-hash claim flow.
+//   GET  /admin/personal/crypto/deposits?status=&q=&page=&limit=
+//        Every crypto_deposit_sales row (webhook-settled, poller-settled or
+//        claimed by tx hash) joined with the owning customer.
+//   GET  /admin/personal/crypto/claims?status=pending
+//        Customer-submitted stablecoin deposit claims (stablecoin_deposits).
+//   POST /admin/personal/crypto/reconcile
+//        Run the deposit reconciliation poller NOW (same idempotent engine
+//        as the 5-minute cron) — reconfirms against Sogo by reference and
+//        on-chain tx hash, credits completions, expires never-confirmed ones.
+// ---------------------------------------------------------------------------
+router.get("/crypto/deposits", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const status = String(req.query.status || "").trim();
+    const q = String(req.query.q || "").trim();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
+    const conds: string[] = ["TRUE"];
+    const params: any[] = [];
+    if (status) { params.push(status); conds.push(`s.status = $${params.length}`); }
+    if (q) { params.push(`%${q}%`); conds.push(`(s.reference ILIKE $${params.length} OR s.tx_hash ILIKE $${params.length} OR u.email ILIKE $${params.length})`); }
+    const where = conds.join(" AND ");
+    const count = await query(
+      `SELECT COUNT(*)::int AS c FROM crypto_deposit_sales s LEFT JOIN users u ON u.id = s.user_id WHERE ${where}`,
+      params,
+    );
+    params.push(limit, (page - 1) * limit);
+    const rows = await query(
+      `SELECT s.id, s.reference, s.tx_hash, s.asset, s.network, s.crypto_amount,
+              s.ngn_gross, s.fee, s.ngn_net, s.rate, s.status, s.provider,
+              s.provider_response, s.created_at, s.settled_at,
+              u.id AS user_id, u.email AS user_email, u.name AS user_name
+         FROM crypto_deposit_sales s
+         LEFT JOIN users u ON u.id = s.user_id
+        WHERE ${where}
+        ORDER BY s.created_at DESC
+        LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params,
+    );
+    const stats = await query(
+      `SELECT status, COUNT(*)::int AS n, COALESCE(SUM(ngn_net), 0) AS ngn FROM crypto_deposit_sales GROUP BY status`,
+    );
+    res.json({
+      success: true,
+      data: {
+        deposits: rows.rows,
+        total: count.rows[0]?.c || 0,
+        page,
+        limit,
+        stats: Object.fromEntries(stats.rows.map((r: any) => [r.status, { count: r.n, ngn: Number(r.ngn) }])),
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load crypto deposits" });
+  }
+});
+
+router.get("/crypto/claims", requirePermission("view_dashboard"), async (req, res) => {
+  try {
+    const status = String(req.query.status || "pending").trim();
+    const params: any[] = [];
+    const conds: string[] = ["TRUE"];
+    if (status && status !== "all") { params.push(status); conds.push(`d.status = $${params.length}`); }
+    const rows = await query(
+      `SELECT d.id, d.currency, d.chain, d.address, d.amount, d.tx_hash, d.status,
+              d.rejection_reason, d.credited_at, d.created_at,
+              u.id AS user_id, u.email AS user_email, u.name AS user_name
+         FROM stablecoin_deposits d
+         LEFT JOIN users u ON u.id = d.user_id
+        WHERE ${conds.join(" AND ")}
+        ORDER BY d.created_at DESC
+        LIMIT 200`,
+      params,
+    );
+    res.json({ success: true, data: { claims: rows.rows } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load deposit claims" });
+  }
+});
+
+router.post("/crypto/reconcile", requirePermission("manage_settings"), async (req: AuthenticatedAdminRequest, res) => {
+  try {
+    const { reconcilePendingCryptoDeposits } = await import("../features/personal/crypto-deposit-settlement");
+    const changed = await reconcilePendingCryptoDeposits(50);
+    await logAuditEvent({
+      userId: (req as any).admin?.id || (req as any).adminId || null,
+      action: "crypto_deposits_reconciled",
+      entityType: "crypto_deposit",
+      newValues: { changed },
+    }).catch(() => {});
+    res.json({ success: true, data: { changed } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e?.message || "Reconciliation failed" });
+  }
+});

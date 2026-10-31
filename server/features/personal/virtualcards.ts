@@ -91,9 +91,44 @@ export async function ensureVirtualCardSchema(): Promise<void> {
       `ADD COLUMN IF NOT EXISTS provider_response JSONB`,
       `ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
       `ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+      // Mounted-router parity columns (features/personal/routes/virtualcards.ts):
+      `ADD COLUMN IF NOT EXISTS reference VARCHAR(80)`,
+      `ADD COLUMN IF NOT EXISTS provider_reference VARCHAR(120)`,
+      `ADD COLUMN IF NOT EXISTS provider_card_id VARCHAR(120)`,
+      `ADD COLUMN IF NOT EXISTS provider_customer_id VARCHAR(120)`,
+      `ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
+      `ADD COLUMN IF NOT EXISTS terminated_at TIMESTAMP`,
+      `ADD COLUMN IF NOT EXISTS category VARCHAR(12) DEFAULT 'usdt'`,
+      `ADD COLUMN IF NOT EXISTS contactless BOOLEAN DEFAULT FALSE`,
     ]) {
       await query(`ALTER TABLE virtual_cards ${col}`);
     }
+    // Bitnob Card KYC — one submission per user (id_type/id_number live only
+    // for the latest attempt; approved rows pin the provider customer_id that
+    // Create Card consumes). See server/routes personal-webhooks for the
+    // virtualcard.user.kyc.* webhook that flips the status asynchronously.
+    await query(`
+    CREATE TABLE IF NOT EXISTS virtual_card_kyc (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL UNIQUE,
+      provider VARCHAR(20) DEFAULT 'bitnob',
+      provider_customer_id VARCHAR(120),
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',   -- pending|approved|rejected
+      normalized_status VARCHAR(30),
+      id_type VARCHAR(30),
+      id_number_masked VARCHAR(40),
+      occupation VARCHAR(80),
+      employment_status VARCHAR(40),
+      account_purpose VARCHAR(120),
+      annual_salary VARCHAR(30),
+      expected_monthly_volume VARCHAR(30),
+      place_of_birth VARCHAR(80),
+      completion_link TEXT,
+      rejection JSONB,
+      provider_response JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
     await query(`CREATE INDEX IF NOT EXISTS idx_virtual_cards_user ON virtual_cards(user_id, created_at DESC)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_virtual_cards_bitnob ON virtual_cards(bitnob_card_id) WHERE bitnob_card_id IS NOT NULL`);
 

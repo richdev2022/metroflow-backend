@@ -88,6 +88,12 @@ export async function ensureCryptoDepositSchema(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_crypto_deposit_addr_lookup ON crypto_deposit_sales(address)`);
+  // Customer-submitted on-chain tx hash (Sogo attribution: every partner has
+  // ONE shared static address per asset+network — deposits are attributed by
+  // the customer's transaction hash, not the address).
+  await query(`ALTER TABLE crypto_deposit_sales ADD COLUMN IF NOT EXISTS tx_hash VARCHAR(200)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_crypto_deposit_txhash ON crypto_deposit_sales(tx_hash)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_crypto_deposit_txhash_pending ON crypto_deposit_sales(tx_hash) WHERE status = 'processing'`);
 }
 
 function rateFor(asset: string, ngnPerUsd: number): number {
@@ -241,28 +247,65 @@ router.post("/deposit-address", authenticateToken, requirePersonalKyc(), checkSu
 
 /**
  * @swagger
- * /crypto/test-deposit:
+ * /crypto/deposits/claim:
  *   post:
- *     summary: SANDBOX ONLY — simulate an on-chain deposit against your sandbox address (fires the full webhook pipeline)
+ *     summary: Claim an on-chain deposit by its transaction hash (Sogo attribution)
  *     tags: [CryptoToCash]
  *     security: [{ bearerAuth: [] }]
+ *     description: |
+ *       Sogo issues ONE shared static deposit address per asset+network per
+ *       partner. On-chain deposits are attributed to the individual customer
+ *       by their blockchain transaction hash. Submit the tx hash right after
+ *       sending — when Sogo confirms the transfer (webhook or poll) the NGN
+ *       value is credited to your wallet.
  */
-router.post("/test-deposit", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.post("/deposits/claim", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
-    if (!sogo.isSogoSandbox()) {
-      return res.status(403).json({ success: false, error: "Deposit simulation is sandbox-only" });
+    if (!(await assertPersonalService(res, "crypto"))) return;
+    const provider = await activeCryptoProvider();
+    if (provider !== "sogo") {
+      return res.status(400).json({ success: false, error: "Deposit claims are unavailable right now", code: "PROVIDER_UNAVAILABLE" });
     }
+    await ensureCryptoDepositSchema();
+    const userId = req.user!.userId;
     const asset = String(req.body?.asset || "").trim().toLowerCase();
-    const network = String(req.body?.network || "").trim().toLowerCase() || undefined;
-    const cryptoAmount = Number(req.body?.crypto_amount);
-    const testReference = String(req.body?.test_reference || `MF-DEP-${Date.now()}`);
-    if (!asset || !(cryptoAmount > 0)) {
-      return res.status(400).json({ success: false, error: "asset and a positive crypto_amount are required" });
+    const network = String(req.body?.network || "").trim().toLowerCase() || null;
+    const txHash = String(req.body?.tx_hash || "").trim();
+    const expectedCryptoAmount = Number(req.body?.crypto_amount);
+    if (!asset) return res.status(400).json({ success: false, error: "asset is required (e.g. usdt, usdc, btc)" });
+    if (!txHash || txHash.length < 10) return res.status(400).json({ success: false, error: "tx_hash is required — paste the on-chain transaction hash" });
+
+    const existing = await query(`SELECT * FROM crypto_deposit_sales WHERE tx_hash = $1 LIMIT 1`, [txHash]);
+    if (existing.rows.length) {
+      const row = existing.rows[0];
+      if (String(row.user_id) !== String(userId)) {
+        return res.status(409).json({ success: false, error: "This transaction hash has already been claimed" });
+      }
+      return res.json({ success: true, data: { deposit: row, reused: true } });
     }
-    const result = await sogo.cryptoTestDeposit({ asset, network, crypto_amount: cryptoAmount, test_reference: testReference });
-    return res.json({ success: true, data: result });
+
+    // Resolve the user's address for the asset (display metadata only).
+    const addr = await query(
+      `SELECT address, network FROM crypto_deposit_addresses WHERE user_id = $1 AND asset = $2 ORDER BY created_at DESC LIMIT 1`,
+      [userId, asset],
+    );
+    const wallet = await query(
+      `SELECT id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
+      [userId],
+    );
+    const reference = genRef("MF-DEP");
+    const ins = await query(
+      `INSERT INTO crypto_deposit_sales
+         (user_id, wallet_id, address, reference, provider, asset, network, crypto_amount, status, provider_response, tx_hash)
+       VALUES ($1,$2,$3,$4,'sogo',$5,$6,$7,'processing','{}'::jsonb,$8) RETURNING *`,
+      [userId, wallet.rows[0]?.id || null, addr.rows[0]?.address || null, reference, asset,
+       network || addr.rows[0]?.network || null,
+       Number.isFinite(expectedCryptoAmount) && expectedCryptoAmount > 0 ? expectedCryptoAmount : null, txHash],
+    );
+    return res.status(201).json({ success: true, data: { deposit: ins.rows[0], reused: false } });
   } catch (e: any) {
-    return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
+    console.error("[crypto] deposit claim error:", e?.message);
+    return res.status(500).json({ success: false, error: "Could not record the deposit claim" });
   }
 });
 
@@ -313,22 +356,24 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     const ngnPerUsd = await flutterwave.getRate("USD", "NGN", 1);
     const usdDebit = Math.round((settlement / ngnPerUsd) * 100) / 100;
 
-    // Live rate for the asset — Bitnob first, then Sogo (provider routing
-    // decides which rail is primary), then FX-derived fallback.
+    // LIVE RATE CALCULATOR — the ACTIVE provider's rate always wins:
+    //   sogo   → GET /crypto/assets/{asset}/rate (Sogo live market rate)
+    //   bitnob → GET /api/exchange-rates
+    //   else   → Flutterwave USD/NGN FX (stablecoins are 1:1 with USD)
     let rate = rateFor(asset, ngnPerUsd);
     let provider = "flutterwave-fx";
     const active = await activeCryptoProvider();
-    if (bitnob.isBitnobConfigured() && (active === "bitnob" || active === "simulator")) {
+    if (active === "sogo" && sogo.isSogoConfigured()) {
+      try {
+        const sr = await sogo.cryptoRate(asset.toLowerCase(), 1);
+        const ngnPerCoin = Number(sr?.rate ?? sr?.user_receives_ngn ?? sr?.estimated_ngn ?? 0);
+        if (ngnPerCoin > 0) { rate = ngnPerCoin; provider = "sogo"; }
+      } catch { /* FX fallback stands */ }
+    }
+    if (provider === "flutterwave-fx" && bitnob.isBitnobConfigured() && (active === "bitnob" || active === "simulator")) {
       try {
         const bn = await bitnob.getRate(asset, "NGN");
         if (Number(bn) > 0) { rate = Number(bn); provider = "bitnob"; }
-      } catch { /* fall back to FX-derived rate */ }
-    }
-    if (provider === "flutterwave-fx" && active === "sogo" && sogo.isSogoConfigured()) {
-      try {
-        const sr = await sogo.cryptoRate(asset.toLowerCase(), 1);
-        const ngnPerCoin = Number(sr?.rate ?? sr?.net_amount ?? sr?.estimated_amount_ngn ?? 0);
-        if (ngnPerCoin > 0) { rate = ngnPerCoin; provider = "sogo"; }
       } catch { /* FX fallback stands */ }
     }
 

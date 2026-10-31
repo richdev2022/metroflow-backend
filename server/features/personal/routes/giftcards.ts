@@ -290,11 +290,12 @@ router.get("/sell/rates", authenticateToken, checkSubscriptionStatus, async (req
     const slug = String(req.query.slug || "").trim().toLowerCase() || undefined;
     if (provider === "sogo") {
       const rates = await sogo.giftcardSellRates(slug);
-      return res.json({ success: true, provider, data: rates });
+      // Live platform fee so client payout calculators never hardcode a guess.
+      return res.json({ success: true, provider, data: rates, sell_fee_percent: await sellFeePercent() });
     }
     // Prestmit: rates already ride on the catalog — return the sellable list.
     const data = await prestmit.sellRateCalculatorData();
-    return res.json({ success: true, provider, data: data?.sellableGiftcards || [] });
+    return res.json({ success: true, provider, data: data?.sellableGiftcards || [], sell_fee_percent: await sellFeePercent() });
   } catch (e: any) {
     console.error("gc sell rates error:", e?.message);
     res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });

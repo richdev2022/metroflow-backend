@@ -1,6 +1,6 @@
 import express from "express";
 import { Request, Response } from "express";
-import { query } from "../db";
+import { query, pool } from "../db";
 import { verifyPrestmitWebhook } from "../services/prestmit";
 import { creditWallet, insertTransaction } from "../features/personal/personal-utils";
 import { createNotification } from "../services/notifications";
@@ -783,12 +783,34 @@ import { getPercent } from "../features/personal/flags";
 
 async function creditUserWallet(userId: string | null, walletId: string | null, amount: number, reference: string, description: string, businessId?: string | null) {
   if (!walletId || !(amount > 0)) return;
-  await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [amount, walletId]);
-  await insertTransaction({
-    userId, businessId: businessId ?? null, walletId,
-    reference, type: "credit", transactionType: "sogo_credit",
-    amount, currency: "NGN", description,
-  });
+  // MONEY SAFETY (replay-proof credit): the ledger row and the balance
+  // update commit ATOMICALLY. The old order (balance first, ledger second)
+  // double-credited on webhook replay: the balance update re-ran, then the
+  // duplicate-reference ledger insert threw — money added twice, audit once.
+  // Now the unique `transactions.reference` guard is the FIRST write; a
+  // replayed webhook rolls back and exits without touching the balance.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO transactions
+         (business_id, user_id, amount, currency, status, reference, type, description,
+          transaction_type, wallet_id, direction)
+       VALUES ($1,$2,$3,'NGN','success',$4,'credit',$5,'sogo_credit',$6,'credit')`,
+      [businessId ?? null, userId ?? null, amount, reference, description, walletId],
+    );
+    await client.query(
+      `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [amount, walletId],
+    );
+    await client.query("COMMIT");
+  } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (String(e?.code) === "23505") return; // unique violation — already credited (replay)
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function handleSogoCryptoDeposit(tx: any) {

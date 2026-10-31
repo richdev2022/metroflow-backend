@@ -732,7 +732,19 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     if (useCashback && total > 0) {
       cashbackUsed = await debitCashbackBalance((wallet as any).id, total);
       mainDebit = Math.max(0, Math.round((total - cashbackUsed) * 100) / 100);
-      if (cashbackUsed > 0) details.cashback_used = cashbackUsed;
+      if (cashbackUsed > 0) {
+        details.cashback_used = cashbackUsed;
+        // MONEY SAFETY: persist the cashback split IMMEDIATELY — before the
+        // main debit, ledger insert and provider dispatch. If the process
+        // dies anywhere in the next steps, every refund path (fail(), catch
+        // recovery, reaper) reads details.cashback_used from the DB row; a
+        // lost split used to refund `total` to the main balance while the
+        // cashback balance had already been drawn down.
+        await query(
+          `UPDATE bill_transactions SET details = $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [billId, JSON.stringify(details)],
+        ).catch(() => {});
+      }
     }
 
     const debitOk = mainDebit === 0 || (await debitWallet((wallet as any).id, mainDebit));
@@ -1063,14 +1075,20 @@ router.get("/transactions/:reference", authenticateToken, checkSubscriptionStatu
     const tx = rows.rows[0];
 
     // Poll the provider for unsettled transactions (live only — sandbox does
-    // not persist transactions and always 404s here).
+    // not persist transactions and always 404s here). MONEY SAFETY: a status
+    // flip discovered here MUST move money through the settlement engine —
+    // the old inline UPDATE flipped the status without booking the
+    // vendor/discount/cashback ledgers or refunding a failed bill, so a
+    // failed bill looked "failed" to the user while the debit stayed stranded.
     if (tx.status === "processing" && tx.provider === "sogo" && !sogo.isSogoSandbox()) {
       try {
-        const remote = await sogo.getTransaction(tx.reference);
-        const mapped = normalizeStatus(sogo.sogoStatus(remote?.transaction || remote));
-        if (mapped !== tx.status) {
-          const upd = await query(`UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`, [tx.id, mapped, JSON.stringify(remote)]);
-          return res.json({ success: true, data: { transaction: publicRow(upd.rows[0]) } });
+        const remote = await sogo.getTransaction(tx.provider_reference || tx.reference);
+        const remoteTx = remote?.transaction || remote;
+        const mapped = normalizeStatus(sogo.sogoStatus(remoteTx));
+        if (mapped && mapped !== tx.status) {
+          const settled = await settleFromProviderReport(tx, mapped, remote);
+          const re = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
+          return res.json({ success: true, data: { transaction: publicRow(re.rows[0] || tx), updated: settled } });
         }
       } catch { /* keep local state */ }
     }
@@ -1095,45 +1113,62 @@ router.post("/transactions/:reference/sync", authenticateToken, checkSubscriptio
     if (!remote) return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
 
     const mapped = normalizeStatus(sogo.sogoStatus(remote?.transaction || remote));
-    if (mapped !== tx.status) {
-      // Provider-side refunds/failures must return the money we debited —
-      // through the settlement engine ONLY. The previous inline
-      // creditWallet-then-insertTransaction block could DOUBLE-CREDIT: the
-      // wallet credit ran before the ledger check, and there was no status
-      // guard, so a concurrent reaper refund (or a provider 'failed' report
-      // landing on an already-'refunded' row) credited the wallet a second
-      // time before the duplicate-reference insert threw.
-      if (["refunded", "failed", "cancelled"].includes(mapped)) {
-        const engine = await import("../bill-settlement");
-        if (tx.status === "completed") {
-          // The provider failed a bill we had marked completed — provider
-          // evidence, so the completed row may be reversed.
-          await engine.reverseBillPayment(
-            tx as any,
-            `Provider reported: ${mapped}`,
-            { providerResponse: remote, skipProviderCheck: true, providerReportedFailure: true },
-          );
-        } else {
-          await engine.refundBillRow(tx as any, `Provider reported: ${mapped}`, remote);
-        }
-      }
-      const upd = await query(
-        `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> 'refunded' RETURNING *`,
-        [tx.id, mapped, JSON.stringify(remote)],
-      );
-      // The engine may have already claimed the row to 'refunded' — re-read
-      // instead of echoing the stale pre-sync status.
-      let row = upd.rows[0];
-      if (!row) {
-        const reread = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
-        row = reread.rows[0] || tx;
-      }
-      return res.json({ success: true, data: { transaction: publicRow(row), updated: true } });
+    if (mapped && mapped !== tx.status) {
+      const settled = await settleFromProviderReport(tx, mapped, remote);
+      // The engine may have already claimed the row (e.g. to 'refunded') —
+      // re-read instead of echoing the stale pre-sync status.
+      const reread = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
+      const row = reread.rows[0] || tx;
+      return res.json({ success: true, data: { transaction: publicRow(row), updated: settled } });
     }
     return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
   } catch (e: any) {
     return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
+
+/**
+ * SHARED SETTLEMENT ROUTER — every path that discovers the provider's verdict
+ * (user poll, user sync, webhook, reaper) lands here so money ALWAYS moves
+ * through the same idempotent engine:
+ *   completed            → settleBillCompleted (vendor true-up, discount
+ *                          revenue, late promo cashback) while 'processing';
+ *                          correctWrongRefund for rows already refunded/failed
+ *   failed/refunded/cxl  → refundBillRow, or reverseBillPayment when the row
+ *                          had already been marked completed
+ * Returns true when the row actually settled (vs. racing another settler).
+ */
+async function settleFromProviderReport(tx: any, mapped: string, remote: any): Promise<boolean> {
+  const engine = await import("../bill-settlement");
+  const remoteTx = remote?.transaction || remote;
+  if (mapped === "completed") {
+    if (tx.status === "processing") {
+      // Claim-claim: settleBillCompleted is idempotent (status = 'processing'
+      // guard) and books ALL completion ledgers; false just means another
+      // settler won the race.
+      return engine.settleBillCompleted(tx as any, remote);
+    }
+    // A refunded/failed/cancelled row the provider later completed — the
+    // refund-correction engine re-debits idempotently (wallet permitting).
+    await engine.correctWrongRefund(tx as any, remote);
+    return true;
+  }
+  if (["refunded", "failed", "cancelled"].includes(mapped)) {
+    if (tx.status === "completed") {
+      // The provider failed a bill we had marked completed — provider
+      // evidence, so the completed row may be reversed.
+      await engine.reverseBillPayment(
+        tx as any,
+        `Provider reported: ${mapped}`,
+        { providerResponse: remote, skipProviderCheck: true, providerReportedFailure: true },
+      );
+      return true;
+    }
+    await engine.refundBillRow(tx as any, `Provider reported: ${mapped}`, remoteTx);
+    return true;
+  }
+  // processing/pending → nothing to settle.
+  return false;
+}
 
 export default router;

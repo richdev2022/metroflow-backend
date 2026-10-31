@@ -1,7 +1,7 @@
 import { query } from "./db";
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
-import { ensureBillsSchema } from "./features/personal/bills";
+import { ensureBillsSchema } from "./features/personal/bills-schema";
 import { ensureBillTransactionsSchema } from "./features/personal/routes/bills";
 import { ensureGiftcardRoutesSchema } from "./features/personal/routes/giftcards";
 import { ensureRmbSchema } from "./features/personal/routes/rmb";

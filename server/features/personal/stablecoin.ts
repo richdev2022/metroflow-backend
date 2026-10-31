@@ -289,9 +289,48 @@ async function insertLedger(opts: {
 // ---------------------------------------------------------------------------
 // Rates
 // ---------------------------------------------------------------------------
-/** Simulator rate — a believable NGN/USDT market band, jittered per call. */
-function simRate(): number {
-    return Math.round((1545 + Math.random() * 30) * 100) / 100;
+/**
+ * Live mid-market rate for 1 <coin> in NGN. Priority (owner directive: the
+ * conversion between NGN and stablecoins must actually work — Flutterwave
+ * powers it):
+ *   1. Sogo   GET /crypto/assets/{asset}/rate   (active provider market rate)
+ *   2. Bitnob exchange-rates (when Bitnob is the routed provider)
+ *   3. Flutterwave USD→NGN FX (stablecoins are 1:1 with USD) — ALWAYS
+ *      available when FLW keys exist, this is what makes conversion work
+ *      end-to-end instead of the old random simulator rate.
+ * Returns null when every source fails — callers surface an honest error,
+ * they NEVER fall back to fabricated numbers.
+ */
+async function stableNgnRate(currency: Stablecoin): Promise<{ rate: number; mode: string } | null> {
+    // 1. Sogo live rate (active provider).
+    if (sogo.isSogoConfigured()) {
+        try {
+            const sr = await sogo.cryptoRate(currency.toLowerCase(), 1);
+            const rate = Number(sr?.rate ?? sr?.user_receives_ngn ?? sr?.estimated_ngn ?? 0);
+            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "sogo" };
+        } catch { /* try next */ }
+    }
+    // 2. Bitnob exchange-rates → convert API.
+    if (await bitnobLive()) {
+        try {
+            const r = await bitnob.getExchangeRate(currency, "NGN");
+            const d = r?.data || {};
+            const rate = Number(d.mid_rate ?? d.midRate ?? d.sell_rate ?? d.buy_rate);
+            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
+        } catch { /* try next */ }
+        try {
+            const c = await bitnob.convertAmount(currency, "NGN", 1);
+            const rate = Number(c?.data?.rate_used || c?.data?.to_amount);
+            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
+        } catch { /* fall through */ }
+    }
+    // 3. Flutterwave FX — the platform's FX source of truth.
+    try {
+        const { getRate } = await import("../../services/flutterwave");
+        const flw = Number(await getRate("USD", "NGN", 1));
+        if (flw > 10) return { rate: Math.round(flw * 100) / 100, mode: "flutterwave" };
+    } catch { /* fall through */ }
+    return null;
 }
 
 /** Admin spread (crypto_spread_percent, default 1%) shrinks what the user receives. */
@@ -300,31 +339,15 @@ async function receiveAfterSpread(value: number): Promise<number> {
     return n2(value * (1 - spread / 100));
 }
 
-/** Live mid-market rate for 1 <coin> in NGN (Bitnob exchange-rates → convert API → simulator). */
-async function stableNgnRate(currency: Stablecoin): Promise<{ rate: number; mode: string }> {
-    if (await bitnobLive()) {
-        // Preferred: GET /api/exchange-rates?from=&to= — returns buy_rate,
-        // sell_rate and mid_rate (docs: Exchange Rates). mid_rate is the fair
-        // display rate; the trading quote prices the actual execution.
-        try {
-            const r = await bitnob.getExchangeRate(currency, "NGN");
-            const d = r?.data || {};
-            const rate = Number(d.mid_rate ?? d.midRate ?? d.sell_rate ?? d.buy_rate);
-            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
-        } catch { /* try next */ }
-        // Fallback: GET /api/exchange-rates/convert (1 USDT → NGN, sell_rate).
-        try {
-            const c = await bitnob.convertAmount(currency, "NGN", 1);
-            const rate = Number(c?.data?.rate_used || c?.data?.to_amount);
-            if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
-        } catch { /* fall through */ }
-    }
-    return { rate: simRate(), mode: "simulator" };
-}
-
-/** Bitnob trading quote (stable→NGN SELL, NGN→stable SELL-NGN) with graceful simulator fallback. */
+/**
+ * Conversion quote. When the active provider is NOT bitnob, the conversion is
+ * an INTERNAL, provider-independent exchange at the live rate (Sogo market
+ * rate → Flutterwave FX): debit one platform wallet, credit the other. No
+ * external order, no simulator, no fabricated prices.
+ */
 async function createConversionQuote(direction: "stable_to_naira" | "naira_to_stable", currency: Stablecoin, amount: number) {
-    if (await bitnobLive()) {
+    const routed = await getActiveProvider("crypto");
+    if (routed === "bitnob" && (await bitnobLive())) {
         try {
             // Docs: quote request = exactly 4 fields; side lowercase; quantity
             // is denominated in the BASE currency.
@@ -352,19 +375,24 @@ async function createConversionQuote(direction: "stable_to_naira" | "naira_to_st
             throw new Error(e?.message || "Bitnob quote failed");
         }
     }
-    // Simulator
-    const rate = simRate();
+    // INTERNAL conversion at the live rate (Sogo → Flutterwave FX).
+    const priced = await stableNgnRate(currency);
+    if (!priced) throw new Error("Live rates are unavailable right now — please try again shortly");
     return direction === "stable_to_naira"
-        ? { mode: "simulator" as const, quote_id: `SIMQ_${randomReference("SC")}`, price: rate, receive_amount: n2(amount * rate), receive_currency: "NGN", send_amount: n8(amount), expires_at: new Date(Date.now() + 10 * 60_000).toISOString(), raw: {} }
-        : { mode: "simulator" as const, quote_id: `SIMQ_${randomReference("SC")}`, price: rate, receive_amount: n8(amount / rate), receive_currency: currency, send_amount: n2(amount), expires_at: new Date(Date.now() + 10 * 60_000).toISOString(), raw: {} };
+        ? { mode: priced.mode as any, quote_id: `INTQ_${randomReference("SC")}`, price: priced.rate, receive_amount: n2(amount * priced.rate), receive_currency: "NGN", send_amount: n8(amount), expires_at: new Date(Date.now() + 2 * 60_000).toISOString(), raw: { internal: true, rate_mode: priced.mode } }
+        : { mode: priced.mode as any, quote_id: `INTQ_${randomReference("SC")}`, price: priced.rate, receive_amount: n8(amount / priced.rate), receive_currency: currency, send_amount: n2(amount), expires_at: new Date(Date.now() + 2 * 60_000).toISOString(), raw: { internal: true, rate_mode: priced.mode } };
 }
 
-/** Submit the trading order against a quote. Returns the Bitnob order (or simulator no-op). */
+/**
+ * Submit the conversion order. Bitnob-routed conversions go through Bitnob
+ * trading; internal conversions (sogo/flutterwave mode) settle instantly by
+ * bookkeeping — the wallets live on OUR ledger.
+ */
 async function submitConversionOrder(input: {
-    mode: "bitnob" | "simulator"; direction: "stable_to_naira" | "naira_to_stable";
+    mode: string; direction: "stable_to_naira" | "naira_to_stable";
     currency: Stablecoin; amount: number; quote: Awaited<ReturnType<typeof createConversionQuote>>; reference: string;
 }): Promise<{ orderId: string | null; status: string; filled: boolean; raw: any }> {
-    if (input.mode === "simulator") return { orderId: null, status: "filled", filled: true, raw: {} };
+    if (input.mode !== "bitnob") return { orderId: null, status: "filled", filled: true, raw: { internal: true } };
     const { currency, direction, amount, quote, reference } = input;
     const body = direction === "stable_to_naira"
         ? { base_currency: currency, quote_currency: "NGN", side: "SELL" as const, quantity: String(n8(amount)), quote_id: quote.quote_id, reference }
@@ -554,8 +582,12 @@ router.get("/chains", authenticateToken, checkSubscriptionStatus, async (_req: A
         } catch (e: any) {
             console.error("[stablecoin] supported-chains failed:", e?.message);
         }
+        // Bitnob is live but its chain probe failed — fall back to the static
+        // Bitnob support matrix (a REAL provider matrix, not a simulator).
+        return res.json({ success: true, data: { chains: FALLBACK_CHAINS, mode: "bitnob" } });
     }
-    return res.json({ success: true, data: { chains: FALLBACK_CHAINS, mode: "simulator" } });
+    // Non-bitnob deployments (sogo default): Sogo's multi-network support.
+    return res.json({ success: true, data: { chains: SOGO_CHAINS, mode: "sogo" } });
 });
 
 /** GET /crypto/stablecoin/addresses — the caller's deposit addresses. */
@@ -620,10 +652,9 @@ router.post("/addresses", authenticateToken, requirePersonalKyc(), checkSubscrip
                 .filter((c: any) => (c.stablecoins || []).some((s: any) => String(s.symbol || "").toUpperCase() === currency))
                 .map((c: any) => String(c.chain));
         } catch { /* fallback list */ }
-        if (live && live.length) { chains = live; } else { chains = FALLBACK_CHAINS[currency]; mode = "simulator"; }
+        if (live && live.length) { chains = live; } else { chains = FALLBACK_CHAINS[currency]; }
     } else {
-        chains = FALLBACK_CHAINS[currency];
-        mode = "simulator";
+        chains = SOGO_CHAINS[currency];
     }
     if (!chain || !chains.includes(chain)) {
         return res.status(400).json({ success: false, error: `chain must be one of: ${chains.join(", ")}`, supported: chains });
@@ -699,23 +730,25 @@ router.post("/addresses", authenticateToken, requirePersonalKyc(), checkSubscrip
         }
     }
 
-    // Simulator address (obviously test-only prefix so nobody sends real funds).
-    const reference = randomReference("SIMADDR");
-    const simAddr = `sim1${chain.slice(0, 4)}${randomReference("x").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 28)}`;
-    const ins = await query(
-        `INSERT INTO stablecoin_addresses (user_id, currency, chain, address, label, reference, provider)
-         VALUES ($1, $2, $3, $4, $5, $6, 'simulator') RETURNING *`,
-        [userId, currency, chain, simAddr, `metroflow:${userId.slice(0, 8)}:${currency}`, reference],
-    );
-    res.json({ success: true, data: { address: publicAddress(ins.rows[0]), reused: false, mode: "simulator" } });
+    // NO SIMULATOR ADDRESSES — a fake address invites real on-chain deposits
+    // into a void (the exact "dummy information" the owner rejected). When
+    // the active provider cannot issue an address, say so honestly.
+    return res.status(502).json({
+        success: false,
+        code: "PROVIDER_UNAVAILABLE",
+        error: "Deposit addresses are unavailable right now — our provider is being connected. Please try again shortly.",
+    });
 });
 
 /** GET /crypto/stablecoin/rate?currency=USDT — live stablecoin → NGN rate. */
 router.get("/rate", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     const currency = String(req.query.currency || "USDT").toUpperCase() as Stablecoin;
     if (!STABLECOINS.includes(currency)) return res.status(400).json({ success: false, error: "currency must be USDT or USDC" });
-    const { rate, mode } = await stableNgnRate(currency);
-    res.json({ success: true, data: { currency, rate, mode, fetched_at: new Date().toISOString() } });
+    const priced = await stableNgnRate(currency);
+    if (!priced) {
+        return res.status(502).json({ success: false, error: "Live rates are unavailable right now — please try again shortly" });
+    }
+    res.json({ success: true, data: { currency, rate: priced.rate, mode: priced.mode, fetched_at: new Date().toISOString() } });
 });
 
 /**
@@ -804,12 +837,13 @@ router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscripti
     const reference = randomReference("SCV");
 
     // FRAUD GATE — conversions move value across rails.
+    const liveRate = await stableNgnRate(currency);
     const fraudResult = await evaluateOutflow({
         flow: "crypto",
         userId,
         walletId: null,
-        amount: direction === "naira_to_stable" ? amount : amount * (await stableNgnRate(currency)).rate,
-        currency: direction === "naira_to_stable" ? "NGN" : "NGN",
+        amount: direction === "naira_to_stable" ? amount : amount * (liveRate?.rate || 0),
+        currency: "NGN",
         reference,
         ip: (String(req.headers["x-forwarded-for"] || "")).split(",")[0]?.trim() || req.ip || null,
         userAgent: (req.headers["user-agent"] as string) || null,
@@ -876,7 +910,9 @@ router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscripti
             [conv.id, order.orderId, JSON.stringify(order.raw || {})],
         );
 
-        if (quote.mode === "simulator") {
+        if (quote.mode !== "bitnob") {
+            // INTERNAL settlement (sogo/flutterwave rate): the two wallets are
+            // both on our ledger — credit the destination instantly.
             const credit = await receiveAfterSpread(quote.receive_amount);
             if (direction === "stable_to_naira") {
                 const ngn = await getUserNgnWallet(userId);
@@ -884,7 +920,7 @@ router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscripti
                 await insertLedger({
                     userId, walletId: ngn.id, reference: `${reference}-IN`, type: "credit",
                     transactionType: "stablecoin_convert", amount: credit, currency: "NGN",
-                    description: `Stablecoin conversion — ${currency} ${n8(amount)} → ₦${credit.toLocaleString()}`,
+                    description: `Stablecoin conversion — ${currency} ${n8(amount)} → ₦${credit.toLocaleString()} @ ₦${quote.price}`,
                 });
             } else {
                 const sw = await getUserStableWallet(userId, currency);
@@ -893,7 +929,7 @@ router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscripti
                 await insertLedger({
                     userId, walletId: sw.id, reference: `${reference}-IN`, type: "credit",
                     transactionType: "stablecoin_convert", amount: stableCredit, currency,
-                    description: `Stablecoin conversion — ₦${n2(amount).toLocaleString()} → ${stableCredit} ${currency}`,
+                    description: `Stablecoin conversion — ₦${n2(amount).toLocaleString()} → ${stableCredit} ${currency} @ ₦${quote.price}`,
                 });
             }
             await query(
@@ -901,7 +937,7 @@ router.post("/convert", authenticateToken, requirePersonalKyc(), checkSubscripti
                 [conv.id],
             );
             const done = await query(`SELECT * FROM stablecoin_conversions WHERE id = $1`, [conv.id]);
-            return res.json({ success: true, data: { conversion: publicConversion(done.rows[0]), mode: "simulator" } });
+            return res.json({ success: true, data: { conversion: publicConversion(done.rows[0]), mode: quote.mode } });
         }
 
         if (order.filled) {
@@ -968,12 +1004,56 @@ router.get("/deposits", authenticateToken, checkSubscriptionStatus, async (req: 
 });
 
 /**
- * POST /crypto/stablecoin/withdraw { currency, chain, to_address, amount, pin }
- * On-chain payout of stablecoins to an external wallet (Bitnob /api/withdrawals).
- * Fraud gates: local + provider address validation, PIN, outflow engine,
- * min/max clamps, atomic debit with automatic refund when the provider fails.
+ * POST /crypto/stablecoin/withdraw — ON-CHAIN SEND IS COMING SOON.
+ * The owner directive: clicking "send stablecoin on-chain" alerts "coming
+ * soon" — the backend refuses the flow outright until the payout rail ships.
  */
 router.post("/withdraw", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    return res.status(501).json({
+        success: false,
+        code: "SEND_COMING_SOON",
+        error: "Sending stablecoins on-chain is coming soon — you'll be able to withdraw USDT/USDC to any external wallet from this screen. Meanwhile, receive crypto or convert between NGN and stablecoins.",
+    });
+});
+
+/**
+ * POST /crypto/stablecoin/deposits/claim { currency, chain, tx_hash, amount? }
+ * Claim an on-chain deposit by its transaction hash. Sogo issues ONE shared
+ * static address per asset+network per partner, so customer attribution runs
+ * through the blockchain tx hash (webhook metadata.deposit_tx_hash). Submit
+ * it right after sending — when Sogo confirms, the NGN value is credited.
+ */
+router.post("/deposits/claim", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    const userId = req.user!.userId;
+    const currency = String(req.body?.currency || "").toUpperCase() as Stablecoin;
+    const chain = String(req.body?.chain || "").toLowerCase().trim() || null;
+    const txHash = String(req.body?.tx_hash || "").trim();
+    const amount = Number(req.body?.amount);
+    if (!STABLECOINS.includes(currency)) return res.status(400).json({ success: false, error: "currency must be USDT or USDC" });
+    if (!txHash || txHash.length < 10) return res.status(400).json({ success: false, error: "tx_hash is required — paste the on-chain transaction hash" });
+
+    const existing = await query(`SELECT * FROM stablecoin_deposits WHERE tx_hash = $1 LIMIT 1`, [txHash]);
+    if (existing.rows.length) {
+        const row = existing.rows[0];
+        if (String(row.user_id) !== String(userId)) {
+            return res.status(409).json({ success: false, error: "This transaction hash has already been claimed" });
+        }
+        return res.json({ success: true, data: { deposit: publicDeposit(row), reused: true } });
+    }
+    const ins = await query(
+        `INSERT INTO stablecoin_deposits (user_id, currency, chain, amount, tx_hash, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING *`,
+        [userId, currency, chain, Number.isFinite(amount) && amount > 0 ? n8(amount) : 0, txHash],
+    );
+    res.status(201).json({ success: true, data: { deposit: publicDeposit(ins.rows[0]), reused: false } });
+});
+
+/**
+ * LEGACY WITHDRAWAL INTAKE — retained for history reads only. The live
+ * on-chain send flow is disabled above (SEND_COMING_SOON).
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function _legacyWithdrawHandler(req: AuthenticatedRequest, res: any) {
     const userId = req.user!.userId;
     const currency = String(req.body?.currency || "").toUpperCase() as Stablecoin;
     const chain = String(req.body?.chain || "").toLowerCase().trim();
@@ -1103,7 +1183,7 @@ router.post("/withdraw", authenticateToken, requirePersonalKyc(), checkSubscript
         );
         return res.status(502).json({ success: false, error: `${e?.message || "Withdrawal failed"} — your wallet was refunded in full.` });
     }
-});
+}
 
 /** GET /crypto/stablecoin/withdrawals — withdrawal history. */
 router.get("/withdrawals", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {

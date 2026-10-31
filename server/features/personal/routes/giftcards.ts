@@ -171,9 +171,23 @@ router.get("/status", authenticateToken, async (_req: AuthenticatedRequest, res)
  * Normalize the Sogo sell catalog (brands) into the unified giftcard entry
  * shape: { id, provider, name, image, country_code, currency, card_types,
  * sub_types, min_amount, max_amount, rate_ngn (ecode NGN rate), form }.
+ * Country entries have been observed in several shapes ({code,label,currency},
+ * {country_code,country_name,currency}, plain strings) — handle them all.
  */
 function normalizeSogoSellEntry(entry: any): any {
-  const countries = Array.isArray(entry.countries) ? entry.countries : [];
+  const rawCountries = Array.isArray(entry.countries) ? entry.countries : [];
+  const countries = rawCountries
+    .map((c: any) => {
+      if (typeof c === "string") return { code: c.toUpperCase(), label: c, currency: "USD" };
+      const code = String(c.code || c.country_code || c.iso || "").toUpperCase() || null;
+      if (!code) return null;
+      return {
+        code,
+        label: String(c.label || c.country_name || c.name || code),
+        currency: String(c.currency || c.currency_code || "USD").toUpperCase(),
+      };
+    })
+    .filter(Boolean);
   const first = countries[0] || {};
   // ecode NGN rate for the brand's first country/currency — display hint only.
   let rateNgn: number | null = null;
@@ -206,10 +220,13 @@ router.get("/sell/catalog", authenticateToken, checkSubscriptionStatus, async (_
   try {
     if (!(await assertPersonalService(res, "giftcards"))) return;
     if (provider === "sogo") {
-      const [catalog, rates] = await Promise.all([
-        sogo.giftcardSellCatalog(),
-        sogo.giftcardSellRates().catch(() => null),
-      ]);
+      // Rates are an ENHANCEMENT — a rates blip must never blank the whole
+      // catalogue (the "sell catalogue unavailable" production report).
+      const catalog = await sogo.giftcardSellCatalog();
+      const rates = await sogo.giftcardSellRates().catch((e: any) => {
+        console.warn("[giftcards] sell rates unavailable (catalog still served):", e?.message);
+        return null;
+      });
       const rateBySlug = new Map<string, any>();
       for (const r of Array.isArray(rates) ? rates : []) rateBySlug.set(String(r.slug), r.rates || r);
       const giftcards = (catalog || []).map((entry: any) =>
@@ -255,6 +272,29 @@ router.get("/sell/categories", authenticateToken, async (_req, res) => {
     res.json({ success: true, categories: cats });
   } catch (e: any) {
     res.status(502).json({ success: false, error: userSafeErr(prestmit.prestmitErr(e)) });
+  }
+});
+
+/**
+ * LIVE SELL RATE CALCULATOR — full rate structure for every sellable brand
+ * (or one brand via ?slug=). Powers the per-card rate display on the Sell
+ * screen: rates are keyed card currency → card type → payout currency, with
+ * sub-type/tier structures passed through untouched for the client to render.
+ */
+router.get("/sell/rates", authenticateToken, checkSubscriptionStatus, async (req, res) => {
+  const provider = await activeGiftcardProvider();
+  try {
+    const slug = String(req.query.slug || "").trim().toLowerCase() || undefined;
+    if (provider === "sogo") {
+      const rates = await sogo.giftcardSellRates(slug);
+      return res.json({ success: true, provider, data: rates });
+    }
+    // Prestmit: rates already ride on the catalog — return the sellable list.
+    const data = await prestmit.sellRateCalculatorData();
+    return res.json({ success: true, provider, data: data?.sellableGiftcards || [] });
+  } catch (e: any) {
+    console.error("gc sell rates error:", e?.message);
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });
 
@@ -789,6 +829,27 @@ router.get("/buy/currencies", authenticateToken, async (_req, res) => {
     const currencies = await prestmit.buyCurrencies();
     res.json({ success: true, provider, currencies });
   } catch (e: any) {
+    res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
+  }
+});
+
+/**
+ * BUY FLOW STEP 1 — countries with buyable products. The client's buy flow
+ * is: pick country → products for that country → calculate → buy.
+ */
+router.get("/buy/countries", authenticateToken, checkSubscriptionStatus, async (_req, res) => {
+  const provider = await activeGiftcardProvider();
+  try {
+    if (provider === "sogo") {
+      const countries = await sogo.giftcardBuyCountries();
+      return res.json({ success: true, provider, countries });
+    }
+    // Prestmit buyable regions derive from the catalog.
+    const data = await prestmit.sellRateCalculatorData().catch(() => null);
+    const countries = Array.from(new Set((data?.sellableGiftcards || []).map((s: any) => s.country).filter(Boolean)));
+    return res.json({ success: true, provider, countries: countries.map((c: any) => ({ country_code: c, country_name: c })) });
+  } catch (e: any) {
+    console.error("gc buy countries error:", e?.message);
     res.status(502).json({ success: false, error: userSafeErr(provider === "prestmit" ? prestmit.prestmitErr(e) : sogo.sogoErr(e)) });
   }
 });

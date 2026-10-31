@@ -29,7 +29,7 @@ const DISPUTE_CATEGORIES = [
 ];
 
 interface ResolvedTxn {
-  source: "transfer_queue" | "transactions";
+  source: "transfer_queue" | "transactions" | "bill_transactions";
   txn: any;
   amount: string;
   currency: string;
@@ -41,36 +41,74 @@ interface ResolvedTxn {
 export async function resolveDisputeTransaction(
   reference: string,
   businessId: string,
+  userId?: string | null,
 ): Promise<ResolvedTxn | null> {
-  const tq = await query(
-    `SELECT * FROM transfer_queue WHERE reference = $1 AND business_id = $2 LIMIT 1`,
-    [reference, businessId],
-  );
-  if (tq.rows[0]) {
-    const t = tq.rows[0];
-    return {
-      source: "transfer_queue",
-      txn: t,
-      amount: t.amount,
-      currency: t.currency || "NGN",
-      status: t.status,
-      description: `Transfer to ${t.recipient_name || t.recipient_account || "account"}`,
-    };
+  // Business scope first (unchanged contract for the Business app).
+  if (businessId) {
+    const tqB = await query(
+      `SELECT * FROM transfer_queue WHERE reference = $1 AND business_id = $2 LIMIT 1`,
+      [reference, businessId],
+    );
+    if (tqB.rows[0]) {
+      const t = tqB.rows[0];
+      return {
+        source: "transfer_queue",
+        txn: t,
+        amount: t.amount,
+        currency: t.currency || "NGN",
+        status: t.status,
+        description: `Transfer to ${t.recipient_name || t.recipient_account || "account"}`,
+      };
+    }
+    const txB = await query(
+      `SELECT * FROM transactions WHERE reference = $1 AND business_id = $2 LIMIT 1`,
+      [reference, businessId],
+    );
+    if (txB.rows[0]) {
+      const t = txB.rows[0];
+      return {
+        source: "transactions",
+        txn: t,
+        amount: t.amount,
+        currency: t.currency || "NGN",
+        status: t.status,
+        description: t.description || t.transaction_type || "Transaction",
+      };
+    }
   }
-  const tx = await query(
-    `SELECT * FROM transactions WHERE reference = $1 AND business_id = $2 LIMIT 1`,
-    [reference, businessId],
-  );
-  if (tx.rows[0]) {
-    const t = tx.rows[0];
-    return {
-      source: "transactions",
-      txn: t,
-      amount: t.amount,
-      currency: t.currency || "NGN",
-      status: t.status,
-      description: t.description || t.transaction_type || "Transaction",
-    };
+  // PERSONAL scope (MetriCorex personal app): the caller's own rows —
+  // bill payments, gift cards, transfers, wallet ledger entries.
+  if (userId) {
+    const bill = await query(
+      `SELECT * FROM bill_transactions WHERE reference = $1 AND user_id = $2 LIMIT 1`,
+      [reference, userId],
+    );
+    if (bill.rows[0]) {
+      const t = bill.rows[0];
+      return {
+        source: "bill_transactions",
+        txn: t,
+        amount: t.total || t.amount,
+        currency: t.currency || "NGN",
+        status: t.status,
+        description: t.description || `${t.category} bill payment${t.customer_ref ? ` — ${t.customer_ref}` : ""}`,
+      };
+    }
+    const txP = await query(
+      `SELECT * FROM transactions WHERE reference = $1 AND user_id = $2 AND business_id IS NULL LIMIT 1`,
+      [reference, userId],
+    );
+    if (txP.rows[0]) {
+      const t = txP.rows[0];
+      return {
+        source: "transactions",
+        txn: t,
+        amount: t.amount,
+        currency: t.currency || "NGN",
+        status: t.status,
+        description: t.description || t.transaction_type || "Transaction",
+      };
+    }
   }
   return null;
 }
@@ -166,9 +204,10 @@ export async function notifyDisputeCustomer(
 const fileDispute: RequestHandler = async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    const businessId = authReq.user?.businessId;
+    const businessId = authReq.user?.businessId || "";
     const userId = authReq.user?.userId;
-    if (!businessId || !userId) {
+    // Personal users (business_id NULL) can dispute their own transactions.
+    if (!userId || (!businessId && authReq.user?.businessId != null)) {
       res.status(401).json({ success: false, error: "Authentication required" });
       return;
     }
@@ -195,7 +234,7 @@ const fileDispute: RequestHandler = async (req, res) => {
       ? String(category)
       : "other";
 
-    const resolved = await resolveDisputeTransaction(reference.trim(), businessId);
+    const resolved = await resolveDisputeTransaction(reference.trim(), businessId, userId);
     if (!resolved) {
       res.status(404).json({
         success: false,
@@ -250,7 +289,7 @@ const fileDispute: RequestHandler = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
        RETURNING *`,
       [
-        businessId,
+        businessId || null,
         userId,
         reference.trim(),
         resolved.source,
@@ -337,15 +376,22 @@ const listMyDisputes: RequestHandler = async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const businessId = authReq.user?.businessId;
-    if (!businessId) {
+    const userId = authReq.user?.userId;
+    if (!userId) {
       res.status(401).json({ success: false, error: "Authentication required" });
       return;
     }
     const limit = Math.min(parseInt(String(req.query.limit || "50"), 10) || 50, 100);
-    const rows = await query(
-      `SELECT * FROM transaction_disputes WHERE business_id = $1 ORDER BY created_at DESC LIMIT $2`,
-      [businessId, limit],
-    );
+    // Business scope OR the caller's personal disputes (business_id NULL).
+    const rows = businessId
+      ? await query(
+          `SELECT * FROM transaction_disputes WHERE business_id = $1 OR user_id = $2 ORDER BY created_at DESC LIMIT $3`,
+          [businessId, userId, limit],
+        )
+      : await query(
+          `SELECT * FROM transaction_disputes WHERE user_id = $1 AND business_id IS NULL ORDER BY created_at DESC LIMIT $2`,
+          [userId, limit],
+        );
     res.json({ success: true, data: rows.rows });
   } catch (err) {
     console.error("[disputes] list mine failed:", err);
@@ -357,14 +403,20 @@ const getMyDispute: RequestHandler = async (req, res) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const businessId = authReq.user?.businessId;
-    if (!businessId) {
+    const userId = authReq.user?.userId;
+    if (!userId) {
       res.status(401).json({ success: false, error: "Authentication required" });
       return;
     }
-    const rows = await query(
-      `SELECT * FROM transaction_disputes WHERE id = $1 AND business_id = $2`,
-      [req.params.id, businessId],
-    );
+    const rows = businessId
+      ? await query(
+          `SELECT * FROM transaction_disputes WHERE id = $1 AND (business_id = $2 OR user_id = $3)`,
+          [req.params.id, businessId, userId],
+        )
+      : await query(
+          `SELECT * FROM transaction_disputes WHERE id = $1 AND user_id = $2 AND business_id IS NULL`,
+          [req.params.id, userId],
+        );
     if (rows.rows.length === 0) {
       res.status(404).json({ success: false, error: "Dispute not found" });
       return;

@@ -1,6 +1,6 @@
 import { query } from "../../db";
 import { creditPlatformWallet } from "../../services/fees";
-import { creditRevenueWallet } from "../../services/fees";
+import { creditRevenueWallet, debitRevenueWallet } from "../../services/fees";
 import { insertTransaction, creditCashbackBalance, debitCashbackBalance } from "./personal-utils";
 
 /**
@@ -26,6 +26,13 @@ import { insertTransaction, creditCashbackBalance, debitCashbackBalance } from "
  *      Admin-configured airtime/data cashback accrues to the wallet's
  *      DEDICATED cashback balance (spendable on bill payments), with its own
  *      user-visible ledger row.
+ *
+ *   4. CASHBACK FUNDING (`<ref>-CB-FUND`, revenue ledger)
+ *      The promo cashback is not free money: the moment it is credited to
+ *      the customer's cashback balance — almost immediately after the
+ *      provider's commission/discount from the webhook was credited into the
+ *      Revenue ledger — the same amount is DEBITED from the PLATFORM REVENUE
+ *      ledger. Revenue pays for cashback; the books stay balanced.
  *
  * Every write is idempotent by reference, so the pay flow, the webhook
  * handler, the settlement reaper and the sync endpoints can all call these
@@ -174,8 +181,51 @@ export async function recordBillCompletionLedger(bill: {
 }
 
 /**
+ * CASHBACK FUNDING — pay for the promo cashback out of the PLATFORM REVENUE
+ * ledger. Called by every accrual path (pay flow, webhook settlement, reaper,
+ * sync) right after the provider's commission/discount was credited into the
+ * Revenue ledger, so the sequence the books see is:
+ *
+ *   Revenue ledger  +commission (webhook)   →  Revenue ledger −cashback
+ *                                                →  user cashback balance +cashback
+ *
+ * Idempotent on the `${ref}-CB-FUND-REVENUE-DEBIT` revenue row, so
+ * concurrent settlers can never double-fund the same cashback.
+ */
+export async function fundBillCashbackFromRevenue(bill: {
+  reference: string;
+  category?: string;
+}, cashbackAmount: number): Promise<boolean> {
+  const reference = String(bill?.reference || "");
+  const cb = r2(Number(cashbackAmount) || 0);
+  if (!reference || !(cb > 0)) return false;
+  try {
+    const existing = await query(
+      `SELECT 1 FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
+      [`${reference}-CB-FUND-REVENUE-DEBIT`],
+    );
+    if (existing.rows.length) return true; // already funded — idempotent no-op
+    await debitRevenueWallet(
+      cb,
+      "NGN",
+      `${reference}-CB-FUND`,
+      `Bill cashback funded from platform revenue — ₦${cb.toLocaleString()} promo cashback for ${bill.category || "bill"} ${reference} moved from the Revenue ledger to the customer's cashback balance`,
+      "bills",
+    );
+    return true;
+  } catch (e: any) {
+    console.error(`[bill-ledger] cashback revenue funding failed for ${reference}:`, e?.message);
+    return false;
+  }
+}
+
+/**
  * CASHBACK accrual — credit the promo cashback into the wallet's DEDICATED
  * cashback balance with a user-visible ledger row. Idempotent on `${ref}-CB`.
+ * The accrual is REVENUE-FUNDED: the exact amount is first debited from the
+ * Platform Revenue ledger (immediately after the provider's commission from
+ * the webhook was credited there), then the customer's cashback balance is
+ * topped up — revenue pays for cashback, always.
  */
 export async function accrueBillCashback(bill: {
   reference: string;
@@ -194,6 +244,10 @@ export async function accrueBillCashback(bill: {
       [`${reference}-CB`],
     );
     if (existing.rows.length) return false;
+    // FUNDING LEG — debit the Platform Revenue ledger first (best-effort: a
+    // failed revenue row must never block the customer's cashback; support
+    // can replay it), then credit the user's cashback balance.
+    await fundBillCashbackFromRevenue(bill, cb);
     await creditCashbackBalance(String(bill.wallet_id), cb);
     await insertTransaction({
       userId: bill.user_id ?? null,
@@ -251,6 +305,39 @@ export async function clawbackBillCashback(bill: { reference: string; user_id?: 
   } catch (e: any) {
     console.error(`[bill-ledger] cashback clawback failed for ${reference}:`, e?.message);
     return 0;
+  }
+}
+
+/**
+ * Cashback-funding unwind (reversal path) — the Revenue ledger paid for the
+ * promo cashback when it was accrued; when the cashback is clawed back, give
+ * the Revenue ledger its money back too. Idempotent on the
+ * `${ref}-CB-FUND-REVERSAL-REVENUE-CREDIT` revenue row.
+ */
+export async function unwindBillCashbackRevenueFunding(reference: string, category?: string): Promise<void> {
+  const ref = String(reference || "");
+  if (!ref) return;
+  try {
+    const funded = await query(
+      `SELECT amount FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
+      [`${ref}-CB-FUND-REVENUE-DEBIT`],
+    );
+    const cb = r2(Number(funded.rows[0]?.amount) || 0);
+    if (!(cb > 0)) return; // never revenue-funded — nothing to unwind
+    const existing = await query(
+      `SELECT 1 FROM transactions WHERE reference = $1 AND wallet_id IS NULL LIMIT 1`,
+      [`${ref}-CB-FUND-REVERSAL-REVENUE-CREDIT`],
+    );
+    if (existing.rows.length) return;
+    await creditRevenueWallet(
+      cb,
+      "NGN",
+      `${ref}-CB-FUND-REVERSAL`,
+      `Reversal — bill cashback funding returned to platform revenue for ${category || "bill"} ${ref}`,
+      "bills",
+    );
+  } catch (e: any) {
+    console.error(`[bill-ledger] cashback funding unwind failed for ${reference}:`, e?.message);
   }
 }
 

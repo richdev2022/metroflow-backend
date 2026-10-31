@@ -889,7 +889,8 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     }
 
     // CASHBACK (admin-set promotions): credit X% of the face value (capped)
-    // into the wallet's cashback balance with its own ledger entry.
+    // into the wallet's cashback balance with its own ledger entry, funded by
+    // an immediate debit on the PLATFORM REVENUE ledger (see bill-ledger.ts).
     // Best-effort — a failed cashback must never fail an already-completed
     // bill payment; the row's details keep the rule so support can replay it.
     if (status === "completed" && pricing.cashback > 0) {

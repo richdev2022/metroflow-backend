@@ -1,6 +1,6 @@
 import express from "express";
 import { Request, Response } from "express";
-import { query } from "../db";
+import { query, pool } from "../db";
 import { verifyPrestmitWebhook } from "../services/prestmit";
 import { creditWallet, insertTransaction } from "../features/personal/personal-utils";
 import { createNotification } from "../services/notifications";
@@ -783,80 +783,45 @@ import { getPercent } from "../features/personal/flags";
 
 async function creditUserWallet(userId: string | null, walletId: string | null, amount: number, reference: string, description: string, businessId?: string | null) {
   if (!walletId || !(amount > 0)) return;
-  await query(`UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [amount, walletId]);
-  await insertTransaction({
-    userId, businessId: businessId ?? null, walletId,
-    reference, type: "credit", transactionType: "sogo_credit",
-    amount, currency: "NGN", description,
-  });
+  // MONEY SAFETY (replay-proof credit): the ledger row and the balance
+  // update commit ATOMICALLY. The old order (balance first, ledger second)
+  // double-credited on webhook replay: the balance update re-ran, then the
+  // duplicate-reference ledger insert threw — money added twice, audit once.
+  // Now the unique `transactions.reference` guard is the FIRST write; a
+  // replayed webhook rolls back and exits without touching the balance.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO transactions
+         (business_id, user_id, amount, currency, status, reference, type, description,
+          transaction_type, wallet_id, direction)
+       VALUES ($1,$2,$3,'NGN','success',$4,'credit',$5,'sogo_credit',$6,'credit')`,
+      [businessId ?? null, userId ?? null, amount, reference, description, walletId],
+    );
+    await client.query(
+      `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [amount, walletId],
+    );
+    await client.query("COMMIT");
+  } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (String(e?.code) === "23505") return; // unique violation — already credited (replay)
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function handleSogoCryptoDeposit(tx: any) {
-  // Match by deposit address (metadata.deposit_address || deposit_address),
-  // falling back to a pre-recorded sale row keyed by reference.
-  const address = String(
-    tx?.metadata?.deposit_address || tx?.deposit_address || tx?.address || "",
-  );
-  let sale = null;
-  if (tx?.reference) {
-    const byRef = await query(`SELECT * FROM crypto_deposit_sales WHERE reference = $1 LIMIT 1`, [String(tx.reference)]);
-    sale = byRef.rows[0] || null;
+  // The full pipeline lives in the shared settlement engine so the 5-minute
+  // poller (server/index.ts cron) drives the EXACT same matching + reconfirm
+  // + ledger-idempotent credit path as this webhook.
+  const { handleSogoDepositEvent } = await import("../features/personal/crypto-deposit-settlement");
+  const outcome = await handleSogoDepositEvent(tx);
+  if (outcome === "held") {
+    console.warn(`[sogo webhook] crypto deposit ${tx?.reference || ""} held — conflicting provider evidence`);
   }
-  if (!sale && address) {
-    const byAddr = await query(
-      `SELECT * FROM crypto_deposit_sales WHERE address = $1 AND status = 'processing' ORDER BY created_at ASC LIMIT 1`,
-      [address],
-    );
-    sale = byAddr.rows[0] || null;
-  }
-  if (!sale && address) {
-    // First deposit on a known address — resolve the owner and open a row.
-    const addr = await query(`SELECT * FROM crypto_deposit_addresses WHERE address = $1 LIMIT 1`, [address]);
-    if (!addr.rows.length) {
-      console.warn("[sogo webhook] deposit for unknown address:", address);
-      return;
-    }
-    const owner = addr.rows[0];
-    const wallet = await query(
-      `SELECT id, business_id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
-      [owner.user_id],
-    );
-    const insert = await query(
-      `INSERT INTO crypto_deposit_sales
-         (user_id, wallet_id, address, reference, provider, asset, network, crypto_amount, status, provider_response)
-       VALUES ($1,$2,$3,$4,'sogo',$5,$6,$7,'processing',$8::jsonb) RETURNING *`,
-      [owner.user_id, wallet.rows[0]?.id || null, address, String(tx.reference || `SO-${Date.now()}`),
-       owner.asset, owner.network, sogo.sogoAmount(tx.crypto_amount) || sogo.sogoAmount(tx.amount) || null, JSON.stringify(tx)],
-    );
-    sale = insert.rows[0];
-  }
-  if (!sale) {
-    console.warn("[sogo webhook] crypto deposit without match:", tx?.reference);
-    return;
-  }
-  if (sale.status === "completed") return; // idempotent
-
-  const gross = sogo.sogoAmount(tx?.payout_amount) || sogo.sogoAmount(tx?.net_amount) ||
-    sogo.sogoAmount(tx?.amount) || Number(sale.ngn_gross || 0);
-  const spreadPct = await getPercent("crypto_spread_percent", 1);
-  const fee = Math.round(gross * (spreadPct / 100) * 100) / 100;
-  const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
-
-  await creditUserWallet(sale.user_id, sale.wallet_id, net, `SOGO-DEP-${sale.reference}`, `Crypto deposit credit — ${sale.asset || ""} ${sale.crypto_amount || ""}`.trim());
-  await query(
-    `UPDATE crypto_deposit_sales SET status = 'completed', ngn_gross = $2, fee = $3, ngn_net = $4,
-       rate = COALESCE($5, rate), provider_response = $6::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-    [sale.id, gross, fee, net, tx?.rate ?? null, JSON.stringify(tx)],
-  );
-  try {
-    await createNotification({
-      businessId: "", userId: String(sale.user_id), type: "credit",
-      title: "Crypto deposit settled",
-      message: `₦${net.toLocaleString()} has been credited to your wallet from your ${sale.asset || "crypto"} deposit.`,
-      actionUrl: "/crypto", actionType: "view_transaction",
-      metadata: { reference: sale.reference }, isActionable: false, expiresInHours: 720,
-    });
-  } catch { /* best effort */ }
 }
 
 async function handleSogoBillPayment(tx: any) {

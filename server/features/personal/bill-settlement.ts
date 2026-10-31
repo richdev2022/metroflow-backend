@@ -5,6 +5,12 @@ import { creditPlatformWallet, creditRevenueWallet, debitRevenueWallet } from ".
 import { sendPushToUsers } from "../../services/push";
 import * as sogo from "../../services/sogo";
 import { getActiveProvider } from "./provider-routing";
+import {
+  recordBillCompletionLedger,
+  accrueBillCashback,
+  clawbackBillCashback,
+  unwindBillDiscountRevenue,
+} from "./bill-ledger";
 
 /**
  * BILL SETTLEMENT ENGINE — money-safe reconciliation for bill payments.
@@ -129,7 +135,9 @@ async function notify(bill: BillRow, title: string, message: string) {
 
 /**
  * Mark a processing bill COMPLETED (late confirmation from webhook, poll or
- * reaper). Credits admin-promo cashback when configured, idempotently.
+ * reaper). Books the provider/discount/cashback ledgers through the shared
+ * bill-ledger engine (cashback accrues to the DEDICATED cashback balance),
+ * idempotently.
  */
 export async function settleBillCompleted(bill: BillRow, providerResponse: any): Promise<boolean> {
   // Claim first — concurrent settlers lose here.
@@ -146,22 +154,17 @@ export async function settleBillCompleted(bill: BillRow, providerResponse: any):
   const amount = Number(bill.amount);
   const details = bill.details || {};
 
-  // Late cashback (admin promo) — only for rows that never got it.
+  // Vendor charge + discount margin (face − discounted → Revenue ledger).
+  const providerTx = providerResponse?.transaction ?? providerResponse;
+  await recordBillCompletionLedger(bill, providerTx);
+
+  // Late cashback (admin promo) — only for rows that never got it. Lands in
+  // the wallet's DEDICATED cashback balance.
   const cbPercent = Number(details?.cashback_percent || 0);
   if (cbPercent > 0 && bill.wallet_id && !(await hasCashbackLedger(bill.reference))) {
     const cashback = Math.round(((amount * cbPercent) / 100) * 100) / 100;
     if (cashback > 0) {
-      try {
-        await creditWallet(bill.wallet_id, cashback);
-        await insertTransaction({
-          userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
-          reference: `${bill.reference}-CB`, type: "credit", transactionType: "bill_cashback",
-          amount: cashback, currency: "NGN",
-          description: `Cashback — ${bill.category} bill payment (${cbPercent}%)`,
-        });
-      } catch (e: any) {
-        console.error(`[bill-settlement] cashback credit failed for ${bill.reference}:`, e?.message);
-      }
+      await accrueBillCashback(bill, cashback, cbPercent);
     }
   }
 
@@ -609,33 +612,20 @@ export async function reverseBillPayment(
   }
 
   // 3c. Promo cashback clawback (completed-bill reversals only): take back
-  //     what was credited IF the wallet still holds it. Best-effort.
+  //     what was credited IF the cashback balance still holds it. Best-effort.
   try {
-    const cbRow = await query(
-      `SELECT amount FROM transactions WHERE reference = $1 AND type = 'credit' LIMIT 1`,
-      [`${ref}-CB`],
-    );
-    const cb = cbRow.rows.length ? Number(cbRow.rows[0].amount) : 0;
-    if (cb > 0) {
-      const claw = await query(
-        `UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP
-          WHERE id = $2 AND balance >= $1 RETURNING id`,
-        [cb, bill.wallet_id],
-      );
-      if (claw.rows.length > 0) {
-        await insertTransaction({
-          userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
-          reference: `${ref}-CB-REVERSAL`, type: "debit", transactionType: "bill_cashback_reversal",
-          amount: cb, currency: "NGN",
-          description: `Cashback reversal — bill ${ref} was reversed`,
-        });
-      } else {
-        notes.push("cashback clawback skipped (wallet balance below cashback)");
-      }
-    }
+    await clawbackBillCashback(bill);
   } catch (e: any) {
     console.error(`[bill-settlement] cashback clawback failed for ${ref}:`, e?.message);
     notes.push("cashback clawback failed (non-fatal)");
+  }
+
+  // 3d. Discount revenue unwind: the provider's discount was booked as
+  //     revenue on completion — take it back when the bill reverses.
+  try {
+    await unwindBillDiscountRevenue(ref, bill.category);
+  } catch (e: any) {
+    console.error(`[bill-settlement] discount unwind failed for ${ref}:`, e?.message);
   }
 
   // ---- 4. Display flip: the original debit must not stay green -----------
@@ -784,6 +774,14 @@ async function askProvider(bill: BillRow): Promise<Verdict> {
     // Network/5xx/429 — an outage says nothing about this bill.
     return { kind: "unknown", transient: true, trust: "unverifiable", why: `provider unreachable (HTTP ${status || "network"})`, providerResponse: undefined };
   }
+}
+
+/**
+ * Public provider-status probe (used by the pay flow's 3-attempt background
+ * confirmation). Same verdict engine the reaper uses.
+ */
+export async function askProviderForBill(bill: BillRow): Promise<Verdict> {
+  return askProvider(bill);
 }
 
 /**

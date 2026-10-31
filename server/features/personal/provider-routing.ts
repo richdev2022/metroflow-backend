@@ -11,6 +11,7 @@ import { isBitnobConfigured } from "../../services/bitnob";
  *   bills      → sogo (default) | flutterwave | simulator
  *   giftcards  → sogo (default) | prestmit    | simulator
  *   crypto     → sogo (default) | bitnob      | simulator
+ *   rmb        → sogo (default) | simulator
  *
  * The active provider per service lives in system_settings
  * (`personal_provider_routing` JSON, admin-editable via /admin/personal/
@@ -22,30 +23,34 @@ import { isBitnobConfigured } from "../../services/bitnob";
  * `provider` field in responses.
  */
 
-export const ROUTABLE_SERVICES = ["bills", "giftcards", "crypto"] as const;
+export const ROUTABLE_SERVICES = ["bills", "giftcards", "crypto", "rmb"] as const;
 export type RoutableService = (typeof ROUTABLE_SERVICES)[number];
 
 export type BillProvider = "sogo" | "flutterwave" | "simulator";
 export type GiftcardProvider = "sogo" | "prestmit" | "simulator";
 export type CryptoProvider = "sogo" | "bitnob" | "simulator";
-export type RoutedProvider = BillProvider | GiftcardProvider | CryptoProvider;
+export type RmbProvider = "sogo" | "simulator";
+export type RoutedProvider = BillProvider | GiftcardProvider | CryptoProvider | RmbProvider;
 
 export const SERVICE_PROVIDERS: Record<RoutableService, readonly RoutedProvider[]> = {
   bills: ["sogo", "flutterwave", "simulator"],
   giftcards: ["sogo", "prestmit", "simulator"],
   crypto: ["sogo", "bitnob", "simulator"],
+  rmb: ["sogo", "simulator"],
 };
 
 const DEFAULT_PROVIDER: Record<RoutableService, RoutedProvider> = {
   bills: "sogo",
   giftcards: "sogo",
   crypto: "sogo",
+  rmb: "sogo",
 };
 
 const LABELS: Record<RoutableService, string> = {
   bills: "Bill payments",
   giftcards: "Gift card trading",
   crypto: "Crypto & stablecoins",
+  rmb: "RMB (Yuan purchases)",
 };
 
 /** Is `provider` actually usable in this deployment (env keys present)? */
@@ -136,7 +141,7 @@ export async function setActiveProvider(service: RoutableService, provider: Rout
     `INSERT INTO system_settings (key, value, description, updated_at)
      VALUES ('personal_provider_routing', $1, $2, CURRENT_TIMESTAMP)
      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
-    [JSON.stringify(parsed), "Personal provider routing — active provider per service (bills/giftcards/crypto)"],
+    [JSON.stringify(parsed), "Personal provider routing — active provider per service (bills/giftcards/crypto/rmb)"],
   );
   console.log(`[provider-routing] ${service}: ${current} -> ${provider}`);
 }

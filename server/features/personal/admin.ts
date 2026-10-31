@@ -14,6 +14,7 @@
 import express from "express";
 import { query } from "../../db";
 import { getSetting } from "../../services/app-config";
+import { getFxProvider } from "../../services/fx";
 import { logAuditEvent } from "../../services/audit";
 import { authenticateAdmin, requirePermission } from "../../middleware/adminAuth";
 import {
@@ -325,6 +326,7 @@ router.get("/config", async (_req, res) => {
                 })),
                 pricing: {
                     ...percents,
+                    fx_rates_provider: await getFxProvider(),
                     fees: feeRows,
                 },
             },
@@ -406,6 +408,20 @@ router.put("/config", async (req, res) => {
         };
         for (const [key, [fb, max]] of Object.entries(percentKeys)) {
             if (pricing[key] !== undefined) await setPercent(key, pricing[key], fb, max);
+        }
+
+        // ---- FX provider toggle (NGN <-> stablecoin conversion source) ----
+        if (pricing.fx_rates_provider !== undefined) {
+            const fxp = String(pricing.fx_rates_provider || "").toLowerCase();
+            if (!["flutterwave", "sogo", "auto"].includes(fxp)) {
+                throw new Error("fx_rates_provider must be flutterwave | sogo | auto");
+            }
+            await query(
+                `INSERT INTO system_settings (key, value, description, updated_at)
+                 VALUES ('fx_rates_provider', $1, 'FX rates source for NGN <-> stablecoin conversion (flutterwave | sogo | auto)', CURRENT_TIMESTAMP)
+                 ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+                [fxp],
+            );
         }
 
         // ---- Pricing: fee_configurations rows ----

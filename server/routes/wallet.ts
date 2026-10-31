@@ -524,7 +524,13 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         let sql = `SELECT t.*, w.currency AS wallet_currency, w.balance AS wallet_balance
                    FROM transactions t
                    LEFT JOIN wallets w ON w.id = t.wallet_id
-                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))`;
+                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))
+                     -- Fee mirror rows (ref-FEE, wallet-scoped) are NOT
+                     -- standalone history entries: the fee displays on its
+                     -- parent transaction's detail row (owner directive).
+                     -- Revenue-ledger fee rows (wallet_id IS NULL, business
+                     -- admin view above) are unaffected.
+                     AND NOT (t.transaction_type = 'fee' AND t.wallet_id IS NOT NULL)`;
         params.push(walletIds, businessId);
         let idx = params.length + 1;
 
@@ -898,15 +904,15 @@ router.post("/swap", authenticateToken, checkSubscriptionStatus, async (req: Aut
             return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
         }
 
-        // Live rate via Flutterwave (fallback provider may differ by direction)
-        const { getRate } = await import("../services/flutterwave");
+        // Live rate via the platform FX desk (admin-toggleable: Flutterwave
+        // default, Sogo fallback — see services/fx.ts).
+        const fx = await import("../services/fx");
         const fromCur = String(from.currency).toUpperCase();
         const toCur = String(to.currency).toUpperCase();
         let rate: number;
         try {
-            // NOTE: amount=1 — Flutterwave returns the converted TOTAL when an
-            // amount is supplied; the unit rate is what a swap multiplier needs.
-            rate = await getRate(fromCur, toCur, 1);
+            // NOTE: unit rate — the caller multiplies by the swap amount.
+            rate = await fx.getRate(fromCur, toCur, 1);
         } catch (e: any) {
             return res.status(503).json({ success: false, error: "Live exchange rate unavailable — try again shortly." });
         }

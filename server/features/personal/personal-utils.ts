@@ -108,6 +108,58 @@ export async function creditWallet(walletId: string, amount: number): Promise<vo
   );
 }
 
+// ---------------------------------------------------------------------------
+// CASHBACK BALANCE — a dedicated spendable balance on the wallet row.
+// Airtime/data cashback accrues here (NOT the main balance); bill payments
+// can draw it down with `use_cashback` before touching the main balance.
+// ---------------------------------------------------------------------------
+let cashbackColumnReady = false;
+
+export async function ensureCashbackColumn(): Promise<void> {
+  if (cashbackColumnReady) return;
+  await query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS cashback_balance DECIMAL(15,2) NOT NULL DEFAULT 0`);
+  cashbackColumnReady = true;
+}
+
+/** Add to the wallet's cashback balance. */
+export async function creditCashbackBalance(walletId: string, amount: number): Promise<void> {
+  if (!(amount > 0)) return;
+  await ensureCashbackColumn();
+  await query(
+    `UPDATE wallets SET cashback_balance = COALESCE(cashback_balance, 0) + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+    [amount, walletId],
+  );
+}
+
+/** Guarded debit of the cashback balance — returns the amount actually taken. */
+export async function debitCashbackBalance(walletId: string, amount: number): Promise<number> {
+  if (!(amount > 0)) return 0;
+  await ensureCashbackColumn();
+  // Atomic: the CTE snapshots the pre-update balance under the row lock the
+  // UPDATE takes, so RETURNING reports the exact applied delta even under
+  // concurrent spends.
+  const r = await query(
+    `WITH prev AS (
+       SELECT COALESCE(cashback_balance, 0) AS bal FROM wallets WHERE id = $2 FOR UPDATE
+     )
+     UPDATE wallets w
+        SET cashback_balance = GREATEST(COALESCE(w.cashback_balance, 0) - $1, 0),
+            updated_at = CURRENT_TIMESTAMP
+       FROM prev
+      WHERE w.id = $2 AND prev.bal > 0
+      RETURNING LEAST($1, prev.bal) AS taken`,
+    [amount, walletId],
+  );
+  return Math.max(0, Number(r.rows[0]?.taken || 0));
+}
+
+/** Current cashback balance of a wallet (0 when the column is missing). */
+export async function getCashbackBalance(walletId: string): Promise<number> {
+  await ensureCashbackColumn();
+  const r = await query(`SELECT COALESCE(cashback_balance, 0) AS cb FROM wallets WHERE id = $1`, [walletId]);
+  return Number(r.rows[0]?.cb || 0);
+}
+
 /**
  * Ledger row. transaction_type is feature-specific (bill, boost, market_order,
  * giftcard_sell, giftcard_buy, crypto_sale, vcard_fund, ...).

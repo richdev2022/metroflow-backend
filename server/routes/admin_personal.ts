@@ -674,6 +674,7 @@ router.put("/bill-pricing/:category", requirePermission("manage_settings"), asyn
       {
         discount_percent: req.body?.discount_percent,
         cashback_percent: req.body?.cashback_percent,
+        cashback_cap: req.body?.cashback_cap,
         enabled: req.body?.enabled,
       },
       (req as any).admin?.email || (req as any).admin?.id || null,

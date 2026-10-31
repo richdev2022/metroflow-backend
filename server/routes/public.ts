@@ -1,7 +1,7 @@
 import express from "express";
 import { query } from "../db";
 import { isMaintenanceMode, getSetting } from "../services/app-config";
-import { getPersonalServiceFlags } from "../features/personal/flags";
+import { getPersonalServiceFlags, getFeatureToggles } from "../features/personal/flags";
 import { postPublicMetricAiAsk } from "./ai";
 
 /**
@@ -187,10 +187,11 @@ router.get("/app-links", async (req, res) => {
  */
 router.get("/app-flags", async (_req, res) => {
   try {
-    const [businessEnabled, personalEnabled, serviceFlags] = await Promise.all([
+    const [businessEnabled, personalEnabled, serviceFlags, featureToggles] = await Promise.all([
       getSetting("business_app_enabled", "true"),
       getSetting("personal_app_enabled", "false"),
       getPersonalServiceFlags(),
+      getFeatureToggles(),
     ]);
     res.set("Cache-Control", "public, max-age=60");
     res.json({
@@ -202,6 +203,9 @@ router.get("/app-flags", async (_req, res) => {
         // Personal app can hide nav entries for tuned services instead of
         // waiting for a 403 on first use. Public, no PII, 60s cache.
         personal_services: serviceFlags,
+        // Admin "Coming soon" switches — feature → boolean per app. Missing
+        // key = ON. Apps show a Coming-soon modal on OFF entrances.
+        feature_toggles: featureToggles,
       },
     });
   } catch (error: any) {

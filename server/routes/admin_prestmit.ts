@@ -38,6 +38,25 @@ function unwrap(e: any): never {
   throw err;
 }
 
+/**
+ * Read endpoints NEVER 400/500 on provider or configuration problems — the
+ * deployed admin UI maps over the array fields (trades/banks/...) and a
+ * non-2xx or non-array payload used to crash the whole screen with
+ * "(intermediate value).map is not a function". Instead every read answers
+ * 200 with STABLE array fields plus explicit status flags:
+ *   configured:false            → credentials not set (empty arrays)
+ *   degraded:true + error       → provider call failed (empty arrays + hint)
+ * so the console can render an actionable banner instead of crashing.
+ */
+async function safeArray<T>(fn: () => Promise<T[]>): Promise<{ items: T[]; degraded: boolean; error: string | null }> {
+  if (!prestmit.isPrestmitConfigured()) return { items: [], degraded: false, error: null };
+  try {
+    return { items: await fn(), degraded: false, error: null };
+  } catch (e: any) {
+    return { items: [], degraded: true, error: prestmit.prestmitErr(e) };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Wallet / account
 // ---------------------------------------------------------------------------
@@ -74,31 +93,30 @@ router.get("/wallet", async (_req, res) => {
 // Banks + bank accounts
 // ---------------------------------------------------------------------------
 router.get("/banks/ng", async (_req, res) => {
-  try {
-    res.json({ success: true, banks: await prestmit.nigerianBanks() });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
-  }
+  const { items, degraded, error } = await safeArray(() => prestmit.nigerianBanks());
+  res.json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded, error, banks: items });
 });
 
 router.get("/banks/gh", async (req, res) => {
-  try {
-    res.json({ success: true, banks: await prestmit.ghanaianBanks(req.query.type ? String(req.query.type) : undefined) });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
-  }
+  const { items, degraded, error } = await safeArray(() =>
+    prestmit.ghanaianBanks(req.query.type ? String(req.query.type) : undefined),
+  );
+  res.json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded, error, banks: items });
 });
 
 router.get("/bank-accounts", async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page) || 1);
-    const [naira, cedis] = await Promise.all([
-      prestmit.nairaBankAccounts(page).catch((e) => ({ error: prestmit.prestmitErr(e) })),
-      prestmit.cedisBankAccounts(page).catch(() => null),
-    ]);
-    res.json({ success: true, data: { naira, cedis } });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
+    const configured = prestmit.isPrestmitConfigured();
+    const [naira, cedis] = configured
+      ? await Promise.all([
+          prestmit.nairaBankAccounts(page).catch((e) => ({ error: prestmit.prestmitErr(e) })),
+          prestmit.cedisBankAccounts(page).catch((e) => ({ error: prestmit.prestmitErr(e) })),
+        ])
+      : [null, null];
+    res.json({ success: true, configured, degraded: !!(naira as any)?.error, error: (naira as any)?.error || null, data: { naira, cedis } });
+  } catch (e: any) {
+    res.status(200).json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded: true, error: e?.message, data: { naira: null, cedis: null } });
   }
 });
 
@@ -134,13 +152,10 @@ router.delete("/bank-accounts/:wallet/:id", async (req, res) => {
 // Withdrawals (payouts to registered bank accounts)
 // ---------------------------------------------------------------------------
 router.get("/withdrawals", async (req, res) => {
-  try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const wallet = req.query.wallet ? (String(req.query.wallet).toUpperCase() as "NAIRA" | "CEDIS") : undefined;
-    res.json({ success: true, data: await prestmit.withdrawalHistory(page, wallet) });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
-  }
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const wallet = req.query.wallet ? (String(req.query.wallet).toUpperCase() as "NAIRA" | "CEDIS") : undefined;
+  const { items, degraded, error } = await safeArray(() => prestmit.withdrawalHistory(page, wallet) as Promise<any[]>);
+  res.json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded, error, data: { data: items } });
 });
 
 router.get("/withdrawals/:id/receipt", async (req, res) => {
@@ -165,23 +180,15 @@ router.post("/withdrawals", async (req, res) => {
 // Partner-level trade history (reconciliation)
 // ---------------------------------------------------------------------------
 router.get("/trades/sell", async (req, res) => {
-  try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const trades = await prestmit.sellHistory({ page });
-    res.json({ success: true, trades });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
-  }
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const { items, degraded, error } = await safeArray(() => prestmit.sellHistory({ page }) as Promise<any[]>);
+  res.json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded, error, trades: items });
 });
 
 router.get("/trades/buy", async (req, res) => {
-  try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const trades = await prestmit.buyHistory({ page });
-    res.json({ success: true, trades });
-  } catch (e) {
-    res.status(400).json({ success: false, error: prestmit.prestmitErr(e) });
-  }
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const { items, degraded, error } = await safeArray(() => prestmit.buyHistory({ page }) as Promise<any[]>);
+  res.json({ success: true, configured: prestmit.isPrestmitConfigured(), degraded, error, trades: items });
 });
 
 // ---------------------------------------------------------------------------

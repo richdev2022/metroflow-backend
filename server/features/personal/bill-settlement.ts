@@ -10,6 +10,8 @@ import {
   accrueBillCashback,
   clawbackBillCashback,
   unwindBillDiscountRevenue,
+  fundBillCashbackFromRevenue,
+  unwindBillCashbackRevenueFunding,
 } from "./bill-ledger";
 
 /**
@@ -159,7 +161,9 @@ export async function settleBillCompleted(bill: BillRow, providerResponse: any):
   await recordBillCompletionLedger(bill, providerTx);
 
   // Late cashback (admin promo) — only for rows that never got it. Lands in
-  // the wallet's DEDICATED cashback balance.
+  // the wallet's DEDICATED cashback balance, and is REVENUE-FUNDED: the exact
+  // amount is debited from the Platform Revenue ledger immediately after the
+  // provider's commission/discount from this webhook was credited there.
   const cbPercent = Number(details?.cashback_percent || 0);
   if (cbPercent > 0 && bill.wallet_id && !(await hasCashbackLedger(bill.reference))) {
     const cashback = Math.round(((amount * cbPercent) / 100) * 100) / 100;
@@ -307,6 +311,10 @@ export async function correctWrongRefund(
     );
     const cb = cbReversed.rows.length ? Number(cbReversed.rows[0].amount) : 0;
     if (cb > 0 && bill.wallet_id) {
+      // The restore is REVENUE-FUNDED like any other cashback accrual: the
+      // funding was given back to the Revenue ledger during the reversal's
+      // unwind, so re-debit it now that the cashback is going back.
+      await fundBillCashbackFromRevenue(bill, cb);
       await creditWallet(bill.wallet_id, cb);
       await insertTransaction({
         userId: bill.user_id, businessId: bill.business_id, walletId: bill.wallet_id,
@@ -613,11 +621,18 @@ export async function reverseBillPayment(
 
   // 3c. Promo cashback clawback (completed-bill reversals only): take back
   //     what was credited IF the cashback balance still holds it. Best-effort.
+  //     The Revenue-ledger funding that paid for that cashback is returned
+  //     right after — revenue paid for it, so revenue gets it back.
   try {
     await clawbackBillCashback(bill);
   } catch (e: any) {
     console.error(`[bill-settlement] cashback clawback failed for ${ref}:`, e?.message);
     notes.push("cashback clawback failed (non-fatal)");
+  }
+  try {
+    await unwindBillCashbackRevenueFunding(ref, bill.category);
+  } catch (e: any) {
+    console.error(`[bill-settlement] cashback funding unwind failed for ${ref}:`, e?.message);
   }
 
   // 3d. Discount revenue unwind: the provider's discount was booked as

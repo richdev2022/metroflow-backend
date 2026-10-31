@@ -6,6 +6,7 @@ import {
   assertPersonalService, genRef, requirePersonalKyc, verifyTransactionPin,
 } from "../personal-utils";
 import { getPercent } from "../flags";
+import { getActiveProvider } from "../provider-routing";
 import { creditRevenueWallet } from "../../../services/fees";
 import { createNotification } from "../../../services/notifications";
 import { upload } from "../../../middleware/upload";
@@ -98,11 +99,12 @@ async function rmbFeePercent(): Promise<number> {
 }
 
 router.get("/status", authenticateToken, async (_req, res) => {
-  const live = sogo.isSogoConfigured();
+  const provider = await getActiveProvider("rmb");
+  const live = provider === "sogo";
   res.json({
     success: true,
     data: {
-      provider: live ? "sogo" : "simulator",
+      provider,
       provider_label: live ? "Sogo" : "Sandbox mode",
       sogo: sogo.sandboxInfo(),
       fee_percent: await rmbFeePercent(),
@@ -114,7 +116,7 @@ router.get("/status", authenticateToken, async (_req, res) => {
 router.get("/rates", authenticateToken, checkSubscriptionStatus, async (_req, res) => {
   try {
     if (!(await assertPersonalService(res, "rmb" as any))) return;
-    const live = sogo.isSogoConfigured();
+    const live = (await getActiveProvider("rmb")) === "sogo";
     if (live) {
       const rates = await sogo.rmbRates();
       return res.json({ success: true, provider: "sogo", rates });
@@ -153,7 +155,7 @@ router.post("/calculate", authenticateToken, checkSubscriptionStatus, async (req
     if (!["alipay", "wechat", "bank"].includes(channel) || !(rmbAmount > 0)) {
       return res.status(400).json({ success: false, error: "channel (alipay/wechat/bank) and a positive rmb_amount are required" });
     }
-    const provider = sogo.isSogoConfigured() ? "sogo" : "simulator";
+    const provider = (await getActiveProvider("rmb")) === "sogo" ? "sogo" : "simulator";
     let rate = 0;
     if (provider === "sogo") {
       const rates = await sogo.rmbRates();
@@ -231,7 +233,7 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       return res.status(400).json({ success: false, error: "RMB purchases are charged in NGN — use your Naira wallet." });
     }
 
-    const provider = sogo.isSogoConfigured() ? "sogo" : "simulator";
+    const provider = (await getActiveProvider("rmb")) === "sogo" ? "sogo" : "simulator";
     let rate = 0;
     if (provider === "sogo") {
       const rates = await sogo.rmbRates();

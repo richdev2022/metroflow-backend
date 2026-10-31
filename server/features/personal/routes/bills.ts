@@ -4,6 +4,7 @@ import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
   assertPersonalService, genRef, requirePersonalKyc, verifyTransactionPin,
+  creditCashbackBalance, debitCashbackBalance, getCashbackBalance,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { createNotification } from "../../../services/notifications";
@@ -13,6 +14,7 @@ import * as flwBills from "../flutterwave-bills";
 import { getActiveProvider, providerLabel } from "../provider-routing";
 import { getBillPricingRule, applyBillPricing, round2, getBillPricingMap, BILL_CATEGORIES } from "../bill-pricing";
 import { sweepUserBills } from "../bill-settlement";
+import { holdVendorForBill, recordBillCompletionLedger, accrueBillCashback } from "../bill-ledger";
 
 /**
  * BILLS HUB — UNIFIED multi-provider bill payments (MetriCorex Personal).
@@ -126,6 +128,59 @@ async function billFee(): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 3-ATTEMPT BACKGROUND CONFIRMATION (TSQ)
+// ---------------------------------------------------------------------------
+// When the provider answers a purchase with processing/pending, the user
+// STILL sees the success page — we keep verifying in the background:
+//   attempt 1 at ~8s, attempt 2 at ~25s, attempt 3 at ~60s.
+// Each attempt queries the provider (same engine the reaper uses):
+//   completed → settleBillCompleted (cashback + vendor/discount ledgers)
+//   failed/refunded/cancelled → refundBillRow (money back)
+// If all 3 attempts are inconclusive, the row legitimately stays
+// 'processing' and the 5-minute reaper + webhook keep watching it.
+const billConfirmTimers = new Set<NodeJS.Timeout>();
+
+function scheduleBillConfirmation(
+  billId: string,
+  reference: string,
+  providerRef: string | null,
+  category: string,
+  amount: number,
+): void {
+  const delays = [8_000, 25_000, 60_000];
+  const runAttempt = async (attempt: number) => {
+    try {
+      const row = await query(`SELECT * FROM bill_transactions WHERE id = $1 LIMIT 1`, [billId]);
+      const bill = row.rows[0];
+      if (!bill || bill.status !== "processing") return; // already settled elsewhere
+      const { settleBillCompleted, refundBillRow, askProviderForBill } = await import("../bill-settlement");
+      const verdict = await askProviderForBill(bill);
+      if (verdict.kind === "completed") {
+        await settleBillCompleted(bill, verdict.providerResponse);
+        console.log(`[bills] confirmation attempt ${attempt}: ${reference} COMPLETED`);
+      } else if (verdict.kind === "failed") {
+        await refundBillRow(bill, verdict.reason, verdict.providerResponse);
+        console.log(`[bills] confirmation attempt ${attempt}: ${reference} FAILED — refunded`);
+      } else if (attempt >= delays.length) {
+        console.log(`[bills] confirmation exhausted for ${reference} — staying processing for reaper/webhook`);
+      } else {
+        console.log(`[bills] confirmation attempt ${attempt}: ${reference} still ${verdict.kind}`);
+      }
+    } catch (e: any) {
+      console.error(`[bills] confirmation attempt ${attempt} failed for ${reference}:`, e?.message);
+    }
+  };
+  delays.forEach((ms, idx) => {
+    const t = setTimeout(() => {
+      billConfirmTimers.delete(t);
+      void runAttempt(idx + 1);
+    }, ms);
+    billConfirmTimers.add(t);
+    t.unref?.();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +341,71 @@ router.get("/pricing", authenticateToken, checkSubscriptionStatus, async (_req, 
   }
 });
 
+// ---------------------------------------------------------------------------
+// CASHBACK — balance, live preview and rules for the Airtime/Data screens.
+// ---------------------------------------------------------------------------
+// GET /bills/cashback            → my cashback balance + per-category rules
+// GET /bills/cashback/preview?category=airtime&amount=500
+//                                → exact cashback this purchase would earn
+router.get("/cashback", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const wallets = await query(
+      `SELECT id, COALESCE(cashback_balance, 0) AS cashback_balance FROM wallets
+        WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+        ORDER BY created_at ASC LIMIT 1`,
+      [userId],
+    );
+    const rules = await getBillPricingMap();
+    const activeRules = Object.fromEntries(
+      Object.entries(rules).filter(([, r]) => r.enabled && (r.cashback_percent > 0 || r.discount_percent > 0)),
+    );
+    return res.json({
+      success: true,
+      data: {
+        cashback_balance: Number(wallets.rows[0]?.cashback_balance || 0),
+        currency: "NGN",
+        rules: activeRules,
+      },
+    });
+  } catch (e: any) {
+    console.error("[bills] cashback summary error:", e?.message);
+    return res.json({ success: true, data: { cashback_balance: 0, currency: "NGN", rules: {} } });
+  }
+});
+
+router.get("/cashback/preview", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const category = String(req.query.category || "").toLowerCase();
+    const amount = Number(req.query.amount);
+    if (!BILL_CATEGORIES.includes(category as any)) {
+      return res.status(400).json({ success: false, error: `category must be one of: ${BILL_CATEGORIES.join(", ")}` });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "amount must be a positive number" });
+    }
+    const rule = await getBillPricingRule(category);
+    const pricing = applyBillPricing(amount, await billFee(), rule);
+    return res.json({
+      success: true,
+      data: {
+        category,
+        amount: round2(amount),
+        cashback: pricing.cashback,
+        cashback_percent: rule?.enabled ? Number(rule.cashback_percent) || 0 : 0,
+        cashback_cap: rule?.enabled ? Number(rule.cashback_cap) || 0 : 0,
+        discount: pricing.discount,
+        fee: await billFee(),
+        total: pricing.total,
+        currency: "NGN",
+      },
+    });
+  } catch (e: any) {
+    console.error("[bills] cashback preview error:", e?.message);
+    return res.status(500).json({ success: false, error: "Could not compute cashback preview" });
+  }
+});
+
 router.get("/epin-stock", authenticateToken, checkSubscriptionStatus, async (_req, res) => {
   try {
     const provider = await getActiveProvider("bills");
@@ -432,9 +552,17 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         providerSlug = String(b.network || "").trim().toLowerCase();
         customerRef = String(b.phone || "").trim();
         details.variation_code = String(b.variation_code || "").trim();
+        amount = Math.round(Number(b.amount) * 100) / 100;
+        if (b.plan_name) details.plan_name = String(b.plan_name).slice(0, 120);
         if (b.ported === true) details.ported = true;
         if (!providerSlug || !customerRef || !details.variation_code) {
           return res.status(400).json({ success: false, error: "network, phone and variation_code are required" });
+        }
+        if (!(amount > 0)) {
+          // PRODUCTION BUG FIX: data purchases used to dispatch with amount 0 —
+          // the user was never debited while the provider still fulfilled the
+          // plan (₦50 airtel data, Oct-31). The plan's price is MANDATORY.
+          return res.status(400).json({ success: false, error: "amount is required — select a data plan first" });
         }
         break;
       }
@@ -510,8 +638,11 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     // ---- Wallet (NGN) + guarded debit ------------------------------------
     // Empty-string wallet_id used to reach getOwnedWallet as "" → Postgres
     // uuid cast error → 500 before any fallback could run. Normalize here.
+    // NOTE: assigns the HOISTED handler-level `wallet` — the old `let wallet`
+    // shadow inside this try block left the catch-block money-recovery blind
+    // (it saw wallet === null and never refunded a stranded debit).
     const requestedWalletId = String(b.wallet_id || "").trim();
-    let wallet = requestedWalletId
+    wallet = requestedWalletId
       ? await getOwnedWallet(requestedWalletId, userId, businessId)
       : null;
     if (!wallet) {
@@ -546,28 +677,45 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     // 'processing'. If the credit throws, failure_reason is marked so the
     // bill-settlement reaper retries the credit until the -REFUND ledger row
     // exists (recoverMissedRefunds / sweepUserBills).
+    // The whole body is guarded: a transient DB blip inside fail() used to
+    // bubble into the handler catch and return a bare 500 AFTER the provider
+    // had already accepted the order (Log 89f5e37b) — the reaper then had to
+    // pick up the pieces. Fail() failures are logged and survived instead.
     const fail = async (status: string, message: string, refund = false) => {
-      await query(
-        `UPDATE bill_transactions SET status = $2, failure_reason = $3, provider = $4,
-           provider_response = $5::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND status = 'processing'`,
-        [billId, status, String(message).slice(0, 500), provider, JSON.stringify(refund ? { refund_pending: refund } : {})],
-      );
-      if (refund) {
-        try {
-          await creditWallet((wallet as any).id, total);
-          await insertTransaction({
-            userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
-            reference: `${reference}-REFUND`, type: "credit", transactionType: "bill_refund",
-            amount: total, currency: "NGN", description: `Refund — bill payment failed (${category})`,
-          });
-        } catch (refundErr: any) {
-          console.error("[bills] fail() refund credit failed — reaper will retry:", refundErr?.message);
-          await query(
-            `UPDATE bill_transactions SET failure_reason = failure_reason || ' (AUTO-REFUND PENDING)' WHERE id = $1`,
-            [billId],
-          );
+      try {
+        await query(
+          `UPDATE bill_transactions SET status = $2, failure_reason = $3, provider = $4,
+             provider_response = $5::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 AND status = 'processing'`,
+          [billId, status, String(message).slice(0, 500), provider, JSON.stringify(refund ? { refund_pending: refund } : {})],
+        );
+        if (refund && (wallet as any)?.id) {
+          try {
+            // Give back whatever the customer actually paid (cashback part
+            // returns to the cashback balance, the rest to the main balance).
+            const cashbackUsed = Number(details.cashback_used || 0);
+            if (cashbackUsed > 0) {
+              await creditCashbackBalance((wallet as any).id, cashbackUsed);
+            }
+            const mainRefund = Math.max(0, Math.round((total - cashbackUsed) * 100) / 100);
+            if (mainRefund > 0) await creditWallet((wallet as any).id, mainRefund);
+            await insertTransaction({
+              userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
+              reference: `${reference}-REFUND`, type: "credit", transactionType: "bill_refund",
+              amount: total, currency: "NGN", description: `Refund — bill payment failed (${category})`,
+            });
+          } catch (refundErr: any) {
+            console.error("[bills] fail() refund credit failed — reaper will retry:", refundErr?.message);
+            await query(
+              `UPDATE bill_transactions SET failure_reason = failure_reason || ' (AUTO-REFUND PENDING)' WHERE id = $1`,
+              [billId],
+            ).catch(() => {});
+          }
         }
+      } catch (failErr: any) {
+        // Never let a settlement write fail the request — the reaper/webhook
+        // will still reconcile this row (it is the same engine).
+        console.error("[bills] fail() status write failed (reaper will reconcile):", failErr?.message);
       }
     };
 
@@ -575,30 +723,60 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     const provider = await getActiveProvider("bills");
     await query(`UPDATE bill_transactions SET provider = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [billId, provider]);
 
-    const debitOk = await debitWallet((wallet as any).id, total);
+    // PAY FROM CASHBACK: when use_cashback is set, draw the cashback balance
+    // FIRST and only debit the main wallet for the remainder — the platform
+    // always holds the full `total` before the provider is called.
+    const useCashback = req.body?.use_cashback === true || req.body?.use_cashback === "true";
+    let cashbackUsed = 0;
+    let mainDebit = total;
+    if (useCashback && total > 0) {
+      cashbackUsed = await debitCashbackBalance((wallet as any).id, total);
+      mainDebit = Math.max(0, Math.round((total - cashbackUsed) * 100) / 100);
+      if (cashbackUsed > 0) {
+        details.cashback_used = cashbackUsed;
+        // MONEY SAFETY: persist the cashback split IMMEDIATELY — before the
+        // main debit, ledger insert and provider dispatch. If the process
+        // dies anywhere in the next steps, every refund path (fail(), catch
+        // recovery, reaper) reads details.cashback_used from the DB row; a
+        // lost split used to refund `total` to the main balance while the
+        // cashback balance had already been drawn down.
+        await query(
+          `UPDATE bill_transactions SET details = $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [billId, JSON.stringify(details)],
+        ).catch(() => {});
+      }
+    }
+
+    const debitOk = mainDebit === 0 || (await debitWallet((wallet as any).id, mainDebit));
     if (!debitOk) {
+      // Restore the cashback we tried to take — nothing has happened yet.
+      if (cashbackUsed > 0) await creditCashbackBalance((wallet as any).id, cashbackUsed).catch(() => {});
       await fail("failed", "Insufficient wallet balance");
       return res.status(400).json({
         success: false, code: "INSUFFICIENT_BALANCE",
-        error: `You need ₦${total.toLocaleString()} for this bill (₦${amount.toLocaleString()}${pricing.discount > 0 ? ` - ₦${pricing.discount.toLocaleString()} discount` : ""} + ₦${fee.toLocaleString()} fee).`,
+        error: `You need ₦${total.toLocaleString()} for this bill (₦${amount.toLocaleString()}${pricing.discount > 0 ? ` - ₦${pricing.discount.toLocaleString()} discount` : ""} + ₦${fee.toLocaleString()} fee)${cashbackUsed > 0 ? ` — your cashback balance covered ₦${cashbackUsed.toLocaleString()}` : ""}.`,
       });
     }
-    // MONEY SAFETY: the wallet is now debited. The ledger insert MUST never be
-    // the reason money vanishes — if it fails, refund immediately instead of
-    // bubbling a 500 with the debit stranded (the "debited but no history"
-    // production bug).
+    // MONEY SAFETY: the wallet is now debited (cashback + main). The ledger
+    // insert MUST never be the reason money vanishes — if it fails, refund
+    // immediately instead of bubbling a 500 with the debit stranded.
     try {
       await insertTransaction({
         userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
         reference, type: "debit", transactionType: "bill",
         amount: total, currency: "NGN", fee,
-        description: `Bill payment — ${category}${providerSlug ? ` (${providerSlug.toUpperCase()})` : ""}${customerRef ? ` — ${customerRef}` : ""}`,
+        description: `Bill payment — ${category}${providerSlug ? ` (${providerSlug.toUpperCase()})` : ""}${customerRef ? ` — ${customerRef}` : ""}${cashbackUsed > 0 ? ` (₦${cashbackUsed.toLocaleString()} cashback used)` : ""}`,
       });
     } catch (ledgerErr: any) {
       console.error("[bills] debit ledger insert failed — refunding:", ledgerErr?.message);
       await fail("failed", "Could not record the bill payment — refunded", true);
       return res.status(500).json({ success: false, error: "Could not complete the bill payment — your wallet has been refunded." });
     }
+
+    // MONEY SAFETY (owner rule): secure the platform's own funds BEFORE the
+    // provider consumes float — the operational wallet is debited the face
+    // value now; the settlement engine releases/reconciles it on the outcome.
+    await holdVendorForBill(reference, amount, category);
 
     let status = "completed";
     let providerRef: string | null = null;
@@ -700,23 +878,27 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       await creditRevenueWallet(fee, "NGN", reference, "Bill payment convenience fee", "bills").catch(() => {});
     }
 
-    // CASHBACK (admin-set promotions): credit X% of the face value back to
-    // the paying wallet with its own ledger entry. Best-effort — a failed
-    // cashback must never fail an already-completed bill payment; the row's
-    // details keep the rule so support can replay it manually.
+    // PROVIDER LEDGER: book the vendor's discounted charge + the margin the
+    // platform made (face − discounted → Revenue ledger) + accrue promo
+    // cashback into the DEDICATED cashback balance. All idempotent.
+    if (status === "completed") {
+      await recordBillCompletionLedger(
+        { reference, category, amount, user_id: userId, business_id: (wallet as any).business_id, wallet_id: (wallet as any).id },
+        providerResponse?.transaction ?? providerResponse,
+      );
+    }
+
+    // CASHBACK (admin-set promotions): credit X% of the face value (capped)
+    // into the wallet's cashback balance with its own ledger entry.
+    // Best-effort — a failed cashback must never fail an already-completed
+    // bill payment; the row's details keep the rule so support can replay it.
     if (status === "completed" && pricing.cashback > 0) {
-      try {
-        await creditWallet((wallet as any).id, pricing.cashback);
-        await insertTransaction({
-          userId, businessId: (wallet as any).business_id, walletId: (wallet as any).id,
-          reference: `${reference}-CB`, type: "credit", transactionType: "bill_cashback",
-          amount: pricing.cashback, currency: "NGN",
-          description: `Cashback — ${category} bill payment (${pricingRule?.cashback_percent ?? 0}%)`,
-        });
-        details.cashback_amount = pricing.cashback;
-      } catch (cbErr: any) {
-        console.error("[bills] cashback credit failed:", cbErr?.message);
-      }
+      const ok = await accrueBillCashback(
+        { reference, category, amount, user_id: userId, business_id: (wallet as any).business_id, wallet_id: (wallet as any).id },
+        pricing.cashback,
+        pricingRule?.cashback_percent ?? 0,
+      );
+      if (ok) details.cashback_amount = pricing.cashback;
     }
 
     // MONEY SAFETY: this UPDATE is the settlement moment. A client-side
@@ -742,7 +924,8 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         updated = re as { rows: any[] }; // committed server-side after all — respond normally
       } else {
         // Genuinely unsettled: the provider call already went out, so the
-        // webhook / settlement engine will land the outcome. Never 500-refund here.
+        // webhook / settlement engine / background confirmation will land the
+        // outcome. Never 500-refund here.
         return res.status(202).json({
           success: true,
           pending: true,
@@ -771,12 +954,20 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       }).catch(() => {});
     }
 
+    // PROVIDER-SAYS-PROCESSING → 3-ATTEMPT CONFIRMATION: show the success
+    // page immediately; the webhook OR these background TSQ retries resolve
+    // the true outcome. Only after all three fail does the row legitimately
+    // stay 'processing' for the user to re-confirm (history/sync/reaper).
+    if (status !== "completed") {
+      scheduleBillConfirmation(billId!, reference, providerRef, category, amount);
+    }
+
     return res.status(201).json({
       success: true,
       provider,
       message: status === "completed"
         ? "Bill payment successful"
-        : "Payment received — the provider is fulfilling this bill. Track it in your history.",
+        : "Payment received — we are confirming your bill with the provider right now. You will get an update any moment.",
       data: { transaction: publicRow(updated.rows[0]) },
     });
   } catch (e: any) {
@@ -884,14 +1075,20 @@ router.get("/transactions/:reference", authenticateToken, checkSubscriptionStatu
     const tx = rows.rows[0];
 
     // Poll the provider for unsettled transactions (live only — sandbox does
-    // not persist transactions and always 404s here).
+    // not persist transactions and always 404s here). MONEY SAFETY: a status
+    // flip discovered here MUST move money through the settlement engine —
+    // the old inline UPDATE flipped the status without booking the
+    // vendor/discount/cashback ledgers or refunding a failed bill, so a
+    // failed bill looked "failed" to the user while the debit stayed stranded.
     if (tx.status === "processing" && tx.provider === "sogo" && !sogo.isSogoSandbox()) {
       try {
-        const remote = await sogo.getTransaction(tx.reference);
-        const mapped = normalizeStatus(sogo.sogoStatus(remote?.transaction || remote));
-        if (mapped !== tx.status) {
-          const upd = await query(`UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`, [tx.id, mapped, JSON.stringify(remote)]);
-          return res.json({ success: true, data: { transaction: publicRow(upd.rows[0]) } });
+        const remote = await sogo.getTransaction(tx.provider_reference || tx.reference);
+        const remoteTx = remote?.transaction || remote;
+        const mapped = normalizeStatus(sogo.sogoStatus(remoteTx));
+        if (mapped && mapped !== tx.status) {
+          const settled = await settleFromProviderReport(tx, mapped, remote);
+          const re = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
+          return res.json({ success: true, data: { transaction: publicRow(re.rows[0] || tx), updated: settled } });
         }
       } catch { /* keep local state */ }
     }
@@ -916,45 +1113,62 @@ router.post("/transactions/:reference/sync", authenticateToken, checkSubscriptio
     if (!remote) return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
 
     const mapped = normalizeStatus(sogo.sogoStatus(remote?.transaction || remote));
-    if (mapped !== tx.status) {
-      // Provider-side refunds/failures must return the money we debited —
-      // through the settlement engine ONLY. The previous inline
-      // creditWallet-then-insertTransaction block could DOUBLE-CREDIT: the
-      // wallet credit ran before the ledger check, and there was no status
-      // guard, so a concurrent reaper refund (or a provider 'failed' report
-      // landing on an already-'refunded' row) credited the wallet a second
-      // time before the duplicate-reference insert threw.
-      if (["refunded", "failed", "cancelled"].includes(mapped)) {
-        const engine = await import("../bill-settlement");
-        if (tx.status === "completed") {
-          // The provider failed a bill we had marked completed — provider
-          // evidence, so the completed row may be reversed.
-          await engine.reverseBillPayment(
-            tx as any,
-            `Provider reported: ${mapped}`,
-            { providerResponse: remote, skipProviderCheck: true, providerReportedFailure: true },
-          );
-        } else {
-          await engine.refundBillRow(tx as any, `Provider reported: ${mapped}`, remote);
-        }
-      }
-      const upd = await query(
-        `UPDATE bill_transactions SET status = $2, provider_response = $3::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> 'refunded' RETURNING *`,
-        [tx.id, mapped, JSON.stringify(remote)],
-      );
-      // The engine may have already claimed the row to 'refunded' — re-read
-      // instead of echoing the stale pre-sync status.
-      let row = upd.rows[0];
-      if (!row) {
-        const reread = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
-        row = reread.rows[0] || tx;
-      }
-      return res.json({ success: true, data: { transaction: publicRow(row), updated: true } });
+    if (mapped && mapped !== tx.status) {
+      const settled = await settleFromProviderReport(tx, mapped, remote);
+      // The engine may have already claimed the row (e.g. to 'refunded') —
+      // re-read instead of echoing the stale pre-sync status.
+      const reread = await query(`SELECT * FROM bill_transactions WHERE id = $1`, [tx.id]);
+      const row = reread.rows[0] || tx;
+      return res.json({ success: true, data: { transaction: publicRow(row), updated: settled } });
     }
     return res.json({ success: true, data: { transaction: publicRow(tx), updated: false } });
   } catch (e: any) {
     return res.status(502).json({ success: false, error: userSafeErr(sogo.sogoErr(e)) });
   }
 });
+
+/**
+ * SHARED SETTLEMENT ROUTER — every path that discovers the provider's verdict
+ * (user poll, user sync, webhook, reaper) lands here so money ALWAYS moves
+ * through the same idempotent engine:
+ *   completed            → settleBillCompleted (vendor true-up, discount
+ *                          revenue, late promo cashback) while 'processing';
+ *                          correctWrongRefund for rows already refunded/failed
+ *   failed/refunded/cxl  → refundBillRow, or reverseBillPayment when the row
+ *                          had already been marked completed
+ * Returns true when the row actually settled (vs. racing another settler).
+ */
+async function settleFromProviderReport(tx: any, mapped: string, remote: any): Promise<boolean> {
+  const engine = await import("../bill-settlement");
+  const remoteTx = remote?.transaction || remote;
+  if (mapped === "completed") {
+    if (tx.status === "processing") {
+      // Claim-claim: settleBillCompleted is idempotent (status = 'processing'
+      // guard) and books ALL completion ledgers; false just means another
+      // settler won the race.
+      return engine.settleBillCompleted(tx as any, remote);
+    }
+    // A refunded/failed/cancelled row the provider later completed — the
+    // refund-correction engine re-debits idempotently (wallet permitting).
+    await engine.correctWrongRefund(tx as any, remote);
+    return true;
+  }
+  if (["refunded", "failed", "cancelled"].includes(mapped)) {
+    if (tx.status === "completed") {
+      // The provider failed a bill we had marked completed — provider
+      // evidence, so the completed row may be reversed.
+      await engine.reverseBillPayment(
+        tx as any,
+        `Provider reported: ${mapped}`,
+        { providerResponse: remote, skipProviderCheck: true, providerReportedFailure: true },
+      );
+      return true;
+    }
+    await engine.refundBillRow(tx as any, `Provider reported: ${mapped}`, remoteTx);
+    return true;
+  }
+  // processing/pending → nothing to settle.
+  return false;
+}
 
 export default router;

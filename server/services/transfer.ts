@@ -1109,8 +1109,8 @@ export async function processAllPending(businessId: string | null) {
           if (existingTxn.rows.length === 0) {
             await query(
               `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')
+               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)
                ON CONFLICT (reference) DO NOTHING`,
               [
                   transfer.business_id, 
@@ -1118,15 +1118,16 @@ export async function processAllPending(businessId: string | null) {
                   transfer.currency || 'NGN', 
                   transfer.reference, 
                   `Transfer to ${transfer.recipient_name || 'Account'}`,
-                  transfer.wallet_id
+                  transfer.wallet_id,
+                  fee
               ]
             );
           } else {
             await query(
               `UPDATE transactions 
-               SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+               SET status = 'success', fee = $2, updated_at = CURRENT_TIMESTAMP 
                WHERE id = $1`,
-              [existingTxn.rows[0].id]
+              [existingTxn.rows[0].id, fee]
             );
           }
 
@@ -1476,23 +1477,24 @@ export async function processTransfer(transferId: string) {
         if (existingTxn.rows.length === 0) {
           await query(
             `INSERT INTO transactions 
-             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-             VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')`,
+             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+             VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)`,
             [
                 transfer.business_id, 
                 amount, 
                 transfer.currency || 'NGN', 
                 transfer.reference, 
                 `Transfer to ${transfer.recipient_name || 'Account'}`,
-                transfer.wallet_id
+                transfer.wallet_id,
+                fee
             ]
           );
         } else {
           await query(
             `UPDATE transactions 
-             SET status = 'success', updated_at = CURRENT_TIMESTAMP 
+             SET status = 'success', fee = $2, updated_at = CURRENT_TIMESTAMP 
              WHERE id = $1`,
-            [existingTxn.rows[0].id]
+            [existingTxn.rows[0].id, fee]
           );
         }
 

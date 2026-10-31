@@ -20,7 +20,6 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
 // const __dirname = path.dirname(__filename);
 
 
-import { handleDemo } from "./routes/demo";
   // PERSONAL APP — routes + routers (mounted below)
   import personalAuthRouter, { registerPersonal, mintSsoTicket, redeemSsoTicket } from "./features/personal/routes/auth";
   import personalSocialRouter from "./features/personal/routes/social";
@@ -32,7 +31,6 @@ import { handleDemo } from "./routes/demo";
   import personalCryptoRouter from "./features/personal/routes/crypto";
   import personalVirtualcardsRouter from "./features/personal/routes/virtualcards";
   import personalEsimRouter from "./features/personal/routes/esim";
-  import billsPersonalRouter from "./features/personal/bills";
   import billsUnifiedRouter from "./features/personal/routes/bills";
   import personalRmbRouter from "./features/personal/routes/rmb";
   import { sogoWebhookHandler } from "./routes/personal-webhooks";
@@ -430,6 +428,19 @@ export async function createServer() {
       } catch (error: any) {
         logger.error("Sogo giftcard sync cron error:", error?.message);
       }
+      // Sogo crypto deposit reconciliation: a missed webhook can no longer
+      // strand a funded deposit in 'processing' — the poller ASKS the provider
+      // (by reference / on-chain tx hash), settles completions, and expires
+      // never-confirmed claims after 24h. Same engine as the webhook.
+      try {
+        const { reconcilePendingCryptoDeposits } = await import("./features/personal/crypto-deposit-settlement");
+        const settledDeposits = await reconcilePendingCryptoDeposits(25);
+        if (settledDeposits > 0) {
+          logger.info(`[crypto] deposit poller reconciled ${settledDeposits} pending deposit(s)`);
+        }
+      } catch (error: any) {
+        logger.error("Crypto deposit poller error:", error?.message);
+      }
     });
   }
 
@@ -754,7 +765,7 @@ export async function createServer() {
     // deploys stay green, and /health reports its own degraded/db:"down"
     // state with HTTP 200 while initialization is still running.
     const p = req.path.replace(/^\/api(?=\/|$)/, "");
-    if (p === '/' || p === '/ping' || p === '/demo' || p === '/health') return next();
+    if (p === '/' || p === '/ping' || p === '/health') return next();
 
     if (!isDbReady) {
       // Allow pre-flight requests to pass through
@@ -905,7 +916,6 @@ export async function createServer() {
     }
   });
 
-  mainRouter.get("/demo", handleDemo);
 
   // Auth API routes
   mainRouter.post("/auth/register", registerBusiness);

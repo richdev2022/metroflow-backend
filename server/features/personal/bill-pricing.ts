@@ -24,6 +24,8 @@ export interface BillPricingRule {
   category: string;
   discount_percent: number;
   cashback_percent: number;
+  /** Maximum cashback payable per single bill (₦) — caps the percentage calc. */
+  cashback_cap: number;
   enabled: boolean;
 }
 
@@ -41,24 +43,27 @@ export async function ensureBillPricingSchema(): Promise<void> {
       category VARCHAR(24) NOT NULL UNIQUE,
       discount_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
       cashback_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
+      cashback_cap DECIMAL(15,2) NOT NULL DEFAULT 0,
       enabled BOOLEAN NOT NULL DEFAULT true,
       updated_by VARCHAR(255),
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await query(`ALTER TABLE bill_pricing_rules ADD COLUMN IF NOT EXISTS cashback_cap DECIMAL(15,2) NOT NULL DEFAULT 0`);
   schemaReady = true;
 }
 
 export async function getAllBillPricingRules(): Promise<BillPricingRule[]> {
   await ensureBillPricingSchema();
   const res = await query(
-    `SELECT category, discount_percent, cashback_percent, enabled
+    `SELECT category, discount_percent, cashback_percent, cashback_cap, enabled
        FROM bill_pricing_rules ORDER BY category ASC`,
   );
   return res.rows.map((r: any) => ({
     category: String(r.category),
     discount_percent: Number(r.discount_percent) || 0,
     cashback_percent: Number(r.cashback_percent) || 0,
+    cashback_cap: Number(r.cashback_cap) || 0,
     enabled: r.enabled !== false,
   }));
 }
@@ -74,7 +79,7 @@ export async function getBillPricingMap(): Promise<Record<string, BillPricingRul
 export async function getBillPricingRule(category: string): Promise<BillPricingRule | null> {
   await ensureBillPricingSchema();
   const res = await query(
-    `SELECT category, discount_percent, cashback_percent, enabled
+    `SELECT category, discount_percent, cashback_percent, cashback_cap, enabled
        FROM bill_pricing_rules WHERE category = $1 LIMIT 1`,
     [String(category).toLowerCase()],
   );
@@ -84,6 +89,7 @@ export async function getBillPricingRule(category: string): Promise<BillPricingR
     category: String(r.category),
     discount_percent: Number(r.discount_percent) || 0,
     cashback_percent: Number(r.cashback_percent) || 0,
+    cashback_cap: Number(r.cashback_cap) || 0,
     enabled: r.enabled !== false,
   };
 }
@@ -96,7 +102,7 @@ const clampPct = (v: unknown, max: number): number => {
 
 export async function upsertBillPricingRule(
   category: string,
-  payload: { discount_percent?: unknown; cashback_percent?: unknown; enabled?: unknown },
+  payload: { discount_percent?: unknown; cashback_percent?: unknown; cashback_cap?: unknown; enabled?: unknown },
   updatedBy?: string | null,
 ): Promise<BillPricingRule> {
   await ensureBillPricingSchema();
@@ -107,23 +113,23 @@ export async function upsertBillPricingRule(
   // Promotions are generous but bounded: discount up to 90%, cashback up to 50%.
   const discount = clampPct(payload.discount_percent ?? 0, 90);
   const cashback = clampPct(payload.cashback_percent ?? 0, 50);
+  // Cap: 0 = no cap. Any positive value bounds the per-transaction cashback.
+  const capRaw = Number(payload.cashback_cap ?? 0);
+  const cap = Number.isFinite(capRaw) && capRaw > 0 ? round2(capRaw) : 0;
   const enabled = payload.enabled !== false;
-  if (enabled && discount === 0 && cashback === 0) {
-    // Allowed (a no-op rule) but pointless — surface it to the caller; admin
-    // UI prefers disabling the row instead.
-  }
   await query(
-    `INSERT INTO bill_pricing_rules (category, discount_percent, cashback_percent, enabled, updated_by)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO bill_pricing_rules (category, discount_percent, cashback_percent, cashback_cap, enabled, updated_by)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (category) DO UPDATE SET
        discount_percent = EXCLUDED.discount_percent,
        cashback_percent = EXCLUDED.cashback_percent,
+       cashback_cap = EXCLUDED.cashback_cap,
        enabled = EXCLUDED.enabled,
        updated_by = EXCLUDED.updated_by,
        updated_at = CURRENT_TIMESTAMP`,
-    [cat, discount, cashback, enabled, updatedBy || null],
+    [cat, discount, cashback, cap, enabled, updatedBy || null],
   );
-  return { category: cat, discount_percent: discount, cashback_percent: cashback, enabled };
+  return { category: cat, discount_percent: discount, cashback_percent: cashback, cashback_cap: cap, enabled };
 }
 
 /** What the customer is actually charged for a face-value bill. */
@@ -137,6 +143,8 @@ export function applyBillPricing(
   const discount = active ? round2(face * (active.discount_percent / 100)) : 0;
   const chargeable = round2(face - discount);
   const total = round2(chargeable + round2(fee));
-  const cashback = active ? round2(face * (active.cashback_percent / 100)) : 0;
+  // Percentage cashback bounded by the admin cap (0 = uncapped).
+  let cashback = active ? round2(face * (active.cashback_percent / 100)) : 0;
+  if (active && active.cashback_cap > 0) cashback = Math.min(cashback, round2(active.cashback_cap));
   return { discount, chargeable, total, cashback };
 }

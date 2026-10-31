@@ -183,3 +183,70 @@ export async function setPercent(key: string, value: number | null | undefined, 
         [key, String(n), `Personal product pricing — ${key} (percent)`],
     );
 }
+
+// ---------------------------------------------------------------------------
+// App feature toggles — the admin "Coming soon" switches.
+//
+// Admin can toggle any feature OFF for an app (personal / business). When
+// OFF, the app shows a "Coming soon" modal whenever the feature's entrance
+ // (sidebar / bottom-nav / More sheet tile) is tapped. Public exposure rides
+// on GET /public/app-flags (feature_toggles) so apps can dim entrances
+// ahead of the tap; the authoritative gate is this server-side store.
+//
+// Stored as JSON in system_settings key `app_feature_toggles`:
+//   { "personal": { "virtualcards": true, "rmb": false, ... },
+//     "business": { "payroll": true, "meetings": false, ... } }
+// Unknown features default to ENABLED (ON) so new features are live by
+// default and admins opt them OUT explicitly.
+// ---------------------------------------------------------------------------
+
+import { getSetting as _getSetting, setSetting as _setSetting } from "../../services/app-config";
+
+export const FEATURE_APPS = ["personal", "business"] as const;
+export type FeatureApp = (typeof FEATURE_APPS)[number];
+
+export const BUSINESS_FEATURES = [
+    "transfers",
+    "payroll",
+    "invoices",
+    "meetings",
+    "cards",
+    "international",
+] as const;
+
+export type FeatureToggles = Record<string, Record<string, boolean>>;
+
+export async function getFeatureToggles(): Promise<FeatureToggles> {
+    const raw = await _getSetting("app_feature_toggles", "");
+    const merged: FeatureToggles = { personal: {}, business: {} };
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            for (const app of FEATURE_APPS) {
+                if (parsed?.[app] && typeof parsed[app] === "object") merged[app] = { ...parsed[app] };
+            }
+        } catch {
+            /* corrupt value -> everything ON (default) */
+        }
+    }
+    return merged;
+}
+
+/** True when the feature is ON (default) for the app. Missing keys = ON. */
+export async function isFeatureEnabled(app: FeatureApp, feature: string): Promise<boolean> {
+    const toggles = await getFeatureToggles();
+    return toggles[app]?.[feature] !== false;
+}
+
+export async function setFeatureToggle(
+    app: FeatureApp,
+    feature: string,
+    enabled: boolean,
+): Promise<FeatureToggles> {
+    const toggles = await getFeatureToggles();
+    if (!toggles[app]) toggles[app] = {};
+    if (enabled) delete toggles[app][feature];
+    else toggles[app][feature] = false;
+    await _setSetting("app_feature_toggles", JSON.stringify(toggles), "Per-app feature toggles (Coming soon switches)");
+    return toggles;
+}

@@ -96,7 +96,7 @@ function hmacHeaders(payload: string): Record<string, string> {
   };
 }
 
-type Method = "GET" | "POST" | "PUT" | "DELETE";
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 async function request<T = any>(method: Method, path: string, body?: unknown): Promise<T> {
   const payload = body === undefined ? "" : JSON.stringify(body);
@@ -135,6 +135,7 @@ const GET = <T = any>(path: string) => request<T>("GET", path);
 const POST = <T = any>(path: string, body?: unknown) => request<T>("POST", path, body ?? {});
 const PUT = <T = any>(path: string, body?: unknown) => request<T>("PUT", path, body ?? {});
 const DEL = <T = any>(path: string, body?: unknown) => request<T>("DELETE", path, body ?? {});
+const PATCH = <T = any>(path: string, body?: unknown) => request<T>("PATCH", path, body ?? {});
 
 // ---------------------------------------------------------------------------
 // Wallets / balances
@@ -248,6 +249,63 @@ export function getCardTransactions(cardId: string, cursor?: string) {
 }
 export function getCardSecureDetails(cardId: string) {
   return GET(`/api/cards/${cardId}/secure`);
+}
+
+/**
+ * PATCH /api/cards/:cardId/contact — cardholder notification details
+ * (email and/or mobile). Omitted fields keep their current value.
+ */
+export function updateCardContact(
+  cardId: string,
+  input: { email?: string; mobile?: string },
+) {
+  return PATCH(`/api/cards/${cardId}/contact`, input);
+}
+
+/**
+ * Decrypt `GET /api/cards/:cardId/secure` credentials when the merchant RSA
+ * private key is configured (BITNOB_RSA_PRIVATE_KEY, PEM, PKCS#8).
+ *
+ * Wire format (per Bitnob Card Issuing docs):
+ *   encrypted_key  = base64 AES-256 content key wrapped with the registered
+ *                    RSA PUBLIC key (OAEP w/ SHA-256)
+ *   encrypted_data = base64( nonce[12] || ciphertext || tag[16] ) of the
+ *                    credentials JSON under AES-256-GCM, no AAD
+ *   algorithm      = "RSA-OAEP-256+AES-256-GCM" (anything else is rejected)
+ *
+ * Returns the decrypted credentials object (card_id, card_number, cvv,
+ * expiry_month, expiry_year, name, balance_amount) or null when decryption
+ * is impossible (no key configured / wrong algorithm / crypto failure) — the
+ * caller then falls back to provider-plaintext fields if any.
+ */
+export async function decryptCardSecureDetails(payload: {
+  encrypted_data?: string;
+  encrypted_key?: string;
+  algorithm?: string;
+}): Promise<Record<string, unknown> | null> {
+  const pem = (process.env.BITNOB_RSA_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+  if (!pem || !payload?.encrypted_data || !payload?.encrypted_key) return null;
+  const algorithm = String(payload.algorithm || "RSA-OAEP-256+AES-256-GCM");
+  if (algorithm !== "RSA-OAEP-256+AES-256-GCM") return null;
+  try {
+    const crypto = await import("crypto");
+    const wrapped = Buffer.from(payload.encrypted_key, "base64");
+    const aesKey = crypto.privateDecrypt(
+      { key: pem, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha256" },
+      wrapped,
+    );
+    const blob = Buffer.from(payload.encrypted_data, "base64");
+    const nonce = blob.subarray(0, 12);
+    const tag = blob.subarray(blob.length - 16);
+    const ciphertext = blob.subarray(12, blob.length - 16);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", aesKey, nonce);
+    decipher.setAuthTag(tag);
+    const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+    return JSON.parse(plain);
+  } catch (e: any) {
+    console.error("[bitnob] card secure decrypt failed:", e?.message);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

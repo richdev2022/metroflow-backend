@@ -32,7 +32,6 @@ import { handleDemo } from "./routes/demo";
   import personalCryptoRouter from "./features/personal/routes/crypto";
   import personalVirtualcardsRouter from "./features/personal/routes/virtualcards";
   import personalEsimRouter from "./features/personal/routes/esim";
-  import billsPersonalRouter from "./features/personal/bills";
   import billsUnifiedRouter from "./features/personal/routes/bills";
   import personalRmbRouter from "./features/personal/routes/rmb";
   import { sogoWebhookHandler } from "./routes/personal-webhooks";
@@ -429,6 +428,19 @@ export async function createServer() {
         await processSogoGiftcardSync();
       } catch (error: any) {
         logger.error("Sogo giftcard sync cron error:", error?.message);
+      }
+      // Sogo crypto deposit reconciliation: a missed webhook can no longer
+      // strand a funded deposit in 'processing' — the poller ASKS the provider
+      // (by reference / on-chain tx hash), settles completions, and expires
+      // never-confirmed claims after 24h. Same engine as the webhook.
+      try {
+        const { reconcilePendingCryptoDeposits } = await import("./features/personal/crypto-deposit-settlement");
+        const settledDeposits = await reconcilePendingCryptoDeposits(25);
+        if (settledDeposits > 0) {
+          logger.info(`[crypto] deposit poller reconciled ${settledDeposits} pending deposit(s)`);
+        }
+      } catch (error: any) {
+        logger.error("Crypto deposit poller error:", error?.message);
       }
     });
   }

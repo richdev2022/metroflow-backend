@@ -324,11 +324,12 @@ async function stableNgnRate(currency: Stablecoin): Promise<{ rate: number; mode
             if (rate > 10) return { rate: Math.round(rate * 100) / 100, mode: "bitnob" };
         } catch { /* fall through */ }
     }
-    // 3. Flutterwave FX — the platform's FX source of truth.
+    // 3. Flutterwave FX — the platform's FX desk (admin-toggleable source,
+    //    60s cache: services/fx.ts). Stablecoins price 1:1 against USD.
     try {
-        const { getRate } = await import("../../services/flutterwave");
-        const flw = Number(await getRate("USD", "NGN", 1));
-        if (flw > 10) return { rate: Math.round(flw * 100) / 100, mode: "flutterwave" };
+        const fx = await import("../../services/fx");
+        const { rate: flw, provider: fxMode } = await fx.getUsdNgnRate();
+        if (flw > 10) return { rate: Math.round(flw * 100) / 100, mode: fxMode === "sogo" ? "sogo" : "flutterwave" };
     } catch { /* fall through */ }
     return null;
 }

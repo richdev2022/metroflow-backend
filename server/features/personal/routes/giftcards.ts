@@ -231,7 +231,10 @@ router.get("/sell/catalog", authenticateToken, checkSubscriptionStatus, async (_
       for (const r of Array.isArray(rates) ? rates : []) rateBySlug.set(String(r.slug), r.rates || r);
       const giftcards = (catalog || []).map((entry: any) =>
         normalizeSogoSellEntry({ ...entry, __rates: rateBySlug.get(String(entry.slug)) }));
-      return res.json({ success: true, provider, giftcards });
+      // The client's payout preview uses the REAL platform fee, not a guess.
+      const { getPercent } = await import("../flags");
+      const sellFeePercent = await getPercent("giftcard_sell_fee_percent", 5);
+      return res.json({ success: true, provider, sell_fee_percent: sellFeePercent, giftcards });
     }
     // Prestmit (legacy shape preserved)
     const data = await prestmit.sellRateCalculatorData();
@@ -904,7 +907,22 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
       return res.status(400).json({ success: false, error: "giftCardSKU and a positive price are required" });
     }
 
-    const wallet = await getOwnedWallet(String(req.body?.wallet_id || ""), userId, req.user!.businessId ?? null);
+    // Wallet resolution: normalize empty/missing wallet_id (an empty string
+    // reaches Postgres as a uuid cast error → 500) and fall back to the
+    // caller's primary NGN wallet — the same contract as /bills/pay.
+    const requestedWalletId = String(req.body?.wallet_id || "").trim();
+    let wallet = requestedWalletId
+      ? await getOwnedWallet(requestedWalletId, userId, req.user!.businessId ?? null)
+      : null;
+    if (!wallet) {
+      const fallback = await query(
+        `SELECT id, business_id, balance, currency FROM wallets
+          WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+          ORDER BY created_at ASC LIMIT 1`,
+        [userId],
+      );
+      wallet = fallback.rows[0] || null;
+    }
     if (!wallet) return res.status(404).json({ success: false, error: "Wallet not found" });
     if (wallet.currency !== "NGN") {
       return res.status(400).json({ success: false, error: "Gift card purchases are charged in NGN — use your Naira wallet." });

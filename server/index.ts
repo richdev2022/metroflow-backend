@@ -20,7 +20,6 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
 // const __dirname = path.dirname(__filename);
 
 
-import { handleDemo } from "./routes/demo";
   // PERSONAL APP — routes + routers (mounted below)
   import personalAuthRouter, { registerPersonal, mintSsoTicket, redeemSsoTicket } from "./features/personal/routes/auth";
   import personalSocialRouter from "./features/personal/routes/social";
@@ -766,7 +765,7 @@ export async function createServer() {
     // deploys stay green, and /health reports its own degraded/db:"down"
     // state with HTTP 200 while initialization is still running.
     const p = req.path.replace(/^\/api(?=\/|$)/, "");
-    if (p === '/' || p === '/ping' || p === '/demo' || p === '/health') return next();
+    if (p === '/' || p === '/ping' || p === '/health') return next();
 
     if (!isDbReady) {
       // Allow pre-flight requests to pass through
@@ -917,7 +916,6 @@ export async function createServer() {
     }
   });
 
-  mainRouter.get("/demo", handleDemo);
 
   // Auth API routes
   mainRouter.post("/auth/register", registerBusiness);

@@ -51,7 +51,7 @@ beforeEach(() => {
 
 describe("provider routing", () => {
   it("exposes the three routable services with sogo available for each", () => {
-    expect(ROUTABLE_SERVICES).toEqual(["bills", "giftcards", "crypto"]);
+    expect(ROUTABLE_SERVICES).toEqual(["bills", "giftcards", "crypto", "rmb"]);
     expect(SERVICE_PROVIDERS.bills).toContain("sogo");
     expect(SERVICE_PROVIDERS.giftcards).toEqual(["sogo", "prestmit", "simulator"]);
     expect(SERVICE_PROVIDERS.crypto).toEqual(["sogo", "bitnob", "simulator"]);

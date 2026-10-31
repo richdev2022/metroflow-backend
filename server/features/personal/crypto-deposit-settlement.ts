@@ -1,5 +1,4 @@
-import { query } from "../../db";
-import { insertTransaction } from "./personal-utils";
+import { query, pool } from "../../db";
 import { createNotification } from "../../services/notifications";
 import * as sogo from "../../services/sogo";
 import { getPercent } from "./flags";
@@ -76,27 +75,34 @@ export async function settleSogoDeposit(
     [creditRef],
   );
   if (!existing.rows.length) {
+    // ATOMIC: the unique ledger reference is the FIRST write and the balance
+    // update commits in the SAME transaction — a crash between "ledger row"
+    // and "balance update" can no longer record money the wallet never
+    // received (a replay would then hit the unique guard and skip forever).
+    const client = await pool.connect();
     try {
-      await insertTransaction({
-        userId: sale.user_id,
-        businessId: null,
-        walletId: sale.wallet_id,
-        reference: creditRef,
-        type: "credit",
-        transactionType: "sogo_credit",
-        amount: net,
-        currency: "NGN",
-        description: `Crypto deposit credit — ${sale.asset || ""} ${sale.crypto_amount || ""}`.trim(),
-        paymentProvider: "sogo",
-      });
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO transactions
+           (user_id, amount, currency, status, reference, type, description,
+            transaction_type, wallet_id, direction, payment_provider)
+         VALUES ($1,$2,'NGN','success',$3,'credit',$4,'sogo_credit',$5,'credit',$6)`,
+        [sale.user_id ?? null, net, creditRef,
+         `Crypto deposit credit — ${sale.asset || ""} ${sale.crypto_amount || ""}`.trim(),
+         sale.wallet_id ?? null, "sogo"],
+      );
       if (sale.wallet_id && net > 0) {
-        await query(
+        await client.query(
           `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
           [net, sale.wallet_id],
         );
       }
+      await client.query("COMMIT");
     } catch (e: any) {
+      await client.query("ROLLBACK").catch(() => {});
       if (e?.code !== "23505") throw e; // unique violation = already credited by a racing worker
+    } finally {
+      client.release();
     }
   }
 

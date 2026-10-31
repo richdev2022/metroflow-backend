@@ -41,6 +41,7 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
   import adminPersonalRouter from "./routes/admin_personal";
   import adminPrestmitRouter from "./routes/admin_prestmit";
   import adminProvidersRouter from "./routes/admin_providers";
+  import adminVirtualcardsRouter from "./routes/admin_virtualcards";
   import personalProductsAdminRouter from "./features/personal/admin";
 import {
   registerBusiness,
@@ -1045,6 +1046,8 @@ export async function createServer() {
   // "Provider's Balance" treasury desk — provider wallets, history, low-
   // balance thresholds and the per-app "Coming soon" feature toggles.
   mainRouter.use("/admin/personal/providers", adminProvidersRouter);
+  // Virtual Card Management — all cards, KYC queue, fee knobs + rate override.
+  mainRouter.use("/admin/personal/virtualcards", adminVirtualcardsRouter);
   mainRouter.use("/admin/personal", personalProductsAdminRouter);
   mainRouter.use("/admin/personal", adminPersonalRouter);
 

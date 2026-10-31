@@ -792,109 +792,14 @@ async function creditUserWallet(userId: string | null, walletId: string | null, 
 }
 
 async function handleSogoCryptoDeposit(tx: any) {
-  // Match by deposit address (metadata.deposit_address || deposit_address),
-  // by a PRE-CLAIMED tx_hash (the customer submitted their on-chain hash),
-  // falling back to a pre-recorded sale row keyed by reference.
-  const depositHash = String(
-    tx?.metadata?.deposit_tx_hash || tx?.deposit_tx_hash || tx?.hash || "",
-  ).trim();
-  const address = String(
-    tx?.metadata?.deposit_address || tx?.deposit_address || tx?.address || "",
-  );
-  let sale = null;
-  if (tx?.reference) {
-    const byRef = await query(`SELECT * FROM crypto_deposit_sales WHERE reference = $1 LIMIT 1`, [String(tx.reference)]);
-    sale = byRef.rows[0] || null;
+  // The full pipeline lives in the shared settlement engine so the 5-minute
+  // poller (server/index.ts cron) drives the EXACT same matching + reconfirm
+  // + ledger-idempotent credit path as this webhook.
+  const { handleSogoDepositEvent } = await import("../features/personal/crypto-deposit-settlement");
+  const outcome = await handleSogoDepositEvent(tx);
+  if (outcome === "held") {
+    console.warn(`[sogo webhook] crypto deposit ${tx?.reference || ""} held — conflicting provider evidence`);
   }
-  if (!sale && depositHash) {
-    // The customer claimed this deposit by submitting their tx hash.
-    const byHash = await query(
-      `SELECT * FROM crypto_deposit_sales WHERE tx_hash = $1 AND status = 'processing' ORDER BY created_at ASC LIMIT 1`,
-      [depositHash],
-    );
-    sale = byHash.rows[0] || null;
-  }
-  if (!sale && address) {
-    const byAddr = await query(
-      `SELECT * FROM crypto_deposit_sales WHERE address = $1 AND status = 'processing' ORDER BY created_at ASC LIMIT 1`,
-      [address],
-    );
-    sale = byAddr.rows[0] || null;
-  }
-  if (!sale && (address || depositHash)) {
-    // First deposit on a known address — resolve the owner and open a row.
-    let owner: any = null;
-    if (address) {
-      const addr = await query(`SELECT * FROM crypto_deposit_addresses WHERE address = $1 LIMIT 1`, [address]);
-      owner = addr.rows[0] || null;
-    }
-    if (!owner && depositHash) {
-      const claim = await query(
-        `SELECT * FROM stablecoin_deposits WHERE tx_hash = $1 AND status = 'pending' AND user_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
-        [depositHash],
-      );
-      if (claim.rows.length) {
-        owner = { user_id: claim.rows[0].user_id, asset: claim.rows[0].currency, network: claim.rows[0].chain };
-      }
-    }
-    if (!owner) {
-      console.warn("[sogo webhook] deposit for unknown address/hash:", address || depositHash);
-      return;
-    }
-    const wallet = await query(
-      `SELECT id, business_id FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
-      [owner.user_id],
-    );
-    const insert = await query(
-      `INSERT INTO crypto_deposit_sales
-         (user_id, wallet_id, address, reference, provider, asset, network, crypto_amount, status, provider_response, tx_hash)
-       VALUES ($1,$2,$3,$4,'sogo',$5,$6,$7,'processing',$8::jsonb,$9)
-       ON CONFLICT (reference) DO NOTHING RETURNING *`,
-      [owner.user_id, wallet.rows[0]?.id || null, address || null, String(tx.reference || `SO-${Date.now()}`),
-       owner.asset, owner.network, sogo.sogoAmount(tx.crypto_amount) || sogo.sogoAmount(tx.amount) || null, JSON.stringify(tx), depositHash || null],
-    );
-    sale = insert.rows[0] || null;
-    if (!sale) {
-      const again = await query(`SELECT * FROM crypto_deposit_sales WHERE reference = $1 LIMIT 1`, [String(tx.reference || "")]);
-      sale = again.rows[0] || null;
-    }
-  }
-  if (!sale) {
-    console.warn("[sogo webhook] crypto deposit without match:", tx?.reference);
-    return;
-  }
-  if (sale.status === "completed") return; // idempotent
-
-  const gross = sogo.sogoAmount(tx?.payout_amount) || sogo.sogoAmount(tx?.net_amount) ||
-    sogo.sogoAmount(tx?.amount) || Number(sale.ngn_gross || 0);
-  const spreadPct = await getPercent("crypto_spread_percent", 1);
-  const fee = Math.round(gross * (spreadPct / 100) * 100) / 100;
-  const net = Math.max(0, Math.round((gross - fee) * 100) / 100);
-
-  await creditUserWallet(sale.user_id, sale.wallet_id, net, `SOGO-DEP-${sale.reference}`, `Crypto deposit credit — ${sale.asset || ""} ${sale.crypto_amount || ""}`.trim());
-  await query(
-    `UPDATE crypto_deposit_sales SET status = 'completed', ngn_gross = $2, fee = $3, ngn_net = $4,
-       rate = COALESCE($5, rate), provider_response = $6::jsonb, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-    [sale.id, gross, fee, net, tx?.rate ?? null, JSON.stringify(tx)],
-  );
-  // Close the matching customer claim (stablecoin hub) so the deposit shows
-  // as credited there too.
-  if (depositHash) {
-    await query(
-      `UPDATE stablecoin_deposits SET status = 'credited', credited_at = CURRENT_TIMESTAMP
-        WHERE tx_hash = $1 AND status = 'pending'`,
-      [depositHash],
-    ).catch(() => {});
-  }
-  try {
-    await createNotification({
-      businessId: "", userId: String(sale.user_id), type: "credit",
-      title: "Crypto deposit settled",
-      message: `₦${net.toLocaleString()} has been credited to your wallet from your ${sale.asset || "crypto"} deposit.`,
-      actionUrl: "/crypto", actionType: "view_transaction",
-      metadata: { reference: sale.reference }, isActionable: false, expiresInHours: 720,
-    });
-  } catch { /* best effort */ }
 }
 
 async function handleSogoBillPayment(tx: any) {

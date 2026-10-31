@@ -9,7 +9,7 @@ import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
 import * as sogo from "../../../services/sogo";
 import { userSafeErr } from "../user-safe-errors";
-import { useProvider, getPercent } from "../flags";
+import { useProvider, getPercent, getProviderModes } from "../flags";
 import { getActiveProvider } from "../provider-routing";
 import { getRate as flwRate } from "../../../services/flutterwave";
 import { createNotification } from "../../../services/notifications";
@@ -352,8 +352,10 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     if (!Number.isFinite(settlement) || settlement <= 0) return res.status(400).json({ success: false, error: "settlement_amount must be positive" });
 
-    // USD cost of the settlement: NGN amount ÷ live NGN-per-USD rate.
-    const ngnPerUsd = await flutterwave.getRate("USD", "NGN", 1);
+    // USD cost of the settlement: NGN amount ÷ live NGN-per-USD rate
+    // (platform FX desk — Flutterwave default with the admin toggle).
+    const fx = await import("../../../services/fx");
+    const ngnPerUsd = (await fx.getUsdNgnRate()).rate;
     const usdDebit = Math.round((settlement / ngnPerUsd) * 100) / 100;
 
     // LIVE RATE CALCULATOR — the ACTIVE provider's rate always wins:
@@ -412,8 +414,10 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     }
 
     // Stablecoin wallet debit — the sale debits the MATCHING coin's wallet
-    // (USDT sale → USDT wallet, USDC sale → USDC wallet).
-    const ngnPerUsd = await flutterwave.getRate("USD", "NGN", 1);
+    // (USDT sale → USDT wallet, USDC sale → USDC wallet). The NGN-per-USD
+    // price comes from the platform FX desk (admin toggle: Flutterwave).
+    const fx = await import("../../../services/fx");
+    const ngnPerUsd = (await fx.getUsdNgnRate()).rate;
     let usdDebit = settlement / ngnPerUsd;
     usdDebit = Math.round(usdDebit * 100) / 100;
 
@@ -441,28 +445,49 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
       description: `Stablecoin sale — ${asset} → ₦${settlement.toLocaleString()}`,
     });
 
+    // Payout rails: the NGN settlement is executed by Bitnob's payout API
+    // regardless of which provider routes the CRYPTO side (Sogo is the
+    // deposit/off-ramp rails). "simulator" is only reachable when the admin
+    // EXPLICITLY forces the simulator mode — in "auto" an unconfigured
+    // payout partner can no longer fake an instant success (money safety).
+    const bitnobLive = bitnob.isBitnobConfigured();
+    const useLive = await useProvider("crypto", bitnobLive);
+    const saleProvider = !useLive ? "simulator" : "bitnob";
     const dbInsert = await query(
       `INSERT INTO crypto_sales
          (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
           settlement_currency, rate, bank_code, account_number, account_name, status)
-       VALUES ($1,$2,$3,'bitnob',$4,$5,$6,'NGN',$7,$8,$9,$10,'processing') RETURNING *`,
-      [userId, wallet.id, reference, asset, usdDebit, settlement, ngnPerUsd, bankCode, accountNumber, accountName],
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,'processing') RETURNING *`,
+      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, ngnPerUsd, bankCode, accountNumber, accountName],
     );
 
-    // Personal Products console mode: "simulator" settles instantly locally
-    // (test environments / incident mode); otherwise Bitnob live when
-    // configured; unconfigured -> park for manual ops settlement.
-    const useLive = await useProvider("crypto", bitnob.isBitnobConfigured());
     if (!useLive) {
-      await query(`UPDATE crypto_sales SET status = 'completed', completed_at = CURRENT_TIMESTAMP, provider = 'simulator' WHERE id = $1`, [dbInsert.rows[0].id]);
-      createNotification({
-        businessId: "", userId, type: "credit", title: "Stablecoin sale completed",
-        message: `₦${settlement.toLocaleString()} has been sent to your ${accountName} account.`,
-      }).catch(() => {});
-      const simFresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
-      return res.status(201).json({ success: true, data: { sale: simFresh.rows[0], mode: "simulator" } });
+      const modes = await getProviderModes();
+      if ((modes as any)["crypto"] === "simulator") {
+        // Admin-forced incident/test mode: settle locally, honestly labelled.
+        await query(`UPDATE crypto_sales SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = $1`, [dbInsert.rows[0].id]);
+        createNotification({
+          businessId: "", userId, type: "credit", title: "Stablecoin sale completed",
+          message: `₦${settlement.toLocaleString()} has been sent to your ${accountName} account.`,
+        }).catch(() => {});
+        const simFresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
+        return res.status(201).json({ success: true, data: { sale: simFresh.rows[0], mode: "simulator" } });
+      }
+      // AUTO mode without payout rails: refund immediately — never pretend.
+      await creditWallet(wallet.id, usdDebit);
+      await insertTransaction({
+        userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
+        transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
+        description: "Refund — crypto sale payout partner unavailable",
+      });
+      await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = 'Payout partner not configured on server — auto-refunded', refunded_at = CURRENT_TIMESTAMP WHERE id = $1`, [dbInsert.rows[0].id]);
+      return res.status(503).json({
+        success: false,
+        code: "PROVIDER_UNCONFIGURED",
+        error: "Stablecoin sell payouts are temporarily unavailable — your wallet has been refunded. You can still receive crypto and convert via the deposit flow.",
+      });
     }
-    if (bitnob.isBitnobConfigured()) {
+    if (bitnobLive) {
       try {
         const quote = await bitnob.createPayoutQuote({
           fromAsset: asset, toCurrency: "NGN", country: "NG",
@@ -506,7 +531,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
         return res.status(502).json({ success: false, error: be.message });
       }
     } else {
-      await query(`UPDATE crypto_sales SET failure_reason = 'Bitnob not configured on server' WHERE id = $1`, [dbInsert.rows[0].id]);
+      await query(`UPDATE crypto_sales SET failure_reason = 'Payout partner not configured on server' WHERE id = $1`, [dbInsert.rows[0].id]);
       return res.status(503).json({
         success: false,
         code: "PROVIDER_UNCONFIGURED",

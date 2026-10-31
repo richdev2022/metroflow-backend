@@ -904,15 +904,15 @@ router.post("/swap", authenticateToken, checkSubscriptionStatus, async (req: Aut
             return res.status(400).json({ success: false, error: pinCheck.error, code: pinCheck.code });
         }
 
-        // Live rate via Flutterwave (fallback provider may differ by direction)
-        const { getRate } = await import("../services/flutterwave");
+        // Live rate via the platform FX desk (admin-toggleable: Flutterwave
+        // default, Sogo fallback — see services/fx.ts).
+        const fx = await import("../services/fx");
         const fromCur = String(from.currency).toUpperCase();
         const toCur = String(to.currency).toUpperCase();
         let rate: number;
         try {
-            // NOTE: amount=1 — Flutterwave returns the converted TOTAL when an
-            // amount is supplied; the unit rate is what a swap multiplier needs.
-            rate = await getRate(fromCur, toCur, 1);
+            // NOTE: unit rate — the caller multiplies by the swap amount.
+            rate = await fx.getRate(fromCur, toCur, 1);
         } catch (e: any) {
             return res.status(503).json({ success: false, error: "Live exchange rate unavailable — try again shortly." });
         }

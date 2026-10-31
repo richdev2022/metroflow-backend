@@ -81,6 +81,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("repairFreeForeverStatuses", repairFreeForeverStatuses); // reactivate free-plan businesses wrongly deactivated by the old trial cron
   await step("ensurePersonalSchema", ensurePersonalSchema); // dormant personal features: bills hub + savings vaults
   await step("ensureBillsSchema", ensureBillsSchema); // bills hub v2: recharge tokens + item codes
+  await step("seedBillFeeConfiguration", seedBillFeeConfiguration); // fee_configurations 'bill' row (admin-editable flat convenience fee)
   await step("ensureGiftcardSchema", ensureGiftcardSchema); // gift card trading (Prestmit)
   await step("ensureEsimSchema", ensureEsimSchema); // eSIM top-ups (pluggable provider, simulator first)
   await step("ensureVirtualCardSchema", ensureVirtualCardSchema); // personal USD virtual cards (Bitnob)
@@ -2078,6 +2079,21 @@ async function ensureAppVersionsSchema(): Promise<void> {
 }
 
 /**
+ * fee_configurations 'bill' — the flat bill-payment convenience fee the
+ * unified bills pay flow charges (billFee() → calculateFee(0, 'bill')).
+ * Without a seeded row the fee silently computes to 0 and the admin console's
+ * Personal Products fee editor has nothing to edit. Default ₦0 — the admin
+ * sets the real amount (PUT /admin/personal/config { pricing.bills_fee_flat }).
+ */
+async function seedBillFeeConfiguration(): Promise<void> {
+  await query(`
+    INSERT INTO fee_configurations (name, fee_type, config_type, config, currency)
+    SELECT 'Bill Payment Convenience Fee', 'bill', 'flat', '{"amount": 0}'::jsonb, 'NGN'
+    WHERE NOT EXISTS (SELECT 1 FROM fee_configurations WHERE fee_type = 'bill')
+  `);
+}
+
+/**
  * Transaction disputes: a customer opens a dispute against a debit
  * (transfer / payment), attaches evidence, and a platform admin investigates
  * and resolves it (reversal with credit-guard, provider recheck, or close).
@@ -2088,10 +2104,10 @@ async function ensureDisputesSchema(): Promise<void> {
   await query(`
     CREATE TABLE IF NOT EXISTS transaction_disputes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      business_id VARCHAR(255) NOT NULL,
+      business_id VARCHAR(255),                 -- NULL = personal-app dispute
       user_id UUID,
       transaction_reference VARCHAR(255) NOT NULL,
-      transaction_source VARCHAR(20),            -- 'transfer_queue' | 'transactions'
+      transaction_source VARCHAR(20),            -- 'transfer_queue' | 'transactions' | 'bill_transactions'
       category VARCHAR(50) DEFAULT 'other',      -- failed_transfer|unauthorized|double_debit|not_received|amount_mismatch|other
       message TEXT NOT NULL,
       attachment_url TEXT,
@@ -2105,6 +2121,9 @@ async function ensureDisputesSchema(): Promise<void> {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // PERSONAL disputes (commit 1f95753) file with business_id NULL — a NOT NULL
+  // constraint from earlier installs would 500 every personal filing (23502).
+  await query(`ALTER TABLE transaction_disputes ALTER COLUMN business_id DROP NOT NULL`);
   // businesses.id was migrated to VARCHAR(255) — earlier installs created
   // business_id as UUID, which breaks both the admin list JOIN
   // (varchar = uuid -> 42883) and filing disputes for any business whose id

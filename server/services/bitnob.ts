@@ -132,7 +132,16 @@ export async function createCustomer(payload: {
   firstName: string; lastName: string; email: string; phone?: string;
   countryCode?: string; provider?: string;
 }): Promise<any> {
-  return unwrap(client().post("/customers", payload));
+  // Bitnob contract: snake_case fields, customer_type "individual",
+  // country_code as ISO-3166 alpha-3 (NGA for Nigeria).
+  return unwrap(client().post("/customers", {
+    email: payload.email,
+    first_name: payload.firstName,
+    last_name: payload.lastName,
+    ...(payload.phone ? { phone_number: payload.phone } : {}),
+    country_code: payload.countryCode && payload.countryCode.length === 3 ? payload.countryCode : "NGA",
+    customer_type: "individual",
+  }));
 }
 
 export async function listCustomers(email?: string): Promise<any> {
@@ -191,6 +200,15 @@ export async function cardSecure(cardId: string): Promise<any> {
 
 export async function cardTransactions(cardId: string, page = 1): Promise<any> {
   return unwrap(client().get(`/cards/${cardId}/transactions`, { params: { page } }));
+}
+
+/**
+ * Card KYC (POST /api/cards/kyc) — submits the issuing-partner verification
+ * for a customer. The ID ALWAYS comes from the user's profile verification
+ * (BVN/NIN); customers must exist first (see createCustomer).
+ */
+export async function submitCardKyc(payload: Record<string, unknown>): Promise<any> {
+  return unwrap(client().post("/cards/kyc", payload));
 }
 
 // ---------------------------------------------------------------------------

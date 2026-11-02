@@ -7,6 +7,7 @@ import { toMinorUnit } from "../services/transfer";
 import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { generateToken } from "../services/auth";
 import { getBankNameByCode } from "../utils/bank-codes";
+import { kycIdentity } from "../features/personal/kyc-identity";
 import { checkFundingLimit, rejectOverLimitFunding, fundingRejectedHtml } from "../services/funding-limits";
 import { getBusinessLimitInfo } from "../services/transaction-limits";
 
@@ -94,21 +95,26 @@ router.post("/create-virtual-account", authenticateToken, checkKycStatus, requir
                  return res.status(404).json({ success: false, error: "User not found" });
             }
 
-            const kycData = user.kyc_data?.data || user.kyc_data;
-            const nameParts = user.name.split(' ');
-            const firstName = kycData?.firstName || nameParts[0] || "User";
-            const lastName = kycData?.lastName || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0] || "User");
-            
+            // KYC identity — the raw Prembly envelope (BVN camelCase vs NIN
+            // lowercase keys) is mapped in one place (kyc-identity.ts) so the
+            // VA customer carries the REAL record names / DOB / address, not
+            // the account display name and "01/01/1990" placeholders.
+            const identity = kycIdentity(user);
+            // VA providers expect DD/MM/YYYY.
+            const vaDob = identity.dob ? identity.dob.split("-").reverse().join("/") : "01/01/1990";
+            const vaGender = String(identity.gender || "").toLowerCase();
+
             const vaData = {
-                 firstName,
-                 lastName,
-                 phoneNumber: kycData?.phoneNumber || user.phone_number || "08000000000",
-                 dob: kycData?.dateOfBirth || "01/01/1990",
+                 firstName: identity.firstName,
+                 lastName: identity.lastName,
+                 // VA providers want the local trunk format ("0803…").
+                 phoneNumber: identity.phoneLocal ? `0${identity.phoneLocal}` : (user.phone_number || "08000000000"),
+                 dob: vaDob,
                  email: user.email,
-                 bvn: kycData?.bvn || user.bvn || "12345678901",
-                 nin: kycData?.nin || user.nin || "12345678901",
-                 gender: kycData?.gender === 'Male' ? "1" : "2",
-                 address: "Lagos, Nigeria", 
+                 bvn: user.bvn || "12345678901",
+                 nin: user.nin || "12345678901",
+                 gender: vaGender.startsWith("m") ? "1" : "2",
+                 address: identity.address || "Lagos, Nigeria",
                  customerIdentifier,
                  beneficiaryAccount: "0000000000"
             };

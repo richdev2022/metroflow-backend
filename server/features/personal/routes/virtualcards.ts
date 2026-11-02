@@ -135,8 +135,11 @@ async function buildKycCustomer(userId: string) {
       line1: identity.address,
       city: identity.city,
       state: identity.state,
-      // Prembly carries no cardholder postal code (nok_postalcode is the
-      // next-of-kin's) — omit rather than fabricate.
+      // Bitnob's customer object marks line1/city/state/postal_code/country
+      // REQUIRED. Prembly carries no cardholder postal code (nok_postalcode
+      // is the next-of-kin's) — "000000" is the neutral NGA placeholder, not
+      // a fabricated real code.
+      postal_code: "000000",
     },
   };
 }
@@ -416,6 +419,9 @@ router.post("/kyc", authenticateToken, checkSubscriptionStatus, async (req: Auth
     }
     if (!customer.line1) {
       return res.status(400).json({ success: false, error: "Your verified identity record has no residential address — contact support to fix your KYC data before requesting a card." });
+    }
+    if (!customer.city || !customer.state) {
+      return res.status(400).json({ success: false, error: "Your verified identity record has no readable city or state of residence — contact support to fix your KYC data before requesting a card." });
     }
 
     // ID falls back to the user's verified BVN / NIN on file. Priority mirrors

@@ -9,6 +9,7 @@ import * as bitnob from "../../../services/bitnob";
 import * as bitnobV2 from "../../../services/providers/bitnob";
 import { createNotification } from "../../../services/notifications";
 import { getSetting } from "../../../services/app-config";
+import { kycIdentity } from "../kyc-identity";
 
 /**
  * VIRTUAL CARDS — REAL Bitnob USD virtual cards (no simulation).
@@ -97,40 +98,45 @@ function maskIdNumber(value: string): string {
   return `${"*".repeat(Math.max(0, v.length - 4))}${v.slice(-4)}`;
 }
 
-/** Extract the customer identity Bitnob wants, from the user's KYC profile. */
+/** Extract the customer identity Bitnob wants, from the user's KYC profile.
+ *
+ * `users.kyc_data` is the RAW Prembly verification envelope ({ status, data,
+ * bvn_data | nin_data, … }) — BVN and NIN responses use different key styles
+ * (see kyc-identity.ts). The old inline mapping read kyc.firstName /
+ * kyc.dateOfBirth / kyc.address off the ENVELOPE — all undefined — so every
+ * Bitnob customer was built from the account display name with no DOB,
+ * address or phone, and card KYC could never match the ID record.
+ */
 async function buildKycCustomer(userId: string) {
   const u = await query(`SELECT * FROM users WHERE id = $1`, [userId]);
   const user = u.rows[0];
   if (!user) throw new bitnob.BitnobError("User not found", "USER_NOT_FOUND", 404);
-  let kyc: any = {};
-  try { kyc = typeof user.kyc_data === "string" ? JSON.parse(user.kyc_data) : (user.kyc_data || {}); } catch { kyc = {}; }
 
-  const fullName = String(user.name || kyc.firstName || "MetriCorex User");
-  const first = String(kyc.firstName || fullName.split(" ")[0] || "MetriCorex").trim();
-  const last = String(kyc.lastName || fullName.split(" ").slice(1).join(" ") || "User").trim();
-  const email = String(user.email || kyc.email || "").trim();
-  const phoneRaw = String(kyc.phoneNumber || user.phone_number || "").replace(/[^\d+]/g, "");
-  // Bitnob wants the local number in phone_number and the dial code separately.
-  const dialCode = phoneRaw.startsWith("+") ? phoneRaw.slice(0, 4).match(/^\+\d{1,3}$/)?.[0] || "+234" : "+234";
-  const localPhone = phoneRaw.replace(/^\+\d{1,3}/, "") || phoneRaw;
-
+  const identity = kycIdentity(user);
   return {
     user,
-    email,
+    email: identity.email,
     customer: {
       customer_type: "individual" as const,
-      first_name: first,
-      last_name: last,
-      email,
-      phone_number: localPhone || undefined,
-      dial_code: dialCode,
+      first_name: identity.firstName,
+      last_name: identity.lastName,
+      email: identity.email,
+      // Bitnob wants the local number WITHOUT the trunk zero ("8034567890")
+      // and the dial code separately ("+234").
+      phone_number: identity.phoneLocal || undefined,
+      dial_code: identity.dialCode,
       // Per product decision: every cardholder is an individual, Nigeria.
       country: "NGA",
-      date_of_birth: kyc.dateOfBirth || undefined,
-      line1: kyc.address || kyc.line1 || undefined,
-      city: kyc.city || undefined,
-      state: kyc.state || undefined,
-      postal_code: kyc.postalCode || undefined,
+      // Bitnob requires DOB (YYYY-MM-DD) + address; both come straight from
+      // the verified BVN/NIN record. DOB parsing is best-effort — the card
+      // KYC route refuses to submit without it rather than sending a wrong
+      // one (the name and DOB must match the ID record exactly).
+      date_of_birth: identity.dob,
+      line1: identity.address,
+      city: identity.city,
+      state: identity.state,
+      // Prembly carries no cardholder postal code (nok_postalcode is the
+      // next-of-kin's) — omit rather than fabricate.
     },
   };
 }
@@ -151,9 +157,12 @@ async function ensureBitnobCustomer(userId: string, userName: string, email: str
     const cust = found?.data?.content?.[0] || found?.data?.[0] || found?.[0];
     if (cust?.id || cust?.customer_id) return cust.id || cust.customer_id;
   } catch { /* not found → create */ }
-  const [firstName, ...rest] = userName.split(" ");
+  // Real KYC names (from the verified BVN/NIN record) beat the display name —
+  // kycIdentity falls back to the display name only when no record exists.
+  const ur = await query(`SELECT kyc_data, name, email, phone_number FROM users WHERE id = $1`, [userId]);
+  const identity = kycIdentity(ur.rows[0] || { name: userName });
   const created = await bitnob.createCustomer({
-    firstName: firstName || "MetriCorex", lastName: rest.join(" ") || "User",
+    firstName: identity.firstName, lastName: identity.lastName,
     email, countryCode: "NG",
   });
   const id = created?.data?.id || created?.data?.customer_id || created?.id;
@@ -399,9 +408,27 @@ router.post("/kyc", authenticateToken, checkSubscriptionStatus, async (req: Auth
     const { user, email, customer } = await buildKycCustomer(userId);
     if (!email) return res.status(400).json({ success: false, error: "A verified email is required for card KYC" });
 
-    // ID falls back to the user's verified BVN / NIN on file.
-    const finalIdType = String(id_type || (user.bvn ? "bvn" : user.nin ? "nin" : "")).toLowerCase();
-    const finalIdNumber = String(id_number || user.bvn || user.nin || "").trim();
+    // Bitnob REQUIRES the cardholder's date of birth and residential address,
+    // and both must come from the verified ID record. If the record lacks
+    // them, refuse with a clear message instead of sending a wrong customer.
+    if (!customer.date_of_birth) {
+      return res.status(400).json({ success: false, error: "Your verified identity record has no readable date of birth — contact support to fix your KYC data before requesting a card." });
+    }
+    if (!customer.line1) {
+      return res.status(400).json({ success: false, error: "Your verified identity record has no residential address — contact support to fix your KYC data before requesting a card." });
+    }
+
+    // ID falls back to the user's verified BVN / NIN on file. Priority mirrors
+    // GET /kyc-status: a VERIFIED nin beats a verified bvn, then any recorded
+    // number — so the ID submitted is the same one the identity box shows.
+    const profileIdType =
+      (user.nin && user.nin_status === "verified") ? "nin" :
+      (user.bvn && user.bvn_status === "verified") ? "bvn" :
+      user.bvn ? "bvn" : user.nin ? "nin" : "";
+    const finalIdType = String(id_type || profileIdType).toLowerCase();
+    const finalIdNumber = String(
+      id_number || (finalIdType === "nin" ? user.nin : user.bvn) || user.bvn || user.nin || "",
+    ).trim();
     for (const [k, v] of Object.entries({
       id_type: finalIdType, id_number: finalIdNumber, occupation, employment_status,
       account_purpose, annual_salary, expected_monthly_volume,
@@ -424,7 +451,9 @@ router.post("/kyc", authenticateToken, checkSubscriptionStatus, async (req: Auth
     }
 
     const result = await bitnobV2.submitCardKyc({
-      customer,
+      // Bitnob's card KYC also reads the ID off the customer object — send it
+      // in both places so either shape validates.
+      customer: { ...customer, id_type: finalIdType, id_number: finalIdNumber },
       id_type: finalIdType,
       id_number: finalIdNumber,
       occupation: String(occupation).toLowerCase().replace(/\s+/g, "_"),

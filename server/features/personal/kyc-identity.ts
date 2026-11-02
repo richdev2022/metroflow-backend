@@ -79,6 +79,49 @@ export function normalizeDob(...vals: unknown[]): string | undefined {
   return undefined;
 }
 
+/** "KOGI" → "Kogi", "OSHODI-ISOLO" → "Oshodi-Isolo". */
+export function titleCase(s: string): string {
+  return s
+    .toLowerCase()
+    .split(/(\s|-)/)
+    .map((p) => (/[a-z]/.test(p[0] || "") ? p[0].toUpperCase() + p.slice(1) : p))
+    .join("");
+}
+
+/**
+ * Parse the LGA (city) and state out of a Nigerian ID address string. NIMC
+ * writes "<town/street> <lga-name> LGA <state-name> STATE" and often leaves
+ * the structured town/LGA/state fields EMPTY — the address text is then the
+ * only place the record carries them:
+ *   "EFEKPE  EGUME DEKINA LGA KOGI STATE" → { city: "Dekina", state: "Kogi" }
+ *   "5 NJAMANIE STREET, ILORIN WEST LGA, KWARA STATE" → { city: "Ilorin West", state: "Kwara" }
+ * Directional LGA suffixes ("Ilorin West", "Ughelli North") are kept together.
+ */
+export function parseAddressBits(addr?: string): { city?: string; state?: string } {
+  if (!addr) return {};
+  const out: { city?: string; state?: string } = {};
+  const lga = addr.match(/([A-Za-z][A-Za-z .,'-]*?)\s*L\.?G\.?A\.?\s*(?:,|$|\s)/i);
+  if (lga) {
+    const words = lga[1].trim().split(/\s+/);
+    const last = words[words.length - 1];
+    // "<Name> North|South|East|West|Central LGA" — the direction belongs to
+    // the LGA name, not the street text.
+    if (words.length >= 2 && /^(north|south|east|west|central)$/i.test(last)) {
+      out.city = titleCase(`${words[words.length - 2]} ${last}`);
+    } else {
+      out.city = titleCase(last);
+    }
+  }
+  const st = addr.match(/([A-Za-z][A-Za-z .,'-]*?)\s*STATE\b/i);
+  if (st) {
+    const words = st[1].trim().replace(/[,.\s]+$/, "").split(/\s+/);
+    out.state = titleCase(words[words.length - 1]);
+  } else if (/\bFCT\b/i.test(addr)) {
+    out.state = "FCT";
+  }
+  return out;
+}
+
 /**
  * Extract the cardholder identity from a `users` row. `user.kyc_data` may be
  * a jsonb object or a JSON string; the identity lives in the FIRST populated
@@ -130,6 +173,11 @@ export function kycIdentity(user: any): KycIdentity {
   }
   local = local.replace(/^0+/, "");
 
+  const address = id("residence_address", "residentialAddress", "address", "line1") || undefined;
+  // Bitnob marks city/state REQUIRED, but NIMC/Prembly often leave those
+  // structured fields empty while the free-text address carries them — parse
+  // the record's OWN address text as the fallback (never invent an address).
+  const parsed = parseAddressBits(address);
   return {
     firstName: first,
     lastName: last,
@@ -137,9 +185,9 @@ export function kycIdentity(user: any): KycIdentity {
     phoneLocal: local,
     dialCode,
     dob: normalizeDob(id("birthdate", "dateOfBirth", "date_of_birth", "birthDate", "dob")),
-    address: id("residence_address", "residentialAddress", "address", "line1") || undefined,
-    city: id("residence_town", "residence_lga", "birthlga", "lgaOfResidence", "lgaOfOrigin", "city") || undefined,
-    state: id("residence_state", "birthstate", "stateOfResidence", "stateOfOrigin", "state") || undefined,
+    address,
+    city: id("residence_town", "residence_lga", "birthlga", "lgaOfResidence", "lgaOfOrigin", "city") || parsed.city,
+    state: id("residence_state", "birthstate", "stateOfResidence", "stateOfOrigin", "state") || parsed.state,
     gender: id("gender", "sex") || undefined,
     // NOTE: `nok_postalcode` is the NEXT-OF-KIN's postal code — deliberately
     // not used as the cardholder's. Prembly carries no user postal code.

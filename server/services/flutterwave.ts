@@ -351,3 +351,41 @@ export async function verifyBankAccount(bankCode: string, accountNumber: string)
   } catch { /* fall through */ }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Platform wallet balances + balance history (GET /v3/balances,
+// GET /v3/balances/:currency, GET /v3/balance-history) — powers the admin
+// "Provider's Balance" desk. Flutterwave is the collection float provider:
+// operators watch these balances to know when to move funds to Sogo /
+// Prestmit (service operations) or Bitnob (virtual cards).
+// ---------------------------------------------------------------------------
+
+/** GET /v3/balances — all currency balances on the account. */
+export async function getBalances(): Promise<any> {
+  const { data } = await client().get("/balances");
+  if (data?.status !== "success") throw new Error(data?.message || "Flutterwave balances unavailable");
+  return data;
+}
+
+/** GET /v3/balances/:currency — a single currency balance snapshot. */
+export async function getBalance(currency: string): Promise<any> {
+  const { data } = await client().get(`/balances/${encodeURIComponent(String(currency).toUpperCase())}`);
+  if (data?.status !== "success") throw new Error(data?.message || "Flutterwave balance unavailable");
+  return data;
+}
+
+/**
+ * GET /v3/balance-history — paginated movement history for a currency
+ * (filterable by date range). Used for reconciliation against local ledgers.
+ */
+export async function getBalanceHistory(
+  params: { currency?: string; page?: number; from?: string; to?: string } = {},
+): Promise<any> {
+  const clean: Record<string, any> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") clean[k] = v;
+  }
+  const { data } = await client().get("/balance-history", { params: clean });
+  if (data?.status !== "success") throw new Error(data?.message || "Flutterwave balance history unavailable");
+  return data;
+}

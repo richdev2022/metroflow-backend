@@ -78,11 +78,13 @@ type CardKycRow = {
   provider_customer_id: string | null;
   completion_link: string | null;
   rejection: any;
+  id_type: string | null;
+  id_number_masked: string | null;
 };
 
 async function getCardKyc(userId: string): Promise<CardKycRow | null> {
   const r = await query(
-    `SELECT status, normalized_status, provider_customer_id, completion_link, rejection
+    `SELECT status, normalized_status, provider_customer_id, completion_link, rejection, id_type, id_number_masked
        FROM virtual_card_kyc WHERE user_id = $1 LIMIT 1`,
     [userId],
   );
@@ -350,6 +352,15 @@ router.get("/kyc-status", authenticateToken, async (req: AuthenticatedRequest, r
     const u = await query(`SELECT bvn, nin, bvn_status, nin_status, kyc_status FROM users WHERE id = $1`, [req.user!.userId]);
     const user = u.rows[0] || {};
     const idType = user.nin_status === "verified" ? "nin" : user.bvn_status === "verified" ? "bvn" : user.bvn ? "bvn" : user.nin ? "nin" : null;
+    // Contract the clients gate on: `completed` = the CARD-ISSUING verification
+    // (virtual_card_kyc) is approved — NOT the profile-level BVN/NIN status.
+    // `has_profile_id` = a verified/recorded BVN or NIN exists on the profile,
+    // so the card form can reuse it instead of sending the user to /kyc.
+    // (These were previously MISSING — the web dialog always fell into the
+    // "Go to KYC verification" branch, and /kyc bounced already-verified
+    // users straight back home. The user-visible bug: Verify → dashboard.)
+    const approved = (kyc?.normalized_status || kyc?.status) === "approved";
+    const profileId = user.bvn || user.nin || "";
     res.json({
       success: true,
       data: {
@@ -358,8 +369,12 @@ router.get("/kyc-status", authenticateToken, async (req: AuthenticatedRequest, r
         provider_customer_id: kyc?.provider_customer_id || null,
         completion_link: kyc?.completion_link || null,
         rejection: kyc?.rejection || null,
+        completed: approved,
+        has_profile_id: !!profileId,
+        id_on_file: !!profileId,
         suggested_id_type: idType,
-        id_on_file: !!(user.bvn || user.nin),
+        id_type: kyc?.id_type || idType,
+        id_number_masked: kyc?.id_number_masked || (profileId ? maskIdNumber(profileId) : null),
       },
     });
   } catch (e: any) {

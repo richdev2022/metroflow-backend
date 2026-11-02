@@ -372,7 +372,14 @@ router.get("/kyc-status", authenticateToken, async (req: AuthenticatedRequest, r
     // "Go to KYC verification" branch, and /kyc bounced already-verified
     // users straight back home. The user-visible bug: Verify → dashboard.)
     const approved = (kyc?.normalized_status || kyc?.status) === "approved";
-    const profileId = user.bvn || user.nin || "";
+    // The masked number MUST belong to the same record as the suggested type.
+    // It previously read `user.bvn || user.nin` while idType prefers the NIN —
+    // so a user with both verified saw "NIN *******7911" showing the BVN's
+    // digits under the NIN label, which reads as the WRONG user's KYC.
+    const profileId =
+      idType === "nin" ? user.nin || user.bvn || "" :
+      idType === "bvn" ? user.bvn || user.nin || "" :
+      user.bvn || user.nin || "";
     res.json({
       success: true,
       data: {
@@ -431,10 +438,17 @@ router.post("/kyc", authenticateToken, checkSubscriptionStatus, async (req: Auth
       (user.nin && user.nin_status === "verified") ? "nin" :
       (user.bvn && user.bvn_status === "verified") ? "bvn" :
       user.bvn ? "bvn" : user.nin ? "nin" : "";
-    const finalIdType = String(id_type || profileIdType).toLowerCase();
-    const finalIdNumber = String(
-      id_number || (finalIdType === "nin" ? user.nin : user.bvn) || user.bvn || user.nin || "",
+    let finalIdType = String(id_type || profileIdType).toLowerCase();
+    let finalIdNumber = String(
+      id_number || (finalIdType === "nin" ? user.nin : user.bvn) || "",
     ).trim();
+    // The submitted number must belong to the submitted type — never send a
+    // NIN label with the BVN's number (or vice versa). If the chosen type has
+    // no number on file, switch to the other ID instead of mixing them.
+    if (!finalIdNumber && !id_number) {
+      finalIdType = finalIdType === "nin" ? "bvn" : "nin";
+      finalIdNumber = String((finalIdType === "nin" ? user.nin : user.bvn) || "").trim();
+    }
     for (const [k, v] of Object.entries({
       id_type: finalIdType, id_number: finalIdNumber, occupation, employment_status,
       account_purpose, annual_salary, expected_monthly_volume,

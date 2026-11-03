@@ -143,6 +143,14 @@ export async function runPostInitializeMigrations(): Promise<void> {
     await query(`CREATE INDEX IF NOT EXISTS idx_users_account_type ON users(account_type)`);
   });
 
+  // TRANSACTION BIOMETRIC — the per-user switch the settings screen toggles
+  // (OTP-confirmed via /settings/transaction-biometric). Server-side flag is
+  // the source of truth so every device of the account agrees.
+  await step("users.transaction_biometric_enabled", async () => {
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS transaction_biometric_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_users_txn_biometric ON users(transaction_biometric_enabled) WHERE transaction_biometric_enabled`);
+  });
+
   // Personal app: live streams (and personal calls) create call rooms with NO
   // owning business. calls.business_id started NOT NULL in the business-era
   // schema, which made every "go live" insert fail with a not-null violation.

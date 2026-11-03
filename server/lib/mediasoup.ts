@@ -80,13 +80,25 @@ const rooms = new Map<string, Room>();
  * Resolution order:
  *  1. MEDIASOUP_ANNOUNCED_IP / MEDIASOUP_PUBLIC_IP if set to a usable,
  *     non-loopback address.
- *  2. Auto-detect: prefer a PUBLIC IPv4 of the host, otherwise the first
- *     non-internal IPv4 interface (works for single VPS deployments).
- *  3. Fall back to the first non-internal IPv4; loopback only as the very
+ *  2. The outbound public IP from the metadata/echo service (ipify) — on NAT
+ *     hosts (CGNAT VPS, Docker, k8s, VPC droplets) this is the ONLY address
+ *     remote peers can reach; the NIC address is unroutable.
+ *  3. A genuinely PUBLIC IPv4 on the host's interfaces (single-VPS setup —
+ *     ipify then returns the same address anyway).
+ *  4. Fall back to the first non-internal IPv4; loopback only as the very
  *     last resort (local development).
  */
 function isPrivateIPv4(ip: string): boolean {
-  return /^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+  return (
+    /^10\./.test(ip) ||
+    /^192\.168\./.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+    /^127\./.test(ip) ||
+    // RFC 6598 CGNAT (100.64.0.0/10): looks public to an RFC1918-only check
+    // but is carrier-internal and UNROUTABLE from the internet — announcing it
+    // strands every remote participant in ICE 'checking' forever.
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)
+  );
 }
 
 /**
@@ -140,6 +152,16 @@ function detectAnnouncedIp(): string {
   let firstNonInternal = '';
   let loopback = '127.0.0.1';
 
+  // NAT-aware preference: the outbound public IP (what the internet sees as
+  // this host) is the ONLY reachable address on NAT'd deployments (CGNAT
+  // VPS, Docker, k8s, VPC droplets). An interface address that merely LOOKS
+  // public (non-RFC1918, e.g. 100.x CGNAT or provider-internal ranges) is
+  // NOT routable from phones — preferring it strands clients in ICE
+  // 'checking' forever (the "livestream connecting forever" report).
+  // On a plain single-VPS box ipify returns the same address as the NIC, so
+  // preferring the metadata result is always safe when it exists.
+  if (metadataPublicIp) return metadataPublicIp;
+
   for (const addresses of Object.values(interfaces)) {
     for (const addr of addresses || []) {
       if (addr.family !== 'IPv4' || addr.internal) continue;
@@ -153,7 +175,6 @@ function detectAnnouncedIp(): string {
   }
 
   // No public IP on the interfaces (VPC-only droplet): use the metadata service.
-  if (metadataPublicIp) return metadataPublicIp;
   if (firstNonInternal) return firstNonInternal;
   if (firstPrivate) return firstPrivate;
   return loopback;
@@ -162,7 +183,24 @@ function detectAnnouncedIp(): string {
 let cachedAnnouncedIp: string | null = null;
 
 function getAnnouncedIp(): string {
-  if (cachedAnnouncedIp) return cachedAnnouncedIp;
+  if (cachedAnnouncedIp) {
+    // Late metadata upgrade: the cache may hold a NIC guess made BEFORE the
+    // outbound public IP resolved. NIC addresses that merely LOOK public
+    // (provider-internal ranges like 21.x, 100.64/10 CGNAT, EC2 1:1-NAT where
+    // the public IP never sits on the NIC) are unroutable from phones and
+    // strand every remote peer in ICE 'checking' (forever-connecting). The
+    // outbound public IP is what the internet sees — it always wins over a
+    // cached NIC guess. An explicit MEDIASOUP_ANNOUNCED_IP env override is
+    // still respected.
+    const explicit = process.env.MEDIASOUP_ANNOUNCED_IP || process.env.MEDIASOUP_PUBLIC_IP || '';
+    if (!explicit && metadataPublicIp && metadataPublicIp !== cachedAnnouncedIp) {
+      logger.warn(
+        `Mediasoup announced IP upgraded from stale "${cachedAnnouncedIp}" to outbound public "${metadataPublicIp}"`,
+      );
+      cachedAnnouncedIp = metadataPublicIp;
+    }
+    return cachedAnnouncedIp;
+  }
   const resolved = detectAnnouncedIp();
   const explicit = process.env.MEDIASOUP_ANNOUNCED_IP || process.env.MEDIASOUP_PUBLIC_IP || '';
   if (resolved === '127.0.0.1') {

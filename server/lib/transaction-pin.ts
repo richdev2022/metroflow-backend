@@ -25,6 +25,9 @@ export interface PinVerifyResult {
   source?: "user" | "business";
   code?: "PIN_REQUIRED" | "PIN_NOT_SET" | "INVALID_PIN";
   error?: string;
+  /** True when the request was authorized by the TRANSACTION BIOMETRIC flag
+   *  (no PIN supplied — the client collected the device-side biometric). */
+  biometric?: boolean;
 }
 
 export async function resolveTransactionPinHash(
@@ -68,6 +71,18 @@ export async function verifyTransactionPin(
   opts: { userId: string; businessId?: string | null },
 ): Promise<PinVerifyResult> {
   if (!pin) {
+    // BIOMETRIC PATH — a PIN-less request is accepted ONLY when the caller's
+    // server-side transaction_biometric_enabled flag is on. The flag flips
+    // exclusively through the OTP-confirmed settings endpoint, so a tampered
+    // client can never self-authorize: the device biometric prompt is just
+    // the local gate the flag unlocks.
+    const bioRes = await query(
+      `SELECT transaction_biometric_enabled FROM users WHERE id = $1`,
+      [opts.userId],
+    );
+    if (bioRes.rows[0]?.transaction_biometric_enabled) {
+      return { ok: true, source: "user", biometric: true };
+    }
     return { ok: false, code: "PIN_REQUIRED", error: "Transaction PIN is required" };
   }
   const { pinHash, source } = await resolveTransactionPinHash(opts.userId, opts.businessId);

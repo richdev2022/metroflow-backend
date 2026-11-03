@@ -999,6 +999,141 @@ router.put("/pin", authenticateToken, checkSubscriptionStatus, validateBody(Upda
 
 /**
  * @swagger
+ * /settings/transaction-biometric/send-otp:
+ *   post:
+ *     summary: Send the OTP that authorizes toggling TRANSACTION BIOMETRIC
+ *       (the OTP rides the caller's OTP preference — otp_method override,
+ *       then businesses.otp_preference, then both email + SMS for personal
+ *       accounts that have no business policy).
+ *     tags: [Settings]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/transaction-biometric/send-otp", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const businessId = req.user?.businessId;
+    const otpMethod = String(req.body?.otp_method || '').toLowerCase();
+
+    // OTP PREFERENCE (the same chain the transfer OTP uses): request
+    // override → business policy → 'both' (a personal account enabling a
+    // security feature should get the OTP wherever it is reachable).
+    let preference = otpMethod;
+    if (!['email', 'sms', 'both'].includes(preference)) {
+      if (businessId) {
+        const prefRes = await query(`SELECT otp_preference FROM businesses WHERE id = $1`, [businessId]);
+        preference = prefRes.rows[0]?.otp_preference || 'both';
+      } else {
+        preference = 'both';
+      }
+    }
+
+    const userRes = await query(`SELECT email, phone_number FROM users WHERE id = $1`, [userId]);
+    const email = userRes.rows[0]?.email;
+    const phone = userRes.rows[0]?.phone_number || null;
+    if (!email && !phone) {
+      return res.status(400).json({ success: false, error: "No contact information available to send OTP" });
+    }
+
+    const otpCode = generateOTP();
+    const otpExpiresAt = getOTPExpiry();
+    await query(
+      `UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_type = 'txn_biometric_toggle' WHERE id = $3`,
+      [hashOtp(otpCode), otpExpiresAt, userId] // VAPT MF-012: hashed at rest
+    );
+
+    let emailSent = false;
+    let smsSent = false;
+    if ((preference === 'email' || preference === 'both') && email) {
+      const html = generateOtpEmailHtml(otpCode, "Confirm Transaction Biometric Setting");
+      emailSent = await sendEmail(
+        email,
+        "Confirm Transaction Biometric Setting - MetriCorex",
+        "Use this OTP to confirm your transaction biometric setting change",
+        html,
+      ).catch(() => false);
+      if (!emailSent) console.error("txn-biometric OTP email delivery failed");
+    }
+    if ((preference === 'sms' || preference === 'both') && phone) {
+      try {
+        await sendSMS(phone, `Your MetriCorex OTP to confirm your transaction biometric setting change is: ${otpCode}`);
+        smsSent = true;
+      } catch (smsErr) {
+        console.error("txn-biometric OTP SMS send error:", smsErr);
+      }
+    }
+
+    if (!emailSent && !smsSent) {
+      return res.status(500).json({ success: false, error: "Failed to send OTP via email and SMS" });
+    }
+
+    res.json({
+      success: true,
+      message: "OTP sent successfully",
+      channels: [...(emailSent ? ['email'] : []), ...(smsSent ? ['sms'] : [])],
+    });
+  } catch (error) {
+    console.error("Send txn-biometric OTP error:", error);
+    res.status(500).json({ success: false, error: "Failed to send OTP" });
+  }
+});
+
+/**
+ * @swagger
+ * /settings/transaction-biometric:
+ *   get:  read the caller's transaction-biometric flag
+ *   put:  flip it (requires the OTP from send-otp — otp_type txn_biometric_toggle)
+ */
+router.get("/transaction-biometric", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const r = await query(
+      `SELECT transaction_biometric_enabled FROM users WHERE id = $1`,
+      [req.user!.userId],
+    );
+    res.json({ success: true, data: { enabled: !!r.rows[0]?.transaction_biometric_enabled } });
+  } catch {
+    res.status(500).json({ success: false, error: "Could not load transaction biometric setting" });
+  }
+});
+
+router.put("/transaction-biometric", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const enabled = req.body?.enabled === true;
+    const otp = String(req.body?.otp || '').trim();
+    if (!/^\d{4,8}$/.test(otp)) {
+      return res.status(400).json({ success: false, error: "Enter the OTP we sent you" });
+    }
+    const rows = await query(
+      `SELECT otp_code, otp_expires_at, otp_type FROM users WHERE id = $1`,
+      [userId],
+    );
+    const row = rows.rows[0];
+    if (!row?.otp_code || row.otp_type !== 'txn_biometric_toggle') {
+      return res.status(400).json({ success: false, error: "Request an OTP first" });
+    }
+    if (!row.otp_expires_at || new Date(row.otp_expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ success: false, error: "OTP expired — request a new one" });
+    }
+    if (!otpMatches(otp, row.otp_code)) {
+      return res.status(400).json({ success: false, error: "Incorrect OTP" });
+    }
+    // Consume the OTP (single use) and persist the flag.
+    await query(
+      `UPDATE users SET otp_code = NULL, otp_expires_at = NULL, otp_type = NULL, transaction_biometric_enabled = $2 WHERE id = $1`,
+      [userId, enabled],
+    );
+    res.json({ success: true, data: { enabled }, message: enabled
+        ? "Transaction biometric enabled"
+        : "Transaction biometric disabled" });
+  } catch (error) {
+    console.error("Update txn-biometric error:", error);
+    res.status(500).json({ success: false, error: "Could not update transaction biometric setting" });
+  }
+});
+
+/**
+ * @swagger
  * /settings/otp-enabled/send-otp:
  *   post:
  *     summary: Send an OTP that authorizes toggling OTP-for-transactions

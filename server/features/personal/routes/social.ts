@@ -12,6 +12,7 @@ import { upload, uploadAudio } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
 import { friendshipMap } from "../../../routes/friends";
 import { getSetting } from "../../../services/app-config";
+import { getBadgeCriteria } from "../../../services/verification-criteria";
 
 /**
  * SOCIAL — Facebook-style feed + robust polls + post boost engine.
@@ -2463,13 +2464,20 @@ export async function getVerificationPricing(): Promise<VerificationPricing> {
 
 /** Evaluate every eligibility criterion for the badge. */
 export async function evaluateVerificationCriteria(userId: string): Promise<Array<{ key: string; label: string; passed: boolean; detail: string }>> {
-  const MIN_FOLLOWERS = 50;
-  const MIN_POSTS = 5;
-  const MIN_AGE_DAYS = 30;
+  // SINGLE SOURCE OF TRUTH — the ADMIN-CONFIGURED badge criteria
+  // (system_settings `verification_badge_criteria`, edited from the dashboard's
+  // Verification Badge page). Before this unification this checklist showed
+  // hardcoded thresholds (50 followers / 5 posts / 30 days) while the grant
+  // engine honored the admin's numbers — admins changed eligibility and users
+  // never saw the checklist move. Now the profile checklist, the subscribe
+  // gate and the auto-grant engine all read the exact same config, in the
+  // exact order the admin page previews: KYC → phone → profile → age →
+  // followers → posts → standing.
+  const cfg = await getBadgeCriteria();
 
   const [u, followers, posts, violations] = await Promise.all([
     query(
-      `SELECT kyc_status, phone_verified, avatar_url, bio, username, created_at FROM users WHERE id = $1`,
+      `SELECT kyc_status, bvn_status, nin_status, phone_verified, avatar_url, bio, username, created_at FROM users WHERE id = $1`,
       [userId],
     ),
     query(`SELECT COUNT(*)::int AS n FROM social_follows WHERE following_id = $1`, [userId]),
@@ -2482,22 +2490,88 @@ export async function evaluateVerificationCriteria(userId: string): Promise<Arra
     ),
   ]);
 
-  const row = u.rows[0] || {};
+  const row: any = u.rows[0] || {};
   const bio = String(row.bio || "").trim();
   const username = String(row.username || "").trim();
   const avatar = String(row.avatar_url || "").trim();
   const profileScore = [avatar, bio.length >= 20, username].filter(Boolean).length;
   const ageDays = row.created_at ? Math.floor((Date.now() - new Date(row.created_at).getTime()) / 86400000) : 0;
+  const followerCount = Number(followers.rows[0]?.n) || 0;
+  const postCount = Number(posts.rows[0]?.n) || 0;
+  const violationCount = Number(violations.rows[0]?.n) || 0;
+  const kycVerified =
+    String(row.kyc_status) === "verified" ||
+    String(row.bvn_status) === "verified" ||
+    String(row.nin_status) === "verified";
 
-  return [
-    { key: "kyc", label: "Identity verified (KYC)", passed: String(row.kyc_status) === "verified", detail: String(row.kyc_status) === "verified" ? "Your identity is verified" : "Complete KYC in the app to verify your identity" },
-    { key: "phone", label: "Phone number verified", passed: row.phone_verified === true, detail: row.phone_verified ? "Phone verified" : "Verify your phone number in Account settings" },
-    { key: "profile", label: "Complete profile (photo, bio, username)", passed: profileScore === 3, detail: `${profileScore}/3 done — ${!avatar ? "add a photo, " : ""}${bio.length < 20 ? "write a longer bio, " : ""}${!username ? "set a username" : ""}`.replace(/, $/, "") || "Profile complete" },
-    { key: "age", label: `Account at least ${MIN_AGE_DAYS} days old`, passed: ageDays >= MIN_AGE_DAYS, detail: `${ageDays} day${ageDays === 1 ? "" : "s"} so far` },
-    { key: "followers", label: `At least ${MIN_FOLLOWERS} followers`, passed: Number(followers.rows[0]?.n) >= MIN_FOLLOWERS, detail: `${Number(followers.rows[0]?.n) || 0}/${MIN_FOLLOWERS} followers` },
-    { key: "posts", label: `At least ${MIN_POSTS} posts`, passed: Number(posts.rows[0]?.n) >= MIN_POSTS, detail: `${Number(posts.rows[0]?.n) || 0}/${MIN_POSTS} active posts` },
-    { key: "standing", label: "Good standing (no removed posts in 90 days)", passed: Number(violations.rows[0]?.n) === 0, detail: Number(violations.rows[0]?.n) === 0 ? "No moderation actions against you" : "Recent content was removed after community reports" },
-  ];
+  const kycRow = {
+    key: "kyc",
+    label: "Identity verified (KYC)",
+    passed: kycVerified,
+    detail: kycVerified ? "Your identity is verified" : "Complete KYC in the app to verify your identity",
+  };
+  const phoneRow = {
+    key: "phone",
+    label: "Phone number verified",
+    passed: row.phone_verified === true,
+    detail: row.phone_verified ? "Phone verified" : "Verify your phone number in Account settings",
+  };
+  const profileRow = {
+    key: "profile",
+    label: "Complete profile (photo, bio, username)",
+    passed: profileScore === 3,
+    detail: `${profileScore}/3 done — ${!avatar ? "add a photo, " : ""}${bio.length < 20 ? "write a longer bio, " : ""}${!username ? "set a username" : ""}`.replace(/, $/, "") || "Profile complete",
+  };
+  const standingRow = {
+    key: "standing",
+    label: "Good standing (no removed posts in 90 days)",
+    passed: violationCount === 0,
+    detail: violationCount === 0 ? "No moderation actions against you" : "Recent content was removed after community reports",
+  };
+
+  // ENGINE OFF → fall back to the base identity set so the PAID subscription
+  // path still has a meaningful gate (the auto-grant engine itself is idle).
+  if (!cfg.enabled) {
+    return [kycRow, phoneRow, profileRow, standingRow];
+  }
+
+  const rows: Array<{ key: string; label: string; passed: boolean; detail: string }> = [];
+  if (cfg.require_kyc) rows.push(kycRow);
+  if (cfg.require_phone) rows.push(phoneRow);
+  if (cfg.require_profile) rows.push(profileRow);
+  if (cfg.min_account_age_days > 0) {
+    const min = Math.round(cfg.min_account_age_days);
+    rows.push({
+      key: "age",
+      label: `Account at least ${min} days old`,
+      passed: ageDays >= min,
+      detail: `${ageDays} day${ageDays === 1 ? "" : "s"} so far`,
+    });
+  }
+  if (cfg.followers > 0) {
+    const min = Math.round(cfg.followers);
+    rows.push({
+      key: "followers",
+      label: `At least ${min} followers`,
+      passed: followerCount >= min,
+      detail: `${followerCount}/${min} followers`,
+    });
+  }
+  if (cfg.min_posts > 0) {
+    const min = Math.round(cfg.min_posts);
+    rows.push({
+      key: "posts",
+      label: `At least ${min} posts`,
+      passed: postCount >= min,
+      detail: `${postCount}/${min} active posts`,
+    });
+  }
+  if (cfg.require_good_standing) rows.push(standingRow);
+  // Guard: a config with nothing active would make `every` trivially true —
+  // keep the base identity gate so "Subscribe" can never be unconditionally
+  // open while the engine says nobody auto-qualifies.
+  if (rows.length === 0) return [kycRow, phoneRow, profileRow, standingRow];
+  return rows;
 }
 
 router.get("/verification/status", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {

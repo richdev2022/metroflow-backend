@@ -13,6 +13,7 @@
     "build": "npm run generate-swagger && vite build --config vite.config.server.ts",
     "start": "node dist/server/node-build.mjs",
     "test": "vitest --run",
+    "test:bitnob-sandbox": "tsx scripts/bitnob-sandbox-e2e.ts",
     "format.fix": "prettier --write .",
     "typecheck": "tsc"
   },

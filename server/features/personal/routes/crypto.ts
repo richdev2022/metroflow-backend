@@ -357,6 +357,7 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     const fx = await import("../../../services/fx");
     const ngnPerUsd = (await fx.getUsdNgnRate()).rate;
     const usdDebit = Math.round((settlement / ngnPerUsd) * 100) / 100;
+    const spread = await getPercent("crypto_spread_percent", 1);
 
     // LIVE RATE CALCULATOR — the ACTIVE provider's rate always wins:
     //   sogo   → GET /crypto/assets/{asset}/rate (Sogo live market rate)
@@ -387,6 +388,12 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
         from_asset: asset,
         settlement_amount: settlement,
         settlement_currency: "NGN",
+        // Conversion fee (admin spread, mirrors the stablecoin convert flow):
+        // the fee is carved out of the NGN settlement, so the payout the user
+        // actually receives is net_amount. Clients render Rate / Fee / Total.
+        fee_percent: spread,
+        fee_amount: Math.round(settlement * (spread / 100) * 100) / 100,
+        net_amount: Math.round((settlement - Math.round(settlement * (spread / 100) * 100) / 100) * 100) / 100,
         provider,
         expires_at: new Date(Date.now() + 2 * 60000).toISOString(),
         reference: genRef("MF-QT"),
@@ -407,6 +414,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     const accountNumber = String(req.body?.account_number || "").trim();
     const bankCode = String(req.body?.bank_code || "").trim();
     const accountName = String(req.body?.account_name || "").trim();
+    const spread = await getPercent("crypto_spread_percent", 1);
     if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
     if (!Number.isFinite(settlement) || settlement <= 0) return res.status(400).json({ success: false, error: "settlement_amount must be positive" });
     if (!/^\d{10}$/.test(accountNumber) || !bankCode || !accountName) {
@@ -436,13 +444,18 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     }
 
     const reference = genRef("MF-CRS");
+    // Conversion fee (admin spread) is carved out of the NGN payout — same
+    // model as the stablecoin convert flow, so the quoted fee matches the
+    // executed payout to the penny.
+    const feeAmount = Math.round(settlement * (spread / 100) * 100) / 100;
+    const netAmount = Math.round((settlement - feeAmount) * 100) / 100;
     if (!(await debitWallet(wallet.id, usdDebit))) {
       return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${asset} balance` });
     }
     await insertTransaction({
       userId, walletId: wallet.id, reference, type: "debit", transactionType: "crypto_sale",
       amount: usdDebit, currency: asset,
-      description: `Stablecoin sale — ${asset} → ₦${settlement.toLocaleString()}`,
+      description: `Stablecoin sale — ${asset} → ₦${netAmount.toLocaleString()} (fee ₦${feeAmount.toLocaleString()})`,
     });
 
     // Payout rails: the NGN settlement is executed by Bitnob's payout API
@@ -456,9 +469,9 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     const dbInsert = await query(
       `INSERT INTO crypto_sales
          (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
-          settlement_currency, rate, bank_code, account_number, account_name, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,'processing') RETURNING *`,
-      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, ngnPerUsd, bankCode, accountNumber, accountName],
+          settlement_currency, rate, fee, bank_code, account_number, account_name, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,$12,'processing') RETURNING *`,
+      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, ngnPerUsd, feeAmount, bankCode, accountNumber, accountName],
     );
 
     if (!useLive) {
@@ -468,7 +481,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
         await query(`UPDATE crypto_sales SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = $1`, [dbInsert.rows[0].id]);
         createNotification({
           businessId: "", userId, type: "credit", title: "Stablecoin sale completed",
-          message: `₦${settlement.toLocaleString()} has been sent to your ${accountName} account.`,
+          message: `₦${netAmount.toLocaleString()} has been sent to your ${accountName} account.`,
         }).catch(() => {});
         const simFresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
         return res.status(201).json({ success: true, data: { sale: simFresh.rows[0], mode: "simulator" } });
@@ -491,7 +504,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
       try {
         const quote = await bitnob.createPayoutQuote({
           fromAsset: asset, toCurrency: "NGN", country: "NG",
-          amount: settlement, reference,
+          amount: netAmount, reference,
         });
         const payout = quote?.data?.payout || quote?.payout;
         const quoteId = payout?.id || payout?.quote_id || quoteIdFromBody(req);
@@ -505,7 +518,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
             [dbInsert.rows[0].id, payout?.id || quoteId]);
           createNotification({
             businessId: "", userId, type: "credit", title: "Crypto sale completed",
-            message: `₦${settlement.toLocaleString()} is on its way to your ${accountName} account.`,
+            message: `₦${netAmount.toLocaleString()} is on its way to your ${accountName} account.`,
           }).catch(() => {});
         }
       } catch (bnErr: any) {

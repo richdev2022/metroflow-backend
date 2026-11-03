@@ -102,6 +102,7 @@ import rolesRouter from "./routes/roles";
 import { requireTeamPermission } from "./middleware/teamAuth";
 import transferRouter from "./routes/transfers";
 import disputesRouter from "./routes/disputes";
+import fraudRouter from "./routes/fraud";
 import payrollRouter from "./routes/payroll";
 import settingsRouter from "./routes/settings";
 import { rtcRouter } from "./lib/calling/routes";
@@ -1069,6 +1070,10 @@ export async function createServer() {
   mainRouter.use("/transfers", transferRouter);
   // Transaction dispute lifecycle (customer side; admin side lives under /admin/disputes)
   mainRouter.use("/disputes", disputesRouter);
+  // FRAUD ENGINE (user side) — held transactions banner + due-diligence form.
+  // This router was previously never mounted, so every /fraud/* call from the
+  // mobile/web clients 404'd ("Failed request" on every screen).
+  mainRouter.use("/fraud", fraudRouter);
 
   // Payroll API routes
   mainRouter.use("/payroll", payrollRouter);

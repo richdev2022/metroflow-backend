@@ -26,7 +26,10 @@ export const InitiateSingleTransferSchema = z.object({
   currency: z.string().length(3).regex(/^[A-Z]+$/, "Currency must be a 3-letter code").optional(),
   remark: z.string().optional(),
   otp: z.string().length(6).regex(/^\d+$/).optional(),
-  pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
+  // PIN is OPTIONAL at the schema level: requests authorized by TRANSACTION
+  // BIOMETRIC send no pin at all — the shared verifyTransactionPin enforces
+  // "pin OR server-side transaction_biometric_enabled" for every caller.
+  pin: z.string().length(4).regex(/^\d+$/, "PIN is required").optional(),
   walletId: z.string().optional(),
   wallet_id: z.string().optional(),
   // ---- International payout beneficiary details (Flutterwave rails) ----
@@ -56,7 +59,8 @@ export const InitiateSingleTransferSchema = z.object({
 export const InitiateBulkTransferSchema = z.object({
   type: z.enum(["Salary", "Epic"]),
   otp: z.string().length(6).regex(/^\d+$/).optional(),
-  pin: z.string().length(4).regex(/^\d+$/, "PIN is required"),
+  // See InitiateSingleTransferSchema — pin optional for biometric flows.
+  pin: z.string().length(4).regex(/^\d+$/, "PIN is required").optional(),
   sourceWalletId: z.string().optional(),
   source_wallet_id: z.string().optional(),
   /** Epic id the payout belongs to (new web/mobile contract). */

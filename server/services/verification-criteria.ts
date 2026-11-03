@@ -16,8 +16,15 @@ import { getSetting, setSetting } from "./app-config";
  *   followers              min follower count          (0 = not required)
  *   min_posts              min posts created           (0 = not required)
  *   min_account_age_days   min account age in days     (0 = not required)
- *   require_kyc            BVN or NIN verified         (false = not required)
+ *   require_kyc            BVN/NIN or KYC verified     (false = not required)
  *   require_phone          phone number verified       (false = not required)
+ *   require_profile        photo + bio (20+ chars) + username set
+ *   require_good_standing  no actioned remove_post reports in the last 90 days
+ *
+ * SINGLE SOURCE OF TRUTH: these are the same criteria the user profile's
+ * checklist displays (GET /social/verification/status →
+ * evaluateVerificationCriteria reads this exact config), so what admins
+ * configure here is verbatim what users are told to complete.
  *
  * Badge sources on users.verified_badge_source:
  *   'subscription' — paid monthly badge (verified_until matters)
@@ -34,6 +41,8 @@ export interface BadgeCriteria {
   min_account_age_days: number;
   require_kyc: boolean;
   require_phone: boolean;
+  require_profile: boolean;
+  require_good_standing: boolean;
 }
 
 const DEFAULT_CRITERIA: BadgeCriteria = {
@@ -43,6 +52,10 @@ const DEFAULT_CRITERIA: BadgeCriteria = {
   min_account_age_days: 0,
   require_kyc: false,
   require_phone: false,
+  // The profile checklist has ALWAYS demanded a complete profile + good
+  // standing — default these on so eligibility matches what users see.
+  require_profile: true,
+  require_good_standing: true,
 };
 
 const nonNegInt = (v: unknown, fallback: number): number => {
@@ -62,6 +75,10 @@ export async function getBadgeCriteria(): Promise<BadgeCriteria> {
       min_account_age_days: nonNegInt(parsed?.min_account_age_days, 0),
       require_kyc: parsed?.require_kyc === true,
       require_phone: parsed?.require_phone === true,
+      // Default ON for stored configs that predate these knobs (the profile
+      // checklist always displayed them).
+      require_profile: parsed?.require_profile !== false,
+      require_good_standing: parsed?.require_good_standing !== false,
     };
   } catch {
     return { ...DEFAULT_CRITERIA };
@@ -77,6 +94,8 @@ export async function setBadgeCriteria(next: Partial<BadgeCriteria>): Promise<Ba
     min_account_age_days: nonNegInt(next.min_account_age_days ?? current.min_account_age_days, 0),
     require_kyc: next.require_kyc !== undefined ? Boolean(next.require_kyc) : current.require_kyc,
     require_phone: next.require_phone !== undefined ? Boolean(next.require_phone) : current.require_phone,
+    require_profile: next.require_profile !== undefined ? Boolean(next.require_profile) : current.require_profile,
+    require_good_standing: next.require_good_standing !== undefined ? Boolean(next.require_good_standing) : current.require_good_standing,
   };
   if (clean.enabled) {
     const anyActive =
@@ -84,15 +103,17 @@ export async function setBadgeCriteria(next: Partial<BadgeCriteria>): Promise<Ba
       clean.min_posts > 0 ||
       clean.min_account_age_days > 0 ||
       clean.require_kyc ||
-      clean.require_phone;
+      clean.require_phone ||
+      clean.require_profile ||
+      clean.require_good_standing;
     if (!anyActive) {
-      throw new Error("Enable at least one criterion (followers, posts, account age, KYC or phone) — otherwise every account would auto-verify.");
+      throw new Error("Enable at least one criterion (followers, posts, account age, KYC, phone, profile or good standing) — otherwise every account would auto-verify.");
     }
   }
   await setSetting(
     "verification_badge_criteria",
     JSON.stringify(clean),
-    "Verified badge auto-criteria (personal app) — followers/posts/age/KYC/phone",
+    "Verified badge auto-criteria (personal app) — followers/posts/age/KYC/phone/profile/standing",
   );
   return clean;
 }
@@ -104,16 +125,31 @@ function criteriaSql(criteria: BadgeCriteria): string {
     parts.push(`(SELECT COUNT(*) FROM social_follows f WHERE f.following_id = u.id) >= ${Math.round(criteria.followers)}`);
   }
   if (criteria.min_posts > 0) {
-    parts.push(`(SELECT COUNT(*) FROM social_posts p WHERE p.user_id = u.id) >= ${Math.round(criteria.min_posts)}`);
+    // Same shape the profile checklist counts (active posts only).
+    parts.push(`(SELECT COUNT(*) FROM social_posts p WHERE p.user_id = u.id AND p.status = 'active') >= ${Math.round(criteria.min_posts)}`);
   }
   if (criteria.min_account_age_days > 0) {
     parts.push(`u.created_at <= CURRENT_TIMESTAMP - INTERVAL '${Math.round(criteria.min_account_age_days)} days'`);
   }
   if (criteria.require_kyc) {
-    parts.push(`(u.bvn_status = 'verified' OR u.nin_status = 'verified')`);
+    // Any official verification path counts — identical to the checklist row.
+    parts.push(`(u.kyc_status = 'verified' OR u.bvn_status = 'verified' OR u.nin_status = 'verified')`);
   }
   if (criteria.require_phone) {
     parts.push(`u.phone_verified = true`);
+  }
+  if (criteria.require_profile) {
+    // photo + bio (20+ chars, trimmed) + username — identical to the checklist row.
+    parts.push(`(u.avatar_url IS NOT NULL AND u.avatar_url <> '' AND u.username IS NOT NULL AND u.username <> '' AND u.bio IS NOT NULL AND LENGTH(TRIM(u.bio)) >= 20)`);
+  }
+  if (criteria.require_good_standing) {
+    parts.push(`NOT EXISTS (
+      SELECT 1 FROM social_post_reports r
+      JOIN social_posts p ON p.id = r.post_id
+      WHERE p.user_id = u.id AND r.status = 'actioned'
+        AND r.decision IN ('remove_post')
+        AND r.decided_at >= NOW() - INTERVAL '90 days'
+    )`);
   }
   // No criteria active → nobody qualifies via the engine (guard upstream).
   return parts.length ? `(${parts.join(" AND ")})` : `false`;

@@ -3294,7 +3294,38 @@ router.get("/search/users", authenticateToken, checkSubscriptionStatus, async (r
     const q = String(req.query.q || "").trim().slice(0, 100);
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
     const cursor = req.query.cursor ? String(req.query.cursor) : null;
-    if (!q) return res.json({ success: true, data: { users: [], next_cursor: null } });
+    // DISCOVER MODE (no q): the discovery screen opens with the full roster —
+    // every active user except the caller, alphabetical, name-keyset paginated.
+    // Search then filters client-side debounced queries on the SAME endpoint.
+    if (!q) {
+      const browseParams: any[] = [userId];
+      let browseWhere = `u.status = 'active' AND u.id <> $1`;
+      if (cursor) { browseWhere += ` AND u.name > $2`; browseParams.push(cursor); }
+      browseParams.push(limit + 1);
+      const browse = await query(
+        `SELECT u.id, u.name, u.avatar_url, u.username, u.bio,
+                (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS is_verified,
+                EXISTS (SELECT 1 FROM social_follows f WHERE f.follower_id = $1 AND f.following_id = u.id AND f.status = 'active') AS viewer_follows,
+                (SELECT COUNT(*)::int FROM social_follows f WHERE f.following_id = u.id AND f.status = 'active') AS follower_count
+         FROM users u
+         WHERE ${browseWhere}
+         ORDER BY u.name
+         LIMIT $${browseParams.length}`,
+        browseParams,
+      );
+      const hasMore = browse.rows.length > limit;
+      return res.json({
+        success: true,
+        data: {
+          users: browse.rows.slice(0, limit).map((u) => ({
+            id: u.id, name: u.name, photo: u.avatar_url, username: u.username, bio: u.bio,
+            is_verified: !!u.is_verified, viewer_follows: !!u.viewer_follows,
+            follower_count: Number(u.follower_count) || 0,
+          })),
+          next_cursor: hasMore ? browse.rows[limit - 1]?.name : null,
+        },
+      });
+    }
     const like = `%${q}%`;
     const params: any[] = [userId, like];
     let where = `u.status = 'active' AND u.id <> $1

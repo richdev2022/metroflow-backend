@@ -267,8 +267,11 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS background_color VARCHAR(64)`);
   // Voice comments — audio attachment (R2/Cloudinary/local URL) + duration in
   // ms so players can render a waveform/progress without loading the file.
-  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_url TEXT`);
-  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_duration_ms INTEGER`);
+  // NOTE: these ALTERs MUST run after the social_comments CREATE below — they
+  // used to sit here (before it), which killed the ENTIRE migration step on
+  // every fresh database ("relation social_comments does not exist"), so
+  // live_sessions was left without host_id and personal live streaming 500'd
+  // on "Could not go live" / viewers never connected.
 
   // Feed reposts (X-style): a repost is a NEW post row referencing the
   // original. Commentary lives in `body`; any recorded/uploaded media rides
@@ -413,6 +416,11 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_comments_parent ON social_comments(parent_id)`);
+  // Voice comments — audio attachment (R2/Cloudinary/local URL) + duration in
+  // ms so players can render a waveform/progress without loading the file.
+  // (Moved below the CREATE — see the note up top.)
+  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_url TEXT`);
+  await query(`ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS audio_duration_ms INTEGER`);
 
   // Per-user comment/reply likes — social_comments.like_count stays a
   // denormalized counter maintained by the toggle endpoint.
@@ -543,6 +551,26 @@ export async function ensurePersonalSchema(): Promise<void> {
     )
   `);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS moderator_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  // UPGRADE the lean table ensureLiveSchema creates first (host_user_id, no
+  // description/category/counters). The personal live stack reads/writes
+  // host_id — on every FRESH database the index below used to fail with
+  // 'column "host_id" does not exist', silently killing the whole personal
+  // schema step (masked on the original deployment by a manual ALTER).
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS host_id UUID`);
+  await query(`UPDATE live_sessions SET host_id = host_user_id WHERE host_id IS NULL AND host_user_id IS NOT NULL`);
+  // Legacy NOT NULL host_user_id would reject personal-live inserts that only
+  // set host_id ("null value in column host_user_id violates not-null
+  // constraint") — relax it; new rows always set host_id.
+  await query(`ALTER TABLE live_sessions ALTER COLUMN host_user_id DROP NOT NULL`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS description TEXT`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS category VARCHAR(40) NOT NULL DEFAULT 'general'`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS pinned_message TEXT`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS slow_mode_seconds INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS current_viewers INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS total_views INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS reaction_count INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS gift_count INTEGER NOT NULL DEFAULT 0`);
+  await query(`ALTER TABLE live_sessions ALTER COLUMN host_id SET NOT NULL`);
   // TikTok-style share thumbnail: the host's stream frame (or avatar) with the
   // LIVE pill composited on — used as og:image when a share link unfurls.
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS thumbnail_url TEXT`);

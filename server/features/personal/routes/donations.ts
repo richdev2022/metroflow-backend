@@ -89,6 +89,21 @@ const DONATION_SELECT = `
   JOIN users u ON u.id = d.creator_id
 `;
 
+// NUMERIC(14,2) money columns travel through node-postgres as JSON STRINGS
+// ("50000.00"). Mobile Dart does `as num?` casts on them — that threw
+// `type 'String' is not a subtype of type 'num?'` and took down the whole
+// Fundraisers view. Coerce every money field to a real number ONCE here so
+// every client (mobile + web) receives JSON numbers.
+function serializeDonation(d: any) {
+  if (!d) return d;
+  return {
+    ...d,
+    goal_amount: num(d.goal_amount),
+    amount_raised: num(d.amount_raised),
+    amount_redeemed: num(d.amount_redeemed),
+  };
+}
+
 function num(v: any): number { return Number(v) || 0; }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +179,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
     res.json({
       success: true,
       data: {
-        donations: rows.rows.map((d) => ({
+        donations: rows.rows.map((d) => serializeDonation({
           ...d,
           is_creator: d.creator_id === userId,
           my_contribution: mineMap.get(d.id) || null,
@@ -267,13 +282,13 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
     res.json({
       success: true,
       data: {
-        donation: {
+        donation: serializeDonation({
           ...d,
           progress: num(d.goal_amount) > 0 ? Math.min(100, Math.round((num(d.amount_raised) / num(d.goal_amount)) * 100)) : 0,
           my_contribution: { amount: num(mine.rows[0]?.amount), times: mine.rows[0]?.times || 0 },
           is_creator: d.creator_id === userId,
-        },
-        redemptions: redemptions.rows,
+        }),
+        redemptions: redemptions.rows.map((r) => ({ ...r, amount: num(r.amount), fee: num(r.fee), net_amount: num(r.net_amount) })),
       },
     });
   } catch (e: any) {

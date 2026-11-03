@@ -79,6 +79,15 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureVaptHardeningSchema", ensureVaptHardeningSchema); // VAPT fixes: admin lockout, hashed OTP columns
   await step("ensureFraudSchema", ensureFraudSchema); // fraud rules/evaluations/cases/blacklists + due diligence
   await step("repairFreeForeverStatuses", repairFreeForeverStatuses); // reactivate free-plan businesses wrongly deactivated by the old trial cron
+  // ORDER MATTERS: ensurePersonalSchema ALTERs live_gifts (commission_amount,
+  // host_amount) — a table ensureLiveSchema creates. With ensurePersonalSchema
+  // first, every FRESH database failed the whole personal step ("relation
+  // live_gifts does not exist") → live_sessions ended up without host_id and
+  // personal live streaming 500'd ("Could not go live") / viewers never
+  // connected. ensureLiveSchema is self-contained (live_sessions + viewers +
+  // gifts off users/calls) so it safely runs first; ensurePersonalSchema then
+  // upgrades both with its CREATE IF NOT EXISTS + ALTER IF NOT EXISTS.
+  await step("ensureLiveSchema", ensureLiveSchema); // one-tap live streaming (call-room backed)
   await step("ensurePersonalSchema", ensurePersonalSchema); // dormant personal features: bills hub + savings vaults
   await step("ensureBillsSchema", ensureBillsSchema); // bills hub v2: recharge tokens + item codes
   await step("seedBillFeeConfiguration", seedBillFeeConfiguration); // fee_configurations 'bill' row (admin-editable flat convenience fee)
@@ -88,7 +97,6 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureCryptoSchema", ensureCryptoSchema); // crypto -> NGN sales (Bitnob payouts)
   await step("ensureStablecoinSchema", ensureStablecoinSchema); // USDT/USDC wallets: addresses, deposits, conversions, withdrawals, webhook ledger
   await step("ensureSocialSchema", ensureSocialSchema); // personal social feed + polls
-  await step("ensureLiveSchema", ensureLiveSchema); // one-tap live streaming (call-room backed)
   await step("ensureSsoSchema", ensureSsoSchema); // cross-app SSO one-time tickets (Business <-> Personal)
   await step("ensureBillTransactionsSchema", ensureBillTransactionsSchema); // unified bills hub (Sogo/Flutterwave routing)
   await step("ensureGiftcardRoutesSchema", ensureGiftcardRoutesSchema); // giftcard trades + provider columns (Sogo/Prestmit)

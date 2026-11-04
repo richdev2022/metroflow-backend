@@ -10,6 +10,7 @@ import { uploadMediaBuffer } from "../../../services/media-upload";
 import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
 import { upload, uploadAudio } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
+import { sendPushToUsers } from "../../../services/push";
 import { friendshipMap } from "../../../routes/friends";
 import { getSetting } from "../../../services/app-config";
 import { getBadgeCriteria } from "../../../services/verification-criteria";
@@ -1566,7 +1567,30 @@ router.post("/posts/:id/comments", authenticateToken, uploadAudio.single("audio"
         title: "New comment",
         message: preview.slice(0, 80),
         type: "social",
+        // Deep link: tapping the push opens THIS post's comment sheet.
+        actionUrl: `/post/${req.params.id}`,
+        metadata: { postId: req.params.id, openComments: true },
       }).catch(() => {});
+      // FCM push so a backgrounded/closed app still alerts; tapping it lands
+      // straight on the post's comment section (type=comment + openComments).
+      const postOwnerId = post.rows[0].user_id;
+      query(`SELECT name FROM users WHERE id = $1`, [userId])
+        .then((n) =>
+          sendPushToUsers(
+            [{ userId: postOwnerId }],
+            {
+              title: `${n.rows[0]?.name || "Someone"} commented on your post`,
+              body: preview.slice(0, 120) || "Tap to view the comment",
+              data: {
+                type: "comment",
+                postId: String(req.params.id),
+                openComments: "true",
+              },
+            },
+            { inApp: false },
+          ),
+        )
+        .catch(() => {});
     }
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     const comment = {
@@ -1644,7 +1668,7 @@ router.patch("/comments/:id", authenticateToken, async (req: AuthenticatedReques
 router.post("/comments/:id/like", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const c = await query(`SELECT id, user_id FROM social_comments WHERE id = $1 AND status = 'active'`, [req.params.id]);
+    const c = await query(`SELECT id, user_id, post_id FROM social_comments WHERE id = $1 AND status = 'active'`, [req.params.id]);
     if (!c.rows.length) return res.status(404).json({ success: false, error: "Comment not found" });
     const existing = await query(
       `SELECT id FROM social_comment_likes WHERE comment_id = $1 AND user_id = $2`,
@@ -1666,6 +1690,9 @@ router.post("/comments/:id/like", authenticateToken, async (req: AuthenticatedRe
           title: "New like",
           message: "Someone liked your comment",
           type: "social",
+          // Deep link: opens the post's comment sheet (where the comment is).
+          actionUrl: `/post/${c.rows[0].post_id}`,
+          metadata: { postId: c.rows[0].post_id, openComments: true },
         }).catch(() => {});
       }
     }

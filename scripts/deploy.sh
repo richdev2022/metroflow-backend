@@ -269,7 +269,10 @@ fi
 if command -v nginx >/dev/null 2>&1 && [ -d /etc/nginx ]; then
   step "6/6  nginx upload limit (client_max_body_size)"
   STAMP="$(date +%Y%m%d%H%M%S)"
-  MIN_BODY_MB=100
+  # 200MB — matches the story route cap (STORY_MAX_MEDIA_BYTES, social.ts).
+  # The old 100m meant any story video between 100–200MB (which the backend
+  # explicitly accepts) died at the proxy with 413 before reaching the API.
+  MIN_BODY_MB=200
   TARGET="client_max_body_size ${MIN_BODY_MB}m"
 
   nginx_mb_to_mib() {

@@ -177,10 +177,26 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
     return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
   }
 
+  // FEED PARITY: music attachment (catalog track or server sound) rides on
+  // the media rows exactly like /social/posts — group/page composers send the
+  // same fields, so a group post with a soundtrack plays everywhere.
+  const soundId = String(req.body?.sound_id || "").trim() || null;
+  const soundUrl = String(req.body?.sound_url || "").trim() || null;
+  const soundTitle = String(req.body?.sound_title || "").trim() || null;
+  const musicVolume = req.body?.music_volume != null && Number.isFinite(Number(req.body.music_volume))
+    ? Math.min(1, Math.max(0, Number(req.body.music_volume))) : null;
+  const videoVolume = req.body?.video_volume != null && Number.isFinite(Number(req.body.video_volume))
+    ? Math.min(1, Math.max(0, Number(req.body.video_volume))) : null;
+  const hasMusic = Boolean(soundId || (soundUrl && soundTitle));
+
+  // Audience parity — groups/pages post publicly today; a private group may
+  // request 'followers' and the feed filter honours the column already.
+  const audience = String(req.body?.audience || "public").toLowerCase() === "followers" ? "followers" : "public";
+
   const r = await query(
     `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, group_id, page_id)
-     VALUES ($1,$2,$3,$4,'public',$5,$6) RETURNING *`,
-    [userId, body, imageUrl, videoUrl, opts.groupId || null, opts.pageId || null],
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [userId, body, imageUrl, videoUrl, audience, opts.groupId || null, opts.pageId || null],
   );
   const postId = r.rows[0].id;
   const savedMedia: Array<{ media_type: string; url: string | null; poster_url: string | null }> = [];
@@ -188,10 +204,35 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
     const m = mediaRows[i];
     if (!m.url) continue;
     await query(
-      `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position) VALUES ($1,$2,$3,$4,$5)`,
-      [postId, m.media_type, m.url, m.poster_url, i],
+      `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        postId, m.media_type, m.url, m.poster_url, i,
+        // Music rides the first VIDEO row (feed behaviour); a music-only
+        // (text + track) post attaches it to the first media row of any type.
+        i === 0 ? soundId : null,
+        i === 0 ? soundUrl : null,
+        i === 0 ? soundTitle : null,
+        i === 0 ? musicVolume : null,
+        i === 0 ? videoVolume : null,
+      ],
     ).catch(() => {});
     savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
+  }
+
+  // NOTE: like /social/posts, music rides on MEDIA rows — a text-only post
+  // with a soundtrack is not a supported carrier anywhere (social_post_media
+  // requires a url), so text+track-only community posts save the text and
+  // drop the track, exactly like the feed composer does today.
+
+  // FEED PARITY: hashtags extracted from the body power the tag feed.
+  const tagMatches = body.match(/#([\p{L}\p{N}_]{1,60})/gu) || [];
+  const cleanTags = [...new Set(tagMatches.map((t) => t.slice(1).toLowerCase()).filter((t: string) => t.length >= 1))].slice(0, 20);
+  for (const tag of cleanTags) {
+    await query(
+      `INSERT INTO social_post_tags (post_id, tag) VALUES ($1,$2) ON CONFLICT (post_id, tag) DO NOTHING`,
+      [postId, tag],
+    ).catch(() => {});
   }
 
   const author = opts.authorAsPage || { id: userId, name: (await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId])).rows[0]?.name, photo: null };
@@ -267,19 +308,34 @@ async function listCommunityPosts(container: { groupId?: string; pageId?: string
     created_at: p.created_at,
   }));
 
-  // Media carousels (batched).
+  // Media carousels (batched) — WITH the sound fields so music attached by
+  // the group/page composers plays in the community feed (web + mobile read
+  // sound_url/sound_title/music_volume off the media rows, same as the main
+  // feed).
   const ids = items.map((i: any) => i.id);
   if (ids.length) {
     try {
       const mediaRes = await query(
-        `SELECT post_id, media_type, url, poster_url FROM social_post_media
+        `SELECT post_id, media_type, url, poster_url, sound_id,
+                COALESCE(s.title, m.sound_title) AS sound_title,
+                s.audio_url AS sound_audio_url, m.sound_url, m.music_volume, m.video_volume
+         FROM social_post_media m
+         LEFT JOIN social_sounds s ON s.id = m.sound_id
          WHERE post_id = ANY($1::uuid[]) ORDER BY post_id, position, created_at`,
         [ids],
       );
       const byPost = new Map<string, any[]>();
       for (const row of mediaRes.rows) {
         const list = byPost.get(String(row.post_id)) || [];
-        list.push({ media_type: row.media_type, url: row.url, poster_url: row.poster_url || null });
+        list.push({
+          media_type: row.media_type, url: row.url, poster_url: row.poster_url || null,
+          sound_id: row.sound_id || null,
+          sound_title: row.sound_title || null,
+          sound_audio_url: row.sound_audio_url || null,
+          sound_url: row.sound_url || null,
+          music_volume: row.music_volume == null ? null : Number(row.music_volume),
+          video_volume: row.video_volume == null ? null : Number(row.video_volume),
+        });
         byPost.set(String(row.post_id), list);
       }
       for (const item of items) {
@@ -287,6 +343,13 @@ async function listCommunityPosts(container: { groupId?: string; pageId?: string
           item.image_url ? { media_type: "image", url: item.image_url, poster_url: null } : null,
           item.video_url ? { media_type: "video", url: item.video_url, poster_url: null } : null,
         ].filter(Boolean);
+        // TikTok-style sound attribution for the community card's sound strip.
+        const m = (item.media || []).find((x: any) => x.sound_id) || (item.media || []).find((x: any) => x.sound_url && x.sound_title);
+        if (m) {
+          item.sound = m.sound_id
+            ? { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: null }
+            : { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog" };
+        }
       }
     } catch { /* legacy columns still render */ }
   }

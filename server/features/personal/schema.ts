@@ -333,6 +333,15 @@ export async function ensurePersonalSchema(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_media_post ON social_post_media(post_id, position)`);
+  // Post music for CATALOG tracks (Audius): catalog picks have no
+  // social_sounds row, so the picked track's stream URL + title + mix volumes
+  // ride directly on the video media row and are echoed by the feed — that's
+  // what makes feed playback work for catalog tracks. Server sounds keep
+  // using social_post_media.sound_id (added in the SOUNDS section below).
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_url TEXT`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_volume NUMERIC DEFAULT 0.8`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS video_volume NUMERIC DEFAULT 1.0`);
 
   // Saved posts — Facebook-style collections. A user files any post into one
   // or more named folders ("Videos", "Photos", or their own creations);

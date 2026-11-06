@@ -1711,10 +1711,15 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
     const { search, status, startDate, endDate, walletId, direction, type, minAmount, maxAmount, page = 1, limit = 20, format } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
-    // PERSONAL ACCOUNTS (businessId IS NULL): `business_id = $1` never matches
-    // NULL, so personal users used to get an EMPTY ledger here. Scope by the
-    // caller's own user_id in that case instead.
+    // PRODUCT RULE — ledgers are PRIVATE: "every user's, wallet's, and
+    // transaction history is separate for themselves". This history endpoint
+    // therefore ALWAYS scopes by the ACTING USER (req.user.id) — never by
+    // business_id alone — so an invited team member's transfers can never
+    // leak into the inviter's history (and vice versa). Personal accounts
+    // (businessId IS NULL) were already scoped this way; business accounts
+    // now are too.
     const personalScope = !businessId;
+    const actingUserId = req.user?.userId;
 
     // Build query for transfer_queue (existing)
     let tqQueryText = `SELECT 
@@ -1743,8 +1748,8 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
         updated_at,
         'transfer' as type
       FROM transfer_queue 
-      WHERE ${personalScope ? 'initiated_by = $1' : 'business_id = $1'}`;
-    let tqParams: any[] = [personalScope ? req.user?.userId : businessId];
+      WHERE initiated_by = $1`;
+    let tqParams: any[] = [actingUserId];
     let tqParamIdx = 2;
 
     // Build query for transactions (credits, and other transactions)
@@ -1766,8 +1771,8 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
         updated_at,
         'transaction' as type
       FROM transactions 
-      WHERE ${personalScope ? 'user_id = $1' : 'business_id = $1'}`;
-    let txParams: any[] = [personalScope ? req.user?.userId : businessId];
+      WHERE user_id = $1`;
+    let txParams: any[] = [actingUserId];
     let txParamIdx = 2;
 
     // Wallet filter: restrict to a specific wallet (credits/debits of that wallet only)

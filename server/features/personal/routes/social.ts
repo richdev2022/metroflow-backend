@@ -376,17 +376,35 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Ordered media carousels for this page — one batched query, grouped per
     // post. Older posts (created before the multi-media upgrade) have no rows
     // here and fall back to their legacy image_url/video_url columns.
-    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null }>>();
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null }>>();
     if (postIds.length) {
       try {
-        const mediaRes = await query(
-          `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
-                  s.title AS sound_title, s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id
-           FROM social_post_media m
-           LEFT JOIN social_sounds s ON s.id = m.sound_id
-           WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
-          [postIds],
-        );
+        let mediaRes;
+        try {
+          // Catalog-track columns (sound_url + mix volumes) ride on media
+          // rows — see schema.ts. On a cold deploy whose ALTERs have not run
+          // yet, retry with the legacy column set so the carousel still
+          // renders (catalog sound degrades, media does not vanish).
+          mediaRes = await query(
+            `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
+                    COALESCE(s.title, m.sound_title) AS sound_title,
+                    s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
+                    m.sound_url, m.music_volume, m.video_volume
+             FROM social_post_media m
+             LEFT JOIN social_sounds s ON s.id = m.sound_id
+             WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
+            [postIds],
+          );
+        } catch {
+          mediaRes = await query(
+            `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
+                    s.title AS sound_title, s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id
+             FROM social_post_media m
+             LEFT JOIN social_sounds s ON s.id = m.sound_id
+             WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
+            [postIds],
+          );
+        }
         for (const row of mediaRes.rows) {
           const list = mediaByPost.get(String(row.post_id)) || [];
           list.push({
@@ -395,6 +413,9 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
             sound_title: row.sound_title || null,
             sound_audio_url: row.sound_audio_url || null,
             sound_owner_id: row.sound_owner_id || null,
+            sound_url: row.sound_url || null,
+            music_volume: row.music_volume == null ? null : Number(row.music_volume),
+            video_volume: row.video_volume == null ? null : Number(row.video_volume),
           });
           mediaByPost.set(String(row.post_id), list);
         }
@@ -534,14 +555,20 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // Ordered multi-media carousel — synthesized from the legacy columns
         // for posts created before social_post_media existed.
         media: mediaByPost.get(String(p.id)) || [
-          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null } : null,
-          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null } : null,
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null } : null,
         ].filter(Boolean),
         // TikTok-style sound attribution — the first video's attached sound,
-        // surfaced so clients can render the "Use sound" affordance.
+        // surfaced so clients can render the "Use sound" affordance. Server
+        // sounds keep the {id,title,audio_url,owner_id} shape; a media row
+        // with a catalog pick (sound_url + sound_title, NO social_sounds row)
+        // returns the catalog shape so feed playback works for Audius tracks.
         sound: (() => {
-          const m = (mediaByPost.get(String(p.id)) || []).find((x: any) => x.sound_id);
-          return m ? { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id } : null;
+          const list = mediaByPost.get(String(p.id)) || [];
+          const m = list.find((x: any) => x.sound_id) || list.find((x: any) => x.sound_url && x.sound_title);
+          if (!m) return null;
+          if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id };
+          return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog" };
         })(),
         // Hashtags extracted at compose time — clients render them as chips
         // and deep-link into the tag feed.
@@ -763,6 +790,19 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       ).catch(() => ({ rows: [] as any[] }));
       if (s.rows.length) attachedSoundId = s.rows[0].id;
     }
+    // Catalog (Audius) tracks — the composer also sends sound_url/sound_title
+    // + mix volumes for picks that have no social_sounds row. These ride
+    // directly on the video media row (see schema.ts) so the feed can play
+    // them; dropping them used to make catalog-track posts silent.
+    const catalogSoundUrl = String(req.body?.sound_url ?? "").trim().slice(0, 2000) || null;
+    const catalogSoundTitle = String(req.body?.sound_title ?? "").trim().slice(0, 200) || null;
+    const clampVolume = (v: any, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
+    };
+    const catalogMusicVolume = clampVolume(req.body?.music_volume, 0.8);
+    const catalogVideoVolume = clampVolume(req.body?.video_volume, 1.0);
+    const hasCatalogSound = !!(catalogSoundUrl && catalogSoundTitle);
 
     const r = await query(
       `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, text_color, font, text_align, background_color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -775,11 +815,27 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     for (let i = 0; i < mediaRows.length; i++) {
       const m = mediaRows[i];
       if (!m.url) continue;
-      const rowSoundId = m.media_type === "video" ? attachedSoundId : null;
+      const isVideo = m.media_type === "video";
+      const rowSoundId = isVideo ? attachedSoundId : null;
+      // Catalog-track fields ride on video rows only (images carry no audio).
+      // Volumes only accompany an actual catalog pick — never invent a mix
+      // for a plain video post.
+      const rowSoundUrl = isVideo ? catalogSoundUrl : null;
+      const rowSoundTitle = isVideo ? catalogSoundTitle : null;
+      const rowMusicVolume = isVideo && hasCatalogSound ? catalogMusicVolume : null;
+      const rowVideoVolume = isVideo && hasCatalogSound ? catalogVideoVolume : null;
       await query(
-        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId],
-      ).catch(() => {});
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume],
+      ).catch(async () => {
+        // Cold deploy without the catalog-sound columns yet — retry with the
+        // legacy column set so the media row itself still lands.
+        await query(
+          `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [postId, m.media_type, m.url, m.poster_url, i, rowSoundId],
+        ).catch(() => {});
+      });
       savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
     }
 
@@ -796,7 +852,9 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
           [attachedSoundId],
         );
         if (bump.rows.length) soundPayload = bump.rows[0];
-      } else {
+      } else if (!hasCatalogSound) {
+        // Catalog picks are NOT the author's original audio — skip minting so
+        // the picked track isn't overridden by a bogus "original sound" row.
         const firstVideo = savedMedia.find((m) => m.media_type === "video");
         if (firstVideo) {
           const ownerName = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
@@ -838,8 +896,17 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
           media: savedMedia.map((m, i) => ({
             ...m,
             sound_id: m.media_type === "video" && soundPayload ? soundPayload.id : null,
+            sound_url: m.media_type === "video" && !soundPayload ? catalogSoundUrl : null,
+            sound_title: m.media_type === "video" && !soundPayload ? catalogSoundTitle : null,
           })),
-          sound: soundPayload ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id } : null,
+          // Server-sound shape stays {id,title,audio_url,owner_id}; a catalog
+          // pick (no social_sounds row) mirrors the feed's catalog shape so
+          // the composer's post plays immediately.
+          sound: soundPayload
+            ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id }
+            : hasCatalogSound
+              ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog" }
+              : null,
           tags: cleanTags,
           like_count: 0, comment_count: 0,
           share_count: 0, liked_by_me: false, created_at: r.rows[0].created_at,
@@ -2770,6 +2837,28 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
 
 const STORY_MAX_MEDIA_BYTES = 200 * 1024 * 1024;
 
+// Story music self-heal — the music columns are created by the schema
+// bootstrap (schema.ts, same statements copied below), but a deploy whose DB
+// has not applied that migration yet would crash EVERY story INSERT with
+// 42703 (undefined_column) → generic 500 "Could not add your story". When we
+// see that exact error we ALTER the table in place and retry once, so stories
+// keep landing while the migration catches up.
+const STORY_MUSIC_COLUMN_DDL = [
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_url TEXT`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`,
+  // Defensive: sound_id ships in the CREATE TABLE, but very old deployed
+  // tables predate it — include it so the retry below cannot 42703 either.
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_id UUID`,
+];
+let storyMusicColumnsHealed = false;
+async function ensureStoryMusicColumns(): Promise<void> {
+  if (storyMusicColumnsHealed) return; // idempotent DDL, run once per process
+  for (const ddl of STORY_MUSIC_COLUMN_DDL) await query(ddl);
+  storyMusicColumnsHealed = true;
+}
+
 /**
  * POST /social/stories — create a story (multipart: image | video | poster,
  * or JSON text story). Users can hold MULTIPLE active stories at once; each
@@ -2801,6 +2890,18 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const musicVolume = clampVolume(req.body?.music_volume, 0.8);
     const videoVolume = clampVolume(req.body?.video_volume, 1.0);
+    // Server sounds ("Use this sound" flow): persist sound_id ONLY when it
+    // references a real social_sounds row — otherwise it stays null and the
+    // catalog URL/title above carry the audio.
+    const requestedStorySoundId = String(req.body?.sound_id ?? "").trim();
+    let storySoundId: string | null = null;
+    if (requestedStorySoundId) {
+      const s = await query(
+        `SELECT id FROM social_sounds WHERE id = $1 AND status = 'active'`,
+        [requestedStorySoundId],
+      ).catch(() => ({ rows: [] as any[] }));
+      if (s.rows.length) storySoundId = s.rows[0].id;
+    }
 
     let mediaType = "text";
     let mediaUrl: string | null = null;
@@ -2826,11 +2927,22 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     }
     if (mediaType === "text" && !caption) return res.status(400).json({ success: false, error: "Write a caption or attach a photo/video" });
 
-    const r = await query(
-      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_url, sound_title, music_volume, video_volume)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundUrl, storySoundTitle, musicVolume, videoVolume],
-    );
+    const insertStory = () =>
+      query(
+        `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+        [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume],
+      );
+    let r;
+    try {
+      r = await insertStory();
+    } catch (e: any) {
+      if (e?.code !== "42703") throw e; // undefined_column → self-heal below
+      // Deployed DB predates the story-music columns: ALTER them in (same
+      // statements as the schema bootstrap) then retry the INSERT once.
+      await ensureStoryMusicColumns();
+      r = await insertStory();
+    }
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     res.status(201).json({
       success: true,
@@ -2838,8 +2950,8 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
       message: "Story added",
     });
   } catch (e: any) {
-    console.error("social/stories create error:", e?.message);
-    res.status(500).json({ success: false, error: "Could not add your story" });
+    console.error("social/stories create error:", e?.message, "| code:", e?.code, "| detail:", e?.detail);
+    res.status(500).json({ success: false, error: "Could not add your story", code: e?.code || "story_create_failed" });
   }
 });
 

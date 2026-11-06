@@ -75,6 +75,31 @@ export async function ensureCryptoSchema(): Promise<void> {
   `);
     await query(`CREATE INDEX IF NOT EXISTS idx_crypto_sales_user ON crypto_sales(user_id, created_at DESC)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_crypto_sales_status ON crypto_sales(status)`);
+    // Column-drift hardening: deployments that created crypto_sales from the
+    // LEGACY shape are missing the columns the mounted sell flow writes, and
+    // vice versa. CREATE TABLE IF NOT EXISTS is a no-op for existing tables,
+    // so the drift survives every reboot — production hit this on 2026-11-06
+    // (every sale failed AFTER the wallet debit on an unknown column).
+    // Idempotent ALTERs reconcile every shape.
+    const salesColumns: Array<[string, string]> = [
+      ["settlement_currency", "VARCHAR(8) DEFAULT 'NGN'"],
+      ["bank_code", "VARCHAR(20)"],
+      ["bank_name", "VARCHAR(160)"],
+      ["account_number", "VARCHAR(32)"],
+      ["account_name", "VARCHAR(160)"],
+      ["provider_reference", "VARCHAR(120)"],
+      ["refunded_at", "TIMESTAMP"],
+      ["to_currency", "VARCHAR(8) DEFAULT 'NGN'"],
+      ["country", "VARCHAR(2) DEFAULT 'NG'"],
+      ["crypto_amount", "DECIMAL(20,8)"],
+      ["payout_id", "VARCHAR(80)"],
+      ["quote_id", "VARCHAR(80)"],
+      ["fee", "DECIMAL(15,2) DEFAULT 0"],
+      ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ];
+    for (const [col, ddl] of salesColumns) {
+      await query(`ALTER TABLE crypto_sales ADD COLUMN IF NOT EXISTS ${col} ${ddl}`).catch(() => {});
+    }
 }
 
 function randomReference(prefix: string): string {

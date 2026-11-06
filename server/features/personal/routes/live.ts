@@ -8,6 +8,7 @@ import { createNotification } from "../../../services/notifications";
 import { upload } from "../../../middleware/upload";
 import { uploadMediaBuffer } from "../../../services/media-upload";
 import { sendPushToUsers } from "../../../services/push";
+import { getSocketServer } from "../../../lib/socket";
 
 /**
  * LIVE — TikTok-style one-tap live streaming (rides the proven call-room
@@ -877,6 +878,29 @@ router.post("/:id/gifts", authenticateToken, requirePersonalKyc(), async (req: A
           userId: session.host_id, type: "transaction", title: `${gift.icon} Gift received`,
           message: `${senderRes.rows[0]?.name || "Someone"} sent you ${gift.name} x${quantity} — ₦${total.toLocaleString()}.`,
         }).catch(() => {});
+      }
+
+      // REAL-TIME gift broadcast — viewers' gift banners used to depend purely
+      // on REST polling (re-showing the same gifts every poll). The room now
+      // gets an instant `live:gift` event; polling stays as the fallback.
+      try {
+        const io = getSocketServer();
+        if (io && decision !== "hold") {
+          const callRow = await query(`SELECT id FROM calls WHERE call_code = $1 LIMIT 1`, [session.call_code]).catch(() => ({ rows: [] as any[] }));
+          const roomId = callRow.rows[0]?.id || session.call_code;
+          io.to(`room:${roomId}`).emit("live:gift", {
+            sessionCode: session.call_code,
+            sessionId: session.id,
+            gift: { id: gift.id, name: gift.name, icon: gift.icon, tier: (gift as any).tier || "starter" },
+            quantity,
+            total_amount: total,
+            sender_name: senderRes.rows[0]?.name || "Someone",
+            reference,
+            sent_at: new Date().toISOString(),
+          });
+        }
+      } catch (emitErr: any) {
+        console.error("[live:gifts] socket emit skipped:", emitErr?.message);
       }
 
       const balRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [senderWallet.id]);
@@ -1914,9 +1938,29 @@ router.post("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, 
     );
 
     createNotification({
-      userId: opponent.host_id, type: "social", title: "⚔️ Battle invite",
+      userId: opponent.host_id, type: "live", title: "⚔️ Battle invite",
       message: `${req.user!.name || "A streamer"} challenged you to a LIVE battle — open your studio to accept.`,
+      actionUrl: `/live/watch?code=${opponent.call_code}`,
+      actionType: "open_battle",
+      metadata: { kind: "battle_invite", battleId: ins.rows[0].id, liveCode: opponent.call_code },
     }).catch(() => {});
+
+    // Deep-link push: tapping the tray notification must OPEN the opponent's
+    // live room (both web service worker and the mobile router read `data`).
+    sendPushToUsers(
+      [{ userId: opponent.host_id }],
+      {
+        title: "⚔️ Battle invite",
+        body: `${req.user!.name || "A streamer"} challenged you to a LIVE battle — tap to open your studio and accept.`,
+        data: {
+          type: "battle_invite",
+          battleId: String(ins.rows[0].id),
+          liveCode: String(opponent.call_code || ""),
+          url: `/live/watch?code=${opponent.call_code}`,
+        },
+      },
+      { inApp: false, type: "battle_invite" },
+    ).catch(() => {});
 
     const full = await query(`${BATTLE_SELECT} WHERE b.id = $1`, [ins.rows[0].id]);
     res.status(201).json({ success: true, data: { battle: decorateBattle(full.rows[0], userId) } });

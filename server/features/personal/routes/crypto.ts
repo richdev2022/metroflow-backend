@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  assertPersonalService, genRef, requirePersonalKyc,
+  assertPersonalService, genRef, requirePersonalKyc, verifyTransactionPin,
 } from "../personal-utils";
 import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
@@ -11,6 +11,8 @@ import * as sogo from "../../../services/sogo";
 import { resolveProvider } from "../../../services/providers/factory";
 import { accountLookup } from "../../../services/transfer";
 import { normalizeToNipBankCode } from "../../../utils/bank-codes";
+import { generateOTP, getOTPExpiry, hashOtp, otpMatches } from "../../../services/auth";
+import { sendEmail, generateOtpEmailHtml } from "../../../services/email";
 import { userSafeErr } from "../user-safe-errors";
 import { useProvider, getPercent, getProviderModes } from "../flags";
 import { getActiveProvider } from "../provider-routing";
@@ -462,7 +464,70 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
   }
 });
 
+// DYNAMIC TRANSACTION OTP REQUEST — emails a fresh single-use code (hashed at
+// rest, VAPT MF-012 pattern shared with /transfers). Powers the crypto sale
+// confirmation step alongside the transaction PIN.
+router.post("/otp/request", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await assertPersonalService(res, "crypto"))) return;
+    const userId = req.user!.userId;
+    const userRes = await query(`SELECT email FROM users WHERE id = $1`, [userId]);
+    const user = userRes.rows[0];
+    if (!user?.email) {
+      return res.status(400).json({ success: false, error: "Your account has no email address — add one to receive transaction codes." });
+    }
+    const otp = generateOTP();
+    await query(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, [hashOtp(otp), getOTPExpiry(), userId]);
+    sendEmail(user.email, "Transaction OTP", "Confirm your crypto sale", generateOtpEmailHtml(otp, "Crypto Sale Verification"))
+      .catch((mailErr: any) => console.error("crypto otp email error:", mailErr?.message));
+    res.json({ success: true, message: "Transaction code sent to your email" });
+  } catch (e: any) {
+    console.error("crypto otp request error:", e?.message);
+    res.status(500).json({ success: false, error: "Failed to send the transaction code" });
+  }
+});
+
 router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  // Money-safety state: once the wallet is debited, EVERY later failure must
+  // compensate. Production incident 2026-11-06: the sale-row INSERT referenced
+  // a column missing on live crypto_sales, the throw landed in the outer catch
+  // with no compensation, and two debits vanished with no sale record and no
+  // refund. `compensate()` closes that hole for every failure class.
+  let saleDebited = false;
+  let saleRefunded = false;
+  let saleWalletId: string | null = null;
+  let saleAsset = "USDT";
+  let saleUsdDebit = 0;
+  let saleRefundRef = "";
+  let saleQuoteId: string | null = null;
+  let saleRowId: string | null = null;
+  const compensate = async (reason: string): Promise<boolean> => {
+    if (!saleDebited || saleRefunded || !saleWalletId) return false;
+    saleRefunded = true;
+    try {
+      await creditWallet(saleWalletId, saleUsdDebit);
+      await insertTransaction({
+        userId: req.user!.userId, walletId: saleWalletId, reference: saleRefundRef, type: "credit",
+        transactionType: "crypto_sale_refund", amount: saleUsdDebit, currency: saleAsset,
+        description: reason || "Refund — crypto sale failed",
+      }).catch(() => {});
+      if (saleRowId) {
+        await query(
+          `UPDATE crypto_sales SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP WHERE id = $1 AND status <> 'completed'`,
+          [saleRowId, reason],
+        ).catch(() => {});
+      }
+      if (saleQuoteId) {
+        // Release the quote so the user can retry the SAME quote after the
+        // refund (it was claimed before the failure, so a retry no longer
+        // reports a phantom "expired").
+        await query(`UPDATE crypto_quotes SET used_at = NULL WHERE id = $1`, [saleQuoteId]).catch(() => {});
+      }
+    } catch (compErr: any) {
+      console.error("crypto sell compensation error:", compErr?.message);
+    }
+    return true;
+  };
   try {
     if (!(await assertPersonalService(res, "crypto"))) return;
     const userId = req.user!.userId;
@@ -481,6 +546,33 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     if (!/^\d{10}$/.test(accountNumber) || !bankCode || !accountName) {
       return res.status(400).json({ success: false, error: "Valid bank account details are required" });
     }
+
+    // TRANSACTION PIN — every personal money move verifies the caller's PIN
+    // (same helper as bills / eSIM / transfers; honors the biometric bypass).
+    const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({ success: false, code: pinCheck.code, error: pinCheck.error });
+    }
+
+    // DYNAMIC TRANSACTION OTP — a crypto off-ramp confirms with a fresh
+    // single-use emailed code (hashed at rest; identical pattern to
+    // /transfers/single). Clients fetch one via POST /crypto/otp/request.
+    const otp = String(req.body?.otp || "").trim();
+    const otpUserRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
+    const otpUser = otpUserRes.rows[0];
+    if (!otpUser?.otp_code) {
+      return res.status(400).json({
+        success: false, code: "OTP_REQUIRED",
+        error: "Request a transaction code, then enter it to confirm this sale.",
+      });
+    }
+    if (!otpMatches(otp, otpUser.otp_code)) {
+      return res.status(400).json({ success: false, code: "OTP_INVALID", error: "Invalid transaction code — check the code we emailed you." });
+    }
+    if (new Date(otpUser.otp_expires_at) < new Date()) {
+      return res.status(400).json({ success: false, code: "OTP_EXPIRED", error: "That transaction code has expired — request a new one." });
+    }
+    await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
 
     // Stablecoin wallet debit — the sale debits the MATCHING coin's wallet
     // (USDT sale → USDT wallet, USDC sale → USDC wallet). Default pricing is
@@ -504,7 +596,13 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
         ).catch(() => ({ rows: [] as any[] }));
         const q = existing.rows[0];
         if (q) {
-          if (q.used_at || new Date(q.expires_at).getTime() <= Date.now()) {
+          // Distinguish "used" from "expired" — clients render a countdown and
+          // users rightly complain when a 30-second-old quote says "expired"
+          // (that message used to hide the already-used case too).
+          if (q.used_at) {
+            return res.status(410).json({ success: false, code: "QUOTE_ALREADY_USED", error: "This quote was already used — get a fresh quote and try again." });
+          }
+          if (new Date(q.expires_at).getTime() <= Date.now()) {
             return res.status(410).json({ success: false, code: "QUOTE_EXPIRED", error: "This quote has expired — get a fresh quote and try again." });
           }
           if (String(q.from_asset).toUpperCase() !== asset || Math.round(Number(q.settlement_amount) * 100) !== Math.round(settlement * 100)) {
@@ -512,8 +610,9 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
           }
           const claim = await query(`UPDATE crypto_quotes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL RETURNING id`, [quoteId]);
           if (claim.rows.length === 0) {
-            return res.status(410).json({ success: false, code: "QUOTE_EXPIRED", error: "This quote was already used — get a fresh quote." });
+            return res.status(410).json({ success: false, code: "QUOTE_ALREADY_USED", error: "This quote was already used — get a fresh quote." });
           }
+          saleQuoteId = quoteId;
           usdDebit = Math.round(Number(q.usd_debit) * 100) / 100;
           feeAmount = Math.round(Number(q.fee_amount) * 100) / 100;
           netAmount = Math.round(Number(q.net_amount) * 100) / 100;
@@ -530,6 +629,9 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     );
     const wallet = walletRes.rows[0];
     if (!wallet) return res.status(400).json({ success: false, error: `You need a ${asset} wallet to sell — receive crypto into your stablecoin wallet first`, code: "STABLECOIN_WALLET_REQUIRED" });
+    saleWalletId = wallet.id;
+    saleAsset = asset;
+    saleUsdDebit = usdDebit;
     if (Number(wallet.balance) < usdDebit) {
       return res.status(400).json({
         success: false,
@@ -539,30 +641,53 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     }
 
     const reference = genRef("MF-CRS");
+    saleRefundRef = `${reference}-REFUND`;
     if (!(await debitWallet(wallet.id, usdDebit))) {
       return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${asset} balance` });
     }
-    await insertTransaction({
-      userId, walletId: wallet.id, reference, type: "debit", transactionType: "crypto_sale",
-      amount: usdDebit, currency: asset,
-      description: `Stablecoin sale — ${asset} → ₦${netAmount.toLocaleString()} (fee ₦${feeAmount.toLocaleString()})`,
-    });
+    saleDebited = true;
 
-    // Payout rails: the NGN settlement is executed by Bitnob's payout API
-    // regardless of which provider routes the CRYPTO side (Sogo is the
-    // deposit/off-ramp rails). "simulator" is only reachable when the admin
-    // EXPLICITLY forces the simulator mode — in "auto" an unconfigured
-    // payout partner can no longer fake an instant success (money safety).
-    const bitnobLive = bitnob.isBitnobConfigured();
-    const useLive = await useProvider("crypto", bitnobLive);
-    const saleProvider = !useLive ? "simulator" : "bitnob";
-    const dbInsert = await query(
-      `INSERT INTO crypto_sales
-         (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
-          settlement_currency, rate, fee, bank_code, account_number, account_name, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,$12,'processing') RETURNING *`,
-      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, saleRate, feeAmount, bankCode, accountNumber, accountName],
-    );
+    // Everything between the debit and the provider payout is failure-prone
+    // plumbing (ledger row, provider-routing read, sale-row INSERT). Any throw
+    // in here used to hit the outer catch with NO compensation — see the
+    // production incident note at the top of this handler. The INSERT also
+    // referenced a `fee` column that does not exist on live crypto_sales, so
+    // EVERY sale failed right after the wallet debit. Wrapped + column fixed.
+    let bitnobLive = false;
+    let useLive = false;
+    let dbInsert: any = null;
+    try {
+      await insertTransaction({
+        userId, walletId: wallet.id, reference, type: "debit", transactionType: "crypto_sale",
+        amount: usdDebit, currency: asset,
+        description: `Stablecoin sale — ${asset} → ₦${netAmount.toLocaleString()} (fee ₦${feeAmount.toLocaleString()})`,
+      });
+
+      // Payout rails: the NGN settlement is executed by Bitnob's payout API
+      // regardless of which provider routes the CRYPTO side (Sogo is the
+      // deposit/off-ramp rails). "simulator" is only reachable when the admin
+      // EXPLICITLY forces the simulator mode — in "auto" an unconfigured
+      // payout partner can no longer fake an instant success (money safety).
+      bitnobLive = bitnob.isBitnobConfigured();
+      useLive = await useProvider("crypto", bitnobLive);
+      const saleProvider = !useLive ? "simulator" : "bitnob";
+      dbInsert = await query(
+        `INSERT INTO crypto_sales
+           (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
+            settlement_currency, rate, bank_code, account_number, account_name, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,$12,'processing') RETURNING *`,
+        [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, saleRate, bankCode, accountNumber, accountName],
+      );
+      saleRowId = dbInsert.rows[0]?.id || null;
+    } catch (bookErr: any) {
+      console.error("crypto sell bookkeeping error:", bookErr?.message);
+      await compensate("Refund — crypto sale bookkeeping failed");
+      return res.status(500).json({
+        success: false,
+        code: "SALE_FAILED_REFUNDED",
+        error: "We could not record this sale — your wallet has been refunded. Please try again.",
+      });
+    }
 
     if (!useLive) {
       const modes = await getProviderModes();
@@ -577,6 +702,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
         return res.status(201).json({ success: true, data: { sale: simFresh.rows[0], mode: "simulator" } });
       }
       // AUTO mode without payout rails: refund immediately — never pretend.
+      saleRefunded = true;
       await creditWallet(wallet.id, usdDebit);
       await insertTransaction({
         userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
@@ -615,6 +741,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
           // settle. Refund immediately and fail honestly. (Previously this
           // branch fell through silently: sale stuck 'processing' forever
           // with the wallet already debited.)
+          saleRefunded = true;
           await creditWallet(wallet.id, usdDebit);
           await insertTransaction({
             userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
@@ -636,6 +763,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
           });
         }
         // Refund on provider rejection
+        saleRefunded = true;
         await creditWallet(wallet.id, usdDebit);
         await insertTransaction({
           userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
@@ -659,6 +787,15 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     res.status(201).json({ success: true, data: { sale: fresh.rows[0] } });
   } catch (e: any) {
     console.error("crypto sell error:", e?.message);
+    // Last-resort compensation: a debited sale that dies anywhere below the
+    // debit refunds itself. Money must never silently vanish.
+    if (await compensate("Refund — crypto sale failed")) {
+      return res.status(500).json({
+        success: false,
+        code: "SALE_FAILED_REFUNDED",
+        error: "We could not complete this sale — your wallet has been refunded. Please try again.",
+      });
+    }
     res.status(500).json({ success: false, error: "Could not complete the sale" });
   }
 });

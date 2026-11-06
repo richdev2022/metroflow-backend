@@ -3,6 +3,7 @@ import multer from "multer";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken } from "../../../middleware/auth";
 import { uploadMediaBuffer } from "../../../services/media-upload";
+import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
 
 /**
  * SOCIAL GROUPS & PAGES — Facebook-style communities, end to end.
@@ -177,6 +178,39 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
     return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
   }
 
+  // FEED PARITY (POST /social/posts): server-side poster fill for videos that
+  // arrived without a client-captured frame (mobile composer) — best-effort
+  // per video, never fails the post.
+  {
+    const videoRowIdx: number[] = [];
+    mediaRows.forEach((m, i) => { if (m.media_type === "video") videoRowIdx.push(i); });
+    for (let v = 0; v < videoRowIdx.length && v < videoFiles.length; v++) {
+      const row = mediaRows[videoRowIdx[v]];
+      if (row.poster_url) continue;
+      try {
+        const frame = await extractVideoPosterFrame(videoFiles[v].buffer, { maxWidth: 720 });
+        if (frame) {
+          const up = await uploadMediaBuffer({
+            buffer: frame,
+            originalname: `poster-${v}.jpg`,
+            mimeType: "image/jpeg",
+            folder: "social-media",
+            userId,
+          });
+          if (up?.url) row.poster_url = up.url;
+        }
+      } catch (err: any) {
+        console.warn("group/page post server-side poster extraction skipped:", err?.message);
+      }
+    }
+    // Mirror a server-extracted poster to image_url so og:image/share cards
+    // for video-only community posts are never blank.
+    if (!imageUrl) {
+      const firstVideoWithPoster = mediaRows.find((m) => m.media_type === "video" && m.poster_url);
+      if (firstVideoWithPoster?.poster_url) imageUrl = firstVideoWithPoster.poster_url;
+    }
+  }
+
   // FEED PARITY: music attachment (catalog track or server sound) rides on
   // the media rows exactly like /social/posts — group/page composers send the
   // same fields, so a group post with a soundtrack plays everywhere.
@@ -193,10 +227,22 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
   // request 'followers' and the feed filter honours the column already.
   const audience = String(req.body?.audience || "public").toLowerCase() === "followers" ? "followers" : "public";
 
+  // FEED PARITY: rich text styling for TEXT-ONLY posts (same contract as
+  // POST /social/posts — bare-hex color + font/align enums + background
+  // solid/gradient). Ignored for posts that carry media.
+  const rawPostTextColor = String(req.body?.text_color ?? "").replace(/^#/, "").trim();
+  const postTextColor = /^[0-9a-fA-F]{3,8}$/.test(rawPostTextColor) ? rawPostTextColor.slice(0, 20) : null;
+  const postFont = ["default", "playfair", "mono", "hand", "impact", "round"].includes(req.body?.font) ? req.body.font : "default";
+  const postTextAlign = ["left", "center", "right"].includes(req.body?.text_align) ? req.body.text_align : "center";
+  const rawPostBg = String(req.body?.background_color ?? "").replace(/^#/, "").trim();
+  const postBgValid = /^(?:[0-9a-fA-F]{3,8})(?:,(?:[0-9a-fA-F]{3,8}))?$/.test(rawPostBg);
+  const postBackgroundColor = postBgValid ? rawPostBg.slice(0, 64) : null;
+  const isTextOnly = mediaRows.length === 0;
+
   const r = await query(
-    `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, group_id, page_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [userId, body, imageUrl, videoUrl, audience, opts.groupId || null, opts.pageId || null],
+    `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, group_id, page_id, text_color, font, text_align, background_color)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+    [userId, body, imageUrl, videoUrl, audience, opts.groupId || null, opts.pageId || null, isTextOnly ? postTextColor : null, isTextOnly ? postFont : "default", isTextOnly ? postTextAlign : "center", isTextOnly ? postBackgroundColor : null],
   );
   const postId = r.rows[0].id;
   const savedMedia: Array<{ media_type: string; url: string | null; poster_url: string | null }> = [];
@@ -220,10 +266,33 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
     savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
   }
 
-  // NOTE: like /social/posts, music rides on MEDIA rows — a text-only post
-  // with a soundtrack is not a supported carrier anywhere (social_post_media
-  // requires a url), so text+track-only community posts save the text and
-  // drop the track, exactly like the feed composer does today.
+  // Sound bookkeeping (feed parity, best-effort — never fails the post):
+  //  · Using an existing server sound → use_count++ (social proof).
+  //  · Video post with NO sound → mint the ORIGINAL sound from this post so
+  //    the author owns the audio and "Use this sound" appears for others.
+  try {
+    if (soundId) {
+      await query(
+        `UPDATE social_sounds SET use_count = use_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [soundId],
+      ).catch(() => {});
+    } else if (!hasMusic) {
+      const firstVideo = savedMedia.find((m) => m.media_type === "video");
+      if (firstVideo) {
+        const ownerName = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const minted = await query(
+          `INSERT INTO social_sounds (owner_id, title, source_post_id, source_media_url, source_poster_url)
+           VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+          [userId, `Original sound — ${ownerName.rows[0]?.name || "Metricorex user"}`, postId, firstVideo.url, firstVideo.poster_url],
+        ).catch(() => ({ rows: [] as any[] }));
+        if (minted.rows.length) {
+          await query(`UPDATE social_post_media SET sound_id = $1 WHERE post_id = $2 AND media_type = 'video'`, [minted.rows[0].id, postId]).catch(() => {});
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn("group/page post sound attach skipped:", e?.message);
+  }
 
   // FEED PARITY: hashtags extracted from the body power the tag feed.
   const tagMatches = body.match(/#([\p{L}\p{N}_]{1,60})/gu) || [];
@@ -232,8 +301,7 @@ async function createCommunityPost(req: AuthenticatedRequest, res: any, opts: { 
     await query(
       `INSERT INTO social_post_tags (post_id, tag) VALUES ($1,$2) ON CONFLICT (post_id, tag) DO NOTHING`,
       [postId, tag],
-    ).catch(() => {});
-  }
+    ).catch(() => {});  }
 
   const author = opts.authorAsPage || { id: userId, name: (await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId])).rows[0]?.name, photo: null };
   return res.status(201).json({

@@ -1407,27 +1407,38 @@ export function initSocketServer(server: http.Server): void {
         userId = socket.data.userId;
         businessId = socket.data.businessId;
       }
-      if (!userId || !businessId) return;
+      // Personal users connect with NO businessId — they still get presence
+      // (own Redis key + user room); the empty-string business room is never
+      // joined (it would lump every personal account into one room).
+      if (!userId) return;
       socket.data.userId = userId;
-      socket.data.businessId = businessId;
+      if (businessId) socket.data.businessId = businessId;
 
       socket.join(`user:${userId}`);
-      socket.join(`business:${businessId}`);
-
-      if (isRedisReady()) {
-        await redisClient.setex(
-          `online:${businessId}:${userId}`,
-          60,
-          Date.now().toString()
-        );
+      if (businessId) {
+        socket.join(`business:${businessId}`);
+        if (isRedisReady()) {
+          await redisClient.setex(
+            `online:${businessId}:${userId}`,
+            60,
+            Date.now().toString()
+          );
+        }
+        socket.to(`business:${businessId}`).emit("user-presence-updated", {
+          userId,
+          status: "online",
+        });
+        logger.info(`User ${userId} marked as online in business ${businessId}`);
+      } else {
+        if (isRedisReady()) {
+          await redisClient.setex(
+            `online:personal:${userId}`,
+            60,
+            Date.now().toString()
+          );
+        }
+        logger.info(`User ${userId} marked as online (personal)`);
       }
-
-      socket.to(`business:${businessId}`).emit("user-presence-updated", {
-        userId,
-        status: "online",
-      });
-
-      logger.info(`User ${userId} marked as online in business ${businessId}`);
     });
 
     socket.on("user-presence", async (status: string) => {
@@ -1457,10 +1468,11 @@ export function initSocketServer(server: http.Server): void {
         userId = socket.data.userId;
         businessId = socket.data.businessId;
       }
-      if (!userId || !businessId) return;
+      if (!userId) return;
       if (isRedisReady()) {
+        // Same personal/business key split as "user-online" above.
         await redisClient.setex(
-          `online:${businessId}:${userId}`,
+          businessId ? `online:${businessId}:${userId}` : `online:personal:${userId}`,
           60,
           Date.now().toString()
         );
@@ -2772,6 +2784,13 @@ export function initSocketServer(server: http.Server): void {
         broadcastPresence(userId, "offline").catch(() => undefined);
 
         logger.info(`User ${userId} marked as offline in business ${businessId}`);
+      } else if (userId) {
+        // Personal user (no business) — clear the personal presence key.
+        if (isRedisReady()) {
+          await redisClient.del(`online:personal:${userId}`);
+        }
+        broadcastPresence(userId, "offline").catch(() => undefined);
+        logger.info(`User ${userId} marked as offline (personal)`);
       }
       logger.info(`Socket disconnected: ${socket.id}`);
     });

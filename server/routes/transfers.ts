@@ -686,16 +686,23 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       }
     }
 
-    // Currency guard: an NGN wallet cannot fund a USD payout (and vice versa)
-    const walletCurRes = await query(`SELECT currency FROM wallets WHERE id = $1`, [walletId]);
-    if (walletCurRes.rows.length > 0) {
-      const walletCurrency = String(walletCurRes.rows[0].currency || 'NGN').toUpperCase();
-      if (walletCurrency !== neededCurrency) {
-        return res.status(400).json({
-          success: false,
-          error: `Source wallet is ${walletCurrency} but this transfer pays out in ${neededCurrency}. Select the ${neededCurrency} wallet.`,
-        });
-      }
+    // Currency + OWNERSHIP guard: the caller may only spend their OWN personal
+    // wallet or a wallet of their own business. Previously only the currency
+    // was checked, so any manage_finance caller could debit ANY wallet id —
+    // including another user's personal wallet (VAPT: cross-tenant spend).
+    const walletCurRes = await query(
+      `SELECT currency FROM wallets WHERE id = $1 AND (user_id = $2 OR (business_id IS NOT NULL AND business_id = $3))`,
+      [walletId, userId, businessId || null],
+    );
+    if (walletCurRes.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "Invalid source wallet", code: "WALLET_NOT_AUTHORIZED" });
+    }
+    const walletCurrency = String(walletCurRes.rows[0].currency || 'NGN').toUpperCase();
+    if (walletCurrency !== neededCurrency) {
+      return res.status(400).json({
+        success: false,
+        error: `Source wallet is ${walletCurrency} but this transfer pays out in ${neededCurrency}. Select the ${neededCurrency} wallet.`,
+      });
     }
 
     const reference = genRef();

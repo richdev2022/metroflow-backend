@@ -127,6 +127,45 @@ export const getNotifications: RequestHandler = async (
 
 /**
  * @swagger
+ * /notifications/unread-count:
+ *   get:
+ *     summary: Lightweight unread badge count (app-icon / favicon badges)
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Unread notification count for the authenticated user
+ */
+export const getUnreadCount: RequestHandler = async (
+  req: AuthenticatedRequest,
+  res
+) => {
+  try {
+    const businessId = req.user?.businessId;
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "User authentication required" });
+    }
+    // Same scoping as getNotifications (personal = user only, workspace =
+    // business+user pair) — but a single COUNT, no row payload, so badge
+    // pollers (favicon badge, FCM setBadge refresh) stay cheap.
+    const scopeClause = businessId ? "business_id = $1 AND user_id = $2" : "user_id = $1";
+    const scopeParams: any[] = businessId ? [businessId, userId] : [userId];
+    const result = await query(
+      `SELECT COUNT(*) as total FROM notifications
+       WHERE ${scopeClause} AND is_read = false`,
+      scopeParams
+    );
+    res.json({ success: true, data: { count: parseInt(result.rows[0].total) || 0 } });
+  } catch (error) {
+    console.error("Get unread notification count error:", error);
+    res.status(500).json({ success: false, error: "Failed to get unread count" });
+  }
+};
+
+/**
+ * @swagger
  * /notifications/{id}/read:
  *   patch:
  *     summary: Mark a notification as read

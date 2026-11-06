@@ -817,8 +817,8 @@ export async function reverseFailedTransfer(
     );
     await query(
       `INSERT INTO transactions
-       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-       VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')
+       (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $7, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit')
        ON CONFLICT (reference) DO NOTHING`,
       [
         transfer.business_id,
@@ -827,6 +827,7 @@ export async function reverseFailedTransfer(
         transfer.reference,
         `Reconciliation: debit reconstruction for transfer ${transfer.reference}`,
         transfer.wallet_id,
+        transfer.initiated_by || null,
       ]
     );
     txnCheck = await query(
@@ -850,8 +851,8 @@ export async function reverseFailedTransfer(
   //   <ref>-FEE-REVENUE-REFUND  revenue ledger, reversal of the fee revenue
   const refundClaim = await query(
     `INSERT INTO transactions
-     (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-     VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
+     (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+     VALUES ($1, $7, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
      ON CONFLICT (reference) DO NOTHING RETURNING id`,
     [
       transfer.business_id,
@@ -859,7 +860,8 @@ export async function reverseFailedTransfer(
       currency,
       transfer.reference + '-REFUND',
       `Auto-reversal for failed transfer: ${transfer.reference}`,
-      transfer.wallet_id
+      transfer.wallet_id,
+      transfer.initiated_by || null,
     ]
   );
   if (refundClaim.rows.length === 0) return false;
@@ -896,8 +898,8 @@ export async function reverseFailedTransfer(
   if (fee > 0) {
     const feeClaim = await query(
       `INSERT INTO transactions
-       (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
-       VALUES ($1, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
+       (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $7, $2, $3, 'success', $4, 'credit', $5, 'refund', $6, 'credit')
        ON CONFLICT (reference) DO NOTHING RETURNING id`,
       [
         transfer.business_id,
@@ -905,7 +907,8 @@ export async function reverseFailedTransfer(
         currency,
         transfer.reference + '-FEE-REFUND',
         `Auto-reversal of fee for failed transfer: ${transfer.reference}`,
-        transfer.wallet_id
+        transfer.wallet_id,
+        transfer.initiated_by || null,
       ]
     );
     if (feeClaim.rows.length > 0) {
@@ -1109,8 +1112,8 @@ export async function processAllPending(businessId: string | null) {
           if (existingTxn.rows.length === 0) {
             await query(
               `INSERT INTO transactions 
-               (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-               VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)
+               (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+               VALUES ($1, $8, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)
                ON CONFLICT (reference) DO NOTHING`,
               [
                   transfer.business_id, 
@@ -1119,7 +1122,8 @@ export async function processAllPending(businessId: string | null) {
                   transfer.reference, 
                   `Transfer to ${transfer.recipient_name || 'Account'}`,
                   transfer.wallet_id,
-                  fee
+                  fee,
+                  transfer.initiated_by || null,
               ]
             );
           } else {
@@ -1141,8 +1145,8 @@ export async function processAllPending(businessId: string | null) {
             if (existingFeeTxn.rows.length === 0) {
               await query(
                 `INSERT INTO transactions 
-                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+                 VALUES ($1, $8, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)
                  ON CONFLICT (reference) DO NOTHING`,
                 [
                     transfer.business_id, 
@@ -1151,7 +1155,8 @@ export async function processAllPending(businessId: string | null) {
                     transfer.reference + '-FEE', 
                     `Fee for transfer: ${transfer.reference}`,
                     transfer.wallet_id,
-                    fee
+                    fee,
+                    transfer.initiated_by || null,
                 ]
               );
             } else {
@@ -1477,8 +1482,8 @@ export async function processTransfer(transferId: string) {
         if (existingTxn.rows.length === 0) {
           await query(
             `INSERT INTO transactions 
-             (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-             VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)`,
+             (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+             VALUES ($1, $8, $2, $3, 'success', $4, 'debit', $5, 'transfer', $6, 'debit', $7)`,
             [
                 transfer.business_id, 
                 amount, 
@@ -1486,7 +1491,8 @@ export async function processTransfer(transferId: string) {
                 transfer.reference, 
                 `Transfer to ${transfer.recipient_name || 'Account'}`,
                 transfer.wallet_id,
-                fee
+                fee,
+                transfer.initiated_by || null,
             ]
           );
         } else {
@@ -1508,8 +1514,8 @@ export async function processTransfer(transferId: string) {
             if (existingFeeTxn.rows.length === 0) {
               await query(
                 `INSERT INTO transactions 
-                 (business_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
-                 VALUES ($1, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee)
+                 VALUES ($1, $8, $2, $3, 'success', $4, 'debit', $5, 'fee', $6, 'debit', $7)`,
                 [
                     transfer.business_id, 
                     fee, 
@@ -1517,7 +1523,8 @@ export async function processTransfer(transferId: string) {
                     transfer.reference + '-FEE', 
                     `Fee for transfer: ${transfer.reference}`,
                     transfer.wallet_id,
-                    fee
+                    fee,
+                    transfer.initiated_by || null,
                 ]
               );
             } else {

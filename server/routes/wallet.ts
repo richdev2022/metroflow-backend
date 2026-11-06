@@ -511,12 +511,26 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         const startDateParam = start_date || q.startDate || "";
         const endDateParam = end_date || q.endDate || "";
 
-        // Resolve the wallets visible to this user: personal wallet + business wallet (admins/owner)
-        const roleRes = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
-        const role = roleRes.rows[0]?.role;
+        // PRODUCT RULE — history is private: "every user's, wallet's, and
+        // transaction history is separate for themselves". The business wallet
+        // and business-level ledger rows are visible to the ACTUAL BUSINESS
+        // OWNER only — an invited 'admin'-role team member must NOT see the
+        // business wallet ledger (or its subscription/fee rows) in their own
+        // history. Ownership is resolved from businesses.owner_id (the source
+        // of truth), NOT from users.role (where 'admin' merely means invited
+        // staff). Personal users (no businessId) keep the current behavior —
+        // the business branch below simply never matches for them.
+        let isBusinessOwner = false;
+        if (businessId) {
+            const ownerRes = await query(`SELECT owner_id FROM businesses WHERE id = $1`, [businessId]).catch(() => ({ rows: [] as any[] }));
+            isBusinessOwner = !!ownerRes.rows[0]?.owner_id && String(ownerRes.rows[0].owner_id) === String(userId);
+        }
+
+        // Resolve the wallets visible to this user: their own personal
+        // wallets, plus the business wallet for the OWNER only.
         const walletParams: any[] = [userId];
         let walletSql = `SELECT id, currency, balance FROM wallets WHERE user_id = $1`;
-        if (['owner', 'admin'].includes(role) && businessId) {
+        if (isBusinessOwner && businessId) {
             walletSql += ` OR business_id = $2`;
             walletParams.push(businessId);
         }
@@ -524,21 +538,6 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         const walletIds = walletsRes.rows.map((w: any) => w.id);
         if (walletIds.length === 0) {
             return res.json({ success: true, data: [], wallets: [], pagination: { total: 0, page: 1, limit: Number(limit), totalPages: 0 } });
-        }
-
-        // PRODUCT RULE — history is private: "every user's, wallet's, and
-        // transaction history is separate for themselves". Business-level
-        // ledger rows (wallet_id IS NULL subscription/fee entries) are shown
-        // to the ACTUAL BUSINESS OWNER only — an invited 'admin'-role team
-        // member must NOT see the business's subscription/fee rows in their
-        // own history. Ownership is resolved from businesses.owner_id (the
-        // source of truth), NOT from users.role (where 'admin' merely means
-        // invited staff). Personal users (no businessId) keep the current
-        // behavior — the business branch below simply never matches for them.
-        let isBusinessOwner = false;
-        if (businessId) {
-            const ownerRes = await query(`SELECT owner_id FROM businesses WHERE id = $1`, [businessId]).catch(() => ({ rows: [] as any[] }));
-            isBusinessOwner = !!ownerRes.rows[0]?.owner_id && String(ownerRes.rows[0].owner_id) === String(userId);
         }
 
         const params: any[] = [];
@@ -912,6 +911,19 @@ router.post("/swap", authenticateToken, checkSubscriptionStatus, async (req: Aut
             (businessId && w.business_id === businessId);
         if (!owns(from) || !owns(to)) {
             return res.status(403).json({ success: false, error: "You can only swap between your own wallets" });
+        }
+        // BUSINESS-WALLET GATE: only the business OWNER may move business
+        // funds via swap. Invited members previously passed owns() for any
+        // wallet of their business and could swap business NGN straight into
+        // their own personal wallet — bypassing the transfer pipeline's fraud
+        // gate (member self-enrichment side door). Members move business
+        // money through /transfers/* (permission + fraud gate + PIN) instead.
+        if (from.business_id || to.business_id) {
+            const ownerRes = await query(`SELECT owner_id FROM businesses WHERE id = $1`, [businessId]).catch(() => ({ rows: [] as any[] }));
+            const ownerId = ownerRes.rows[0]?.owner_id;
+            if (!businessId || !ownerId || String(ownerId) !== String(userId)) {
+                return res.status(403).json({ success: false, error: "Only the business owner can swap business wallet funds" });
+            }
         }
         if (String(from.currency).toUpperCase() === String(to.currency).toUpperCase()) {
             return res.status(400).json({ success: false, error: "Choose wallets in different currencies" });

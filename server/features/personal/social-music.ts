@@ -168,7 +168,12 @@ async function loadBucket(key: string): Promise<{ tracks: any[]; cached: boolean
     if (stale?.tracks?.length) return { tracks: stale.tracks, cached: true };
     throw new Error(`audius bucket "${key}" unavailable`);
   }
-  cachePut(key, tracks);
+  // Cache only MEANINGFUL buckets (a real page's worth). A transiently
+  // degraded fetch (Audius hiccup → 1-3 tracks) is still served for THIS
+  // request but not pinned into the 10-minute cache — the next picker open
+  // retries Audius and recovers immediately instead of showing a shrunken
+  // library for ten minutes.
+  if (tracks.length >= 15) cachePut(key, tracks);
   return { tracks, cached: false };
 }
 
@@ -216,7 +221,9 @@ async function loadAllBucket(): Promise<{ tracks: any[]; cached: boolean }> {
     if (stale?.tracks?.length) return { tracks: stale.tracks, cached: true };
     throw new Error('audius bucket "all" unavailable');
   }
-  cachePut(ALL_KEY, tracks);
+  // Same degraded-result guard as loadBucket: never pin a shrunken merge
+  // (a healthy "all" is hundreds of tracks) into the long cache.
+  if (tracks.length >= 50) cachePut(ALL_KEY, tracks);
   return { tracks, cached: false };
 }
 

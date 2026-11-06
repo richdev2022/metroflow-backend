@@ -1267,6 +1267,14 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS text_color VARCHAR(20)`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS font VARCHAR(24) DEFAULT 'default'`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS text_align VARCHAR(10) DEFAULT 'center'`);
+  // Story music: catalog tracks have no social_sounds row, so the picked
+  // track's stream URL + title + mix volumes ride directly on the story row
+  // and are echoed back by shapeStory — that's what makes viewers hear the
+  // track the author attached (the mobile viewer already reads these keys).
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_url TEXT`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_story_views (

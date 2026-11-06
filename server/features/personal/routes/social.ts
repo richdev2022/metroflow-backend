@@ -9,6 +9,7 @@ import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import { uploadMediaBuffer } from "../../../services/media-upload";
 import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
 import { upload, uploadAudio } from "../../../middleware/upload";
+import musicRoutes from "../social-music";
 import { createNotification } from "../../../services/notifications";
 import { sendPushToUsers } from "../../../services/push";
 import { friendshipMap } from "../../../routes/friends";
@@ -51,6 +52,10 @@ import { getBadgeCriteria } from "../../../services/verification-criteria";
  */
 
 const router = express.Router();
+
+// Real, full-length licensed music catalog (Audius proxy — afrobeats,
+// hip-hop, pop, R&B) for the composers' music picker.
+router.use("/music", musicRoutes);
 
 const REACTION_TYPES = new Set(["like", "love", "haha", "wow", "sad", "angry"]);
 
@@ -2748,6 +2753,11 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
     duration_seconds: row.duration_seconds,
     audience: row.audience,
     sound_id: row.sound_id ?? null,
+    // Story music (catalog tracks ride directly on the row — see schema).
+    sound_url: row.sound_url ?? null,
+    sound_title: row.sound_title ?? null,
+    music_volume: row.music_volume == null ? 0.8 : Number(row.music_volume),
+    video_volume: row.video_volume == null ? 1.0 : Number(row.video_volume),
     view_count: Number(row.view_count) || 0,
     like_count: Number(row.like_count) || 0,
     viewed_by_me: !!row.viewed_by_me,
@@ -2780,6 +2790,17 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     const textAlign = ["left", "center", "right"].includes(req.body?.text_align) ? req.body.text_align : "center";
     const audience = ["public", "followers"].includes(req.body?.audience) ? req.body.audience : "public";
     const durationSeconds = Math.min(60, Math.max(3, Number(req.body?.duration_seconds) || 7));
+    // Story music — the composer sends the picked track (catalog tracks have
+    // no social_sounds row, so the stream URL + title + mix volumes ride on
+    // the story row itself; server sounds keep using sound_id).
+    const storySoundUrl = String(req.body?.sound_url ?? "").trim().slice(0, 2000) || null;
+    const storySoundTitle = String(req.body?.sound_title ?? "").trim().slice(0, 200) || null;
+    const clampVolume = (v: any, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
+    };
+    const musicVolume = clampVolume(req.body?.music_volume, 0.8);
+    const videoVolume = clampVolume(req.body?.video_volume, 1.0);
 
     let mediaType = "text";
     let mediaUrl: string | null = null;
@@ -2806,9 +2827,9 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     if (mediaType === "text" && !caption) return res.status(400).json({ success: false, error: "Write a caption or attach a photo/video" });
 
     const r = await query(
-      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience],
+      `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_url, sound_title, music_volume, video_volume)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundUrl, storySoundTitle, musicVolume, videoVolume],
     );
     const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [userId]);
     res.status(201).json({

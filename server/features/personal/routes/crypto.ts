@@ -8,6 +8,9 @@ import {
 import * as bitnob from "../../../services/bitnob";
 import * as flutterwave from "../../../services/flutterwave";
 import * as sogo from "../../../services/sogo";
+import { resolveProvider } from "../../../services/providers/factory";
+import { accountLookup } from "../../../services/transfer";
+import { normalizeToNipBankCode } from "../../../utils/bank-codes";
 import { userSafeErr } from "../user-safe-errors";
 import { useProvider, getPercent, getProviderModes } from "../flags";
 import { getActiveProvider } from "../provider-routing";
@@ -112,12 +115,41 @@ const FALLBACK_BANKS = [
 ];
 
 router.get("/banks", authenticateToken, async (_req, res) => {
+  // SAME list + code space as the working bank-transfer flow
+  // (/transfers/banks → BANK_LIST, 6-digit NIP codes). The old Flutterwave
+  // list used 3-digit NIBSS codes which the shared lookup/payout pipeline
+  // rejects — the exact reason "sell crypto → select bank → enter account
+  // number" never resolved. Old clients still holding 3-digit codes are
+  // handled by normalizeToNipBankCode on /lookup and /sell.
+  try {
+    const provider = await resolveProvider();
+    const banks = provider.getBanks();
+    if (banks?.length) {
+      return res.json({ success: true, data: { banks, mode: "live" } });
+    }
+  } catch (e: any) {
+    console.warn("crypto banks: transfer provider list unavailable:", e?.message);
+  }
+  // Last-resort fallbacks, normalised into the NIP code space so lookups
+  // keep working even when the provider layer is down.
   try {
     const banks = await flutterwave.getNigerianBanks();
-    res.json({ success: true, data: { banks, mode: "live" } });
+    return res.json({
+      success: true,
+      data: {
+        banks: banks.map((b) => ({ code: normalizeToNipBankCode(b.code), name: b.name })),
+        mode: "live",
+      },
+    });
   } catch (e: any) {
     console.error("crypto banks error (serving fallback list):", e?.message);
-    res.json({ success: true, data: { banks: FALLBACK_BANKS, mode: "fallback" } });
+    return res.json({
+      success: true,
+      data: {
+        banks: FALLBACK_BANKS.map((b) => ({ code: normalizeToNipBankCode(b.code), name: b.name })),
+        mode: "fallback",
+      },
+    });
   }
 });
 
@@ -332,12 +364,23 @@ router.get("/deposits", authenticateToken, checkSubscriptionStatus, async (req: 
 router.post("/lookup", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
     const accountNumber = String(req.body?.account_number || "").replace(/\D+/g, "");
-    const bankCode = String(req.body?.bank_code || "").trim();
+    // REUSE THE TRANSFER FLOW'S LOOKUP PIPELINE (admin-selected provider,
+    // shared NIP code space) — the old Flutterwave name-enquiry call hit a
+    // non-endpoint and could never resolve. Legacy 3-digit codes are
+    // normalised so pre-existing installs keep working.
+    const bankCode = normalizeToNipBankCode(String(req.body?.bank_code || "").trim());
     if (!/^\d{10}$/.test(accountNumber)) return res.status(400).json({ success: false, error: "Enter a valid 10-digit account number" });
     if (!bankCode) return res.status(400).json({ success: false, error: "Select a bank" });
-    const name = await flutterwave.verifyBankAccount(bankCode, accountNumber);
+    const payload = await accountLookup(bankCode, accountNumber);
+    const p = payload && typeof payload === "object" ? (payload as Record<string, any>) : {};
+    const name: string | null =
+      p?.data?.account_name ||
+      p?.account_name ||
+      p?.responseBody?.accountName ||
+      p?.accountName ||
+      null;
     if (!name) return res.status(404).json({ success: false, error: "Account could not be verified — check the number and bank" });
-    res.json({ success: true, data: { account_name: name } });
+    res.json({ success: true, data: { account_name: name, account_number: accountNumber, bank_code: bankCode } });
   } catch (e: any) {
     console.error("crypto lookup error:", e?.message);
     res.status(502).json({ success: false, error: "Account lookup failed — try again" });
@@ -412,7 +455,11 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     const asset = String(req.body?.from_asset || "USDT").toUpperCase();
     const settlement = Number(req.body?.settlement_amount);
     const accountNumber = String(req.body?.account_number || "").trim();
-    const bankCode = String(req.body?.bank_code || "").trim();
+    const rawBankCode = String(req.body?.bank_code || "").trim();
+    // Normalise legacy 3-digit NIBSS codes (old installs / cached lists) to
+    // the NIP space the payout partner and lookup pipeline share. No-op for
+    // fresh 6-digit codes.
+    const bankCode = normalizeToNipBankCode(rawBankCode);
     const accountName = String(req.body?.account_name || "").trim();
     const spread = await getPercent("crypto_spread_percent", 1);
     if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });

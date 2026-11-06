@@ -1469,3 +1469,65 @@ export function getBankNameByCode(code?: string | null): string | null {
   const found = BANK_LIST.find((b) => b.code === normalized);
   return found ? found.name : null;
 }
+
+/**
+ * Flutterwave/NIBSS 3-digit bank codes → display names in the 6-digit NIP
+ * BANK_LIST space. The crypto sell flow historically collected these short
+ * codes (from the old /crypto/banks list) and fed them into the
+ * account-lookup + payout pipeline, which is keyed on the 6-digit NIP codes
+ * every transfer provider shares — so every resolution died with
+ * "Lookup failed". Resolved against BANK_LIST by name so the pairs stay
+ * honest; anything unknown passes through untouched.
+ */
+const NIBSS_SHORT_CODES: Record<string, string> = {
+  "011": "First Bank of Nigeria",
+  "013": "JAIZ Bank",
+  "030": "Sterling Bank",
+  "032": "Union Bank",
+  "033": "United Bank for Africa",
+  "035": "Wema Bank",
+  "044": "Access Bank",
+  "050": "Ecobank Bank",
+  "057": "Zenith Bank Plc",
+  "058": "GTBank Plc",
+  "070": "Fidelity Bank",
+  "076": "Polaris Bank",
+  "082": "Keystone Bank",
+  "090": "Kuda Microfinance Bank",
+  "101": "Providus Bank",
+  "214": "FCMB",
+  "221": "StanbicIBTC Bank",
+  "566": "PalmPay Limited",
+  "999": "OPay Digital Services Limited (OPay)",
+};
+
+/** True when [code] exists in the 6-digit NIP BANK_LIST code space. */
+export function isNipBankCode(code?: string | null): boolean {
+  if (!code) return false;
+  const raw = String(code).trim();
+  return BANK_LIST.some((b) => b.code === raw);
+}
+
+/**
+ * Normalise ANY client bank code (3-digit NIBSS or 6-digit NIP) to the
+ * 6-digit NIP code used by the transfer/lookup pipeline. Unknown codes are
+ * returned as-is so the active provider surfaces its own, real error.
+ */
+export function normalizeToNipBankCode(code?: string | null): string {
+  const raw = String(code ?? "").trim();
+  if (!raw) return raw;
+  if (BANK_LIST.some((b) => b.code === raw)) return raw;
+  const name = NIBSS_SHORT_CODES[raw];
+  if (!name) return raw;
+  const target = name.toLowerCase();
+  const exact = BANK_LIST.find((b) => b.name.toLowerCase() === target);
+  if (exact) return exact.code;
+  // Loose fallback: match on the first significant word ("GTBank" →
+  // "GTBank Plc", "OPay" → "OPay Digital Services Limited (OPay)").
+  const head = target.split(" ")[0];
+  const loose = BANK_LIST.find((b) => {
+    const n = b.name.toLowerCase();
+    return n.includes(head) || head.includes(n.split(" ")[0]);
+  });
+  return loose ? loose.code : raw;
+}

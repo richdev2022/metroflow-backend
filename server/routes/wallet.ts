@@ -526,18 +526,38 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
             return res.json({ success: true, data: [], wallets: [], pagination: { total: 0, page: 1, limit: Number(limit), totalPages: 0 } });
         }
 
+        // PRODUCT RULE — history is private: "every user's, wallet's, and
+        // transaction history is separate for themselves". Business-level
+        // ledger rows (wallet_id IS NULL subscription/fee entries) are shown
+        // to the ACTUAL BUSINESS OWNER only — an invited 'admin'-role team
+        // member must NOT see the business's subscription/fee rows in their
+        // own history. Ownership is resolved from businesses.owner_id (the
+        // source of truth), NOT from users.role (where 'admin' merely means
+        // invited staff). Personal users (no businessId) keep the current
+        // behavior — the business branch below simply never matches for them.
+        let isBusinessOwner = false;
+        if (businessId) {
+            const ownerRes = await query(`SELECT owner_id FROM businesses WHERE id = $1`, [businessId]).catch(() => ({ rows: [] as any[] }));
+            isBusinessOwner = !!ownerRes.rows[0]?.owner_id && String(ownerRes.rows[0].owner_id) === String(userId);
+        }
+
         const params: any[] = [];
         let sql = `SELECT t.*, w.currency AS wallet_currency, w.balance AS wallet_balance
                    FROM transactions t
                    LEFT JOIN wallets w ON w.id = t.wallet_id
-                   WHERE (t.wallet_id = ANY($1) OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL))
+                   WHERE (t.wallet_id = ANY($1)`;
+        params.push(walletIds);
+        if (isBusinessOwner) {
+            sql += ` OR (t.business_id = $2 AND t.transaction_type IN ('subscription','fee') AND t.wallet_id IS NULL)`;
+            params.push(businessId);
+        }
+        sql += `)
                      -- Fee mirror rows (ref-FEE, wallet-scoped) are NOT
                      -- standalone history entries: the fee displays on its
                      -- parent transaction's detail row (owner directive).
                      -- Revenue-ledger fee rows (wallet_id IS NULL, business
                      -- admin view above) are unaffected.
                      AND NOT (t.transaction_type = 'fee' AND t.wallet_id IS NOT NULL)`;
-        params.push(walletIds, businessId);
         let idx = params.length + 1;
 
         if (walletIdParam && walletIds.includes(walletIdParam)) {

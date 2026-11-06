@@ -390,6 +390,7 @@ router.post("/lookup", authenticateToken, async (req: AuthenticatedRequest, res)
 router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     if (!(await assertPersonalService(res, "crypto"))) return;
+    const userId = req.user!.userId;
     const asset = String(req.query.from_asset || "USDT").toUpperCase();
     const settlement = Number(req.query.settlement_amount);
     if (!ASSETS.has(asset)) return res.status(400).json({ success: false, error: "from_asset must be USDT or USDC" });
@@ -401,6 +402,9 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
     const ngnPerUsd = (await fx.getUsdNgnRate()).rate;
     const usdDebit = Math.round((settlement / ngnPerUsd) * 100) / 100;
     const spread = await getPercent("crypto_spread_percent", 1);
+    const feeAmount = Math.round(settlement * (spread / 100) * 100) / 100;
+    const netAmount = Math.round((settlement - feeAmount) * 100) / 100;
+    const expiresAt = new Date(Date.now() + 2 * 60000);
 
     // LIVE RATE CALCULATOR — the ACTIVE provider's rate always wins:
     //   sogo   → GET /crypto/assets/{asset}/rate (Sogo live market rate)
@@ -423,6 +427,16 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
       } catch { /* FX fallback stands */ }
     }
 
+    // PERSIST the quote: /sell binds to the EXACT rate/debit/fee/net the
+    // user saw (claimed atomically via used_at) instead of re-computing from
+    // live FX that may have drifted since the quote was shown.
+    const quoteInsert = await query(
+      `INSERT INTO crypto_quotes
+         (user_id, from_asset, settlement_amount, rate, usd_debit, fee_amount, net_amount, provider, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [userId, asset, settlement, rate, usdDebit, feeAmount, netAmount, provider, expiresAt],
+    );
+
     res.json({
       success: true,
       data: {
@@ -435,11 +449,11 @@ router.get("/quote", authenticateToken, checkSubscriptionStatus, async (req: Aut
         // the fee is carved out of the NGN settlement, so the payout the user
         // actually receives is net_amount. Clients render Rate / Fee / Total.
         fee_percent: spread,
-        fee_amount: Math.round(settlement * (spread / 100) * 100) / 100,
-        net_amount: Math.round((settlement - Math.round(settlement * (spread / 100) * 100) / 100) * 100) / 100,
+        fee_amount: feeAmount,
+        net_amount: netAmount,
         provider,
-        expires_at: new Date(Date.now() + 2 * 60000).toISOString(),
-        reference: genRef("MF-QT"),
+        expires_at: expiresAt.toISOString(),
+        reference: `MF-QT-${quoteInsert.rows[0].id}`,
       },
     });
   } catch (e: any) {
@@ -469,12 +483,46 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     }
 
     // Stablecoin wallet debit — the sale debits the MATCHING coin's wallet
-    // (USDT sale → USDT wallet, USDC sale → USDC wallet). The NGN-per-USD
-    // price comes from the platform FX desk (admin toggle: Flutterwave).
+    // (USDT sale → USDT wallet, USDC sale → USDC wallet). Default pricing is
+    // the live FX desk; a valid quote reference BINDS the sale to the quoted
+    // numbers instead (see /quote persistence above).
     const fx = await import("../../../services/fx");
     const ngnPerUsd = (await fx.getUsdNgnRate()).rate;
-    let usdDebit = settlement / ngnPerUsd;
-    usdDebit = Math.round(usdDebit * 100) / 100;
+    let usdDebit = Math.round((settlement / ngnPerUsd) * 100) / 100;
+    let feeAmount = Math.round(settlement * (spread / 100) * 100) / 100;
+    let netAmount = Math.round((settlement - feeAmount) * 100) / 100;
+    let saleRate = ngnPerUsd;
+
+    const quoteRef = String(req.body?.quote_reference || "").trim();
+    if (quoteRef.startsWith("MF-QT-")) {
+      const quoteId = quoteRef.slice(6).trim();
+      if (/^[0-9a-fA-F-]{36}$/.test(quoteId)) {
+        const existing = await query(
+          `SELECT id, from_asset, settlement_amount, rate, usd_debit, fee_amount, net_amount, used_at, expires_at
+           FROM crypto_quotes WHERE id = $1 AND user_id = $2 LIMIT 1`,
+          [quoteId, userId],
+        ).catch(() => ({ rows: [] as any[] }));
+        const q = existing.rows[0];
+        if (q) {
+          if (q.used_at || new Date(q.expires_at).getTime() <= Date.now()) {
+            return res.status(410).json({ success: false, code: "QUOTE_EXPIRED", error: "This quote has expired — get a fresh quote and try again." });
+          }
+          if (String(q.from_asset).toUpperCase() !== asset || Math.round(Number(q.settlement_amount) * 100) !== Math.round(settlement * 100)) {
+            return res.status(400).json({ success: false, code: "QUOTE_MISMATCH", error: "This quote does not match the sale — get a fresh quote." });
+          }
+          const claim = await query(`UPDATE crypto_quotes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL RETURNING id`, [quoteId]);
+          if (claim.rows.length === 0) {
+            return res.status(410).json({ success: false, code: "QUOTE_EXPIRED", error: "This quote was already used — get a fresh quote." });
+          }
+          usdDebit = Math.round(Number(q.usd_debit) * 100) / 100;
+          feeAmount = Math.round(Number(q.fee_amount) * 100) / 100;
+          netAmount = Math.round(Number(q.net_amount) * 100) / 100;
+          saleRate = Number(q.rate);
+        }
+        // No row for this id (older clients send random MF-QT refs) → live
+        // pricing above stands, exactly the pre-binding behavior.
+      }
+    }
 
     const walletRes = await query(
       `SELECT * FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = $2 AND status = 'active' LIMIT 1`,
@@ -491,11 +539,6 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     }
 
     const reference = genRef("MF-CRS");
-    // Conversion fee (admin spread) is carved out of the NGN payout — same
-    // model as the stablecoin convert flow, so the quoted fee matches the
-    // executed payout to the penny.
-    const feeAmount = Math.round(settlement * (spread / 100) * 100) / 100;
-    const netAmount = Math.round((settlement - feeAmount) * 100) / 100;
     if (!(await debitWallet(wallet.id, usdDebit))) {
       return res.status(400).json({ success: false, code: "INSUFFICIENT_BALANCE", error: `Insufficient ${asset} balance` });
     }
@@ -518,7 +561,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
          (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
           settlement_currency, rate, fee, bank_code, account_number, account_name, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'NGN',$8,$9,$10,$11,$12,'processing') RETURNING *`,
-      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, ngnPerUsd, feeAmount, bankCode, accountNumber, accountName],
+      [userId, wallet.id, reference, saleProvider, asset, usdDebit, settlement, saleRate, feeAmount, bankCode, accountNumber, accountName],
     );
 
     if (!useLive) {
@@ -554,7 +597,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
           amount: netAmount, reference,
         });
         const payout = quote?.data?.payout || quote?.payout;
-        const quoteId = payout?.id || payout?.quote_id || quoteIdFromBody(req);
+        const quoteId = payout?.id || payout?.quote_id || null;
         if (quoteId) {
           await bitnob.executePayout(quoteId, {
             beneficiary: { accountNumber, accountName, bankCode },
@@ -567,6 +610,19 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
             businessId: "", userId, type: "credit", title: "Crypto sale completed",
             message: `₦${netAmount.toLocaleString()} is on its way to your ${accountName} account.`,
           }).catch(() => {});
+        } else {
+          // Quote created but no executable id returned — the sale can never
+          // settle. Refund immediately and fail honestly. (Previously this
+          // branch fell through silently: sale stuck 'processing' forever
+          // with the wallet already debited.)
+          await creditWallet(wallet.id, usdDebit);
+          await insertTransaction({
+            userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
+            transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
+            description: "Refund — payout partner returned an unexecutable quote",
+          });
+          await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = 'Payout quote missing executable id — auto-refunded', refunded_at = CURRENT_TIMESTAMP WHERE id = $1`, [dbInsert.rows[0].id]);
+          return res.status(502).json({ success: false, error: "The payout partner could not execute this sale — your wallet has been refunded." });
         }
       } catch (bnErr: any) {
         const be = bitnob.bitnobErr(bnErr);
@@ -606,10 +662,6 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     res.status(500).json({ success: false, error: "Could not complete the sale" });
   }
 });
-
-function quoteIdFromBody(req: AuthenticatedRequest): string | null {
-  return (req.body?.quote_reference as string) || null;
-}
 
 /**
  * @swagger

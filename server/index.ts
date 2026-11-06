@@ -129,7 +129,7 @@ import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
 import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest, reapStaleCalls } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording, getRecordingById } from "./routes/recordings";
-import { getNotifications, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
+import { getNotifications, getUnreadCount, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
 import { subscribePush, unsubscribePush, getVapidPublicKeyEndpoint } from "./routes/push";
 import { isPushConfigured, pushDeliveryMode } from "./services/push";
 import { isWebPushConfigured } from "./services/webPush";
@@ -1302,6 +1302,8 @@ export async function createServer() {
 
   // Notifications API routes
   mainRouter.get("/notifications", authenticateToken, checkSubscriptionStatus, getNotifications);
+  // Lightweight badge count for app-icon/favicon badges (single COUNT, no rows).
+  mainRouter.get("/notifications/unread-count", authenticateToken, getUnreadCount);
   mainRouter.patch("/notifications/:id/read", authenticateToken, checkSubscriptionStatus, markNotificationAsRead);
   mainRouter.patch("/notifications/read-all", authenticateToken, checkSubscriptionStatus, markAllNotificationsAsRead);
   mainRouter.post("/notifications/:id/action", authenticateToken, checkSubscriptionStatus, takeNotificationAction);

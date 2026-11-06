@@ -199,3 +199,31 @@ Add event handlers for:
          │  (DB)         │
          └───────────────┘
 ```
+
+---
+
+## Provider Toggle — LiveKit (default) vs MediaSoup (IMPORTANT, 2026-11)
+
+Live streaming and calls run **LiveKit-first**. The active provider is the
+`calling_provider` system setting (seeded to `livekit`, switchable via
+`PUT /admin/calling/provider`, status via `GET /admin/calling/providers/status`).
+Each call/live room persists its own `provider` column; rooms created while a
+provider was active keep using it.
+
+**If live streams "don't work" or silently run MediaSoup, check the LIVEKIT_*
+environment first** — an unconfigured or unreachable LiveKit deployment makes
+`resolveProviderForRoom` degrade to MediaSoup automatically:
+
+| Env var | Purpose |
+| --- | --- |
+| `LIVEKIT_URL` | Client-facing `wss://` LiveKit host (tokens embed it) |
+| `LIVEKIT_API_KEY` | LiveKit API key |
+| `LIVEKIT_API_SECRET` | LiveKit API secret |
+| `LIVEKIT_API_URL` | Optional server-side `https://` host (derived from URL if empty) |
+| `LIVEKIT_EGRESS_URL` | Optional dedicated egress host (recordings) |
+
+All three of `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` must be
+set to real values (placeholders count as missing). Reachability is probed and
+cached for 30s; a 502 behind the URL fails the probe and degrades to MediaSoup.
+The web apps and both mobile apps pick the provider from the join response
+(`calling.provider` + token), so **no client change is needed to switch**.

@@ -912,6 +912,49 @@ async function ensurePayrollVerificationColumns(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_biometric_user ON biometric_credentials(user_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_biometric_token ON biometric_credentials(token_hash)`);
+
+  // Per-user transaction history (owner directive: every user's history is
+  // their own): transfer-ledger rows used to be written with business_id only
+  // and user_id NULL, so any query filtering transactions by user_id silently
+  // missed every transfer debit/fee/refund row. New writes carry
+  // user_id = transfer_queue.initiated_by (services/transfer.ts); this
+  // idempotent backfill repairs historical rows via the reference linkage
+  // (<ref>, <ref>-FEE, <ref>-REFUND, <ref>-FEE-REFUND).
+  await query(`
+    UPDATE transactions t
+    SET user_id = q.initiated_by
+    FROM transfer_queue q
+    WHERE t.user_id IS NULL
+      AND q.initiated_by IS NOT NULL
+      AND (
+        t.reference = q.reference
+        OR t.reference = q.reference || '-FEE'
+        OR t.reference = q.reference || '-REFUND'
+        OR t.reference = q.reference || '-FEE-REFUND'
+      )
+  `);
+
+  // Crypto sell quotes: GET /crypto/quote persists a binding quote row and
+  // POST /crypto/sell consumes it atomically (used_at claim), so the user is
+  // debited EXACTLY the numbers the screen showed — never a re-computed live
+  // rate that drifted between quote and sell.
+  await query(`
+    CREATE TABLE IF NOT EXISTS crypto_quotes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      from_asset VARCHAR(10) NOT NULL,
+      settlement_amount DECIMAL(20, 2) NOT NULL,
+      rate DECIMAL(20, 8) NOT NULL,
+      usd_debit DECIMAL(20, 4) NOT NULL,
+      fee_amount DECIMAL(20, 2) NOT NULL,
+      net_amount DECIMAL(20, 2) NOT NULL,
+      provider VARCHAR(30),
+      expires_at TIMESTAMP NOT NULL,
+      used_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_crypto_quotes_user ON crypto_quotes(user_id, created_at DESC)`);
 }
 
 async function ensureSystemSettingsDefaults(): Promise<void> {

@@ -1769,17 +1769,17 @@ export function initSocketServer(server: http.Server): void {
         ).catch(() => undefined);
       }
       // Broadcast to the LIVE room (`room:{id}`) — `call:{id}` is never joined.
-      io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+      io.to(`room:${resolvedCallId}`).emit("call:ended", { callId: resolvedCallId, callCode: preEnd?.call_code ?? null, endedBy: socket.data.userId });
       // A callee who is still RINGING (or browsing any other route) has NOT
       // joined room:{id} yet — reach their personal user rooms too, otherwise
       // their phone keeps ringing until the local 45s timeout.
       for (const pid of preEndParticipantIds) {
         if (pid) {
-          io.to(`user:${pid}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+          io.to(`user:${pid}`).emit("call:ended", { callId: resolvedCallId, callCode: preEnd?.call_code ?? null, endedBy: socket.data.userId });
         }
       }
       if (preEnd?.created_by) {
-        io.to(`user:${preEnd.created_by}`).emit("call:ended", { callId: resolvedCallId, endedBy: socket.data.userId });
+        io.to(`user:${preEnd.created_by}`).emit("call:ended", { callId: resolvedCallId, callCode: preEnd?.call_code ?? null, endedBy: socket.data.userId });
       }
       // SILENT push for the devices still ringing in another room / with the
       // app backgrounded: dismiss the full-screen ring notification + the

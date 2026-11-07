@@ -63,7 +63,10 @@ export const CATEGORY_LABELS: Record<string, string> = {
 
 const BILL_CATEGORIES = new Set(["airtime", "data", "tv", "electricity", "betting"]);
 
-function categorize(type: string, billCat: string): string {
+/** Auto-categorisation — maps a personal-ledger transaction_type (+ the
+ *  bill_payments.category sub-split for bill payments) to an insight
+ *  category key. Exported for unit tests. */
+export function categorize(type: string, billCat: string): string {
   switch (type) {
     case "bill":
       return BILL_CATEGORIES.has(billCat) ? billCat : "bills";
@@ -174,6 +177,89 @@ async function loadBudgets(userId: string, spend: Bucket) {
   });
 }
 
+/** Shared ₦ formatter for nudge copy (matches the app's money voice). */
+export function naira(v: number): string {
+  return `₦${Math.round(v).toLocaleString()}`;
+}
+
+/** Shape of a budget envelope the nudge builder consumes. */
+export interface BudgetView {
+  label: string;
+  monthly_limit: number;
+  spent: number;
+  remaining: number;
+  pct: number;
+}
+
+export interface Nudge {
+  type: string;
+  title: string;
+  body: string;
+}
+
+/** PURE nudge core — spikes, budget alerts and the always-on top-category
+ *  context, derived from one month's spend bucket, the per-category trailing
+ *  3-month average and the live envelopes. Week-over-week and the Round-Up
+ *  bridge stay in the handler because they need extra DB signals.
+ *  Thresholds: a spike needs ≥₦2,000 spent AND ≥2× a ≥₦500 trailing average;
+ *  envelopes alert at 100% (blown) and 80% (almost gone). */
+export function buildCoreNudges(
+  thisMonth: Bucket,
+  avgByCat: Map<string, number>,
+  budgets: BudgetView[],
+  thisTotal: number,
+): Nudge[] {
+  const nudges: Nudge[] = [];
+
+  // 1. Category spikes — "you spent ₦12,400 on airtime — 3× your average".
+  const spikes: Array<{ cat: string; amount: number; ratio: number }> = [];
+  for (const [cat, v] of Object.entries(thisMonth)) {
+    if (v.amount < 2000) continue;
+    const avg = avgByCat.get(cat) || 0;
+    if (avg >= 500 && v.amount >= avg * 2) {
+      spikes.push({ cat, amount: v.amount, ratio: Math.round((v.amount / avg) * 10) / 10 });
+    }
+  }
+  spikes.sort((a, z) => z.amount - a.amount);
+  for (const s of spikes.slice(0, 2)) {
+    nudges.push({
+      type: "spike",
+      title: `${CATEGORY_LABELS[s.cat] || "Spending"} is up sharply`,
+      body: `You've spent ${naira(s.amount)} on ${(CATEGORY_LABELS[s.cat] || s.cat).toLowerCase()} this month — ${s.ratio}× your monthly average.`,
+    });
+  }
+
+  // 2. Budget alerts — over and close-to-limit envelopes.
+  for (const b of budgets) {
+    if (b.monthly_limit <= 0) continue;
+    if (b.pct >= 100) {
+      nudges.push({
+        type: "budget_over",
+        title: `${b.label} budget blown`,
+        body: `You're at ${b.pct}% of your ${naira(b.monthly_limit)} ${b.label.toLowerCase()} envelope — ${naira(b.spent - b.monthly_limit)} over.`,
+      });
+    } else if (b.pct >= 80) {
+      nudges.push({
+        type: "budget_warn",
+        title: `${b.label} budget almost gone`,
+        body: `${b.pct}% of your ${b.label.toLowerCase()} budget is used — ${naira(b.remaining)} left this month.`,
+      });
+    }
+  }
+
+  // 5. Top category share — always-on context.
+  const top = bucketList(thisMonth)[0];
+  if (top && thisTotal >= 5000) {
+    nudges.push({
+      type: "top_category",
+      title: `${top.label} leads your spending`,
+      body: `${naira(top.amount)} — ${top.share}% of everything you spent this month.`,
+    });
+  }
+
+  return nudges;
+}
+
 // ---------------------------------------------------------------------------
 // GET /insights/overview?month=YYYY-MM
 // ---------------------------------------------------------------------------
@@ -280,45 +366,10 @@ router.get("/nudges", authenticateToken, checkSubscriptionStatus, async (req: Au
       }
     }
 
-    const nudges: Array<{ type: string; title: string; body: string }> = [];
-    const naira = (v: number) => `₦${Math.round(v).toLocaleString()}`;
-
-    // 1. Category spikes — "you spent ₦12,400 on airtime — 3× your average".
-    const spikes: Array<{ cat: string; amount: number; ratio: number }> = [];
-    for (const [cat, v] of Object.entries(thisMonth)) {
-      if (v.amount < 2000) continue;
-      const avg = avgByCat.get(cat) || 0;
-      if (avg >= 500 && v.amount >= avg * 2) {
-        spikes.push({ cat, amount: v.amount, ratio: Math.round((v.amount / avg) * 10) / 10 });
-      }
-    }
-    spikes.sort((a, z) => z.amount - a.amount);
-    for (const s of spikes.slice(0, 2)) {
-      nudges.push({
-        type: "spike",
-        title: `${CATEGORY_LABELS[s.cat] || "Spending"} is up sharply`,
-        body: `You've spent ${naira(s.amount)} on ${(CATEGORY_LABELS[s.cat] || s.cat).toLowerCase()} this month — ${s.ratio}× your monthly average.`,
-      });
-    }
-
-    // 2. Budget alerts — over and close-to-limit envelopes.
+    // 1+2+5. Spikes, budget alerts and top-category context — the pure
+    // core (unit-tested); the DB-driven nudges below are appended after.
     const budgets = await loadBudgets(userId, thisMonth);
-    for (const b of budgets) {
-      if (b.monthly_limit <= 0) continue;
-      if (b.pct >= 100) {
-        nudges.push({
-          type: "budget_over",
-          title: `${b.label} budget blown`,
-          body: `You're at ${b.pct}% of your ${naira(b.monthly_limit)} ${b.label.toLowerCase()} envelope — ${naira(b.spent - b.monthly_limit)} over.`,
-        });
-      } else if (b.pct >= 80) {
-        nudges.push({
-          type: "budget_warn",
-          title: `${b.label} budget almost gone`,
-          body: `${b.pct}% of your ${b.label.toLowerCase()} budget is used — ${naira(b.remaining)} left this month.`,
-        });
-      }
-    }
+    const nudges = buildCoreNudges(thisMonth, avgByCat, budgets, thisTotal);
 
     // 3. Week-over-week move.
     const weeks = await query(
@@ -388,16 +439,6 @@ router.get("/nudges", authenticateToken, checkSubscriptionStatus, async (req: Au
         }
       }
     } catch { /* round-up signal is optional */ }
-
-    // 5. Top category share — always-on context.
-    const top = bucketList(thisMonth)[0];
-    if (top && thisTotal >= 5000) {
-      nudges.push({
-        type: "top_category",
-        title: `${top.label} leads your spending`,
-        body: `${naira(top.amount)} — ${top.share}% of everything you spent this month.`,
-      });
-    }
 
     res.json({ success: true, nudges: nudges.slice(0, 6) });
   } catch (e: any) {

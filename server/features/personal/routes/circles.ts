@@ -64,9 +64,15 @@ function trustLabel(score: number): string {
   return "at_risk";
 }
 
+/** Trust scores are integers clamped to [0, TRUST_MAX] — rounds fractional
+ *  inputs so a 99.6 written by a future formula never escapes the band. */
+export function clampTrust(score: number): number {
+  return Math.max(0, Math.min(TRUST_MAX, Math.round(score)));
+}
+
 function serializeMember(m: any) {
   if (!m) return m;
-  const score = Math.max(0, Math.min(TRUST_MAX, Math.round(num(m.trust_score))));
+  const score = clampTrust(num(m.trust_score));
   return {
     ...m,
     trust_score: score,
@@ -82,10 +88,21 @@ function serializeMember(m: any) {
 // whole calendar is deterministic and inspectable.
 // ---------------------------------------------------------------------------
 
-function addFrequency(from: Date, frequency: string, steps: number): Date {
+export function addFrequency(from: Date, frequency: string, steps: number): Date {
   const d = new Date(from.getTime());
-  if (frequency === "monthly") d.setUTCMonth(d.getUTCMonth() + steps);
-  else d.setUTCDate(d.getUTCDate() + (frequency === "biweekly" ? 14 : 7) * steps);
+  if (frequency === "monthly") {
+    // Calendar-safe monthly step: pin to the 1st, step the month, then clamp
+    // the day to the target month's length — Jan 31 + 1mo lands on Feb 28,
+    // never on Mar 3 (setUTCMonth alone overflows and would DRIFT the whole
+    // payment calendar).
+    const day = d.getUTCDate();
+    d.setUTCDate(1);
+    d.setUTCMonth(d.getUTCMonth() + steps);
+    const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+    d.setUTCDate(Math.min(day, lastDay));
+  } else {
+    d.setUTCDate(d.getUTCDate() + (frequency === "biweekly" ? 14 : 7) * steps);
+  }
   return d;
 }
 
@@ -522,7 +539,7 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
         ...s,
         my_role: r.my_role,
         my_position: r.my_position,
-        my_trust_score: Math.max(0, Math.min(TRUST_MAX, Math.round(num(r.my_trust_score)))),
+        my_trust_score: clampTrust(num(r.my_trust_score)),
         my_streak: r.my_streak,
       };
     });
@@ -613,7 +630,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
         role: me.role,
         status: me.status,
         position: me.position,
-        trust_score: Math.max(0, Math.min(TRUST_MAX, Math.round(num(me.trust_score)))),
+        trust_score: clampTrust(num(me.trust_score)),
         trust_label: trustLabel(num(me.trust_score)),
         streak: me.streak,
         paid_total: money(num(me.paid_total)),

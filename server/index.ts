@@ -563,7 +563,6 @@ export async function createServer() {
       if (!key || key.includes("..") || key.includes("\\") || !r2Storage.isAvailable()) {
         return res.status(404).send("Not found");
       }
-      const buffer = await r2Storage.getFile(key);
       const ext = path.extname(key).toLowerCase();
       const contentType =
         ext === ".png" ? "image/png" :
@@ -581,6 +580,23 @@ export async function createServer() {
         "application/octet-stream";
       res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.setHeader("Accept-Ranges", "bytes");
+      // RANGE STREAMING — video players open "bytes=N-" requests to seek and
+      // to start playback mid-file. Answering 200 with the WHOLE object (the
+      // previous behavior) forced full-file downloads through Node RAM on
+      // every view — the playback "buffering" users reported. Serve bounded
+      // 206 windows instead; suffix/malformed ranges keep the legacy 200 path.
+      const rangeHeader = req.headers.range;
+      if (rangeHeader && /^bytes=\d+-\d*$/.test(String(rangeHeader).trim())) {
+        const ranged = await r2Storage.getFileRange(key, String(rangeHeader));
+        if (ranged) {
+          res.setHeader("Content-Range", `bytes ${ranged.start}-${ranged.end}/${ranged.total}`);
+          res.setHeader("Content-Length", String(ranged.buffer.length));
+          return res.status(206).send(ranged.buffer);
+        }
+        return res.status(416).setHeader("Content-Range", "bytes */*").send("Range not satisfiable");
+      }
+      const buffer = await r2Storage.getFile(key);
       return res.send(buffer);
     } catch (err) {
       return res.status(404).send("Not found");

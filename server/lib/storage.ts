@@ -1,5 +1,5 @@
 
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import logger from './logger';
 
@@ -126,6 +126,57 @@ class R2Storage {
     }
 
     return Buffer.concat(chunks);
+  }
+
+  /**
+   * Range-aware fetch for video/audio streaming. Video players (and the
+   * HTML5 <video> seek path) request byte slices; answering with the WHOLE
+   * object forced full-file downloads on every view/seek (the "buffering"
+   * complaint) and buffered the entire video in Node RAM. This returns a
+   * bounded window (default 4 MB) starting at the requested offset, with
+   * the object's TOTAL size so the route can emit a correct Content-Range.
+   * Supported range forms: "bytes=a-b", "bytes=a-" (open-ended), and
+   * "bytes=-N" (suffix — served as a plain 200 by the caller's fallback).
+   */
+  async getFileRange(
+    key: string,
+    range: string,
+    maxWindowBytes = 4 * 1024 * 1024,
+  ): Promise<{ buffer: Buffer; start: number; end: number; total: number } | null> {
+    if (!this.client) {
+      throw new Error('R2 storage is not available');
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+    if (!m || (m[1] === '' && m[2] === '')) {
+      return null; // malformed / suffix-only — caller falls back to 200
+    }
+    const start = m[1] === '' ? 0 : Number(m[1]);
+    // Open-ended requests get the bounded window; closed requests clamp too
+    // (some players ask for multi-MB tails — serving ≤ the window keeps RAM flat).
+    const requestedEnd = m[2] === '' ? start + maxWindowBytes - 1 : Number(m[2]);
+    const end = Math.min(requestedEnd, start + maxWindowBytes - 1);
+    if (!(start >= 0) || start > end) {
+      return null; // unsatisfiable → caller answers 416
+    }
+    const command = new GetObjectCommand({
+      Bucket: this.config.bucketName,
+      Key: key,
+      Range: `bytes=${start}-${end}`,
+    });
+    const response = await this.client.send(command);
+    if (!response.Body) {
+      throw new Error('File not found');
+    }
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks);
+    // "bytes 0-4194303/52428800" — the total after the "/" is authoritative.
+    const contentRange = String(response.ContentRange || '');
+    const totalMatch = /\/(\d+)$/.exec(contentRange);
+    const total = totalMatch ? Number(totalMatch[1]) : buffer.length;
+    return { buffer, start, end: start + buffer.length - 1, total };
   }
 
   async deleteFile(key: string): Promise<void> {

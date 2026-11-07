@@ -877,6 +877,14 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     // Poster frames — captured client-side per video (canvas snapshot), in the
     // same order as the videos were appended.
     const posterFiles = files.poster || [];
+    // Fail fast on oversized files — a 400MB video would otherwise upload
+    // fully (client → API), buffer in RAM, then die at the R2/proxy limits
+    // minutes later. Matches the 200MB guard the web composer enforces.
+    const POST_MAX_MEDIA_BYTES = 200 * 1024 * 1024;
+    const oversized = [...imageFiles, ...videoFiles].find((f) => (f.size || 0) > POST_MAX_MEDIA_BYTES);
+    if (oversized) {
+      return res.status(413).json({ success: false, error: "Video is too large — keep each file under 200MB" });
+    }
     // Ordered media sequence. The composer sends `media_order` (JSON array of
     // "image"|"video") so mixed carousels render in the user's chosen order;
     // when absent (old clients) fall back to images-then-videos.
@@ -898,51 +906,42 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       (await uploadMediaBuffer({ buffer: f.buffer, originalname: f.originalname, mimeType: f.mimetype, folder: "social-media", userId }))?.url || null;
 
     type MediaRow = { media_type: "image" | "video"; url: string | null; poster_url: string | null };
-    const mediaRows: MediaRow[] = [];
+    // Plan the row sequence first (same order rules as before), then upload
+    // EVERYTHING in parallel — carousels previously uploaded file-by-file,
+    // so a 5-media post paid 5 sequential round-trips to storage.
+    type PlanRow = { kind: "image" | "video"; file: Express.Multer.File; posterFile?: Express.Multer.File };
+    const plan: PlanRow[] = [];
     for (const kind of order) {
-      if (mediaRows.length >= MAX_MEDIA) break;
+      if (plan.length >= MAX_MEDIA) break;
       if (kind === "image" && imageQueue.length) {
-        mediaRows.push({ media_type: "image", url: await uploadOne(imageQueue.shift()!), poster_url: null });
+        plan.push({ kind: "image", file: imageQueue.shift()! });
       } else if (kind === "video" && videoQueue.length) {
-        const poster = posterQueue.length ? await uploadOne(posterQueue.shift()!) : null;
-        mediaRows.push({ media_type: "video", url: await uploadOne(videoQueue.shift()!), poster_url: poster });
+        plan.push({ kind: "video", file: videoQueue.shift()!, posterFile: posterQueue.shift() });
       }
     }
     // Leftover files when media_order was absent/short (cap respected).
-    while (mediaRows.length < MAX_MEDIA && (imageQueue.length || videoQueue.length)) {
-      if (imageQueue.length) mediaRows.push({ media_type: "image", url: await uploadOne(imageQueue.shift()!), poster_url: null });
-      else if (videoQueue.length) {
-        const poster = posterQueue.length ? await uploadOne(posterQueue.shift()!) : null;
-        mediaRows.push({ media_type: "video", url: await uploadOne(videoQueue.shift()!), poster_url: poster });
-      }
+    while (plan.length < MAX_MEDIA && (imageQueue.length || videoQueue.length)) {
+      if (imageQueue.length) plan.push({ kind: "image", file: imageQueue.shift()! });
+      else if (videoQueue.length) plan.push({ kind: "video", file: videoQueue.shift()!, posterFile: posterQueue.shift() });
     }
+    const mediaRows: MediaRow[] = await Promise.all(plan.map(async (p) => {
+      if (p.kind === "image") return { media_type: "image" as const, url: await uploadOne(p.file), poster_url: null };
+      const poster = p.posterFile ? await uploadOne(p.posterFile) : null;
+      return { media_type: "video" as const, url: await uploadOne(p.file), poster_url: poster };
+    }));
 
-    // Server-side poster fill — any video that arrived WITHOUT a client-captured
-    // frame (old clients, mobile app, failed canvas capture) gets a thumbnail
-    // extracted on the host with ffmpeg. Best-effort per video: a missing
-    // binary or an exotic codec degrades to the no-poster path and never fails
-    // the post. Keeps og:image/feed thumbnails real for EVERY video post.
-    // Pair video rows with their original buffers in upload order.
+    // Server-side poster fill — videos that arrived WITHOUT a client-captured
+    // frame used to block the response on ffmpeg (up to ~90s per video at
+    // three retry offsets) — the "upload hangs at 99%" complaint. Extraction
+    // now runs AFTER the response, and the rows are patched once ready
+    // (post id + sound cover included — see fillPostersForPost below).
+    const pendingPosters: Array<{ file: Express.Multer.File }> = [];
     {
-      const videoRowIdx: number[] = [];
-      mediaRows.forEach((m, i) => { if (m.media_type === "video") videoRowIdx.push(i); });
-      for (let v = 0; v < videoRowIdx.length && v < videoFiles.length; v++) {
-        const row = mediaRows[videoRowIdx[v]];
-        if (row.poster_url) continue; // client already supplied a poster
-        try {
-          const frame = await extractVideoPosterFrame(videoFiles[v].buffer, { maxWidth: 720 });
-          if (frame) {
-            const up = await uploadMediaBuffer({
-              buffer: frame,
-              originalname: `poster-${v}.jpg`,
-              mimeType: "image/jpeg",
-              folder: "social-media",
-              userId,
-            });
-            if (up?.url) row.poster_url = up.url;
-          }
-        } catch (err: any) {
-          console.warn("social/posts server-side poster extraction skipped:", err?.message);
+      let videoIdx = 0;
+      for (const row of mediaRows) {
+        if (row.media_type === "video") {
+          const file = videoFiles[videoIdx++];
+          if (file && !row.poster_url) pendingPosters.push({ file });
         }
       }
     }
@@ -1042,6 +1041,35 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
         ).catch(() => {});
       });
       savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
+    }
+
+    // FIRE-AND-FORGET poster fill (see pendingPosters above): ffmpeg-extract
+    // a frame per poster-less video, upload it, then patch the media row,
+    // the back-compat image_url column AND the minted original-sound cover.
+    // Never blocks the create response; individual failures are logged and
+    // skipped — the post itself is already live.
+    if (pendingPosters.length) {
+      void (async () => {
+        for (const { file } of pendingPosters) {
+          try {
+            const frame = await extractVideoPosterFrame(file.buffer, { maxWidth: 720 });
+            if (!frame) continue;
+            const up = await uploadMediaBuffer({
+              buffer: frame,
+              originalname: "poster-async.jpg",
+              mimeType: "image/jpeg",
+              folder: "social-media",
+              userId,
+            });
+            if (!up?.url) continue;
+            await query(`UPDATE social_post_media SET poster_url = $2 WHERE post_id = $1 AND poster_url IS NULL AND media_type = 'video'`, [postId, up.url]).catch(() => {});
+            await query(`UPDATE social_posts SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [postId, up.url]).catch(() => {});
+            await query(`UPDATE social_sounds SET source_poster_url = $2 WHERE source_post_id = $1 AND source_poster_url IS NULL`, [postId, up.url]).catch(() => {});
+          } catch (err: any) {
+            console.warn("social/posts async poster fill skipped:", err?.message);
+          }
+        }
+      })().catch(() => {});
     }
 
     // Sound bookkeeping (best-effort — never fails the post):
@@ -2078,6 +2106,7 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
     let imageUrl: string | null = null;
     let videoUrl: string | null = null;
     let posterUrl: string | null = null;
+    let pendingReposter: Express.Multer.File | null = null;
     try {
       if (image) {
         const up = await uploadMediaBuffer({ buffer: image.buffer, originalname: image.originalname, mimeType: image.mimetype, folder: "social-media", userId });
@@ -2090,9 +2119,12 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
       if (poster) {
         const up = await uploadMediaBuffer({ buffer: poster.buffer, originalname: poster.originalname, mimeType: poster.mimetype, folder: "social-media", userId });
         posterUrl = up.url;
-      } else if (videoUrl) {
-        posterUrl = await extractVideoPosterFrame(video.buffer).catch(() => null);
       }
+      // NOTE: no inline ffmpeg here — extraction ran synchronously before the
+      // response (up to ~90s) and its raw Buffer was stored AS poster_url
+      // (a [object Buffer] string in the DB). The frame now fills in the
+      // background after the repost row exists (filler below).
+      if (!posterUrl && videoUrl) pendingReposter = video;
     } catch (e: any) {
       console.error("repost media upload failed:", e?.message);
       return res.status(500).json({ success: false, error: "Could not store the media" });
@@ -2114,6 +2146,31 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
          VALUES ($1, $2, $3, $4, 0)`,
         [post.id, videoUrl ? "video" : "image", videoUrl || imageUrl, posterUrl],
       ).catch(() => {});
+    }
+
+    // Background poster fill for video reposts (see pendingReposter above) —
+    // ffmpeg + upload run AFTER the response; rows patched when ready.
+    if (pendingReposter) {
+      const reposterFile = pendingReposter;
+      const reposterUserId = userId;
+      void (async () => {
+        try {
+          const frame = await extractVideoPosterFrame(reposterFile.buffer, { maxWidth: 720 });
+          if (!frame) return;
+          const up = await uploadMediaBuffer({
+            buffer: frame,
+            originalname: "repost-poster.jpg",
+            mimeType: "image/jpeg",
+            folder: "social-media",
+            userId: reposterUserId,
+          });
+          if (!up?.url) return;
+          await query(`UPDATE social_post_media SET poster_url = $2 WHERE post_id = $1 AND poster_url IS NULL`, [post.id, up.url]).catch(() => {});
+          await query(`UPDATE social_posts SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [post.id, up.url]).catch(() => {});
+        } catch (err: any) {
+          console.warn("repost async poster fill skipped:", err?.message);
+        }
+      })().catch(() => {});
     }
 
     if (orig.user_id !== userId) {
@@ -3414,9 +3471,15 @@ router.get("/sounds/:id", authenticateToken, checkSubscriptionStatus, async (req
 
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 30));
     const cursor = req.query.cursor ? new Date(String(req.query.cursor)) : null;
-    const params: any[] = [req.params.id, limit + 1];
+    // ONE param array, in the exact order the SQL consumes it:
+    //   $1 sound id, $2 viewer (audience + follower EXISTS), $3 limit+1, $4 cursor.
+    // (Previously TWO arrays drifted apart: the built `params` ordered
+    // [id, limit+1, viewer, cursor] while the call passed
+    // [id, viewer, limit+1] — and the LIMIT placeholder hardcoded $2, which
+    // bound the viewer UUID into `LIMIT <bigint>` → 42883 on every request
+    // and "Could not load sound page" in production, found 2026-11-07.)
+    const params: any[] = [req.params.id, userId, limit + 1];
     let where = `m.sound_id = $1 AND p.status = 'active' AND (p.audience = 'public' OR p.user_id = $2)`;
-    params.push(userId);
     if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $${params.length + 1}`; params.push(cursor.toISOString()); }
     const usersRes = await query(
       `SELECT DISTINCT ON (p.user_id, p.id) p.id AS post_id, p.user_id, p.body, p.video_url, p.image_url, p.created_at,
@@ -3430,8 +3493,8 @@ router.get("/sounds/:id", authenticateToken, checkSubscriptionStatus, async (req
        JOIN users u ON u.id = p.user_id
        WHERE ${where}
        ORDER BY p.user_id, p.id, p.created_at DESC
-       LIMIT $${2}`,
-      [req.params.id, userId, limit + 1],
+       LIMIT $${params.length + 1}`,
+      params,
     );
     // Distinct-on returns per-author latest; re-sort newest first + paginate.
     let users = usersRes.rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());

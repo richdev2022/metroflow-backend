@@ -267,7 +267,26 @@ router.put("/settings", authenticateToken, checkSubscriptionStatus, async (req: 
     let vaultId = req.body?.vault_id ? String(req.body.vault_id).trim() : null;
     if (enabled) {
       if (!vaultId) {
-        return res.status(400).json({ success: false, error: "vault_id is required to enable round-up" });
+        // AUTO-PICK: both the web toggle and the mobile quick-enable switch
+        // flip ON before a destination vault is chosen (the vault picker only
+        // renders once enabled) — rejecting with "vault_id is required" here
+        // deadlocked the feature (found in production 2026-11-07). Instead,
+        // resolve to the user's first active NGN vault; only ask them to
+        // create one when they genuinely have none.
+        const auto = await query(
+          `SELECT id FROM savings_vaults
+            WHERE user_id = $1 AND status = 'active' AND UPPER(currency) = 'NGN'
+            ORDER BY created_at ASC LIMIT 1`,
+          [userId],
+        );
+        if (!auto.rows.length) {
+          return res.status(400).json({
+            success: false,
+            code: "NO_VAULT",
+            error: "Create a savings vault first — round-up needs somewhere to save the spare change",
+          });
+        }
+        vaultId = String(auto.rows[0].id);
       }
       const v = await query(
         `SELECT id, currency, status FROM savings_vaults WHERE id = $1 AND user_id = $2 LIMIT 1`,

@@ -40,6 +40,8 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
   import personalSplitsRouter from "./features/personal/routes/splits";
   import personalPotsRouter from "./features/personal/routes/pots";
   import personalLiveShopRouter from "./features/personal/routes/live-shop";
+  import personalCirclesRouter, { processDueSavingsCircles } from "./features/personal/routes/circles";
+  import personalInsightsRouter from "./features/personal/routes/insights";
   import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
   import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
@@ -1307,6 +1309,10 @@ export async function createServer() {
   // Live Shopping — in-stream product rail + wallet checkout (same /live
   // mount as personalLiveRouter; subpaths /:id/shop/* don't collide).
   mainRouter.use("/live", personalLiveShopRouter);
+  // Savings Circles — rotating group savings (ajo/esusu) with an auto-pay
+  // cycle engine; /insights — smart spending analytics + budget envelopes.
+  mainRouter.use("/circles", personalCirclesRouter);
+  mainRouter.use("/insights", personalInsightsRouter);
   // Fundraising donations: create campaigns, contribute from NGN wallet,
   // donor lists, creator redemption to NGN wallet (admin manages economics).
   mainRouter.use("/donations", personalDonationsRouter);
@@ -1363,6 +1369,15 @@ export async function createServer() {
       })
       .catch((err) => console.error("[cleanup] expired notifications:", err?.message || err));
   }, 60 * 60 * 1000).unref();
+
+  // Savings Circles cycle engine: auto-pays due contribution slots, enforces
+  // the missed-payment grace window and releases pots on their rotation date.
+  // Idempotent + concurrency-guarded (see circles.ts); runs every 5 minutes
+  // and is also kicked lazily by GET /circles reads.
+  setInterval(() => {
+    processDueSavingsCircles().catch((err) =>
+      console.error("[circles] interval tick:", err?.message || err));
+  }, 5 * 60 * 1000).unref();
 
   // Redirect /wallet/verify to /api/wallet/verify (for backward compatibility with old callback URLs)
   app.get("/wallet/verify", (req, res) => {

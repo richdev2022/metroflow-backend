@@ -570,11 +570,27 @@ export async function ensurePersonalSchema(): Promise<void> {
   // 'column "host_id" does not exist', silently killing the whole personal
   // schema step (masked on the original deployment by a manual ALTER).
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS host_id UUID`);
-  await query(`UPDATE live_sessions SET host_id = host_user_id WHERE host_id IS NULL AND host_user_id IS NOT NULL`);
-  // Legacy NOT NULL host_user_id would reject personal-live inserts that only
-  // set host_id ("null value in column host_user_id violates not-null
-  // constraint") — relax it; new rows always set host_id.
-  await query(`ALTER TABLE live_sessions ALTER COLUMN host_user_id DROP NOT NULL`);
+  // The backfill/relax below only applies to databases where the lean
+  // ensureLiveSchema table exists (it declares host_user_id NOT NULL). The
+  // ORIGINAL production table (call-room origin) has host_id but NEVER had
+  // host_user_id — running the backfill unconditionally threw 42703, which
+  // aborted the WHOLE ensurePersonalSchema step (fault-isolated, so masked)
+  // and silently skipped every later statement — the Round-Up / Splits /
+  // Pots / Cheers / Live-Shop tables shipped missing in production (found
+  // 2026-11-07: "Could not load your splits" / "Could not create the pot").
+  // Guard on the actual column so both shapes (lean + legacy) survive.
+  const legacyHostCol = await query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'live_sessions' AND column_name = 'host_user_id'
+      LIMIT 1`
+  );
+  if (legacyHostCol.rows.length) {
+    await query(`UPDATE live_sessions SET host_id = host_user_id WHERE host_id IS NULL AND host_user_id IS NOT NULL`);
+    // Legacy NOT NULL host_user_id would reject personal-live inserts that only
+    // set host_id ("null value in column host_user_id violates not-null
+    // constraint") — relax it; new rows always set host_id.
+    await query(`ALTER TABLE live_sessions ALTER COLUMN host_user_id DROP NOT NULL`);
+  }
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS description TEXT`);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS category VARCHAR(40) NOT NULL DEFAULT 'general'`);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS pinned_message TEXT`);

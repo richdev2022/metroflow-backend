@@ -10,6 +10,7 @@ import { uploadMediaBuffer } from "../../../services/media-upload";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
 import { getBoostPricing, estimateReach, getActiveBoostMap } from "./social";
+import { maybeApplyRoundUp } from "./roundup";
 
 /**
  * MARKETPLACE — Facebook-Marketplace-style buying + selling (mounted at
@@ -429,6 +430,18 @@ router.post("/:id/buy", authenticateToken, requirePersonalKyc(), checkSubscripti
       message: `Your listing "${l.name}" was purchased. Ship it and confirm the order to get paid.`,
       type: "marketplace",
     }).catch(() => {});
+
+    // ROUND-UP AUTO-SAVE: spare change on a completed NGN purchase lands in
+    // the buyer's vault. Best-effort — maybeApplyRoundUp never throws.
+    if (String(wallet.currency || "").toUpperCase() === "NGN") {
+      maybeApplyRoundUp({
+        userId,
+        amount: total,
+        sourceType: "marketplace",
+        sourceReference: reference,
+      });
+    }
+
     res.status(201).json({ success: true, data: { order: r.rows[0], listing: { id: l.id, name: l.name } } });
   } catch (e: any) {
     console.error("marketplace buy error:", e?.message);

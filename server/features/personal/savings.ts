@@ -874,4 +874,92 @@ export async function processDueAutoSaves(limit = 50): Promise<{ processed: numb
     return { processed: dueRes.rows.length, succeeded, failed };
 }
 
+// ---------------------------------------------------------------------------
+// GOAL CHEERS — friends cheer a goal vault (shareable goal pages). One cheer
+// per user per vault: re-cheering updates the message. The vault owner gets
+// an in-app + realtime notification whenever someone else cheers.
+// ---------------------------------------------------------------------------
+
+router.post("/vaults/:id/cheer", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const userId = req.user!.userId;
+        const vaultRes = await query(
+            `SELECT id, user_id, name FROM savings_vaults WHERE id = $1 LIMIT 1`,
+            [req.params.id]
+        );
+        const vault = vaultRes.rows[0];
+        if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
+
+        const message = String(req.body?.message || "").trim().slice(0, 140) || null;
+
+        // Upsert: UNIQUE (vault_id, user_id) — re-cheering refreshes the message.
+        const up = await query(
+            `INSERT INTO goal_cheers (vault_id, user_id, message)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (vault_id, user_id)
+             DO UPDATE SET message = $3, created_at = CURRENT_TIMESTAMP
+             RETURNING *`,
+            [vault.id, userId, message]
+        );
+        const cheer = up.rows[0];
+
+        const totalRes = await query(
+            `SELECT COUNT(*)::int AS n FROM goal_cheers WHERE vault_id = $1`,
+            [vault.id]
+        );
+        const total = totalRes.rows[0]?.n || 0;
+
+        // Notify the vault owner (cheerer ≠ owner) — best effort.
+        if (vault.user_id && vault.user_id !== userId) {
+            try {
+                const me = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+                const cheererName = me.rows[0]?.name || "Someone";
+                await createNotification({
+                    businessId: (req.user!.businessId ?? "") as string,
+                    userId: vault.user_id,
+                    type: "goal_cheer",
+                    title: "Goal cheer",
+                    message: `${cheererName} cheered your goal "${String(vault.name).slice(0, 60)}"${message ? `: “${message.slice(0, 60)}”` : ""}`,
+                    actionUrl: "/savings",
+                    actionType: "view_vault",
+                    metadata: { vaultId: vault.id, cheerId: cheer.id, total },
+                    expiresInHours: 168,
+                });
+            } catch { /* best-effort */ }
+        }
+
+        res.json({ success: true, cheer, total });
+    } catch (error) {
+        console.error("Vault cheer error:", error);
+        res.status(500).json({ success: false, error: "Failed to cheer this goal" });
+    }
+});
+
+router.get("/vaults/:id/cheers", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const vaultRes = await query(`SELECT id FROM savings_vaults WHERE id = $1 LIMIT 1`, [req.params.id]);
+        if (!vaultRes.rows.length) return res.status(404).json({ success: false, error: "Vault not found" });
+
+        const cheers = await query(
+            `SELECT c.user_id, c.message, c.created_at,
+                    u.name AS display_name, u.avatar_url
+               FROM goal_cheers c
+               JOIN users u ON u.id = c.user_id
+              WHERE c.vault_id = $1
+              ORDER BY c.created_at DESC
+              LIMIT 100`,
+            [req.params.id]
+        );
+        const totalRes = await query(
+            `SELECT COUNT(*)::int AS n FROM goal_cheers WHERE vault_id = $1`,
+            [req.params.id]
+        );
+
+        res.json({ success: true, cheers: cheers.rows, total: totalRes.rows[0]?.n || 0 });
+    } catch (error) {
+        console.error("Vault cheers list error:", error);
+        res.status(500).json({ success: false, error: "Failed to load cheers" });
+    }
+});
+
 export default router;

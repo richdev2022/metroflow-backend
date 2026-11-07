@@ -12,6 +12,7 @@ import { userSafeErr } from "../user-safe-errors";
 import { getActiveProvider } from "../provider-routing";
 import { upload } from "../../../middleware/upload";
 import { createNotification } from "../../../services/notifications";
+import { maybeApplyRoundUp } from "./roundup";
 
 /**
  * GIFT CARDS — REAL Prestmit integration (buy + sell, no simulation).
@@ -1010,6 +1011,9 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
           return res.status(502).json({ success: false, error: `${d.failure_reason || "The partner rejected this order"} — your wallet has been refunded.` });
         }
         if (fee > 0) creditRevenueWallet(fee, "NGN", reference, "Gift card buy fee", "giftcards").catch(() => {});
+        // ROUND-UP AUTO-SAVE: spare change on the completed NGN purchase.
+        // Best-effort — maybeApplyRoundUp never throws.
+        maybeApplyRoundUp({ userId, amount: total, sourceType: "giftcard", sourceReference: reference });
         return res.status(201).json({
           success: true,
           provider,
@@ -1041,6 +1045,8 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
           [orderId, result.reference || null, status, JSON.stringify(result.raw || result), codes ? JSON.stringify(codes) : null],
         );
         if (fee > 0) creditRevenueWallet(fee, "NGN", reference, "Gift card buy fee", "giftcards").catch(() => {});
+        // ROUND-UP AUTO-SAVE: spare change on the completed NGN purchase.
+        maybeApplyRoundUp({ userId, amount: total, sourceType: "giftcard", sourceReference: reference });
         return res.status(201).json({
           success: true,
           provider,
@@ -1057,6 +1063,8 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         [orderId, `SIM-${reference}`, JSON.stringify({ simulator: true }), JSON.stringify(codes)],
       );
       if (fee > 0) creditRevenueWallet(fee, "NGN", reference, "Gift card buy fee", "giftcards").catch(() => {});
+      // ROUND-UP AUTO-SAVE: spare change on the completed NGN purchase.
+      maybeApplyRoundUp({ userId, amount: total, sourceType: "giftcard", sourceReference: reference });
       return res.status(201).json({
         success: true, provider,
         message: "Purchase complete — codes delivered!",

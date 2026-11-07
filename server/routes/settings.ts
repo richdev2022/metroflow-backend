@@ -1275,10 +1275,20 @@ router.put("/otp-enabled", authenticateToken, checkSubscriptionStatus, validateB
       });
     }
 
-    await query(
-      `UPDATE businesses SET otp_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-      [enabled, businessId]
-    );
+    if (businessId) {
+      // BUSINESS account: the toggle stays on the businesses row (owner-only).
+      await query(
+        `UPDATE businesses SET otp_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [enabled, businessId]
+      );
+    } else {
+      // PERSONAL account: the toggle lives on the USER row (users.otp_enabled,
+      // see the db.ts migration). Transfers/sell-crypto read this same flag.
+      await query(
+        `UPDATE users SET otp_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [enabled, userId]
+      );
+    }
 
     // Consume the OTP so it cannot be replayed.
     await query(
@@ -1316,17 +1326,22 @@ router.get("/otp-enabled", authenticateToken, checkSubscriptionStatus, async (re
         // PERSONAL ACCOUNTS (businessId IS NULL): the businesses join matches no
         // row, which used to force otpEnabled=true and silently HIDE the user's
         // own PIN (pinCreated=false) — that dead-end blocked every personal
-        // transfer behind an OTP flow that could never be completed. Personal
-        // accounts have no business-level OTP policy, so OTP is simply off and
-        // the per-user PIN alone decides pinCreated.
+        // transfer behind an OTP flow that could never be completed.
+        // PER-USER OTP TOGGLE: personal accounts now carry their own flag
+        // (users.otp_enabled, toggled via PUT /settings/otp-enabled); the
+        // per-user PIN alone still decides pinCreated.
         if (!businessId) {
             const personal = await query(
-                `SELECT (transaction_pin_hash IS NOT NULL) AS user_pin FROM users WHERE id = $1`,
+                `SELECT otp_enabled, (transaction_pin_hash IS NOT NULL) AS user_pin FROM users WHERE id = $1`,
                 [userId]
             );
+            // PER-USER OTP TOGGLE: personal accounts now read their OWN
+            // users.otp_enabled flag (set via PUT /settings/otp-enabled) —
+            // previously this was hardcoded false, which silently hid the
+            // toggle the user had switched on. pinCreated logic is unchanged.
             return res.json({
                 success: true,
-                otpEnabled: false,
+                otpEnabled: !!personal.rows[0]?.otp_enabled,
                 pinCreated: !!personal.rows[0]?.user_pin
             });
         }

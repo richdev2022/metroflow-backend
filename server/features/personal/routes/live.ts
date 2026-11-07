@@ -1058,13 +1058,37 @@ router.post("/:id/join", authenticateToken, async (req: AuthenticatedRequest, re
     // before the backing-row fix) and hand the call id to the watch page so it
     // can mint media credentials via POST /calls/:id/join.
     const callId = await ensureLiveCallRow(s);
+    // FULL ROOM STATE on (re)join — ADDITIVE fields. A retry/reconnect re-joins
+    // here and gets everything needed to render immediately: stream status,
+    // live viewer count, and (host view) the gift pocket balance for the
+    // studio header. Producer lists ride the socket layer (`mediasoup:getProducers`
+    // + the producer snapshot now included in every `mediasoup:createWebRtcTransport`
+    // ack) because the SFU state changes faster than REST ever could.
+    const hostView = s.host_id === userId;
+    let giftPocketBalance: number | null = null;
+    if (hostView) {
+      try {
+        const pocket = await query(
+          `SELECT GREATEST(0, total_earned - total_withdrawn) AS balance FROM live_gift_pockets WHERE user_id = $1 LIMIT 1`,
+          [userId],
+        );
+        giftPocketBalance = Number(pocket.rows[0]?.balance) || 0;
+      } catch { /* additive — never fail the join over it */ }
+    }
     res.json({
       success: true,
       // MODERN ROUTE (see GET /:id): /live/watch?code=… — the mobile WebView
       // and any deep link land on the real watch room instead of the legacy
       // /join-call URL the web app ignores. Absolute + ?token= for the native
       // WebView (see authedWatchUrl helper).
-      data: { watch_url: authedWatchUrl(s.call_code, req), call_id: callId, session: s },
+      data: {
+        watch_url: authedWatchUrl(s.call_code, req),
+        call_id: callId,
+        session: s,
+        status: s.status,
+        viewer_count: Number(s.current_viewers) || 0,
+        ...(hostView && giftPocketBalance != null ? { gift_pocket_balance: giftPocketBalance } : {}),
+      },
     });
   } catch (e: any) {
     console.error("live join error:", e?.message);

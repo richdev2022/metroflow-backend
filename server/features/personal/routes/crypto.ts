@@ -554,25 +554,40 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
       return res.status(400).json({ success: false, code: pinCheck.code, error: pinCheck.error });
     }
 
-    // DYNAMIC TRANSACTION OTP — a crypto off-ramp confirms with a fresh
-    // single-use emailed code (hashed at rest; identical pattern to
-    // /transfers/single). Clients fetch one via POST /crypto/otp/request.
+    // DYNAMIC TRANSACTION OTP — resolved exactly like /transfers/single:
+    // a caller operating in a business context follows the business-wide
+    // toggle (businesses.otp_enabled); personal users follow their OWN
+    // per-user toggle (users.otp_enabled, set via PUT /settings/otp-enabled).
+    // When the toggle is OFF the OTP validation is skipped entirely; when ON
+    // the emailed single-use code flow below stays (request one via
+    // POST /crypto/otp/request). PIN requirement above is unchanged.
     const otp = String(req.body?.otp || "").trim();
-    const otpUserRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
-    const otpUser = otpUserRes.rows[0];
-    if (!otpUser?.otp_code) {
-      return res.status(400).json({
-        success: false, code: "OTP_REQUIRED",
-        error: "Request a transaction code, then enter it to confirm this sale.",
-      });
+    let otpEnabled = false;
+    const otpBusinessId = req.user!.businessId || null;
+    if (otpBusinessId) {
+      const businessOtpRes = await query(`SELECT otp_enabled FROM businesses WHERE id = $1`, [otpBusinessId]);
+      otpEnabled = !!businessOtpRes.rows[0]?.otp_enabled;
+    } else {
+      const userOtpRes = await query(`SELECT otp_enabled FROM users WHERE id = $1`, [userId]);
+      otpEnabled = !!userOtpRes.rows[0]?.otp_enabled;
     }
-    if (!otpMatches(otp, otpUser.otp_code)) {
-      return res.status(400).json({ success: false, code: "OTP_INVALID", error: "Invalid transaction code — check the code we emailed you." });
+    if (otpEnabled) {
+      const otpUserRes = await query(`SELECT otp_code, otp_expires_at FROM users WHERE id = $1`, [userId]);
+      const otpUser = otpUserRes.rows[0];
+      if (!otpUser?.otp_code) {
+        return res.status(400).json({
+          success: false, code: "OTP_REQUIRED",
+          error: "Request a transaction code, then enter it to confirm this sale.",
+        });
+      }
+      if (!otpMatches(otp, otpUser.otp_code)) {
+        return res.status(400).json({ success: false, code: "OTP_INVALID", error: "Invalid transaction code — check the code we emailed you." });
+      }
+      if (new Date(otpUser.otp_expires_at) < new Date()) {
+        return res.status(400).json({ success: false, code: "OTP_EXPIRED", error: "That transaction code has expired — request a new one." });
+      }
+      await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
     }
-    if (new Date(otpUser.otp_expires_at) < new Date()) {
-      return res.status(400).json({ success: false, code: "OTP_EXPIRED", error: "That transaction code has expired — request a new one." });
-    }
-    await query(`UPDATE users SET otp_code = NULL WHERE id = $1`, [userId]);
 
     // Stablecoin wallet debit — the sale debits the MATCHING coin's wallet
     // (USDT sale → USDT wallet, USDC sale → USDC wallet). Default pricing is

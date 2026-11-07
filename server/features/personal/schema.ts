@@ -316,6 +316,10 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_post ON social_post_views(post_id, viewed_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_author_day ON social_post_views(author_id, day)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_day ON social_post_views(day)`);
+  // Feed ranking queries per-viewer state (seen-post penalty + tag interest
+  // affinity) filter by viewer_id — without this index every feed request
+  // scanned the whole view ledger.
+  await query(`CREATE INDEX IF NOT EXISTS idx_social_post_views_viewer ON social_post_views(viewer_id, post_id)`);
 
   // Multi-media posts — a post may carry up to 10 photos/videos in an ordered
   // carousel. `social_posts.image_url`/`video_url` stay populated with the

@@ -643,6 +643,10 @@ export async function initializeDatabase() {
     // Add transaction PIN and OTP toggle columns
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS transaction_pin_hash VARCHAR(255)`);
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS otp_enabled BOOLEAN DEFAULT TRUE`);
+    // PER-USER TRANSACTION OTP TOGGLE: personal accounts (business_id IS NULL)
+    // have no businesses row to hold the flag, so the transfer/sell-OTP toggle
+    // lives on the USER row. GET/PUT /settings/otp-enabled branch on it.
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
 
     // User-configurable display timezone (IANA name) for date/time rendering
     await query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'UTC'`);

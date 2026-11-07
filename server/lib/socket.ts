@@ -1,5 +1,6 @@
 import { Server } from "socket.io";
 import http from "http";
+import type * as mediasoup from "mediasoup";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { getRedisClient } from "./cache";
 import logger from "./logger";
@@ -11,8 +12,13 @@ import {
   createWebRtcTransportForRoom,
   associateTransport,
   getRoomProducers,
-  closePeer,
+  closePeerInRoom,
+  schedulePeerClose,
+  unregisterSocketFromRooms,
+  getRoomSocketIds,
+  setPeerCleanupHook,
   maybeCloseRoom,
+  removeRoom,
   ProducerAppData,
 } from "./mediasoup";
 import { query } from "../db";
@@ -405,6 +411,152 @@ async function runRoomCheckLoop() {
 }
 runRoomCheckLoop();
 
+// =============================================================================
+// LIVE ROOM WATCHDOG — server-side heartbeat enforcement for personal live
+// streams (TikTok-style broadcasts riding the call-room stack).
+//
+// The old failure mode: the host's phone loses connectivity (or the app is
+// killed) and NOTHING told the viewers — the room simply went black and every
+// viewer sat dead on a frozen frame with no close event, no retry affordance,
+// and a live_session stuck at status='live' forever.
+//
+// The watchdog keeps lightweight per-room state:
+//   · which stage identities (host + co-hosts) currently hold a socket here
+//   · the last time a stage identity was seen (join, `live:ping`, produce)
+// Every 30s it checks each tracked live room:
+//   · stage socket present OR SFU producers alive → room is healthy
+//   · stage gone AND no producers for > LIVE_HOST_GONE_GRACE_MS → emit the
+//     STRUCTURED close event (`call:ended` { reason: 'host_disconnected' } —
+//     the exact event every client already handles for "stream ended"),
+//     finalize live_sessions/calls rows, tear the SFU room down so no
+//     producers leak, and stop tracking.
+// Socket.IO's engine-level ping/pong handles per-socket liveness (a dead
+// socket fires `disconnect` → grace sweep); this loop covers ROOM-level
+// liveness so clients never sit dead.
+// =============================================================================
+const LIVE_HOST_GONE_GRACE_MS = Math.max(20_000, Number(process.env.LIVE_HOST_GONE_GRACE_MS) || 45_000);
+const LIVE_WATCH_INTERVAL_MS = 30_000;
+
+interface LiveWatchEntry {
+  callCode: string;
+  liveSessionId: string;
+  hostUserId: string;
+  stageUserIds: Set<string>;
+  /** socket ids currently joined to this room (any role, incl. viewers). */
+  presentSockets: Set<string>;
+  /** socket id -> stage userId, so exits can refresh stage presence. */
+  stageSockets: Map<string, string>;
+  /** True once a stage identity was SEEN here — the watchdog only closes
+   *  rooms whose host we actually watched leave (a host that never touched
+   *  the socket layer, e.g. a pure-LiveKit room, is left to REST lifecycle). */
+  stageEverSeen: boolean;
+  lastStageSeenAt: number;
+  busy: boolean;
+}
+
+const liveWatch = new Map<string, LiveWatchEntry>();
+
+/** socket id -> live room ids it joined (for disconnect/leave cleanup). */
+const socketLiveRooms = new Map<string, Set<string>>();
+
+function trackSocketLiveRoom(socketId: string, roomId: string): void {
+  let set = socketLiveRooms.get(socketId);
+  if (!set) {
+    set = new Set();
+    socketLiveRooms.set(socketId, set);
+  }
+  set.add(roomId);
+}
+
+function touchLiveStage(roomId: string, socketId: string, userId: string): void {
+  const entry = liveWatch.get(roomId);
+  if (!entry) return;
+  if (entry.stageUserIds.has(userId)) {
+    entry.stageSockets.set(socketId, userId);
+    entry.presentSockets.add(socketId);
+    entry.lastStageSeenAt = Date.now();
+    entry.stageEverSeen = true;
+  }
+}
+
+function removeLiveSocket(roomId: string, socketId: string): void {
+  const entry = liveWatch.get(roomId);
+  if (!entry) return;
+  entry.presentSockets.delete(socketId);
+  if (entry.stageSockets.has(socketId)) {
+    entry.stageSockets.delete(socketId);
+    // The sweep's clock runs from the moment the LAST stage socket left.
+    if (entry.stageSockets.size === 0) entry.lastStageSeenAt = Date.now();
+  }
+}
+
+/** Structured close + DB finalization for a dead live room. Never throws. */
+async function finalizeLiveRoom(roomId: string, entry: LiveWatchEntry, reason: string): Promise<void> {
+  entry.busy = true;
+  try {
+    const ioServer = getSocketServer();
+    // `call:ended` is the event EVERY client (web LiveWatch, mobile watch
+    // screen via socket_service.onCallEnded) already maps to the
+    // "stream ended" screen — reuse it so no client changes are needed.
+    // callCode rides along (parity with the host-initiated call:ended payload)
+    // so clients keyed on the code also match this close event.
+    ioServer?.to(`room:${roomId}`).emit("call:ended", { callId: roomId, callCode: entry.callCode || null, reason });
+    await query(
+      `UPDATE live_sessions SET status = 'ended', ended_at = CURRENT_TIMESTAMP, current_viewers = 0
+       WHERE id = $1 AND status = 'live'`,
+      [entry.liveSessionId],
+    ).catch(() => {});
+    await query(
+      `UPDATE live_viewers SET left_at = CURRENT_TIMESTAMP WHERE session_id = $1 AND left_at IS NULL`,
+      [entry.liveSessionId],
+    ).catch(() => {});
+    await query(
+      `UPDATE calls SET status = 'completed', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE call_code = $1 AND status <> 'completed'`,
+      [entry.callCode],
+    ).catch(() => {});
+    // Tear the SFU room down so no producers/transports leak after host loss.
+    try {
+      removeRoom(roomId);
+    } catch { /* room may already be gone */ }
+    logger.warn(`[live-watchdog] room ${roomId} finalized (${reason})`);
+  } finally {
+    liveWatch.delete(roomId);
+  }
+}
+
+async function runLiveWatchdogSweep(): Promise<void> {
+  const now = Date.now();
+  for (const [roomId, entry] of Array.from(liveWatch.entries())) {
+    if (entry.busy) continue;
+    try {
+      // Stage presence: any stage identity holding a live socket in the room.
+      const stagePresent = entry.stageSockets.size > 0;
+      // SFU-level liveness: producers survive a stage socket flap within the
+      // mediasoup grace window; while they exist the stream is still real.
+      const producersAlive = getRoomProducers(roomId).length > 0;
+      if (stagePresent || producersAlive) continue;
+      // Never close a room whose stage we never saw — a host that joins only
+      // via REST/LiveKit is governed by its own lifecycle, not this watchdog.
+      if (!entry.stageEverSeen) continue;
+      const viewersPresent = entry.presentSockets.size > 0;
+      const goneForMs = now - entry.lastStageSeenAt;
+      if (goneForMs >= LIVE_HOST_GONE_GRACE_MS) {
+        await finalizeLiveRoom(roomId, entry, "host_disconnected");
+      }
+    } catch (err) {
+      logger.warn(`[live-watchdog] sweep failed for room ${roomId}:`, err);
+    }
+  }
+}
+
+// Self-scheduling (same pattern as the room-lifecycle loop above).
+async function runLiveWatchdogLoop() {
+  await runLiveWatchdogSweep();
+  setTimeout(runLiveWatchdogLoop, LIVE_WATCH_INTERVAL_MS);
+}
+runLiveWatchdogLoop();
+
 export function initSocketServer(server: http.Server): void {
   // Initialize mediasoup with one automatic retry — a failed worker spawn must
   // not permanently kill the media plane for the process lifetime.
@@ -436,6 +588,19 @@ export function initSocketServer(server: http.Server): void {
 
   const redisClient = getRedisClient();
   const isRedisReady = () => redisClient?.status === "ready";
+
+  // GRACE-SWEEP NOTIFICATION: when the mediasoup layer's disconnect-grace
+  // sweep actually closes a dead socket's transports (up to 45-90s after the
+  // socket dropped), tell the rooms `mediasoup:peerLeft` so peers remove the
+  // matching remote tiles EXACTLY when the streams die — not at the first
+  // socket flap, which would blank a stream that was still healthy.
+  setPeerCleanupHook(({ socketId, roomIds }) => {
+    const ioServer = getSocketServer();
+    if (!ioServer) return;
+    for (const roomId of roomIds) {
+      ioServer.to(`room:${roomId}`).emit("mediasoup:peerLeft", { roomId, socketId });
+    }
+  });
 
   if (isRedisReady()) {
     const pubClient = redisClient.duplicate();
@@ -847,7 +1012,7 @@ export function initSocketServer(server: http.Server): void {
         }
         if (!resolved) {
           logger.warn(`call:join failed - cannot resolve roomId/code: ${data.roomId}`);
-          if (callback) callback({ success: false, error: "Call or meeting not found" });
+          if (callback) callback({ success: false, error: "Call or meeting not found", code: "ROOM_NOT_FOUND", retryable: true });
           return;
         }
         const isCall = resolved.type === 'call';
@@ -940,6 +1105,22 @@ export function initSocketServer(server: http.Server): void {
           isGuest: isGuest || Boolean(socket.data.guest),
         }, endsAt, maxMeetingDuration);
 
+        // IDEMPOTENT RE-JOIN: a socket reconnect re-runs call:join. The old
+        // socket is dead but its roomSockets entry lingered until its disconnect
+        // event fired, which (a) false-positived the same-account multi-device
+        // echo warning and (b) could double-count participants. Drop the stale
+        // binding for the SAME user first, then track the new socket.
+        let reconnected = false;
+        const existingSockets = roomSockets.get(resolvedRoomId);
+        if (existingSockets) {
+          for (const [oldSocketId, info] of Array.from(existingSockets.entries())) {
+            if (oldSocketId !== socket.id && info.userId === data.userId) {
+              existingSockets.delete(oldSocketId);
+              reconnected = true;
+            }
+          }
+        }
+
         const participantCount = roomManager.getParticipants(resolvedRoomId).length;
 
         let durationStarted = false;
@@ -1018,6 +1199,7 @@ export function initSocketServer(server: http.Server): void {
         // Provider-specific media credentials. LiveKit tokens are minted here
         // so the client never touches provider secrets; mediasoup needs none.
         let calling: CallingCredentials | undefined;
+        let liveRoomInfo: { sessionId: string; isHost: boolean; isStage: boolean; canPublish: boolean } | null = null;
         try {
           const provider = await resolveProviderForRoom(isCall ? "call" : "meeting", resolvedRoomId, roomProvider);
           // LIVE broadcast room? Derive publish rights server-side from the
@@ -1031,6 +1213,39 @@ export function initSocketServer(server: http.Server): void {
             if (liveStage.isLiveSession) {
               canPublish = liveStage.canPublish;
               stageIsHost = liveStage.isHost || liveStage.isStage;
+              liveRoomInfo = {
+                sessionId: liveStage.sessionId!,
+                isHost: liveStage.isHost,
+                isStage: liveStage.isStage,
+                canPublish: liveStage.canPublish,
+              };
+              // LIVE WATCHDOG REGISTRATION — the room is now tracked so the
+              // sweep can detect a vanished host and close the room with a
+              // structured event instead of letting viewers sit dead.
+              const existingEntry = liveWatch.get(resolvedRoomId);
+              const stageUserIds = new Set([liveStage.hostId || "", ...liveStage.cohostIds].filter(Boolean));
+              if (!existingEntry) {
+                const codeRes = await query(`SELECT call_code FROM calls WHERE id = $1 LIMIT 1`, [resolvedRoomId]).catch(() => ({ rows: [] as any[] }));
+                liveWatch.set(resolvedRoomId, {
+                  callCode: codeRes.rows[0]?.call_code || "",
+                  liveSessionId: liveStage.sessionId!,
+                  hostUserId: liveStage.hostId || "",
+                  stageUserIds,
+                  presentSockets: new Set([socket.id]),
+                  stageSockets: new Map(liveStage.isStage ? [[socket.id, data.userId]] : []),
+                  stageEverSeen: !!liveStage.isStage,
+                  lastStageSeenAt: Date.now(),
+                  busy: false,
+                });
+              } else {
+                existingEntry.stageUserIds = stageUserIds;
+                existingEntry.presentSockets.add(socket.id);
+                if (liveStage.isStage) existingEntry.stageSockets.set(socket.id, data.userId);
+                if (liveStage.isStage) existingEntry.stageEverSeen = true;
+                existingEntry.lastStageSeenAt = Date.now();
+                existingEntry.busy = false; // rejoin cancels a pending finalize
+              }
+              trackSocketLiveRoom(socket.id, resolvedRoomId);
             }
           }
           calling = await buildCallingCredentials(provider, {
@@ -1048,7 +1263,37 @@ export function initSocketServer(server: http.Server): void {
           logger.warn("Failed to build calling credentials:", err);
         }
 
-        if (callback) callback({ success: true, roomId: resolvedRoomId, calling });
+        // LIVE ROOM STATE in the join ack (ADDITIVE — older clients read only
+        // the fields they already know). Gives the client everything needed to
+        // render without a second round-trip and to recover after a reconnect:
+        // stream status, live viewer count and, for the host, the gift pocket
+        // balance shown in the studio header.
+        let liveState: Record<string, any> | undefined;
+        if (liveRoomInfo) {
+          try {
+            const sessRes = await query(
+              `SELECT status, COALESCE(current_viewers, 0) AS current_viewers FROM live_sessions WHERE id = $1 LIMIT 1`,
+              [liveRoomInfo.sessionId],
+            );
+            liveState = {
+              session_id: liveRoomInfo.sessionId,
+              status: sessRes.rows[0]?.status || "live",
+              viewer_count: Number(sessRes.rows[0]?.current_viewers) || 0,
+              is_host: liveRoomInfo.isHost,
+              is_stage: liveRoomInfo.isStage,
+              can_publish: liveRoomInfo.canPublish,
+            };
+            if (liveRoomInfo.isHost) {
+              const pocket = await query(
+                `SELECT GREATEST(0, total_earned - total_withdrawn) AS balance FROM live_gift_pockets WHERE user_id = $1 LIMIT 1`,
+                [data.userId],
+              ).catch(() => ({ rows: [] as any[] }));
+              liveState.gift_pocket_balance = Number(pocket.rows[0]?.balance) || 0;
+            }
+          } catch { /* additive — never fail the join over it */ }
+        }
+
+        if (callback) callback({ success: true, roomId: resolvedRoomId, calling, ...(reconnected ? { reconnected: true } : {}), ...(liveState ? { live: liveState } : {}) });
 
         if (durationStarted) {
           io.to(`room:${resolvedRoomId}`).emit("call:duration-started", {
@@ -1076,7 +1321,7 @@ export function initSocketServer(server: http.Server): void {
         maybeEmitMultiDeviceAlert(resolvedRoomId, data.userId, data.userName, sameUserCount, isCall);
       } catch (error) {
         logger.error("Error joining call:", error);
-        if (callback) callback({ success: false, error: "Failed to join call" });
+        if (callback) callback({ success: false, error: "Failed to join call", code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -1090,6 +1335,30 @@ export function initSocketServer(server: http.Server): void {
         roomManager.removeParticipant(resolvedRoomId, data.userId);
         untrackRoomSocket(resolvedRoomId, socket.id);
         socket.leave(`room:${resolvedRoomId}`);
+
+        // EXPLICIT leave = intentional teardown. Unlike a socket drop (which
+        // now waits out the disconnect grace), release this socket's SFU
+        // transports immediately and tell the room which producers died so
+        // peers drop the matching tiles/streams. This is also what prevents
+        // a LEAVING HOST from leaking producers after they stop broadcasting.
+        try {
+          const { closedProducerIds } = closePeerInRoom(resolvedRoomId, socket.id);
+          if (closedProducerIds.length) {
+            for (const producerId of closedProducerIds) {
+              io.to(`room:${resolvedRoomId}`).emit("mediasoup:producerClosed", {
+                producerId,
+                roomId: resolvedRoomId,
+                peerId: data.userId,
+              });
+            }
+          }
+          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:peerLeft", { roomId: resolvedRoomId, socketId: socket.id });
+        } catch (mediaErr) {
+          logger.warn("call:leave media cleanup failed:", mediaErr);
+        }
+        removeLiveSocket(resolvedRoomId, socket.id);
+        socketLiveRooms.get(socket.id)?.delete(resolvedRoomId);
+        unregisterSocketFromRooms(socket.id);
 
         socket.to(`room:${resolvedRoomId}`).emit("call:participant-left", {
           roomId: resolvedRoomId,
@@ -1488,6 +1757,30 @@ export function initSocketServer(server: http.Server): void {
         await query(`UPDATE users SET last_seen_at = NOW() WHERE id = $1`, [pingUserId]);
       } catch (err) {
         logger.warn(`presence:ping failed for user ${pingUserId}:`, err);
+      }
+    });
+
+    // LIVE heartbeat — application-level ping/pong for personal live rooms.
+    // Complements Socket.IO's engine-level ping/pong: each ping refreshes the
+    // live watchdog's stage-presence clock, and the ack carries the room's
+    // current stream state so a reconnecting client can self-verify that the
+    // stream is still live (structured close arrives via `call:ended`).
+    socket.on("live:ping", async (data: { roomId?: string; sessionId?: string }, callback?: (res: any) => void) => {
+      try {
+        const key = String(data?.roomId || data?.sessionId || "");
+        if (key) {
+          const resolved = await resolveRoomId(key);
+          const roomId = resolved?.id || key;
+          touchLiveStage(roomId, socket.id, socket.data.userId || "");
+          // Non-stage viewers keep their own presence fresh via REST heartbeats;
+          // the ping is still acked so clients can measure RTT.
+          if (callback) callback({ ok: true, ts: Date.now() });
+          return;
+        }
+        if (callback) callback({ ok: true, ts: Date.now() });
+      } catch (err) {
+        logger.warn("live:ping failed:", err);
+        if (callback) callback({ ok: false, error: "ping_failed", retryable: true });
       }
     });
 
@@ -2059,7 +2352,7 @@ export function initSocketServer(server: http.Server): void {
         if (!isMediasoupReady()) {
           // Workers are still booting — tell the client to retry shortly
           // instead of stranding it on the join screen.
-          callback({ error: "Media service is starting, please retry", retryable: true });
+          callback({ error: "Media service is starting, please retry", code: "MEDIA_STARTING", retryable: true });
           return;
         }
         let router;
@@ -2070,21 +2363,21 @@ export function initSocketServer(server: http.Server): void {
           router = room.router;
         }
         if (!router) {
-          callback({ error: "Router not initialized", retryable: true });
+          callback({ error: "Router not initialized", code: "MEDIA_STARTING", retryable: true });
           return;
         }
         callback({ rtpCapabilities: router.rtpCapabilities });
       } catch (error) {
         logger.error("Error getting router rtp capabilities:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
-    socket.on("mediasoup:createWebRtcTransport", async ({ roomId }, callback) => {
+    socket.on("mediasoup:createWebRtcTransport", async ({ roomId }: { roomId?: string }, callback) => {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const { transport } = await createWebRtcTransportForRoom(resolvedRoomId);
+        const { transport } = await createWebRtcTransportForRoom(resolvedRoomId, socket.id);
         associateTransport(resolvedRoomId, transport.id, socket.id);
 
         transport.on("dtlsstatechange", (state) => {
@@ -2094,16 +2387,24 @@ export function initSocketServer(server: http.Server): void {
           }
         });
 
+        // PRODUCER SNAPSHOT (late-joiner race fix): every producer that exists
+        // at transport-creation time rides the ack. Clients previously had a
+        // blind window between `getProducers` and their first `consume` where
+        // a host publishing in exactly that gap was invisible until they
+        // re-joined. Consumers are keyed by producerId on every client, so
+        // callers that ignore this additive field behave exactly as before.
+        const producers = getRoomProducers(resolvedRoomId, socket.id, socket.data.userId);
         callback({
           id: transport.id,
           roomId: resolvedRoomId,
           iceParameters: transport.iceParameters,
           iceCandidates: transport.iceCandidates,
           dtlsParameters: transport.dtlsParameters,
+          producers,
         });
       } catch (error) {
         logger.error("Error creating transport:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2118,7 +2419,7 @@ export function initSocketServer(server: http.Server): void {
         callback();
       } catch (error) {
         logger.error("Error connecting transport:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2180,13 +2481,45 @@ export function initSocketServer(server: http.Server): void {
           peerName: effectiveUserName,
           appData: producer.appData,
         };
-        // Notify everyone except the producer's own socket
-        socket.to(`room:${resolvedRoomId}`).emit("mediasoup:newProducer", newProducerPayload);
+        // Notify every interested peer EXCEPT the producer's own socket —
+        // EXACTLY ONCE per socket. Two complementary paths, no overlap:
+        //   1. DIRECT to the per-room media registry: sockets that created a
+        //      transport for this room but whose `call:join` ack failed/lagged
+        //      are not members of the Socket.IO room, and previously NEVER
+        //      learned that the host had started publishing (the "viewer
+        //      joined, screen stays black" bug).
+        //   2. ROOM broadcast to remaining members (legacy clients that joined
+        //      the room but have no transport yet), excluding every registry
+        //      peer so nobody receives the event twice — a double-delivery
+        //      would make clients race two consumes for the same producerId.
+        // Clients that somehow miss both still recover: every
+        // `mediasoup:createWebRtcTransport` ack now carries a producer
+        // snapshot, and `mediasoup:getProducers` remains the primary sync.
+        const registryPeers = getRoomSocketIds(resolvedRoomId).filter((id) => id !== socket.id);
+        // Only DIRECT-emit to peers on THIS worker — under the Redis adapter
+        // `io.sockets` is a local map, so remote workers' sockets are reached
+        // (exactly once) by the room broadcast instead. Excluding ONLY local
+        // direct recipients from the broadcast keeps delivery exactly-once
+        // per socket in both single-process and clustered deployments.
+        const localRegistryPeers: string[] = [];
+        for (const peerId of registryPeers) {
+          const peer = io.of("/").sockets.get(peerId);
+          if (peer) {
+            localRegistryPeers.push(peerId);
+            peer.emit("mediasoup:newProducer", newProducerPayload);
+          }
+        }
+        io.to(`room:${resolvedRoomId}`)
+          .except([...localRegistryPeers, socket.id])
+          .emit("mediasoup:newProducer", newProducerPayload);
+        // A stage member producing is the strongest liveness signal — it also
+        // feeds the live watchdog's "host is alive" clock.
+        touchLiveStage(resolvedRoomId, socket.id, effectiveUserId);
 
         callback({ id: producer.id, roomId: resolvedRoomId, appData: producer.appData });
       } catch (error) {
         logger.error("Error producing:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2196,11 +2529,14 @@ export function initSocketServer(server: http.Server): void {
       try {
         const resolved = await resolveRoomId(roomId);
         const resolvedRoomId = resolved ? resolved.id : roomId;
-        const producers = getRoomProducers(resolvedRoomId, socket.id);
+        // Exclude the caller's own producers (same socket AND same user): a
+        // re-joining host whose previous socket dropped within the grace
+        // window used to discover its OWN stale producers and consume them.
+        const producers = getRoomProducers(resolvedRoomId, socket.id, socket.data.userId);
         callback({ producers });
       } catch (error) {
         logger.error("Error getting room producers:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2227,7 +2563,7 @@ export function initSocketServer(server: http.Server): void {
         }
       } catch (error) {
         logger.error("Error closing producer:", error);
-        if (callback) callback({ success: false, error: String(error) });
+        if (callback) callback({ success: false, error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2281,7 +2617,7 @@ export function initSocketServer(server: http.Server): void {
         });
       } catch (error) {
         logger.error("Error consuming:", error);
-        callback({ error: String(error) });
+        callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
@@ -2296,40 +2632,117 @@ export function initSocketServer(server: http.Server): void {
         if (callback) callback();
       } catch (error) {
         logger.error("Error resuming consumer:", error);
-        if (callback) callback({ error: String(error) });
+        if (callback) callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
     });
 
-    socket.on("mediasoup:pauseProducer", async ({ roomId, producerId }: { roomId: string; producerId: string }, callback) => {
+    // -------------------------------------------------------------------------
+    // PRODUCER PAUSE/RESUME RELAY — "camera turned off — audio still live".
+    //
+    // Contract (both clients, web MediaSoupCallingClient + mobile
+    // mediasoup_room_service, emit fire-and-forget and listen):
+    //   emit  `mediasoup:pauseProducer`  { producerId | id, roomId }
+    //   emit  `mediasoup:resumeProducer` { producerId | id, roomId }
+    //   recv  `mediasoup:producerPaused`  { producerId, roomId, paused:true,  peerId, kind }
+    //   recv  `mediasoup:producerResumed` { producerId, roomId, paused:false, peerId, kind }
+    //
+    // Validation: the emitter must OWN the producer (same socket OR the same
+    // authenticated user across a reconnect — a host whose socket dropped
+    // within the disconnect grace re-publishes under a NEW socket id while the
+    // SFU-side producer still carries the OLD one) OR be the room HOST.
+    //
+    // Relay: fanned out through BOTH paths (media-registry direct + room
+    // broadcast with exclusion) exactly like `mediasoup:newProducer`, so
+    // viewers that are not members of the Socket.IO room (their call:join ack
+    // lagged/failed) still learn the camera went off instead of staring at a
+    // frozen frame forever.
+    // -------------------------------------------------------------------------
+    const relayProducerState = (
+      resolvedRoomId: string,
+      eventName: "mediasoup:producerPaused" | "mediasoup:producerResumed",
+      payload: { producerId: string; roomId: string; paused: boolean; peerId?: string; peerName?: string; kind?: string },
+    ) => {
+      const relayTargets = getRoomSocketIds(resolvedRoomId).filter((id) => id !== socket.id);
+      const localRelayPeers: string[] = [];
+      for (const peerId of relayTargets) {
+        const peer = io.of("/").sockets.get(peerId);
+        if (peer) {
+          localRelayPeers.push(peerId);
+          peer.emit(eventName, payload);
+        }
+      }
+      io.to(`room:${resolvedRoomId}`)
+        .except([...localRelayPeers, socket.id])
+        .emit(eventName, payload);
+    };
+
+    /** Owner / same-user / room-host authorization for producer control. */
+    const canControlProducer = (resolvedRoomId: string, producer: mediasoup.types.Producer): boolean => {
+      const appData = (producer.appData as ProducerAppData) || {};
+      if (appData.socketId === socket.id) return true;
+      const uid = socket.data.userId || "";
+      if (!uid) return false;
+      // Same authenticated user across a reconnect (producer still bound to
+      // the dead socket id from the previous connection).
+      if (appData.userId && appData.userId === uid) return true;
+      // Room host moderation override.
+      return liveWatch.get(resolvedRoomId)?.hostUserId === uid;
+    };
+
+    // Tolerant payload resolution: accept `producerId` (canonical) and `id`
+    // (some clients send the shorter key) — never trust a missing id.
+    const resolveProducerId = (data: { producerId?: string; id?: string }): string =>
+      String(data?.producerId || data?.id || "").trim();
+
+    const handleProducerPauseToggle = async (
+      data: { roomId?: string; producerId?: string; id?: string },
+      paused: boolean,
+      callback?: (res: any) => void,
+    ): Promise<void> => {
       try {
-        const resolved = await resolveRoomId(roomId);
-        const resolvedRoomId = resolved ? resolved.id : roomId;
+        const producerId = resolveProducerId(data);
+        if (!producerId) {
+          if (callback) callback({ success: false, error: "producerId is required", code: "BAD_REQUEST", retryable: false });
+          return;
+        }
+        const resolved = await resolveRoomId(data.roomId);
+        const resolvedRoomId = resolved ? resolved.id : data.roomId;
         const room = getRoom(resolvedRoomId);
         const producer = room?.producers.get(producerId);
-        if (producer && (producer.appData as ProducerAppData)?.socketId === socket.id) {
-          await producer.pause();
-          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:producerPaused", { producerId, roomId: resolvedRoomId });
-          if (callback) callback({ success: true });
-        } else if (callback) callback({ success: false, error: "Producer not found" });
+        if (!producer || producer.closed) {
+          // The room/producer may have aged out during a disconnect grace —
+          // the owner must re-publish rather than retry this same op.
+          if (callback) callback({ success: false, error: "Producer not found", code: "PRODUCER_NOT_FOUND", retryable: false });
+          return;
+        }
+        if (!canControlProducer(resolvedRoomId, producer)) {
+          if (callback) callback({ success: false, error: "Not allowed to control this producer", code: "FORBIDDEN", retryable: false });
+          return;
+        }
+        if (paused && !producer.paused) await producer.pause();
+        if (!paused && producer.paused) await producer.resume();
+        const appData = (producer.appData as ProducerAppData) || {};
+        relayProducerState(resolvedRoomId, paused ? "mediasoup:producerPaused" : "mediasoup:producerResumed", {
+          producerId,
+          roomId: resolvedRoomId,
+          paused,
+          peerId: appData.userId,
+          peerName: appData.userName,
+          kind: producer.kind,
+        });
+        if (callback) callback({ success: true, producerId, roomId: resolvedRoomId, paused });
       } catch (error) {
-        if (callback) callback({ error: String(error) });
+        logger.error(`Error ${paused ? "pausing" : "resuming"} producer:`, error);
+        if (callback) callback({ error: String(error), code: "SIGNAL_UNAVAILABLE", retryable: true });
       }
+    };
+
+    socket.on("mediasoup:pauseProducer", (data: { roomId?: string; producerId?: string; id?: string }, callback) => {
+      void handleProducerPauseToggle(data || {}, true, callback);
     });
 
-    socket.on("mediasoup:resumeProducer", async ({ roomId, producerId }: { roomId: string; producerId: string }, callback) => {
-      try {
-        const resolved = await resolveRoomId(roomId);
-        const resolvedRoomId = resolved ? resolved.id : roomId;
-        const room = getRoom(resolvedRoomId);
-        const producer = room?.producers.get(producerId);
-        if (producer && (producer.appData as ProducerAppData)?.socketId === socket.id) {
-          await producer.resume();
-          socket.to(`room:${resolvedRoomId}`).emit("mediasoup:producerResumed", { producerId, roomId: resolvedRoomId });
-          if (callback) callback({ success: true });
-        } else if (callback) callback({ success: false, error: "Producer not found" });
-      } catch (error) {
-        if (callback) callback({ error: String(error) });
-      }
+    socket.on("mediasoup:resumeProducer", (data: { roomId?: string; producerId?: string; id?: string }, callback) => {
+      void handleProducerPauseToggle(data || {}, false, callback);
     });
 
     // Recording events
@@ -2757,16 +3170,29 @@ export function initSocketServer(server: http.Server): void {
         }
       }
 
-      // Close all mediasoup transports/producers owned by this socket and
-      // notify rooms so peers can drop the corresponding consumers/streams.
+      // GRACE-PERIOD media cleanup: do NOT tear the peer's transports down on
+      // a transient disconnect. schedulePeerClose marks them orphaned and the
+      // mediasoup layer sweeps after the grace window (closing only transports
+      // whose DTLS actually died, with one extension while media still flows).
+      // Within the grace window a returning viewer/host reuses the room state.
+      // The peer-cleanup hook (registered below) emits `mediasoup:peerLeft` at
+      // SWEEP time so peers remove tiles exactly when the streams die.
       try {
-        const { affectedRooms } = closePeer(socket.id);
+        const { affectedRooms } = schedulePeerClose(socket.id);
         for (const roomId of affectedRooms) {
-          socket.to(`room:${roomId}`).emit("mediasoup:peerLeft", { roomId, socketId: socket.id });
           maybeCloseRoom(roomId);
         }
       } catch (err) {
-        logger.error("Error cleaning up mediasoup peer on disconnect:", err);
+        logger.error("Error scheduling mediasoup peer cleanup on disconnect:", err);
+      }
+
+      // Live watchdog bookkeeping: this socket's live rooms lose a member.
+      const liveRoomIds = socketLiveRooms.get(socket.id);
+      if (liveRoomIds) {
+        for (const roomId of liveRoomIds) {
+          removeLiveSocket(roomId, socket.id);
+        }
+        socketLiveRooms.delete(socket.id);
       }
 
       if (userId && businessId) {

@@ -212,7 +212,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
       const p = participants[i];
       if (p.user_id === userId) continue;
       createNotification({
-        businessId: (req.user!.businessId ?? "") as string,
+        businessId: null,
         userId: p.user_id,
         type: "split_invite",
         title: "Split request",
@@ -305,7 +305,7 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const split = await loadSplit(req.params.id);
+    const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
 
     const membership = await query(
@@ -333,7 +333,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
 router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const split = await loadSplit(req.params.id);
+    const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
     if (split.status !== "pending") {
       return res.status(400).json({ success: false, code: "NOT_PENDING", error: "This split is no longer open" });
@@ -439,7 +439,7 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
     const me = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
     const payerName = me.rows[0]?.name || "Someone";
     createNotification({
-      businessId: (req.user!.businessId ?? "") as string,
+      businessId: null,
       userId: split.creator_id,
       type: settled ? "split_settled" : "split_paid",
       title: settled ? "Split settled" : "Split payment received",
@@ -471,7 +471,7 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
 router.post("/:id/decline", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const split = await loadSplit(req.params.id);
+    const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
 
     const claim = await query(
@@ -501,7 +501,7 @@ router.post("/:id/decline", authenticateToken, checkSubscriptionStatus, async (r
     const me = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
     const declinerName = me.rows[0]?.name || "Someone";
     createNotification({
-      businessId: (req.user!.businessId ?? "") as string,
+      businessId: null,
       userId: split.creator_id,
       type: "split_declined",
       title: "Split request declined",
@@ -531,7 +531,7 @@ router.post("/:id/decline", authenticateToken, checkSubscriptionStatus, async (r
 router.post("/:id/remind", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const split = await loadSplit(req.params.id);
+    const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
     if (split.creator_id !== userId) {
       return res.status(403).json({ success: false, error: "Only the creator can send reminders" });
@@ -566,7 +566,7 @@ router.post("/:id/remind", authenticateToken, checkSubscriptionStatus, async (re
     for (const p of pending.rows) {
       if (throttled.has(p.user_id)) continue;
       await createNotification({
-        businessId: (req.user!.businessId ?? "") as string,
+        businessId: null,
         userId: p.user_id,
         type: "split_reminder",
         title: "Split reminder",

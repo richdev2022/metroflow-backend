@@ -153,7 +153,7 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 // ---------------------------------------------------------------------------
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
-    const pot = await loadPot(req.params.id);
+    const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
 
     const contributions = await query(
@@ -190,7 +190,7 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
       return res.status(400).json({ success: false, error: "amount must be greater than 0" });
     }
 
-    const pot = await loadPot(req.params.id);
+    const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
     if (pot.status !== "open") {
       return res.status(400).json({ success: false, code: "POT_CLOSED", error: "This pot is closed" });
@@ -270,7 +270,7 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
       const me = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
       const contributorName = me.rows[0]?.name || "Someone";
       createNotification({
-        businessId: (req.user!.businessId ?? "") as string,
+        businessId: null,
         userId: pot.creator_id,
         type: "pot_contribution",
         title: "New pot contribution",
@@ -284,7 +284,7 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
       const target = num(pot.target_amount);
       if (balanceBefore < target && balanceAfter >= target) {
         createNotification({
-          businessId: (req.user!.businessId ?? "") as string,
+          businessId: null,
           userId: pot.creator_id,
           type: "pot_target",
           title: "Pot target reached 🎉",
@@ -314,7 +314,7 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
 router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
-    const pot = await loadPot(req.params.id);
+    const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
     if (pot.creator_id !== userId) {
       return res.status(403).json({ success: false, error: "Only the creator can close this pot" });

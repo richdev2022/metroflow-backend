@@ -3471,16 +3471,24 @@ router.get("/sounds/:id", authenticateToken, checkSubscriptionStatus, async (req
 
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 30));
     const cursor = req.query.cursor ? new Date(String(req.query.cursor)) : null;
-    // ONE param array, in the exact order the SQL consumes it:
-    //   $1 sound id, $2 viewer (audience + follower EXISTS), $3 limit+1, $4 cursor.
-    // (Previously TWO arrays drifted apart: the built `params` ordered
-    // [id, limit+1, viewer, cursor] while the call passed
-    // [id, viewer, limit+1] — and the LIMIT placeholder hardcoded $2, which
-    // bound the viewer UUID into `LIMIT <bigint>` → 42883 on every request
-    // and "Could not load sound page" in production, found 2026-11-07.)
-    const params: any[] = [req.params.id, userId, limit + 1];
+    // ONE param array, built in the exact order the SQL consumes it:
+    //   $1 sound id, $2 viewer (audience + follower EXISTS), optional $3 cursor,
+    //   and the LIMIT value ALWAYS appended LAST so `LIMIT $n` binds it
+    //   correctly on both paths.
+    // (HISTORY 1: two arrays drifted apart and the hardcoded LIMIT $2 bound the
+    // viewer UUID → 42883 on every request, found in production 2026-11-07.
+    // HISTORY 2: the first patch kept the limit at index 3 but wrote
+    // `LIMIT $${params.length + 1}` — on the NO-CURSOR path that referenced $4
+    // with only three bound params, so the sound page STILL 500'd
+    // ("bind message supplies 3 parameters..."). The limit must be pushed last
+    // and referenced as $${params.length}.)
+    const params: any[] = [req.params.id, userId];
     let where = `m.sound_id = $1 AND p.status = 'active' AND (p.audience = 'public' OR p.user_id = $2)`;
-    if (cursor && !isNaN(cursor.getTime())) { where += ` AND p.created_at < $${params.length + 1}`; params.push(cursor.toISOString()); }
+    if (cursor && !isNaN(cursor.getTime())) {
+      params.push(cursor.toISOString());
+      where += ` AND p.created_at < $${params.length}`;
+    }
+    params.push(limit + 1);
     const usersRes = await query(
       `SELECT DISTINCT ON (p.user_id, p.id) p.id AS post_id, p.user_id, p.body, p.video_url, p.image_url, p.created_at,
               u.name, u.avatar_url, u.username,
@@ -3493,7 +3501,7 @@ router.get("/sounds/:id", authenticateToken, checkSubscriptionStatus, async (req
        JOIN users u ON u.id = p.user_id
        WHERE ${where}
        ORDER BY p.user_id, p.id, p.created_at DESC
-       LIMIT $${params.length + 1}`,
+       LIMIT $${params.length}`,
       params,
     );
     // Distinct-on returns per-author latest; re-sort newest first + paginate.

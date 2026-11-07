@@ -1529,5 +1529,108 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE market_orders ADD COLUMN IF NOT EXISTS live_session_id UUID`);
   await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_live ON market_orders(live_session_id)`);
 
-  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages + stories + sounds + tags) schema applied");
+  // ---------------------------------------------------------------------
+  // SAVINGS CIRCLES — rotating group savings (ajo / esusu). A fixed
+  // membership (2–15) rotates a pot: every cycle each active member
+  // auto-pays their slot from their NGN wallet, one member (by rotation
+  // order) takes the full pot. A payment calendar is generated at start
+  // (one round per member). Missed payments get a grace window, then are
+  // marked failed and dent the member's trust score. Skips are explicit.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_circles (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_id UUID NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      description VARCHAR(500),
+      contribution_amount DECIMAL(15,2) NOT NULL CHECK (contribution_amount > 0),
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      frequency VARCHAR(20) NOT NULL DEFAULT 'weekly',   -- weekly | biweekly | monthly
+      max_members INTEGER NOT NULL DEFAULT 10,
+      grace_hours INTEGER NOT NULL DEFAULT 48,
+      status VARCHAR(20) NOT NULL DEFAULT 'forming',     -- forming | active | completed | cancelled
+      current_round INTEGER NOT NULL DEFAULT 0,
+      next_due_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      started_at TIMESTAMP,
+      completed_at TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circles_creator ON savings_circles(creator_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circles_status ON savings_circles(status, next_due_at)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_circle_members (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      circle_id UUID NOT NULL REFERENCES savings_circles(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'member',        -- admin | member
+      position INTEGER,                                  -- payout order 1..N (set at start)
+      status VARCHAR(20) NOT NULL DEFAULT 'invited',     -- invited | active | left | removed
+      trust_score INTEGER NOT NULL DEFAULT 100,
+      streak INTEGER NOT NULL DEFAULT 0,                 -- consecutive on-time rounds
+      paid_total DECIMAL(15,2) NOT NULL DEFAULT 0,
+      received_total DECIMAL(15,2) NOT NULL DEFAULT 0,
+      joined_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (circle_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_members_user ON savings_circle_members(user_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_members_circle ON savings_circle_members(circle_id, status)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_circle_rounds (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      circle_id UUID NOT NULL REFERENCES savings_circles(id) ON DELETE CASCADE,
+      round_number INTEGER NOT NULL,
+      recipient_id UUID NOT NULL,
+      due_at TIMESTAMP NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'upcoming',    -- upcoming | collecting | paid_out | cancelled
+      collected_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      paid_out_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (circle_id, round_number)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_rounds_due ON savings_circle_rounds(status, due_at)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_circle_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      circle_id UUID NOT NULL REFERENCES savings_circles(id) ON DELETE CASCADE,
+      round_id UUID NOT NULL REFERENCES savings_circle_rounds(id) ON DELETE CASCADE,
+      payer_id UUID NOT NULL,
+      amount DECIMAL(15,2) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',     -- pending | paid | failed | skipped
+      timing VARCHAR(10),                                -- early | on_time | late
+      wallet_reference VARCHAR(255) UNIQUE,              -- idempotent ledger reference
+      paid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (round_id, payer_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_payments_payer ON savings_circle_payments(payer_id, status)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_payments_round ON savings_circle_payments(round_id, status)`);
+
+  // ---------------------------------------------------------------------
+  // SPENDING INSIGHTS & BUDGETS — auto-categorized spend analytics over the
+  // transactions the user already generates (bills/airtime/data, transfers,
+  // marketplace, gift cards, splits, pots, circles...). Budgets are monthly
+  // envelopes per category; spent is computed live from the ledger.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS budget_envelopes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      category VARCHAR(40) NOT NULL,                     -- matches the insights taxonomy
+      monthly_limit DECIMAL(15,2) NOT NULL CHECK (monthly_limit >= 0),
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id, category)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_budget_envelopes_user ON budget_envelopes(user_id, active)`);
+
+  console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages + stories + sounds + tags + circles + insights) schema applied");
 }

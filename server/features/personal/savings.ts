@@ -293,14 +293,83 @@ router.get("/vaults/:id", authenticateToken, checkSubscriptionStatus, async (req
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
 
+        // CLEAN ACTIVITY LEDGER: newest-first, explicit projection (type,
+        // amount, fee, balance_after, reference, note, created_at) so web +
+        // mobile render transaction history without leaking internal columns.
+        // Every money path writes a row here: deposits (~deposit endpoint),
+        // early-break withdrawals WITH the fee on the same row (fee column),
+        // and auto-save pulls — there are no admin balance-adjustment paths.
         const history = await query(
-            `SELECT * FROM savings_transactions WHERE vault_id = $1 ORDER BY created_at DESC LIMIT 100`,
+            `SELECT id, type, amount, fee, balance_after, wallet_id, reference, status, note, created_at
+             FROM savings_transactions WHERE vault_id = $1
+             ORDER BY created_at DESC
+             LIMIT 100`,
             [id]
         );
         res.json({ success: true, vault, transactions: history.rows });
     } catch (error) {
         console.error("Vault detail error:", error);
         res.status(500).json({ success: false, error: "Failed to load vault" });
+    }
+});
+
+/**
+ * @openapi
+ * /savings/vaults/{id}/transactions:
+ *   get:
+ *     summary: Paginated transaction history for a vault (newest first)
+ *     tags: [Savings]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50, maximum: 200 }
+ *       - in: query
+ *         name: offset
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200:
+ *         description: Vault transactions page + total count
+ *       404:
+ *         description: Vault not found
+ */
+router.get("/vaults/:id/transactions", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+    try {
+        const { id } = req.params;
+        const { userId, businessId } = req.user!;
+        const vaultRes = await query(
+            `SELECT id FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
+            [id, userId, businessId]
+        );
+        if (!vaultRes.rows[0]) return res.status(404).json({ success: false, error: "Vault not found" });
+
+        const lim = Math.min(Math.max(parseInt(String((req.query as any).limit)) || 50, 1), 200);
+        const off = Math.max(parseInt(String((req.query as any).offset)) || 0, 0);
+
+        const countRes = await query(
+            `SELECT COUNT(*)::int AS total FROM savings_transactions WHERE vault_id = $1`,
+            [id]
+        );
+        const rows = await query(
+            `SELECT id, type, amount, fee, balance_after, wallet_id, reference, status, note, created_at
+             FROM savings_transactions WHERE vault_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2 OFFSET $3`,
+            [id, lim, off]
+        );
+        res.json({
+            success: true,
+            transactions: rows.rows,
+            pagination: { total: countRes.rows[0]?.total || 0, limit: lim, offset: off },
+        });
+    } catch (error) {
+        console.error("Vault transactions error:", error);
+        res.status(500).json({ success: false, error: "Failed to load vault transactions" });
     }
 });
 

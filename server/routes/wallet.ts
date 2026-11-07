@@ -4,7 +4,7 @@ import { requireTeamPermission } from "../middleware/teamAuth";
 import { query, pool } from "../db";
 import { getProvider, resolveProvider, getActiveProviderName, getAvailableProviders } from "../services/providers/factory";
 import { toMinorUnit } from "../services/transfer";
-import { calculateFee, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
+import { calculateFee, getFeeConfiguration, creditPlatformWallet, debitPlatformWallet, creditRevenueWallet } from "../services/fees";
 import { generateToken } from "../services/auth";
 import { getBankNameByCode } from "../utils/bank-codes";
 import { kycIdentity } from "../features/personal/kyc-identity";
@@ -12,6 +12,37 @@ import { checkFundingLimit, rejectOverLimitFunding, fundingRejectedHtml } from "
 import { getBusinessLimitInfo } from "../services/transaction-limits";
 
 const router = express.Router();
+
+// PENDING CARD-FUNDING EXPIRY — a checkout that was opened but never paid
+// must not haunt the wallet UI forever as a phantom "pending" transaction.
+// Any wallet_funding row still 'pending' after 24h is flipped to 'failed'
+// (reason recorded in gateway_response) by this cheap sweep-on-read, run
+// from GET /wallet and GET /wallet/history. Idempotent: rows already
+// terminal (success/failed/cancelled) are never touched, and the wallet is
+// only ever credited through the verified paths which re-check status.
+const FUNDING_PENDING_EXPIRY_HOURS = 24;
+async function expireStalePendingFundings(walletIds: string[]) {
+    if (!walletIds || walletIds.length === 0) return;
+    try {
+        await query(
+            `UPDATE transactions
+             SET status = 'failed',
+                 updated_at = CURRENT_TIMESTAMP,
+                 gateway_response = COALESCE(gateway_response, jsonb_build_object(
+                     'code', 'FUNDING_EXPIRED',
+                     'message', 'Payment was not completed within 24 hours. No money was deducted — if you were debited, contact support with this reference.'
+                 ))
+             WHERE transaction_type = 'wallet_funding'
+               AND status = 'pending'
+               AND wallet_id = ANY($1::uuid[])
+               AND created_at < CURRENT_TIMESTAMP - ($2 || ' hours')::interval`,
+            [walletIds, String(FUNDING_PENDING_EXPIRY_HOURS)],
+        );
+    } catch (err: any) {
+        // Never fail the read because the sweep hiccuped.
+        console.error("Stale pending-funding sweep failed:", err?.message || err);
+    }
+}
 
 /**
  * @swagger
@@ -405,6 +436,10 @@ router.get("/", authenticateToken, async (req: AuthenticatedRequest, res) => {
                 virtual_accounts: await getWalletWithVAs(w.id)
             });
         }
+
+        // Cheap sweep-on-read: pending card fundings older than 24h expire so
+        // abandoned checkouts never show as eternally "pending" in the UI.
+        await expireStalePendingFundings(userWalletsRaw.map((w: any) => String(w.id)));
         
         let businessWallet = null;
         // Invited members must NEVER see the business wallet — only the
@@ -539,6 +574,10 @@ router.get("/history", authenticateToken, async (req: AuthenticatedRequest, res)
         if (walletIds.length === 0) {
             return res.json({ success: true, data: [], wallets: [], pagination: { total: 0, page: 1, limit: Number(limit), totalPages: 0 } });
         }
+
+        // Cheap sweep-on-read: pending card fundings older than 24h expire so
+        // abandoned checkouts never show as eternally "pending" in the UI.
+        await expireStalePendingFundings(walletIds);
 
         const params: any[] = [];
         let sql = `SELECT t.*, w.currency AS wallet_currency, w.balance AS wallet_balance
@@ -752,10 +791,19 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
         // registration-category tier): reject BEFORE the payment session is
         // created so the user can never pay more than their tier allows.
         const walletCurrency0 = String(wallet.currency || 'NGN').toUpperCase();
+        // STABLECOIN CARD FUNDING: Flutterwave checkout supports NGN/USD/GBP/EUR
+        // but NOT USDT/USDC — a USDT checkout can never be paid (production
+        // incident FUND-d2c76dad-1794012978796: 'couldn't be processed').
+        // Stablecoin wallets are therefore charged in USD and credited 1:1
+        // (1 USD = 1 coin unit) on confirmation. The client may send an NGN
+        // amount (body.currency === 'NGN') — it is converted with the live
+        // Flutterwave rate first.
+        const bodyCurrency = String((req.body as any)?.currency || '').toUpperCase();
+        const isStablecoinWallet = ['USDT', 'USDC'].includes(walletCurrency0);
         const fundingLimit = await checkFundingLimit(
             { businessId: wallet.business_id, userId: wallet.user_id || userId, ownerKey: businessId || userId },
             Number(amount),
-            { currency: walletCurrency0 },
+            { currency: bodyCurrency === 'NGN' ? 'NGN' : walletCurrency0 },
         );
         if (!fundingLimit.ok) {
             return res.status(403).json({
@@ -766,9 +814,57 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
             });
         }
 
+        // Amount + currency the checkout is denominated in. NGN wallets keep
+        // the exact pre-stablecoin behaviour (amount as sent, provider default
+        // NGN). Stablecoin wallets charge USD: the request amount is already
+        // the coin-unit target (1 USD = 1 coin), unless the client explicitly
+        // sent NGN — then it is converted to its USD value.
+        let chargeAmount = Number(amount);
+        const chargeCurrency = isStablecoinWallet ? 'USD' : walletCurrency0;
+        let conversionInfo: Record<string, any> | null = null;
+        if (isStablecoinWallet) {
+            if (bodyCurrency === 'NGN') {
+                const { getRate: flwGetRate } = await import('../services/flutterwave');
+                const usdValue = await flwGetRate('NGN', 'USD', chargeAmount);
+                chargeAmount = Math.round(Number(usdValue) * 100) / 100;
+                conversionInfo = { source_currency: 'NGN', source_amount: Number(amount) };
+            }
+            conversionInfo = {
+                ...(conversionInfo || {}),
+                target_currency: walletCurrency0,
+                target_amount: chargeAmount, // 1 USD = 1 coin unit (bookkeeping)
+                usd_to_coin_rate: 1,
+                checkout_currency: 'USD',
+            };
+        }
+
         // Calculate Fee for Funding via Card
-        const fee = await calculateFee(amount, 'funding_card');
-        const totalAmount = Number(amount) + Number(fee);
+        const fee = await calculateFee(chargeAmount, 'funding_card');
+        // CURRENCY-SAFE FEE: fee_configurations rows carry their own currency
+        // (prod 'funding_card' is NGN) but calculateFee() returns the raw
+        // config number. On a USD stablecoin checkout that would turn a flat
+        // ₦50 config into a $50 charge. Convert NGN-denominated fee results
+        // to USD here: flat/conditional/range values convert wholesale; for
+        // percentage_cap the percentage part is currency-neutral, only the
+        // NGN cap converts (and only when it actually capped the fee).
+        let feeAmount = Number(fee);
+        if (chargeCurrency === 'USD' && feeAmount > 0) {
+            const feeCfg = await getFeeConfiguration('funding_card');
+            if (feeCfg && String(feeCfg.currency || 'NGN').toUpperCase() === 'NGN') {
+                const { getRate: flwGetRate } = await import('../services/flutterwave');
+                if (feeCfg.config_type === 'percentage_cap') {
+                    const pct = Number(feeCfg.config?.percentage || 0);
+                    const cap = Number(feeCfg.config?.cap || 0);
+                    const pctFee = Number(chargeAmount) * (pct / 100);
+                    feeAmount = cap > 0 && pctFee >= cap
+                        ? Math.round((await flwGetRate('NGN', 'USD', cap)) * 100) / 100
+                        : Math.round(pctFee * 100) / 100;
+                } else {
+                    feeAmount = Math.round((await flwGetRate('NGN', 'USD', feeAmount)) * 100) / 100;
+                }
+            }
+        }
+        const totalAmount = Number(chargeAmount) + feeAmount;
 
         // Generate Reference
         const reference = `FUND-${wallet_id.substring(0, 8)}-${Date.now()}-${userId.substring(0, 8)}`;
@@ -798,10 +894,14 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
             userEmail = userRes.rows[0]?.email || null;
         }
         
-        // Use object parameter for initiatePayment
+        // Use object parameter for initiatePayment.
+        // NOTE: currency is ONLY passed for the stablecoin→USD checkout; every
+        // other provider/wallet keeps the exact payload it has always sent
+        // (provider defaults to NGN) so existing rails are untouched.
         const paymentResponse = await provider.initiatePayment({
             email: userEmail || "customer@metroflow.app",
             amount: amountMinor,
+            ...(isStablecoinWallet ? { currency: chargeCurrency } : {}),
             reference,
             callbackUrl
         });
@@ -821,15 +921,18 @@ router.post("/fund/card", authenticateToken, checkKycStatus, requireTeamPermissi
         }
 
         if (isSuccess && paymentUrl) {
-            // Currency follows the SELECTED WALLET (wallet.currency) — the
-            // dashboard wallet picker can now fund a business/NGN or USD
-            // wallet; the transaction row must match or the ledger breaks.
-            const walletCurrency = String(wallet.currency || 'NGN').toUpperCase();
+            // Transaction row currency = the currency the CHECKOUT is
+            // denominated in (NOT necessarily the wallet currency):
+            //  - NGN wallet  → 'NGN', amount as sent (behaviour unchanged).
+            //  - USDT/USDC   → 'USD', amount = USD value charged; the target
+            //    wallet currency + conversion info ride in provider_metadata
+            //    so the webhook/verify credit path routes the 1:1 coin credit.
+            const rowCurrency = isStablecoinWallet ? 'USD' : walletCurrency0;
             await query(
                 `INSERT INTO transactions 
-                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider)
-                 VALUES ($1, $2, $3, $4, 'pending', $5, 'credit', 'Wallet Funding via Card', 'wallet_funding', $6, 'credit', $7, $8)`,
-                [wallet.business_id, wallet.user_id, amount, walletCurrency, reference, wallet.id, fee, provider.name]
+                 (business_id, user_id, amount, currency, status, reference, type, description, transaction_type, wallet_id, direction, fee, payment_provider, provider_metadata)
+                 VALUES ($1, $2, $3, $4, 'pending', $5, 'credit', 'Wallet Funding via Card', 'wallet_funding', $6, 'credit', $7, $8, $9)`,
+                [wallet.business_id, wallet.user_id, chargeAmount, rowCurrency, reference, wallet.id, fee, provider.name, conversionInfo ? JSON.stringify(conversionInfo) : null]
             );
 
             // Attach the user's live limits so the funding UI can display the

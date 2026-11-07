@@ -148,49 +148,141 @@ export async function getActiveBoostMap(targetType: "post" | "listing", ids: str
   return map;
 }
 
-/**
- * FEED RANKING ALGORITHM (organic + paid + personalized):
- *   score = engagement_score × recency_decay × personalization + boost_priority
- *   engagement_score = likes×1 + comments×3 + shares×5 (+ reaction weight)
- *   recency_decay    = 100 / (hours_since_post + 2)
- *   personalization  = author affinity (viewer's recent interactions) ×
- *                      follow bonus × rich-media bonus — the "niche engine":
- *                      the more a viewer engages with an author or format,
- *                      the more of that niche the feed serves (Facebook-style).
- *   boost_priority   = 1000 × remaining_reach_ratio  (paid placement dominates
- *                      until its estimated reach is served, then decays)
- * A light diversity pass demotes runs of 3+ posts from the same author.
- */
+/* ===========================================================================
+ * FEED RANKING ALGORITHM v2 — TikTok-style hybrid scorer
+ * ===========================================================================
+ * The feed window (a chronological page of posts) is re-ranked by this scorer.
+ * It is DETERMINISTIC given the same inputs — infinite scroll pages never
+ * shuffle underneath the client — and every per-user/per-post lookup is
+ * batched upstream (no N+1 inside the loop).
+ *
+ *   E  engagement   = likes×1 + comments×2.5 + shares×5 + views×0.02
+ *   rec recency     = 100 / (hours_since_post + 2)                (proven decay)
+ *   vel velocity    = log10(1 + E) / (1 + hours)                  (engagement
+ *                     per hour since creation, log-scaled so an old viral
+ *                     post keeps flowing but its advantage decays linearly
+ *                     in time instead of compounding forever)
+ *   A  author       = (1 + 0.15 × min(4, viewer's 30d interactions with
+ *                     the author)) × (viewer follows author ? 1.2 : 1)
+ *   I  interest     = 1 + 0.45 × overlap/(overlap+3), where overlap =
+ *                     Σ over the post's hashtags of the viewer's 30-day
+ *                     engagement weight for that hashtag (reactions +
+ *                     comments + viewed-tag posts, batch-queried)
+ *   S  seen         = 1 | 0.35 (viewed once) | 0.2 (viewed 2+)
+ *                     — posts the user already viewed SINK but not to zero
+ *   F  fresh        = 1.15 when hours < 2 else 1                  (cold-start
+ *                     nudge so brand-new posts get impressions to learn from)
+ *   X  exploration  = deterministic per (user, post, 10-min window): posts
+ *                     from authors the viewer does NOT follow get a +30%
+ *                     bump with probability ~¼ (FNV-1a hash bucket). The
+ *                     time bucket is the session surrogate: stable within a
+ *                     pagination window and across rapid refreshes, but new
+ *                     candidates are explored as the session ages.
+ *   B  boost        = 1000 × remaining_reach_ratio + 100          (UNCHANGED —
+ *                     paid placement still dominates until its estimated
+ *                     reach is served, then decays)
+ *
+ *   organic = (E + 1)^0.75 × rec        (sub-linear engagement compression —
+ *                 the TikTok trick: a 100k-like post scores ~56× a 10-like
+ *                 post, not ~9000×, so today's fresh content can always
+ *                 out-run yesterday's viral monster; old viral posts decay
+ *                 out of the top in days instead of dominating forever)
+ *   score   = organic × A × I × S × F  +  60 × vel × A  +  X  +  B
+ *
+ *   sort: score DESC → created_at DESC → id ASC   (fully deterministic
+ *   tie-break so equal-score posts never reorder between requests)
+ *   then a diversity pass enforces ≤2 consecutive posts by the same author
+ *   (violators are held back one slot instead of being dropped).
+ * =========================================================================== */
+
+/** FNV-1a 32-bit string hash — tiny, stable, dependency-free. */
+function fnv1a(input: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+export interface FeedRankContext {
+  /** Authenticated viewer — seeds the exploration hash. */
+  userId?: string;
+  /** authorId → 30-day interaction count (reactions + comments). */
+  affinity?: Map<string, number>;
+  /** Authors the viewer follows. */
+  followed?: Set<string>;
+  /** tag → 30-day engagement weight from this viewer's history. */
+  tagAffinity?: Map<string, number>;
+  /** postId → times this viewer already viewed the post. */
+  viewedCounts?: Map<string, number>;
+  /** Pagination-window seed (cursor) — exploration stays stable per window. */
+  explorationSeed?: string;
+}
+
+const EXPLORATION_WINDOW_MS = 10 * 60 * 1000; // 10-minute "session" bucket
+
 function rankFeed(
   rows: any[],
   boosts: Map<string, any>,
-  ctx?: { affinity?: Map<string, number>; followed?: Set<string> },
+  ctx?: FeedRankContext,
 ): any[] {
   const now = Date.now();
   const affinity = ctx?.affinity;
   const followed = ctx?.followed;
+  const tagAffinity = ctx?.tagAffinity;
+  const viewedCounts = ctx?.viewedCounts;
+  const hasInterestSignal = !!tagAffinity && tagAffinity.size > 0;
+  // One shared exploration bucket per request — stable within the window.
+  const explorationBucket = Math.floor(now / EXPLORATION_WINDOW_MS);
+
   const scored = rows.map((row) => {
-    const hours = Math.max(0, (now - new Date(row.created_at).getTime()) / 3600000);
+    const createdMs = new Date(row.created_at).getTime();
+    const hours = Math.max(0, (now - createdMs) / 3600000);
     const likes = Number(row.like_count) || 0;
     const comments = Number(row.comment_count) || 0;
     const shares = Number(row.share_count) || 0;
-    const engagement = likes * 1 + comments * 3 + shares * 5;
-    let organic = (engagement + 1) * (100 / (hours + 2));
+    const views = Number(row.view_count) || 0;
+    const engagement = likes * 1 + comments * 2.5 + shares * 5 + views * 0.02;
+    const recency = 100 / (hours + 2);
+    // Sub-linear engagement compression: viral history can never permanently
+    // outweigh fresh content (see formula block above).
+    const organic = Math.pow(engagement + 1, 0.75) * recency;
 
-    // ---- Personalization (niche recognition) ----
+    // ---- Author affinity (the niche engine) ----
     const authorId = String(row.user_id ?? row.author?.id ?? "");
-    if (affinity && affinity.size) {
-      const hits = affinity.get(authorId) || 0;
-      if (hits > 0) {
-        // 1 interaction ×1.15 → 4+ interactions ×1.60 (saturating).
-        organic *= 1 + 0.15 * Math.min(4, hits);
-      }
-    }
-    if (followed?.has(authorId)) organic *= 1.2;
-    // Rich media earns a small organic edge (video > photo > text).
-    if (row.video_url) organic *= 1.15;
-    else if (row.image_url) organic *= 1.05;
+    const hits = affinity?.get(authorId) || 0;
+    const authorFactor = (1 + 0.15 * Math.min(4, hits)) * (followed?.has(authorId) ? 1.2 : 1);
 
+    // ---- Interest affinity: hashtag overlap with the viewer's history ----
+    let interestFactor = 1;
+    if (hasInterestSignal) {
+      const tags: string[] = Array.isArray(row.tags)
+        ? row.tags.map((t: any) => String(t || "").toLowerCase()).filter(Boolean)
+        : [];
+      let overlap = 0;
+      for (const tag of tags) overlap += tagAffinity!.get(tag) || 0;
+      if (overlap > 0) interestFactor = 1 + 0.45 * (overlap / (overlap + 3)); // saturates ≤1.45
+    }
+
+    // ---- Seen/viewed penalty (sink, not zero — rediscovery stays possible) --
+    const seenCount = viewedCounts?.get(String(row.id)) || 0;
+    const seenFactor = seenCount >= 2 ? 0.2 : seenCount === 1 ? 0.35 : 1;
+
+    // ---- Freshness nudge (cold-start exploration for brand-new posts) ----
+    const freshFactor = hours < 2 ? 1.15 : 1;
+
+    // ---- Engagement velocity (log-scaled, per hour since creation) ----
+    const velocityBonus = (60 * Math.log10(1 + engagement)) / (1 + hours) * authorFactor;
+
+    // ---- Deterministic exploration epsilon (non-followed authors) ----
+    let explorationBonus = 0;
+    if (!followed?.has(authorId) && ctx?.userId) {
+      const h = fnv1a(`${ctx.userId}:${ctx.explorationSeed || "root"}:${explorationBucket}:${row.id}`);
+      if (h % 4 === 0) explorationBonus = organic * 0.3;
+    }
+
+    // ---- Paid boost priority (UNCHANGED contract) ----
     const boost = boosts.get(row.id);
     let boostPriority = 0;
     if (boost) {
@@ -199,31 +291,58 @@ function rankFeed(
       const remaining = Math.max(0, 1 - served / planned);
       boostPriority = 1000 * remaining + 100; // floor keeps it above fresh organic
     }
-    return { ...row, _score: organic + boostPriority, _authorId: authorId, boost: boost ? { active: true, ends_at: boost.ends_at } : undefined };
+
+    const score =
+      organic * authorFactor * interestFactor * seenFactor * freshFactor +
+      velocityBonus +
+      explorationBonus +
+      boostPriority;
+
+    return {
+      ...row,
+      boost: boost ? { active: true, ends_at: boost.ends_at } : undefined,
+      _score: score,
+      _authorId: authorId,
+      _createdAtMs: createdMs,
+    };
   });
 
-  scored.sort((a, b) => b._score - a._score);
+  // Deterministic order: score DESC, then created_at DESC, then id ASC.
+  scored.sort((a, b) =>
+    b._score - a._score ||
+    b._createdAtMs - a._createdAtMs ||
+    String(a.id).localeCompare(String(b.id)),
+  );
 
-  // ---- Diversity pass: no 3-in-a-row from one author (demote the 3rd) ----
+  // ---- Diversity pass: at most 2 consecutive posts by the same author ----
+  // Violators are HELD BACK and re-emitted after a different author's post —
+  // nothing is dropped, and the pass is deterministic for a given input order.
   const out: any[] = [];
-  const recent = new Map<string, number>(); // authorId → index of their 2nd-most-recent appearance
+  const heldBack: any[] = [];
+  const runCount = (aid: string) => {
+    let n = 0;
+    for (let i = out.length - 1; i >= 0 && out[i]._authorId === aid; i--) n++;
+    return n;
+  };
   for (const item of scored) {
     const aid = item._authorId as string;
-    const lastIdx = recent.get(aid);
-    if (lastIdx !== undefined && out.length - lastIdx <= 1) {
-      // Author already occupies the previous slot — push one slot down if possible.
-      const nextDifferent = out.findIndex((x, i) => i > lastIdx && (x._authorId as string) !== aid);
-      if (nextDifferent !== -1) {
-        out.splice(nextDifferent, 0, item);
-        recent.set(aid, nextDifferent);
-        continue;
-      }
+    if (out.length > 0 && runCount(aid) >= 2) {
+      heldBack.push(item);
+      continue;
     }
     out.push(item);
-    recent.set(aid, out.length - 1);
+    // A held-back post becomes eligible again after any other author's post.
+    if (heldBack.length) {
+      for (let i = heldBack.length - 1; i >= 0; i--) {
+        if (runCount(heldBack[i]._authorId as string) < 2) {
+          out.push(heldBack.splice(i, 1)[0]);
+        }
+      }
+    }
   }
+  out.push(...heldBack);
 
-  return out.map(({ _score, _authorId, ...rest }) => rest);
+  return out.map(({ _score, _authorId, _createdAtMs, ...rest }) => rest);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +473,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
 
     const postsRes = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.audience, p.share_count, p.created_at,
+              p.view_count,
               p.text_color, p.font, p.text_align, p.background_color, p.repost_of_id,
               u.name AS author_name, u.avatar_url AS author_photo,
               COALESCE(u.account_privacy, 'public') AS account_privacy,
@@ -477,6 +597,55 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
       for (const row of affRes.rows) affinity.set(String(row.author_id), Number(row.hits) || 0);
     } catch { /* affinity is best-effort — ranking still works without it */ }
 
+    // INTEREST AFFINITY (batched, single query) — hashtags this viewer engaged
+    // with over the last 30 days, weighted by how much they engaged: reactions
+    // + comments (30d) and distinct posts viewed under that tag (14d). Feeds
+    // the scorer's interest factor — the feed learns WHAT topics this viewer
+    // cares about, not just WHO they follow.
+    const tagAffinity = new Map<string, number>();
+    try {
+      const tagRes = await query(
+        `SELECT tag, SUM(n)::float8 AS weight FROM (
+           SELECT pt.tag AS tag, COUNT(*)::int AS n
+           FROM social_reactions r
+           JOIN social_post_tags pt ON pt.post_id = r.post_id
+           WHERE r.user_id = $1 AND r.created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY pt.tag
+           UNION ALL
+           SELECT pt.tag AS tag, COUNT(*)::int AS n
+           FROM social_comments c
+           JOIN social_post_tags pt ON pt.post_id = c.post_id
+           WHERE c.user_id = $1 AND c.status = 'active' AND c.created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY pt.tag
+           UNION ALL
+           SELECT pt.tag AS tag, COUNT(DISTINCT v.post_id)::int AS n
+           FROM social_post_views v
+           JOIN social_post_tags pt ON pt.post_id = v.post_id
+           WHERE v.viewer_id = $1 AND v.viewed_at >= NOW() - INTERVAL '14 days'
+           GROUP BY pt.tag
+         ) t GROUP BY tag`,
+        [userId],
+      );
+      for (const row of tagRes.rows) tagAffinity.set(String(row.tag).toLowerCase(), Number(row.weight) || 0);
+    } catch { /* tags are additive — ranking still works without them */ }
+
+    // SEEN/VIEWED (batched, single query) — how many times this viewer already
+    // viewed each post ON THIS PAGE. Already-seen posts sink in the ranking
+    // (not to zero) so the feed stops re-serving the same content first.
+    const viewedCounts = new Map<string, number>();
+    if (postIds.length) {
+      try {
+        const viewedRes = await query(
+          `SELECT post_id, COUNT(*)::int AS n
+           FROM social_post_views
+           WHERE viewer_id = $1 AND post_id = ANY($2::uuid[])
+           GROUP BY post_id`,
+          [userId, postIds],
+        );
+        for (const row of viewedRes.rows) viewedCounts.set(String(row.post_id), Number(row.n) || 0);
+      } catch { /* view ledger is best-effort */ }
+    }
+
     // Poll payloads for posts that carry one
     let pollsByPost = new Map<string, any>();
     if (postIds.length) {
@@ -485,26 +654,52 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
          WHERE pl.post_id = ANY($1::uuid[]) AND pl.status != 'removed'`,
         [postIds],
       );
+      // BATCHED poll tallies — the per-poll vote queries used to run 2 round
+      // trips PER POLL on the page (N+1). One GROUP BY per concern instead.
+      const pollIds = pollsRes.rows.map((pl: any) => pl.id);
+      const votesByPoll = new Map<string, Map<number, number>>();
+      const myVotesByPoll = new Map<string, number[]>();
+      if (pollIds.length) {
+        try {
+          const [allVotesRes, myVotesRes] = await Promise.all([
+            query(
+              `SELECT poll_id, option_index, COUNT(*)::int AS votes
+               FROM social_poll_votes WHERE poll_id = ANY($1::uuid[])
+               GROUP BY poll_id, option_index`,
+              [pollIds],
+            ),
+            query(
+              `SELECT poll_id, option_index FROM social_poll_votes
+               WHERE poll_id = ANY($1::uuid[]) AND user_id = $2`,
+              [pollIds, userId],
+            ),
+          ]);
+          for (const v of allVotesRes.rows) {
+            let m = votesByPoll.get(String(v.poll_id));
+            if (!m) { m = new Map(); votesByPoll.set(String(v.poll_id), m); }
+            m.set(Number(v.option_index), Number(v.votes) || 0);
+          }
+          for (const v of myVotesRes.rows) {
+            const list = myVotesByPoll.get(String(v.poll_id)) || [];
+            list.push(Number(v.option_index));
+            myVotesByPoll.set(String(v.poll_id), list);
+          }
+        } catch { /* polls degrade to zero counts on cold deploys */ }
+      }
       for (const pl of pollsRes.rows) {
         const options = (pl.options || []).map((o: any, i: number) => ({ ...o, index: i }));
-        const votesRes = await query(
-          `SELECT option_index, COUNT(*)::int AS votes FROM social_poll_votes WHERE poll_id = $1 GROUP BY option_index`,
-          [pl.id],
-        );
-        const myVotes = await query(
-          `SELECT option_index FROM social_poll_votes WHERE poll_id = $1 AND user_id = $2`,
-          [pl.id, userId],
-        );
-        const total = votesRes.rows.reduce((a, v) => a + v.votes, 0);
+        const votesMap = votesByPoll.get(String(pl.id)) || new Map<number, number>();
+        const myVoteList = myVotesByPoll.get(String(pl.id)) || [];
+        const total = options.reduce((a: number, o: any) => a + (votesMap.get(o.index) || 0), 0);
         pollsByPost.set(pl.post_id, {
           kind: "poll",
           id: pl.id,
           post_id: pl.post_id,
           question: pl.question,
-          options: options.map((o: any) => {
-            const votes = votesRes.rows.find((v) => v.option_index === o.index)?.votes || 0;
-            return { index: o.index, text: o.text, image_url: o.image_url ?? null, vote_count: votes };
-          }),
+          options: options.map((o: any) => ({
+            index: o.index, text: o.text, image_url: o.image_url ?? null,
+            vote_count: votesMap.get(o.index) || 0,
+          })),
           allow_multiple: pl.allow_multiple,
           hide_results_until_closed: pl.hide_results_until_closed,
           ends_at: pl.ends_at,
@@ -514,7 +709,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           pool_withdrawn: Number(pl.pool_withdrawn) || 0,
           status: pl.status === "active" && pl.ends_at && new Date(pl.ends_at) < new Date() ? "closed" : pl.status,
           total_votes: total,
-          my_vote: myVotes.rows.length ? myVotes.rows.map((m) => m.option_index) : null,
+          my_vote: myVoteList.length ? myVoteList : null,
           created_at: pl.created_at,
           author: { id: pl.user_id, name: pl.poll_author },
         });
@@ -574,6 +769,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // and deep-link into the tag feed.
         tags: tagsByPost.get(String(p.id)) || [],
         audience: p.audience,
+        view_count: Number(p.view_count) || 0,
         like_count: Number(p.like_count) || 0,
         comment_count: Number(p.comment_count) || 0,
         share_count: Number(p.share_count) || 0,
@@ -628,7 +824,16 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
       }
     } catch { /* cosmetic */ }
 
-    items = rankFeed(items, boosts, { affinity, followed: followSet });
+    items = rankFeed(items, boosts, {
+      userId,
+      affinity,
+      followed: followSet,
+      tagAffinity,
+      viewedCounts,
+      // Exploration stays stable within a pagination window: the cursor (or
+      // "root" for the first page) seeds the deterministic epsilon.
+      explorationSeed: cursor ? cursor.toISOString() : "root",
+    });
 
     // Impression accounting for active boosts surfaced in this page (throttled
     // by only counting the first N boosted rows per request).

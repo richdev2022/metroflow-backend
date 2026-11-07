@@ -995,10 +995,12 @@ async function creditWalletFundingTransaction(transaction: any, providerName: st
 
         // 4. Funding fee -> REVENUE ledger (owner invariant: deposit fees are
         //    revenue, they must NOT sit in the platform operational ledger).
+        //    Currency follows the CHECKOUT currency (USD for stablecoin-target
+        //    card fundings, NGN otherwise) — not hardcoded NGN.
         const fee = parseFloat(transaction.fee || 0);
         if (fee > 0) {
             try {
-                await creditRevenueWallet(fee, 'NGN', reference, 'Wallet Funding Fee', 'flutterwave');
+                await creditRevenueWallet(fee, transaction.currency || 'NGN', reference, 'Wallet Funding Fee', 'flutterwave');
             } catch (feeErr: any) {
                 console.warn(`Funding fee revenue credit skipped for ${reference}:`, (feeErr?.message || feeErr).toString().substring(0, 150));
             }
@@ -1153,12 +1155,19 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 const newBalance = newBalanceRes.rows.length > 0 ? parseFloat(newBalanceRes.rows[0].balance) : null;
 
                 if (transaction.user_id) {
+                    // Stablecoin card fundings settle in USD and credit the
+                    // USDT/USDC wallet 1:1 — render the amount in the
+                    // checkout currency instead of a hardcoded ₦.
+                    const creditCurrency = String(transaction.currency || 'NGN').toUpperCase();
+                    const creditAmount = parseFloat(transaction.amount).toLocaleString();
                     await createNotification({
                         businessId: businessId!,
                         userId: transaction.user_id,
                         type: "credit",
                         title: "Wallet Credited",
-                        message: `Your wallet has been credited with ₦${parseFloat(transaction.amount).toLocaleString()}`,
+                        message: creditCurrency === 'NGN'
+                            ? `Your wallet has been credited with ₦${creditAmount}`
+                            : `Your wallet has been credited with ${creditAmount} ${creditCurrency}`,
                         actionUrl: "/wallet",
                         actionType: "view_wallet",
                         metadata: { amount: parseFloat(transaction.amount), reference, transactionType: "wallet_funding" },

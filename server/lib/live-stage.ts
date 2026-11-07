@@ -19,6 +19,10 @@ export interface LiveStageInfo {
   isStage: boolean;
   /** May publish mic/cam/screen tracks into the room. */
   canPublish: boolean;
+  /** Session owner (used by the live watchdog to detect "host vanished"). */
+  hostId: string | null;
+  /** Approved stage guests (co-hosts) — they keep the stream alive too. */
+  cohostIds: string[];
 }
 
 const NOT_LIVE: LiveStageInfo = {
@@ -27,6 +31,8 @@ const NOT_LIVE: LiveStageInfo = {
   isHost: false,
   isStage: false,
   canPublish: true,
+  hostId: null,
+  cohostIds: [],
 };
 
 export async function liveStageForCallRoom(callRoomId: string, userId: string): Promise<LiveStageInfo> {
@@ -50,6 +56,8 @@ export async function liveStageForCallRoom(callRoomId: string, userId: string): 
       isHost,
       isStage,
       canPublish: isStage,
+      hostId: row.host_id || null,
+      cohostIds: cohosts,
     };
   } catch {
     // Fail-open for non-live rooms: this helper must never break normal calls.

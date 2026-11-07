@@ -25,6 +25,8 @@ import { sendWhatsApp } from "../services/whatsapp";
 import { logAuditEvent, generateTransactionHash } from "../services/audit";
 import { transferQueue } from "../lib/queues";
 import { evaluateOutflow, fraudRejectReason } from "../services/fraud";
+// ROUND-UP AUTO-SAVE (personal NGN spends): shared spare-change hook.
+import { maybeApplyRoundUp } from "../features/personal/routes/roundup";
 
 const router = express.Router();
 
@@ -920,6 +922,24 @@ router.post("/single", authenticateToken, checkSubscriptionStatus, checkFeatureP
       console.error("Beneficiary auto-save failed (non-fatal):", bErr);
     }
 
+    // ROUND-UP AUTO-SAVE (personal paths only): when a personal NGN transfer
+    // settles successfully, sweep the spare change into the user's vault.
+    // maybeApplyRoundUp never throws — a round-up failure can never corrupt
+    // the transfer response. Personal = no business context (business
+    // transfers must never trigger personal round-ups).
+    if (
+      finalTransfer.status === 'success' &&
+      !businessId &&
+      String(finalTransfer.currency || 'NGN').toUpperCase() === 'NGN'
+    ) {
+      maybeApplyRoundUp({
+        userId: String(userId || ''),
+        amount: Number(finalTransfer.amount),
+        sourceType: 'transfer',
+        sourceReference: finalTransfer.reference,
+      });
+    }
+
     const statusCode = finalTransfer.status === 'failed' ? 200 : 200;
 
     // Provider internals are scrubbed from the customer-facing payload below —
@@ -1600,6 +1620,28 @@ router.post("/bulk", authenticateToken, checkSubscriptionStatus, checkFeaturePer
       if (statusCounts.pending) parts.push(`${statusCounts.pending} pending`);
       responseMessage = `Transfers: ${parts.join(', ')}`;
       overallSuccess = statusCounts.failed ? statusCounts.success > 0 : true;
+    }
+
+    // ROUND-UP AUTO-SAVE (personal paths only): each successful NGN payout in
+    // the batch sweeps its spare change into the user's vault. NOTE: /bulk
+    // currently hard-requires a businessId above, so personal callers cannot
+    // reach this point today — the hook is wired behind the same personal gate
+    // for parity should bulk open to personal accounts.
+    if (!businessId) {
+      for (const t of finalTransfers) {
+        if (
+          t.status === 'success' &&
+          String(t.currency || 'NGN').toUpperCase() === 'NGN' &&
+          Number(t.amount) > 0
+        ) {
+          maybeApplyRoundUp({
+            userId: String(req.user?.userId || ''),
+            amount: Number(t.amount),
+            sourceType: 'transfer',
+            sourceReference: t.reference,
+          });
+        }
+      }
     }
 
     res.json({ 

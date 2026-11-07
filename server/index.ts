@@ -36,6 +36,10 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
   import { sogoWebhookHandler } from "./routes/personal-webhooks";
   import savingsPersonalRouter from "./features/personal/savings";
   import personalDonationsRouter from "./features/personal/routes/donations";
+  import personalRoundupRouter from "./features/personal/routes/roundup";
+  import personalSplitsRouter from "./features/personal/routes/splits";
+  import personalPotsRouter from "./features/personal/routes/pots";
+  import personalLiveShopRouter from "./features/personal/routes/live-shop";
   import { prestmitWebhookHandler, bitnobWebhookHandler, stablecoinWebhookHandler } from "./routes/personal-webhooks";
   import stablecoinRouter from "./features/personal/stablecoin";
   import adminPersonalRouter from "./routes/admin_personal";
@@ -1279,6 +1283,14 @@ export async function createServer() {
   // bridge, simulator) with the provider-routing layer in front.
   mainRouter.use("/bills", billsUnifiedRouter);
   mainRouter.use("/savings", savingsPersonalRouter);
+  // Round-Up Auto-Save — spare-change saving into goal vaults.
+  mainRouter.use("/roundup", personalRoundupRouter);
+  // Split Bills + Group Pots — shared expenses & money pots.
+  mainRouter.use("/splits", personalSplitsRouter);
+  mainRouter.use("/pots", personalPotsRouter);
+  // Live Shopping — in-stream product rail + wallet checkout (same /live
+  // mount as personalLiveRouter; subpaths /:id/shop/* don't collide).
+  mainRouter.use("/live", personalLiveShopRouter);
   // Fundraising donations: create campaigns, contribute from NGN wallet,
   // donor lists, creator redemption to NGN wallet (admin manages economics).
   mainRouter.use("/donations", personalDonationsRouter);

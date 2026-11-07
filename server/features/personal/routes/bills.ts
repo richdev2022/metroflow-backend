@@ -15,6 +15,7 @@ import { getActiveProvider, providerLabel } from "../provider-routing";
 import { getBillPricingRule, applyBillPricing, round2, getBillPricingMap, BILL_CATEGORIES } from "../bill-pricing";
 import { sweepUserBills } from "../bill-settlement";
 import { holdVendorForBill, recordBillCompletionLedger, accrueBillCashback } from "../bill-ledger";
+import { maybeApplyRoundUp } from "./roundup";
 
 /**
  * BILLS HUB — UNIFIED multi-provider bill payments (MetriCorex Personal).
@@ -1020,6 +1021,16 @@ router.post("/pay", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
         isActionable: false,
         expiresInHours: 168,
       }).catch(() => {});
+
+      // ROUND-UP AUTO-SAVE: spare change on the settled NGN bill total lands
+      // in the user's vault. Best-effort — maybeApplyRoundUp never throws, so
+      // this can never disturb the completed payment.
+      maybeApplyRoundUp({
+        userId,
+        amount: total,
+        sourceType: category === "airtime" ? "airtime" : category === "data" ? "data" : "bill",
+        sourceReference: reference,
+      });
     }
 
     // PROVIDER-SAYS-PROCESSING → 3-ATTEMPT CONFIRMATION: show the success

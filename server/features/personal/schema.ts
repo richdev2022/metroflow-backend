@@ -1361,5 +1361,157 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_live_viewers_active ON live_viewers(session_id, left_at, last_seen_at)`);
   await query(`ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS unique_viewers INTEGER NOT NULL DEFAULT 0`);
 
+  // ---------------------------------------------------------------------
+  // ROUND-UP AUTO-SAVE — spare-change saving into goal vaults. Every
+  // personal NGN spend (bills, transfers, marketplace, gift cards) rounds
+  // up to the next `round_to` step; the change (× multiplier) is debited
+  // from the wallet and credited to the user's chosen vault. Idempotent:
+  // one ledger row per source reference.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS roundup_settings (
+      user_id UUID PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      multiplier INTEGER NOT NULL DEFAULT 1,          -- 1x | 2x | 3x
+      round_to INTEGER NOT NULL DEFAULT 100,          -- NGN step: 100 | 200 | 500
+      vault_id UUID REFERENCES savings_vaults(id) ON DELETE SET NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_roundup_settings_vault ON roundup_settings(vault_id)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS roundup_ledger (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      vault_id UUID,
+      source_type VARCHAR(40) NOT NULL,               -- bill | transfer | marketplace | giftcard | airtime | data
+      source_reference VARCHAR(255) NOT NULL,
+      source_amount DECIMAL(15,2) NOT NULL,
+      round_up DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id, source_reference)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_roundup_ledger_user ON roundup_ledger(user_id, created_at DESC)`);
+
+  // ---------------------------------------------------------------------
+  // SPLIT BILLS — divide an expense across contacts; each participant pays
+  // their share from their own wallet; creator sees who has paid.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS splits (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_id UUID NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      description TEXT,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      total_amount DECIMAL(15,2) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | settled | cancelled
+      context VARCHAR(20),                            -- direct | group | page
+      context_id UUID,
+      share_token VARCHAR(64) UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      settled_at TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_splits_creator ON splits(creator_id, created_at DESC)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS split_participants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      split_id UUID NOT NULL REFERENCES splits(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      share_amount DECIMAL(15,2) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | paid | declined
+      paid_at TIMESTAMP,
+      paid_reference VARCHAR(255) UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (split_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_split_participants_user ON split_participants(user_id, status)`);
+
+  // ---------------------------------------------------------------------
+  // GROUP POTS — shared money pots (events, gifts, launches). Anyone with
+  // the link/context can contribute from their wallet; the creator closes
+  // the pot and the balance pays out to their wallet.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS pots (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_id UUID NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      purpose TEXT,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      target_amount DECIMAL(15,2),
+      balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'open',     -- open | closed
+      context VARCHAR(20),                            -- direct | group | page
+      context_id UUID,
+      share_token VARCHAR(64) UNIQUE,
+      deadline DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      closed_at TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_pots_creator ON pots(creator_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_pots_context ON pots(context, context_id)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS pot_contributions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pot_id UUID NOT NULL REFERENCES pots(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      amount DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      note VARCHAR(255),
+      reference VARCHAR(255) UNIQUE,
+      balance_after DECIMAL(15,2),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_pot_contributions_pot ON pot_contributions(pot_id, created_at DESC)`);
+
+  // ---------------------------------------------------------------------
+  // GOAL CHEERS — friends cheer a goal vault (shareable goal pages).
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS goal_cheers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      vault_id UUID NOT NULL REFERENCES savings_vaults(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      message VARCHAR(140),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (vault_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_goal_cheers_vault ON goal_cheers(vault_id, created_at DESC)`);
+
+  // ---------------------------------------------------------------------
+  // LIVE SHOPPING — hosts pin marketplace products to a livestream;
+  // viewers buy without leaving the stream; hosts earn a commission.
+  // Purchases reuse market_orders with live attribution.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_shop_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id UUID NOT NULL,                       -- live_sessions.id
+      host_id UUID NOT NULL,
+      listing_id UUID NOT NULL,                       -- market_listings.id
+      price_snapshot DECIMAL(12,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      pinned BOOLEAN NOT NULL DEFAULT TRUE,
+      pinned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      sold_count INTEGER NOT NULL DEFAULT 0,
+      revenue DECIMAL(12,2) NOT NULL DEFAULT 0,
+      commission DECIMAL(12,2) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (session_id, listing_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_shop_items_session ON live_shop_items(session_id, pinned)`);
+  await query(`ALTER TABLE market_orders ADD COLUMN IF NOT EXISTS live_session_id UUID`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_live ON market_orders(live_session_id)`);
+
   console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages + stories + sounds + tags) schema applied");
 }

@@ -848,6 +848,32 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_crypto_sales_user ON crypto_sales(user_id)`);
 
+  // SCHEMA DRIFT GUARD — live installs created crypto_sales from an older
+  // version of this file; CREATE TABLE IF NOT EXISTS never upgrades an
+  // existing table, so the sell flow's newer columns threw "column does not
+  // exist" on EVERY sale right after the wallet debit (production incident
+  // 2026-11-06). Additive ALTERs bring any vintage of the table up to the
+  // code's contract.
+  const cryptoSalesDrift: Array<[string, string]> = [
+    ["provider", "VARCHAR(20) NOT NULL DEFAULT 'bitnob'"],
+    ["provider_reference", "VARCHAR(160)"],
+    ["settlement_currency", "VARCHAR(5) NOT NULL DEFAULT 'NGN'"],
+    ["rate", "DECIMAL(18,6)"],
+    ["bank_code", "VARCHAR(20)"],
+    ["bank_name", "VARCHAR(120)"],
+    ["account_number", "VARCHAR(30)"],
+    ["account_name", "VARCHAR(160)"],
+    ["beneficiary", "JSONB"],
+    ["status", "VARCHAR(24) NOT NULL DEFAULT 'pending'"],
+    ["provider_response", "JSONB"],
+    ["failure_reason", "TEXT"],
+    ["completed_at", "TIMESTAMP"],
+    ["refunded_at", "TIMESTAMP"],
+  ];
+  for (const [col, def] of cryptoSalesDrift) {
+    await query(`ALTER TABLE crypto_sales ADD COLUMN IF NOT EXISTS ${col} ${def}`);
+  }
+
   await query(`
     CREATE TABLE IF NOT EXISTS virtual_cards (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1451,6 +1477,23 @@ export async function ensurePersonalSchema(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_split_participants_user ON split_participants(user_id, status)`);
+
+  // Email invites for split participants who don't have a Metricorex account
+  // yet — mirrors savings_circle_invites: created alongside the split, shown
+  // as "Invited" chips in the client, and merged automatically when the
+  // person later signs up (they can settle their share via the share link).
+  await query(`
+    CREATE TABLE IF NOT EXISTS split_email_invites (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      split_id UUID NOT NULL REFERENCES splits(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      invited_by UUID,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | joined | expired
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (split_id, email)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_split_email_invites_split ON split_email_invites(split_id)`);
 
   // ---------------------------------------------------------------------
   // GROUP POTS — shared money pots (events, gifts, launches). Anyone with

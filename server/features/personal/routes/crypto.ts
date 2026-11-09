@@ -669,6 +669,7 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     // referenced a `fee` column that does not exist on live crypto_sales, so
     // EVERY sale failed right after the wallet debit. Wrapped + column fixed.
     let bitnobLive = false;
+    let flwLive = false;
     let useLive = false;
     let dbInsert: any = null;
     try {
@@ -684,8 +685,12 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
       // EXPLICITLY forces the simulator mode — in "auto" an unconfigured
       // payout partner can no longer fake an instant success (money safety).
       bitnobLive = bitnob.isBitnobConfigured();
-      useLive = await useProvider("crypto", bitnobLive);
-      const saleProvider = !useLive ? "simulator" : "bitnob";
+      flwLive = flutterwave.isFlutterwaveConfigured();
+      // "configured" for AUTO mode now means ANY payout rail exists — Bitnob
+      // (crypto-native off-ramp) OR Flutterwave (NGN transfers from the float
+      // that holds all customer funds).
+      useLive = await useProvider("crypto", bitnobLive || flwLive);
+      const saleProvider = !useLive ? "simulator" : (bitnobLive ? "bitnob" : "flutterwave");
       dbInsert = await query(
         `INSERT INTO crypto_sales
            (user_id, wallet_id, reference, provider, from_asset, usd_debit, settlement_amount,
@@ -731,6 +736,16 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
         error: "Stablecoin sell payouts are temporarily unavailable — your wallet has been refunded. You can still receive crypto and convert via the deposit flow.",
       });
     }
+    // PAYOUT CHAIN (owner directive): try the active rails IN ORDER — Bitnob
+    // (crypto-native off-ramp) first, then Flutterwave, which holds all
+    // customer funds and settles straight into the same NGN bank account via
+    // its transfer API. The wallet is ONLY refunded when every configured
+    // rail fails, and the real provider errors are surfaced verbatim instead
+    // of a generic "couldn't be processed".
+    let settled = false;
+    let pendingProvider = false;
+    let lastProviderError = "";
+
     if (bitnobLive) {
       try {
         const quote = await bitnob.createPayoutQuote({
@@ -751,55 +766,84 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
             businessId: "", userId, type: "credit", title: "Crypto sale completed",
             message: `₦${netAmount.toLocaleString()} is on its way to your ${accountName} account.`,
           }).catch(() => {});
+          settled = true;
         } else {
-          // Quote created but no executable id returned — the sale can never
-          // settle. Refund immediately and fail honestly. (Previously this
-          // branch fell through silently: sale stuck 'processing' forever
-          // with the wallet already debited.)
-          saleRefunded = true;
-          await creditWallet(wallet.id, usdDebit);
-          await insertTransaction({
-            userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
-            transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
-            description: "Refund — payout partner returned an unexecutable quote",
-          });
-          await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = 'Payout quote missing executable id — auto-refunded', refunded_at = CURRENT_TIMESTAMP WHERE id = $1`, [dbInsert.rows[0].id]);
-          return res.status(502).json({ success: false, error: "The payout partner could not execute this sale — your wallet has been refunded." });
+          // Quote created but no executable id — Bitnob can never settle this
+          // sale; fall through to the Flutterwave rail before refunding.
+          lastProviderError = "Bitnob returned an unexecutable payout quote";
         }
       } catch (bnErr: any) {
-        const be = bitnob.bitnobErr(bnErr);
-        if (be.code === "BITNOB_IP_WHITELIST") {
-          // Money is debited; the sale stays 'processing' for ops settlement.
-          await query(`UPDATE crypto_sales SET failure_reason = $2 WHERE id = $1`, [dbInsert.rows[0].id, be.message]);
-          return res.status(503).json({
-            success: false,
-            code: be.code,
-            error: "Your sale was received and is queued — our payout partner is being connected. Support will complete it shortly.",
-          });
-        }
-        // Refund on provider rejection
-        saleRefunded = true;
-        await creditWallet(wallet.id, usdDebit);
-        await insertTransaction({
-          userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
-          transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
-          description: "Refund — crypto sale failed",
-        });
-        await query(`UPDATE crypto_sales SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP WHERE id = $1`,
-          [dbInsert.rows[0].id, be.message]);
-        return res.status(502).json({ success: false, error: be.message });
+        // Rail 1 rejected — record why and let the chain try Flutterwave.
+        lastProviderError = bitnob.bitnobErr(bnErr).message;
       }
-    } else {
-      await query(`UPDATE crypto_sales SET failure_reason = 'Payout partner not configured on server' WHERE id = $1`, [dbInsert.rows[0].id]);
-      return res.status(503).json({
-        success: false,
-        code: "PROVIDER_UNCONFIGURED",
-        error: "Crypto sales are being connected to our payout partner. Your balance is safe — support will settle queued sales.",
-      });
     }
 
-    const fresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
-    res.status(201).json({ success: true, data: { sale: fresh.rows[0] } });
+    if (!settled && flutterwave.isFlutterwaveConfigured()) {
+      try {
+        const xfer = await flutterwave.sendTransfer({
+          reference: `${reference}-FLW`, // unique per sale; idempotent on retry
+          bankCode,
+          accountNumber,
+          accountName,
+          amount: netAmount,
+          currency: "NGN",
+          narration: "MetriCorex crypto sale",
+        });
+        if (xfer.ok) {
+          pendingProvider = !!xfer.pending;
+          await query(
+            `UPDATE crypto_sales
+                SET provider = 'flutterwave', provider_reference = $2,
+                    status = $3, failure_reason = NULL,
+                    completed_at = CASE WHEN $3 = 'completed' THEN CURRENT_TIMESTAMP ELSE completed_at END
+              WHERE id = $1`,
+            [dbInsert.rows[0].id, xfer.provider_reference || `${reference}-FLW`, pendingProvider ? "processing" : "completed"],
+          );
+          createNotification({
+            businessId: "", userId, type: "credit",
+            title: pendingProvider ? "Crypto sale processing" : "Crypto sale completed",
+            message: pendingProvider
+              ? `₦${netAmount.toLocaleString()} to your ${accountName} account is being transferred — we'll confirm shortly.`
+              : `₦${netAmount.toLocaleString()} is on its way to your ${accountName} account.`,
+          }).catch(() => {});
+          settled = true;
+        } else {
+          lastProviderError = lastProviderError
+            ? `${lastProviderError}; Flutterwave: ${xfer.error || "transfer rejected"}`
+            : `Flutterwave: ${xfer.error || "transfer rejected"}`;
+        }
+      } catch (fwErr: any) {
+        const fe = flutterwave.flwErr(fwErr);
+        lastProviderError = lastProviderError ? `${lastProviderError}; Flutterwave: ${fe}` : `Flutterwave: ${fe}`;
+      }
+    }
+
+    if (settled) {
+      const fresh = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [dbInsert.rows[0].id]);
+      return res.status(201).json({ success: true, data: { sale: fresh.rows[0] } });
+    }
+
+    // Every configured rail failed (or the server has none) — refund the
+    // debit immediately and tell the user WHAT failed. A debited wallet with
+    // a permanently unfulfillable sale is never acceptable.
+    saleRefunded = true;
+    await creditWallet(wallet.id, usdDebit);
+    await insertTransaction({
+      userId, walletId: wallet.id, reference: `${reference}-REFUND`, type: "credit",
+      transactionType: "crypto_sale_refund", amount: usdDebit, currency: asset,
+      description: "Refund — crypto sale payout failed on all rails",
+    });
+    await query(
+      `UPDATE crypto_sales SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [dbInsert.rows[0].id, lastProviderError || "No payout rail configured on server"],
+    );
+    return res.status(502).json({
+      success: false,
+      code: "PAYOUT_FAILED_REFUNDED",
+      error: lastProviderError
+        ? `Sale could not be settled — your wallet has been refunded. (${lastProviderError})`
+        : "Stablecoin sell payouts are temporarily unavailable — your wallet has been refunded.",
+    });
   } catch (e: any) {
     console.error("crypto sell error:", e?.message);
     // Last-resort compensation: a debited sale that dies anywhere below the

@@ -4,6 +4,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import { insertTransaction, creditWallet } from "../personal-utils";
 import { createNotification } from "../../../services/notifications";
+import { sendEmail } from "../../../services/email";
 
 /**
  * SPLIT BILLS — divide an expense across contacts (mounted at /splits,
@@ -18,7 +19,11 @@ import { createNotification } from "../../../services/notifications";
  * paid_reference.
  *
  * Endpoints:
+ *   GET  /splits/candidates?q=    → searchable directory of EVERY Metricorex
+ *                                   user (name/username/email) for the picker
  *   POST /splits                  → create a split + invite participants
+ *                                   (user_ids AND/OR emails[] — unknown emails
+ *                                   get a pending email invite + invite mail)
  *   GET  /splits/mine             → created by me (+ status counts) + participating
  *   GET  /splits/:id              → detail (creator or participant only)
  *   POST /splits/:id/pay          → pay my share (participant, pending)
@@ -37,6 +42,7 @@ function money(v: number): number { return Math.round(v * 100) / 100; }
 // comes back mangled, so its context chip renders correctly.
 const CONTEXTS = new Set(["direct", "group", "page", "dinner", "trip", "gift", "rent", "other"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const SPLIT_BASE = `
   SELECT s.*, u.name AS creator_name, u.avatar_url AS creator_avatar,
@@ -134,6 +140,71 @@ async function loadParticipants(splitId: string) {
 // ---------------------------------------------------------------------------
 // Create a split
 // ---------------------------------------------------------------------------
+/** Pending email invites for a split — rendered as "Invited" chips. Fail-soft
+ *  to [] while a not-yet-migrated deployment lacks the table. */
+async function loadEmailInvites(splitId: string) {
+  try {
+    const rows = await query(
+      `SELECT email, status, created_at FROM split_email_invites WHERE split_id = $1 ORDER BY created_at ASC`,
+      [splitId],
+    );
+    return rows.rows.map((r: any) => ({ email: String(r.email), status: String(r.status), invited_at: r.created_at }));
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Candidates — searchable directory of EVERY Metricorex user (name /
+// username / email) so the split composer can find anyone on the platform,
+// not just saved contacts. Mirrors the savings-circles invite picker.
+//   GET /splits/candidates?q=alice  → empty q returns the most recent users
+// ---------------------------------------------------------------------------
+router.get("/candidates", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const q = String(req.query.q || "").trim().slice(0, 80);
+    const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 20));
+    const rows = q
+      ? await query(
+          `SELECT id, name, avatar_url,
+                  LOWER(COALESCE(username, SPLIT_PART(email, '@', 1))) AS username,
+                  email
+             FROM users
+            WHERE id <> $1
+              AND (name ILIKE $2 OR username ILIKE $2 OR email ILIKE $2)
+            ORDER BY name ASC
+            LIMIT $3`,
+          [userId, `%${q}%`, limit],
+        )
+      : await query(
+          `SELECT id, name, avatar_url,
+                  LOWER(COALESCE(username, SPLIT_PART(email, '@', 1))) AS username,
+                  email
+             FROM users
+            WHERE id <> $1
+            ORDER BY created_at DESC
+            LIMIT $2`,
+          [userId, limit],
+        );
+    const candidates = rows.rows.map((u: any) => ({
+      id: String(u.id),
+      name: u.name,
+      avatar_url: u.avatar_url || null,
+      username: u.username || null,
+      // Masked for privacy — enough to disambiguate without leaking the full
+      // address into client state and logs.
+      email_masked: u.email
+        ? `${String(u.email).slice(0, 1)}${"*".repeat(4)}@${String(u.email).split("@")[1] || ""}`
+        : null,
+    }));
+    res.json({ success: true, candidates });
+  } catch (e: any) {
+    console.error("[splits/candidates]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load candidates" });
+  }
+});
+
 router.post("/", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
@@ -150,10 +221,7 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
       return res.status(400).json({ success: false, error: "total_amount must be greater than 0" });
     }
 
-    const rawParticipants = Array.isArray(req.body?.participants) ? req.body.participants : null;
-    if (!rawParticipants || rawParticipants.length === 0) {
-      return res.status(400).json({ success: false, error: "At least one participant is required" });
-    }
+    const rawParticipants = Array.isArray(req.body?.participants) ? req.body.participants : [];
     if (rawParticipants.length > 50) {
       return res.status(400).json({ success: false, error: "A split can have at most 50 participants" });
     }
@@ -172,6 +240,43 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
         user_id: pid,
         share_amount: p?.share_amount !== undefined && p?.share_amount !== null ? Number(p.share_amount) : null,
       });
+    }
+
+    // Email invites — the same contract as the savings-circle picker: a
+    // REGISTERED email behaves exactly like a user pick; an UNKNOWN email is
+    // recorded as a pending email invite and receives the invite mail.
+    const rawEmails = Array.isArray(req.body?.emails) ? req.body.emails : [];
+    const emails: string[] = [];
+    for (const v of rawEmails) {
+      const email = String(v || "").trim().toLowerCase();
+      if (!email) continue;
+      if (!EMAIL_RE.test(email)) {
+        return res.status(400).json({ success: false, error: `"${email.slice(0, 60)}" is not a valid email address` });
+      }
+      if (!emails.includes(email)) emails.push(email);
+    }
+    const emailOnly: string[] = [];
+    if (emails.length) {
+      const matched = await query(
+        `SELECT id, LOWER(email) AS email FROM users WHERE LOWER(email) = ANY($1::text[])`,
+        [emails],
+      );
+      const byEmail = new Map<string, string>(matched.rows.map((r: any) => [String(r.email), String(r.id)]));
+      for (const email of emails) {
+        const uid = byEmail.get(email);
+        if (uid && uid !== userId && !seen.has(uid)) {
+          seen.add(uid);
+          participants.push({ user_id: uid, share_amount: null });
+        } else if (!uid) {
+          emailOnly.push(email);
+        }
+      }
+    }
+    if (!participants.length && !emailOnly.length) {
+      return res.status(400).json({ success: false, error: "At least one participant is required" });
+    }
+    if (participants.length + emailOnly.length > 50) {
+      return res.status(400).json({ success: false, error: "A split can have at most 50 participants" });
     }
 
     // Users must exist.
@@ -227,9 +332,48 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
       }).catch(() => {});
     }
 
+    // Pending email invites — recorded so the detail view shows "Invited"
+    // chips, and mailed to the person (they join with that email and settle
+    // their share; registered emails never reach this path).
+    if (emailOnly.length) {
+      await query(
+        `INSERT INTO split_email_invites (split_id, email, invited_by)
+         SELECT $1, x.email, $2 FROM UNNEST($3::text[]) AS x(email)
+         ON CONFLICT (split_id, email) DO UPDATE
+           SET invited_by = EXCLUDED.invited_by, status = 'pending', created_at = CURRENT_TIMESTAMP`,
+        [split.id, userId, emailOnly],
+      );
+      const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL || "https://personal.metricorex.com";
+      for (const email of emailOnly) {
+        try {
+          await sendEmail(
+            email,
+            "There",
+            `${creatorName} asked you to split ₦${Number(total).toLocaleString()} on MetriCorex`,
+            `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+              <h2 style="margin:0 0 12px">"${String(title).slice(0, 80)}"</h2>
+              <p style="color:#374151;line-height:1.6">
+                ${creatorName} split <strong>₦${Number(total).toLocaleString()}</strong> and added you as a participant.<br/>
+                Sign up on MetriCorex with this email to view and pay your share.
+              </p>
+              <p style="margin:24px 0">
+                <a href="${baseUrl}/splits" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Open Splits</a>
+              </p>
+            </div>`,
+          );
+        } catch (mailErr: any) {
+          console.error("[splits/invite-email]", mailErr?.message);
+        }
+      }
+    }
+
     res.status(201).json({
       success: true,
       split: serializeSplit({ ...split, participants: await loadParticipants(split.id) }),
+      email_invites: await loadEmailInvites(split.id),
+      ...(emailOnly.length
+        ? { message: `${emailOnly.length} email invite${emailOnly.length === 1 ? "" : "s"} sent` }
+        : {}),
     });
   } catch (e: any) {
     console.error("[splits/create]", e?.message);
@@ -330,6 +474,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
       success: true,
       split: serializeSplit(split),
       participants: await loadParticipants(split.id),
+      email_invites: await loadEmailInvites(split.id),
     });
   } catch (e: any) {
     console.error("[splits/detail]", e?.message);

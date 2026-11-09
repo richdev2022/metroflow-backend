@@ -264,7 +264,7 @@ export function buildCoreNudges(
 // GET /insights/overview?month=YYYY-MM
 // ---------------------------------------------------------------------------
 
-router.get("/overview", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+router.get(["/overview", "/summary"], authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const monthParam = String(req.query.month || "");

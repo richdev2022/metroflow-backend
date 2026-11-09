@@ -353,6 +353,78 @@ export async function verifyBankAccount(bankCode: string, accountNumber: string)
 }
 
 // ---------------------------------------------------------------------------
+// NGN TRANSFERS (fallback payout rail) — POST /v3/transfers + GET by reference.
+// Flutterwave is the provider that holds all customer funds, so when the
+// primary crypto off-ramp (Bitnob) rejects or is unconfigured, a crypto sale
+// settles as a plain NGN bank transfer from the Flutterwave balance.
+// ---------------------------------------------------------------------------
+
+export interface SendTransferArgs {
+  /** Unique per attempt — the same reference retried is idempotent on FW side. */
+  reference: string;
+  /** NG bank code in FW's space (NIP 6-digit codes; already normalised upstream). */
+  bankCode: string;
+  accountNumber: string;
+  accountName?: string;
+  amount: number;
+  currency?: string;
+  narration?: string;
+}
+
+export async function sendTransfer(
+  args: SendTransferArgs,
+): Promise<{ ok: boolean; pending?: boolean; provider_reference?: string | null; raw?: any; error?: string }> {
+  try {
+    const { data } = await client().post(
+      "/transfers",
+      {
+        account_bank: args.bankCode,
+        account_number: args.accountNumber,
+        amount: args.amount,
+        narration: args.narration || "MetriCorex payout",
+        currency: args.currency || "NGN",
+        reference: args.reference,
+        ...(args.accountName ? { beneficiary_name: args.accountName } : {}),
+      },
+      { timeout: 60000 }, // NIP transfers can be slower than card/bill calls
+    );
+    if (data?.status === "success") {
+      const d = data?.data || {};
+      const status = String(d.status || "").toUpperCase();
+      // Honest async state: NEW/ACCEPTED/PENDING/QUEUED are NOT completed —
+      // callers must keep the sale 'processing' and read getTransfer later.
+      const pending = ["NEW", "ACCEPTED", "PENDING", "QUEUED", "PROCESSING", "CREATED"].includes(status);
+      return {
+        ok: true,
+        pending,
+        provider_reference: String(d.id || d.reference || args.reference),
+        raw: data,
+      };
+    }
+    return { ok: false, error: data?.message || "Transfer rejected", raw: data };
+  } catch (e: any) {
+    // Idempotent retry: a duplicate-reference rejection means the FIRST call
+    // actually landed — read as pending rather than failing the payout chain.
+    const fwMsg = String(e?.response?.data?.message || "");
+    if (/duplicate|already exists|same reference/i.test(fwMsg)) {
+      return { ok: true, pending: true, provider_reference: args.reference, raw: e?.response?.data };
+    }
+    return { ok: false, error: flwErr(e), raw: e?.response?.data };
+  }
+}
+
+/** GET /v3/transfers?reference= — poll an async transfer to its final state. */
+export async function getTransfer(reference: string): Promise<any | null> {
+  try {
+    const { data } = await client().get("/transfers", { params: { reference } });
+    if (data?.status === "success") return data?.data ?? null;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Platform wallet balances + balance history (GET /v3/balances,
 // GET /v3/balances/:currency, GET /v3/balance-history) — powers the admin
 // "Provider's Balance" desk. Flutterwave is the collection float provider:

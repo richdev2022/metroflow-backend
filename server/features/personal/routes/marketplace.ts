@@ -344,48 +344,110 @@ router.get("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => 
   }
 });
 
-router.put("/:id", authenticateToken, async (req: AuthenticatedRequest, res) => {
+router.put("/:id", authenticateToken, marketUpload, async (req: AuthenticatedRequest, res) => {
   try {
-    const own = await query(`SELECT id FROM market_listings WHERE id = $1 AND seller_id = $2`, [req.params.id, req.user!.userId]);
+    // Ownership check — also fetch the existing images JSONB so we can MERGE
+    // (append new uploads) and/or subtract `remove_images` on this edit. The
+    // mobile seller sheet previously had to delete + re-create the whole
+    // listing just to change photos; this PUT now accepts the same multipart
+    // contract as POST (fields `images` | `media`, ≤10 files each).
+    const own = await query(
+      `SELECT id, images FROM market_listings WHERE id = $1 AND seller_id = $2`,
+      [req.params.id, req.user!.userId],
+    );
     if (!own.rows.length) return res.status(404).json({ success: false, error: "Listing not found (or not yours)" });
+    const existingImages: string[] = Array.isArray(own.rows[0]?.images)
+      ? (own.rows[0].images as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+      : [];
+
+    // Normalize uploaded files: upload.fields() yields { images?: [], media?: [] }.
+    // Mirror the POST create route's normalization verbatim.
+    const rawFiles = req.files as
+      | unknown
+      | { [field: string]: Express.Multer.File[] };
+    const files: Express.Multer.File[] = Array.isArray(rawFiles)
+      ? (rawFiles as Express.Multer.File[])
+      : [
+          ...((rawFiles as { [field: string]: Express.Multer.File[] })?.images ?? []),
+          ...((rawFiles as { [field: string]: Express.Multer.File[] })?.media ?? []),
+        ];
+
+    // `remove_images` is a JSON array of URLs the seller wants dropped from the
+    // listing. Accept either a parsed array (JSON body) or a JSON-encoded
+    // string (multipart). Malformed payloads are silently ignored.
+    const removeSet = new Set<string>();
+    try {
+      const raw = (req.body as any)?.remove_images;
+      if (raw) {
+        const parsed: unknown = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (Array.isArray(parsed)) {
+          for (const u of parsed) if (typeof u === "string" && u.length > 0) removeSet.add(u);
+        }
+      }
+    } catch { /* ignore bad remove_images payload */ }
+
+    // Merge: existing − remove + new uploads (de-duplicated, capped at 10).
+    let merged: string[] = existingImages.filter((u) => !removeSet.has(u));
+    for (const f of files.slice(0, 10)) {
+      if (merged.length >= 10) break;
+      try {
+        const up = await uploadMediaBuffer({ buffer: f.buffer, originalname: f.originalname, mimeType: f.mimetype, folder: "marketplace", userId: req.user!.userId });
+        if (up?.url && !merged.includes(up.url)) merged.push(up.url);
+      } catch (e: any) {
+        console.warn("marketplace PUT image upload failed:", e?.message);
+      }
+    }
+
+    // Only persist the images column when there is something to change — keeps
+    // the text-only edit path (no files, no remove_images) byte-for-byte the
+    // same as before, so existing PUT callers see no behaviour drift.
+    const shouldWriteImages = files.length > 0 || removeSet.size > 0;
+
     const b = req.body || {};
     const deliveryFeeNum = Number(b.delivery_fee);
+    const setClauses: string[] = [
+      "name = COALESCE($2, name)",
+      "description = COALESCE($3, description)",
+      "category = COALESCE($4, category)",
+      "price = COALESCE($5, price)",
+      "location_text = COALESCE($6, location_text)",
+      "stock = COALESCE($7, stock)",
+      "status = COALESCE($8, status)",
+      "brand = COALESCE($9, brand)",
+      "model = COALESCE($10, model)",
+      "warranty_note = COALESCE($11, warranty_note)",
+      "pickup_ok = COALESCE($12, pickup_ok)",
+      "delivery_ok = COALESCE($13, delivery_ok)",
+      "delivery_fee = COALESCE($14, delivery_fee)",
+    ];
+    const params: any[] = [
+      req.params.id,
+      b.name ? String(b.name).slice(0, 160) : null,
+      b.description !== undefined ? (b.description ? String(b.description).slice(0, 4000) : null) : null,
+      MARKET_CATEGORIES.includes(b.category) ? b.category : null,
+      Number.isFinite(Number(b.price)) && Number(b.price) > 0 ? Number(b.price) : null,
+      b.location_text !== undefined ? (b.location_text ? String(b.location_text).slice(0, 160) : null) : null,
+      b.stock !== undefined && b.stock !== null && b.stock !== "" ? Math.max(0, Number(b.stock)) : null,
+      ["active", "sold"].includes(b.status) ? b.status : null,
+      b.brand ? String(b.brand).slice(0, 80) : null,
+      b.model ? String(b.model).slice(0, 80) : null,
+      b.warranty_note ? String(b.warranty_note).slice(0, 200) : null,
+      typeof b.pickup_ok === "boolean" ? b.pickup_ok : (b.pickup_ok === "true" ? true : b.pickup_ok === "false" ? false : null),
+      typeof b.delivery_ok === "boolean" ? b.delivery_ok : (b.delivery_ok === "true" ? true : b.delivery_ok === "false" ? false : null),
+      Number.isFinite(deliveryFeeNum) && deliveryFeeNum >= 0 ? Math.round(deliveryFeeNum * 100) / 100 : null,
+    ];
+    if (shouldWriteImages) {
+      params.push(JSON.stringify(merged));
+      setClauses.push(`images = $${params.length}::jsonb`);
+    }
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     await query(
-      `UPDATE market_listings SET
-         name = COALESCE($2, name),
-         description = COALESCE($3, description),
-         category = COALESCE($4, category),
-         price = COALESCE($5, price),
-         location_text = COALESCE($6, location_text),
-         stock = COALESCE($7, stock),
-         status = COALESCE($8, status),
-         brand = COALESCE($9, brand),
-         model = COALESCE($10, model),
-         warranty_note = COALESCE($11, warranty_note),
-         pickup_ok = COALESCE($12, pickup_ok),
-         delivery_ok = COALESCE($13, delivery_ok),
-         delivery_fee = COALESCE($14, delivery_fee),
-         updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [
-        req.params.id,
-        b.name ? String(b.name).slice(0, 160) : null,
-        b.description !== undefined ? (b.description ? String(b.description).slice(0, 4000) : null) : null,
-        MARKET_CATEGORIES.includes(b.category) ? b.category : null,
-        Number.isFinite(Number(b.price)) && Number(b.price) > 0 ? Number(b.price) : null,
-        b.location_text !== undefined ? (b.location_text ? String(b.location_text).slice(0, 160) : null) : null,
-        b.stock !== undefined && b.stock !== null && b.stock !== "" ? Math.max(0, Number(b.stock)) : null,
-        ["active", "sold"].includes(b.status) ? b.status : null,
-        b.brand ? String(b.brand).slice(0, 80) : null,
-        b.model ? String(b.model).slice(0, 80) : null,
-        b.warranty_note ? String(b.warranty_note).slice(0, 200) : null,
-        typeof b.pickup_ok === "boolean" ? b.pickup_ok : (b.pickup_ok === "true" ? true : b.pickup_ok === "false" ? false : null),
-        typeof b.delivery_ok === "boolean" ? b.delivery_ok : (b.delivery_ok === "true" ? true : b.delivery_ok === "false" ? false : null),
-        Number.isFinite(deliveryFeeNum) && deliveryFeeNum >= 0 ? Math.round(deliveryFeeNum * 100) / 100 : null,
-      ],
+      `UPDATE market_listings SET ${setClauses.join(", ")} WHERE id = $1`,
+      params,
     );
-    res.json({ success: true, message: "Listing updated" });
-  } catch {
+    res.json({ success: true, message: "Listing updated", data: { images: merged } });
+  } catch (e: any) {
+    console.error("marketplace PUT error:", e?.message);
     res.status(500).json({ success: false, error: "Could not update listing" });
   }
 });

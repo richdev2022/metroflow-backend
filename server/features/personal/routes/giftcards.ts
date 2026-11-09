@@ -3,7 +3,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import {
   getOwnedWallet, debitWallet, creditWallet, insertTransaction,
-  assertPersonalService, genRef, requirePersonalKyc,
+  assertPersonalService, genRef, requirePersonalKyc, verifyTransactionPin,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
 import * as prestmit from "../../../services/prestmit";
@@ -387,6 +387,16 @@ router.post("/sell", authenticateToken, requirePersonalKyc(), checkSubscriptionS
     const rawId = String(req.body?.giftcard_id || "").trim();
     if (!rawId || !Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ success: false, error: "giftcard_id and a positive amount are required" });
+    }
+
+    // TRANSACTION PIN — every personal money move verifies the caller's PIN
+    // (same helper as /crypto/sell + /bills/pay; honors the biometric bypass).
+    // The sell trade credits the caller's wallet on approval, so a hijacked
+    // session must not be able to lodge a trade in the first place. The mobile
+    // client already sends `pin` on the sell payload.
+    const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({ success: false, code: pinCheck.code, error: pinCheck.error });
     }
 
     // Resolve wallet up-front: the NGN (or fallback) personal wallet receives the payout.
@@ -907,6 +917,16 @@ router.post("/buy", authenticateToken, requirePersonalKyc(), checkSubscriptionSt
     const giftcardName = String(req.body?.giftcard_name || `SKU ${sku}`).slice(0, 160);
     if (!sku || !Number.isFinite(price) || price <= 0) {
       return res.status(400).json({ success: false, error: "giftCardSKU and a positive price are required" });
+    }
+
+    // TRANSACTION PIN — every personal money move verifies the caller's PIN
+    // (same helper as /crypto/sell + /bills/pay; honors the biometric bypass).
+    // The web (client/features/personal/GiftCards.tsx) and mobile
+    // (giftcards_screen.dart) clients already send `pin`; we must enforce it
+    // here so a hijacked session cannot drain the wallet buying gift cards.
+    const pinCheck = await verifyTransactionPin(req.body?.pin, { userId });
+    if (!pinCheck.ok) {
+      return res.status(400).json({ success: false, code: pinCheck.code, error: pinCheck.error });
     }
 
     // Wallet resolution: normalize empty/missing wallet_id (an empty string

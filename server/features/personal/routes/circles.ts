@@ -37,6 +37,7 @@ import { sendEmail } from "../../../services/email";
  *   POST /circles/:id/order                → admin rewrites the payout order
  *   POST /circles/:id/leave                → member exits (forming freely; active winds down)
  *   POST /circles/:id/pay                  → pay my slot for the open round now
+ *   POST /circles/:id/cycles/:cycleId/settle → pay a MISSED cycle's slot late
  *   POST /circles/:id/run                  → process due rounds (also lazy + interval)
  *   POST /circles/:id/members/:userId/skip → admin skips a member's slot for a round
  */
@@ -93,6 +94,9 @@ function serializeMember(m: any) {
     trust_label: trustLabel(score),
     paid_total: money(num(m.paid_total)),
     received_total: money(num(m.received_total)),
+    // Web alias — members render `slot` (the DB column is `position`);
+    // additive, mobile keeps reading `position`.
+    slot: m.slot ?? (m.position != null ? Math.round(num(m.position)) : null),
   };
 }
 
@@ -161,11 +165,43 @@ function clientCycle(r: any) {
     payout_name: r.recipient_name ?? null,
     recipient_id: r.recipient_id,
     recipient_name: r.recipient_name ?? null,
+    recipient_avatar: r.recipient_avatar ?? null,
     due_at: r.due_at,
     status: r.status === "paid_out" ? "paid" : r.status === "cancelled" ? "closed" : "scheduled",
     collected: money(num(r.collected_amount)),
     paid_at: r.paid_out_at ?? null,
   };
+}
+
+/** Web contract — per-cycle contribution rows grouped by round_id:
+ *  { [roundId]: [{ user_id, status, amount, paid_at, timing, display_name }] }
+ *  `status` is the client-facing one (paid | late | missed | skipped | pending)
+ *  via clientPayStatus, so the calendar badges color correctly. Never returns
+ *  undefined — an empty object when the circle has no payments yet. */
+async function loadContributions(circleId: string): Promise<Record<string, Array<object>>> {
+  const r = await query(
+    `SELECT p.round_id, p.payer_id, p.amount, p.status, p.timing, p.paid_at,
+            u.name AS display_name, u.avatar_url AS avatar_url
+       FROM savings_circle_payments p
+       JOIN users u ON u.id = p.payer_id
+      WHERE p.circle_id = $1
+      ORDER BY p.round_id ASC, p.paid_at ASC NULLS LAST, u.name ASC`,
+    [circleId],
+  );
+  const grouped: Record<string, Array<object>> = {};
+  for (const row of r.rows) {
+    const key = String(row.round_id);
+    (grouped[key] ||= []).push({
+      user_id: String(row.payer_id),
+      status: clientPayStatus(String(row.status || "pending"), row.timing ?? null),
+      amount: money(num(row.amount)),
+      paid_at: row.paid_at ?? null,
+      timing: row.timing ?? null,
+      display_name: row.display_name ?? null,
+      avatar_url: row.avatar_url ?? null,
+    });
+  }
+  return grouped;
 }
 
 /** Accepts req.params.id as-is (Express 5 types it string | string[]) and
@@ -588,9 +624,14 @@ router.get("/", authenticateToken, checkSubscriptionStatus, async (req: Authenti
       return {
         ...s,
         my_role: r.my_role,
+        my_status: r.my_status,
         my_position: r.my_position,
         my_trust_score: clampTrust(num(r.my_trust_score)),
         my_streak: r.my_streak,
+        // Web aliases — additive; mobile keeps reading my_position /
+        // next_recipient_name.
+        my_slot: r.my_position,
+        next_payout_name: r.next_recipient_name ?? null,
       };
     });
     const invites = rows.rows.filter((r: any) => r.my_status === "invited").map(serializeCircle);
@@ -610,7 +651,9 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     const description = String(req.body?.description || "").trim().slice(0, 500) || null;
     const amount = money(num(req.body?.contribution_amount));
     const frequency = FREQUENCIES.has(String(req.body?.frequency)) ? String(req.body.frequency) : "weekly";
-    const maxMembers = Math.round(num(req.body?.max_members)) || 10;
+    // member_limit is the web's field name; max_members is the DB/mobile's —
+    // accept both (max_members wins when both are sent).
+    const maxMembers = Math.round(num(req.body?.max_members ?? req.body?.member_limit)) || 10;
     const graceHours = Math.min(72, Math.max(6, Math.round(num(req.body?.grace_hours)) || 48));
 
     if (name.length < 3 || name.length > 100) {
@@ -658,6 +701,14 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
     const activeCount = await activeMemberCount(circle.id);
     const pot = money(amount(activeCount, circle.contribution_amount));
 
+    // Web contract aliases — `cycles` is the same calendar as `rounds` in the
+    // shape the web renders (mobile keeps reading `rounds`), `contributions`
+    // groups the payments per round, `my_member` is the caller's serialized
+    // membership. All additive; never undefined.
+    const cycles = rounds.map(clientCycle);
+    const contributions = await loadContributions(circle.id);
+    const myMember = members.find((m: any) => String(m.user_id) === String(userId)) || null;
+
     // My pending payment for the open round (if any).
     let myPending = null;
     const open = rounds.find((r: any) => r.status === "collecting");
@@ -681,12 +732,15 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
       circle: { ...serializeCircle(circle), active_count: activeCount, pot_per_round: pot },
       members,
       rounds,
+      cycles,
+      contributions,
       email_invites: emailInvites.rows,
       my: {
         membership_id: me.id,
         role: me.role,
         status: me.status,
         position: me.position,
+        slot: me.position,
         trust_score: clampTrust(num(me.trust_score)),
         trust_label: trustLabel(num(me.trust_score)),
         streak: me.streak,
@@ -694,6 +748,8 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
         received_total: money(num(me.received_total)),
         pending_payment: myPending,
       },
+      // Web contract — the caller's member row (slot, role, status, trust…).
+      my_member: myMember,
     });
   } catch (e: any) {
     console.error("[circles/detail]", e?.message);
@@ -1297,6 +1353,224 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
   } catch (e: any) {
     console.error("[circles/pay]", e?.message);
     res.status(500).json({ success: false, error: "Could not pay your contribution" });
+  }
+});
+
+// Settle a MISSED cycle's slot — the member pays a contribution the engine
+// already marked failed (or one sitting past grace that the engine hasn't
+// picked up yet). Same claim-before-debit pattern as /:id/pay: the payment
+// row is claimed (pending|failed → paid) with a conditional UPDATE first, so
+// replays and the engine can never double-debit. Trust: a missed slot costs
+// -15 (see processRound) — a late settle restores that credit. If the pot was
+// already released, the late money goes to the round's recipient (the payment
+// claim is the single gate that guarantees the credit runs once).
+router.post("/:id/cycles/:cycleId/settle", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    kickEngine();
+    const userId = req.user!.userId;
+    const circle = await loadCircle(req.params.id);
+    if (!circle) return res.status(404).json({ success: false, error: "Circle not found" });
+    if (circle.status !== "active") {
+      return res.status(400).json({ success: false, error: "This circle is not running" });
+    }
+    const me = await myMembership(circle.id, userId);
+    if (!me || me.status !== "active") {
+      return res.status(403).json({ success: false, error: "You are not an active member of this circle" });
+    }
+
+    const cycleKey = String((Array.isArray(req.params.cycleId) ? req.params.cycleId[0] : req.params.cycleId) || "").trim();
+    if (!UUID_RE.test(cycleKey)) return res.status(400).json({ success: false, error: "Invalid cycle" });
+
+    const r = await query(
+      `SELECT * FROM savings_circle_rounds WHERE id = $1 AND circle_id = $2 LIMIT 1`,
+      [cycleKey, circle.id],
+    );
+    const round = r.rows[0];
+    if (!round) return res.status(404).json({ success: false, error: "Cycle not found in this circle" });
+    if (round.status === "cancelled") {
+      return res.status(400).json({ success: false, error: "This cycle was cancelled — nothing to settle" });
+    }
+    if (round.status === "upcoming") {
+      return res.status(400).json({ success: false, error: "This cycle hasn't opened yet" });
+    }
+
+    const p = await query(
+      `SELECT * FROM savings_circle_payments WHERE round_id = $1 AND payer_id = $2 LIMIT 1`,
+      [round.id, userId],
+    );
+    const payment = p.rows[0];
+    if (!payment) return res.status(400).json({ success: false, error: "No contribution slot found for you this cycle" });
+    if (payment.status === "paid") {
+      return res.status(400).json({ success: false, code: "ALREADY_PAID", error: "Your contribution for this cycle is already in" });
+    }
+    if (payment.status === "skipped") {
+      return res.status(400).json({ success: false, code: "NOT_PAYABLE", error: "This slot was skipped by the admin" });
+    }
+    if (payment.status !== "pending" && payment.status !== "failed") {
+      return res.status(400).json({ success: false, code: "NOT_PENDING", error: `This slot was ${payment.status}` });
+    }
+
+    // Settle is strictly for MISSED slots — inside the grace window the
+    // regular /:id/pay flow applies.
+    const now = await dbNow();
+    const dueAt = new Date(round.due_at);
+    const graceEnds = new Date(dueAt.getTime() + Math.max(0, Math.round(num(circle.grace_hours))) * 3600_000);
+    const wasFailed = payment.status === "failed";
+    if (!wasFailed && now <= graceEnds) {
+      return res.status(400).json({
+        success: false,
+        code: "STILL_IN_GRACE",
+        error: "This cycle is still inside its grace window — pay it from the calendar instead",
+      });
+    }
+
+    const amountMoney = money(num(payment.amount));
+    // CLAIM FIRST (pending|failed → paid) — the never-double-debit guard.
+    const walletReference = `CIR-SETTLE-${payment.id}`.slice(0, 255);
+    const claim = await query(
+      `UPDATE savings_circle_payments
+          SET status = 'paid', timing = 'late', paid_at = CURRENT_TIMESTAMP, wallet_reference = $2
+        WHERE id = $1 AND payer_id = $3 AND status IN ('pending','failed')
+        RETURNING id`,
+      [payment.id, walletReference, userId],
+    );
+    if (!claim.rows.length) {
+      return res.status(400).json({ success: false, code: "ALREADY_CLAIMED", error: "This slot was just settled — refresh to see it" });
+    }
+
+    let walletId: string | null = null;
+    let debited = 0;
+    try {
+      const w = await query(
+        `SELECT id FROM wallets
+          WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+          ORDER BY created_at ASC LIMIT 1`,
+        [userId],
+      );
+      const wallet = w.rows[0];
+      if (!wallet) throw new Error("no-ngn-wallet");
+      const debit = await query(
+        `UPDATE wallets SET balance = balance - $2, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1 AND balance >= $2 AND status = 'active' RETURNING id`,
+        [wallet.id, amountMoney],
+      );
+      if (!debit.rows.length) throw new Error("insufficient-balance");
+      walletId = wallet.id;
+      debited = amountMoney;
+
+      await insertTransaction({
+        userId,
+        walletId: wallet.id,
+        reference: walletReference,
+        type: "debit",
+        transactionType: "circle_contribution",
+        amount: amountMoney,
+        currency: "NGN",
+        description: `Savings circle — ${String(circle.name).slice(0, 60)} (round ${Math.round(num(round.round_number))}, late settle)`,
+      });
+
+      await query(
+        `UPDATE savings_circle_members
+            SET paid_total = paid_total + $2, updated_at = CURRENT_TIMESTAMP
+          WHERE circle_id = $1 AND user_id = $3`,
+        [circle.id, amountMoney, userId],
+      );
+
+      if (round.status === "collecting") {
+        // Still open (engine lag) — release when the settle completes it.
+        // releasePot's status guard makes this safe under any race.
+        const counts = await query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+             COUNT(*) FILTER (WHERE status = 'paid')::int AS paid,
+             COUNT(*)::int AS total
+             FROM savings_circle_payments WHERE round_id = $1`,
+          [round.id],
+        );
+        const c = counts.rows[0] || {};
+        if (c.total > 0 && c.pending === 0 && c.paid === c.total) {
+          await releasePot(circle, round);
+        }
+      } else if (round.status === "paid_out") {
+        // The pot already went out without this money — route the late
+        // contribution to the round's recipient. Runs exactly once because
+        // the payment claim above is the only gate to this block.
+        const rw = await query(
+          `SELECT id FROM wallets
+            WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+            ORDER BY created_at ASC LIMIT 1`,
+          [round.recipient_id],
+        );
+        const recipWallet = rw.rows[0];
+        if (!recipWallet) throw new Error("recipient-wallet-unavailable");
+        const outRef = `CIR-OUT-${round.id}-${payment.id}`.slice(0, 255);
+        await creditWallet(recipWallet.id, amountMoney);
+        await insertTransaction({
+          userId: String(round.recipient_id),
+          walletId: recipWallet.id,
+          reference: outRef,
+          type: "credit",
+          transactionType: "circle_payout",
+          amount: amountMoney,
+          currency: "NGN",
+          description: `Savings circle late settle — ${String(circle.name).slice(0, 60)} (round ${Math.round(num(round.round_number))})`,
+        });
+        await query(
+          `UPDATE savings_circle_members
+              SET received_total = received_total + $2, updated_at = CURRENT_TIMESTAMP
+            WHERE circle_id = $1 AND user_id = $3`,
+          [circle.id, amountMoney, round.recipient_id],
+        );
+        await query(
+          `UPDATE savings_circle_rounds
+              SET collected_amount = collected_amount + $2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1`,
+          [round.id, amountMoney],
+        );
+        await notify({
+          userId: String(round.recipient_id),
+          type: "circle_payout",
+          title: "Circle late contribution received",
+          message: `A missed ₦${amountMoney.toLocaleString()} contribution for round ${Math.round(num(round.round_number))} of "${String(circle.name).slice(0, 60)}" just landed in your wallet.`,
+          actionUrl: "/savings?tab=circles",
+          actionType: "view_circle",
+          metadata: { circleId: circle.id, roundId: round.id, amount: amountMoney },
+        });
+      }
+
+      // Trust: the engine dents a missed slot -15 — settle restores that
+      // credit. A pending row was never dented, so nothing to restore.
+      // Kept LAST inside the try: every failure before this point refunds the
+      // debit and re-opens the claim without touching trust.
+      if (wasFailed) {
+        await adjustTrust(circle.id, userId, +15, false);
+      }
+
+      const fresh = await loadCircle(circle.id);
+      res.json({ success: true, circle: serializeCircle(fresh) });
+    } catch (e: any) {
+      console.error(`[circles/settle] ${payment.id} failed:`, e?.message);
+      // Compensation — same care as /:id/pay: refund the debit and re-open
+      // the claim (restoring the row's prior status) so the member can retry.
+      if (debited > 0 && walletId) {
+        await creditWallet(walletId, debited).catch((rErr: any) =>
+          console.error("[circles/settle] CRITICAL: wallet refund failed:", rErr?.message));
+      }
+      await query(
+        `UPDATE savings_circle_payments
+            SET status = $2, timing = NULL, paid_at = NULL, wallet_reference = NULL
+          WHERE id = $1 AND wallet_reference = $3`,
+        [payment.id, wasFailed ? "failed" : "pending", walletReference],
+      ).catch(() => {});
+      return res.status(400).json({
+        success: false,
+        code: "SETTLE_FAILED",
+        error: "Could not complete the late payment — nothing was charged. Try again in a moment.",
+      });
+    }
+  } catch (e: any) {
+    console.error("[circles/settle]", e?.message);
+    res.status(500).json({ success: false, error: "Could not settle the missed contribution" });
   }
 });
 

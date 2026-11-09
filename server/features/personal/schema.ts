@@ -1612,6 +1612,31 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_payments_payer ON savings_circle_payments(payer_id, status)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_payments_round ON savings_circle_payments(round_id, status)`);
 
+  // Invite codes + EMAIL invites — the clients share the circle via a short
+  // code (join-by-code) and admins can invite not-yet-registered friends by
+  // email; those hold a PENDING invite row until the person signs up.
+  await query(`ALTER TABLE savings_circles ADD COLUMN IF NOT EXISTS invite_code VARCHAR(20)`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_savings_circles_invite_code ON savings_circles(invite_code) WHERE invite_code IS NOT NULL`);
+  // Backfill codes for circles created before the column existed (forming
+  // circles only — active/completed ones never shared a code).
+  await query(`
+    UPDATE savings_circles
+       SET invite_code = UPPER(SUBSTRING(MD5(random()::text || id::text), 1, 10))
+     WHERE invite_code IS NULL AND status = 'forming'
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS savings_circle_invites (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      circle_id UUID NOT NULL REFERENCES savings_circles(id) ON DELETE CASCADE,
+      email VARCHAR(255) NOT NULL,
+      invited_by UUID NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',     -- pending | accepted
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (circle_id, email)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_invites_email ON savings_circle_invites(LOWER(email))`);
+
   // ---------------------------------------------------------------------
   // SPENDING INSIGHTS & BUDGETS — auto-categorized spend analytics over the
   // transactions the user already generates (bills/airtime/data, transfers,

@@ -442,8 +442,13 @@ router.get("/nudges", authenticateToken, checkSubscriptionStatus, async (req: Au
 
     res.json({ success: true, nudges: nudges.slice(0, 6) });
   } catch (e: any) {
+    // Resilience contract: the nudges surface is best-effort — a missing or
+    // broken optional signal (no budgets table, no transactions yet, a dead
+    // round-up settings row) must NOT 500 the Insights home. Log the error
+    // for ops, then return an empty nudge array so the client renders the
+    // empty state instead of a hard error.
     console.error("[insights/nudges]", e?.message);
-    res.status(500).json({ success: false, error: "Could not load your nudges" });
+    res.json({ success: true, nudges: [] });
   }
 });
 

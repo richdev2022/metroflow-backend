@@ -76,6 +76,81 @@ function mapListingRow(l: any, boost?: any, saved = false) {
   };
 }
 
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function firstImage(images: unknown): string | null {
+  if (Array.isArray(images)) {
+    const first = images.find((x) => typeof x === "string" && x.length > 0);
+    return typeof first === "string" ? first : null;
+  }
+  return null;
+}
+
+/**
+ * Clean order DTO for the mobile Orders/Sales tabs (and the web owner
+ * surfaces, which keep their legacy key names). Rules:
+ *   · DECIMAL columns arrive from pg as strings — every money field ships as
+ *     a number so clients never render "12000.00" raw or `₦NaN`.
+ *   · Missing/null fields are null (never undefined) and image lists are
+ *     always arrays — a listing without images must not crash a tab.
+ *   · Delivery info carries the ETA + weekday name WHEN the order record has
+ *     one (delivery_eta); empty otherwise. Both flat keys (web) and the
+ *     nested `delivery` object (mobile) are provided.
+ */
+function mapOrderRow(o: any, viewer: "buyer" | "seller") {
+  const images = Array.isArray(o.listing_images)
+    ? o.listing_images.filter((x: unknown): x is string => typeof x === "string" && x.length > 0)
+    : [];
+  const rawEta = o.delivery_eta ? new Date(o.delivery_eta) : null;
+  const eta = rawEta && !isNaN(rawEta.getTime()) ? rawEta : null;
+  const etaIso = eta ? eta.toISOString() : null;
+  const etaDay = eta ? WEEKDAYS[eta.getUTCDay()] : null;
+  return {
+    id: o.id,
+    reference: o.reference || null,
+    listing_id: o.listing_id || null,
+    // Item
+    title: o.listing_name || null,
+    listing_name: o.listing_name || null,
+    image: firstImage(images),
+    image_url: firstImage(images),
+    images,
+    listing_images: images,
+    // Money
+    price: Number(o.unit_price) || 0,
+    unit_price: Number(o.unit_price) || 0,
+    total: Number(o.total) || 0,
+    fee: Number(o.fee) || 0,
+    quantity: Number(o.quantity) || 1,
+    currency: o.currency || "NGN",
+    status: o.status || null,
+    // Counterparty — the OTHER side of THIS viewer's role, plus the flat
+    // seller_name/buyer_name keys the web + mobile already render.
+    counterparty:
+      viewer === "buyer"
+        ? { id: o.seller_id || null, name: o.seller_name || null }
+        : { id: o.buyer_id || null, name: o.buyer_name || null },
+    seller: { id: o.seller_id || null, name: o.seller_name || null },
+    buyer: { id: o.buyer_id || null, name: o.buyer_name || null },
+    seller_name: o.seller_name || null,
+    buyer_name: o.buyer_name || null,
+    // Delivery — ETA + day only when the record carries one.
+    delivery_address: o.delivery_address || null,
+    delivery_phone: o.delivery_phone || null,
+    delivery_eta: etaIso,
+    delivery_eta_day: etaDay,
+    delivery: {
+      address: o.delivery_address || null,
+      phone: o.delivery_phone || null,
+      eta: etaIso,
+      eta_day: etaDay,
+    },
+    payment_released_at: o.payment_released_at || null,
+    created_at: o.created_at,
+    updated_at: o.updated_at,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Wall
 // ---------------------------------------------------------------------------
@@ -459,9 +534,10 @@ router.get("/orders/mine", authenticateToken, async (req: AuthenticatedRequest, 
        WHERE o.buyer_id = $1 ORDER BY o.created_at DESC LIMIT 100`,
       [req.user!.userId],
     );
-    res.json({ success: true, data: { orders: r.rows } });
-  } catch {
-    res.status(500).json({ success: false, error: "Could not load orders" });
+    res.json({ success: true, data: { orders: r.rows.map((o: any) => mapOrderRow(o, "buyer")) } });
+  } catch (e: any) {
+    console.error("marketplace orders error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load orders", data: { orders: [] } });
   }
 });
 
@@ -475,9 +551,10 @@ router.get("/sales/mine", authenticateToken, async (req: AuthenticatedRequest, r
        WHERE o.seller_id = $1 ORDER BY o.created_at DESC LIMIT 100`,
       [req.user!.userId],
     );
-    res.json({ success: true, data: { sales: r.rows } });
-  } catch {
-    res.status(500).json({ success: false, error: "Could not load sales" });
+    res.json({ success: true, data: { sales: r.rows.map((o: any) => mapOrderRow(o, "seller")) } });
+  } catch (e: any) {
+    console.error("marketplace sales error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load sales", data: { sales: [] } });
   }
 });
 

@@ -827,6 +827,71 @@ export const getConversationMessages: RequestHandler = async (
  *       200:
  *         description: Existing direct conversation returned
  */
+/**
+ * Fully-hydrated conversation row (participants with name/email/avatar +
+ * presence, last message, unread count). Shared by the conversation-CREATE
+ * response (both the "existing direct conversation" fast path and the freshly
+ * created one) so every client — mobile Conversation.fromJson included — gets
+ * the SAME shape the GET /chat/conversations list produces. The mobile
+ * "Message seller" flow feeds this straight into ChatDetailScreen; a bare
+ * create row used to render a nameless "Direct chat" header with no avatar.
+ */
+async function getHydratedConversationRow(conversationId: string) {
+  const hydrated = await query(
+    `SELECT
+      cc.id, cc.business_id as "businessId", cc.name, cc.type,
+      cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
+      (
+        SELECT json_agg(json_build_object(
+          'id', cp.id,
+          'userId', cp.user_id,
+          'role', COALESCE(cp.role, 'member'),
+          'lastReadAt', cp.last_read_at,
+          'lastSeen', (
+            SELECT us.last_activity_at
+            FROM user_sessions us
+            WHERE us.user_id = cp.user_id
+            ORDER BY us.last_activity_at DESC
+            LIMIT 1
+          ),
+          'presenceStatus', COALESCE(u.presence_status, 'offline'),
+          'lastSeenAt', u.last_seen_at,
+          'name', u.name,
+          'email', u.email,
+          'avatarUrl', u.avatar_url
+        ))
+        FROM chat_participants cp
+        LEFT JOIN users u ON cp.user_id = u.id
+        WHERE cp.conversation_id = cc.id
+      ) as participants,
+      (SELECT CASE
+         WHEN cm.deleted_for_everyone THEN 'This message was deleted'
+         WHEN cm.content IS NOT NULL AND btrim(cm.content) <> '' THEN cm.content
+         WHEN cm.attachment_type = 'image' THEN '📷 Photo'
+         WHEN cm.attachment_type = 'video' THEN '🎬 Video'
+         WHEN cm.attachment_type = 'audio' THEN '🎤 Voice note'
+         WHEN cm.attachment_type = 'gif' THEN 'GIF'
+         WHEN cm.attachment_type = 'sticker' THEN 'Sticker'
+         WHEN cm.attachment_name IS NOT NULL AND btrim(cm.attachment_name) <> ''
+           THEN ('📎 ' || cm.attachment_name)
+         WHEN cm.attachment_url IS NOT NULL THEN '📎 Attachment'
+         ELSE 'Message'
+       END
+       FROM chat_messages cm
+       WHERE cm.conversation_id = cc.id
+       ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
+      (SELECT cm.created_at FROM chat_messages cm
+       WHERE cm.conversation_id = cc.id
+       ORDER BY cm.created_at DESC LIMIT 1) as "lastMessageAt",
+      0 as "unreadCount"
+    FROM chat_conversations cc
+    WHERE cc.id = $1
+    LIMIT 1`,
+    [conversationId],
+  );
+  return hydrated.rows[0] || null;
+}
+
 export const createConversation: RequestHandler = async (
   req: AuthenticatedRequest,
   res,
@@ -938,67 +1003,14 @@ export const createConversation: RequestHandler = async (
         // response / GET list) — clients feed this straight into their
         // conversation model, so a bare `{ id }` used to render a broken
         // "Direct chat" header with no participants.
-        const hydrated = await query(
-          `SELECT
-            cc.id, cc.business_id as "businessId", cc.name, cc.type,
-            cc.created_by as "createdById", cc.created_at as "createdAt", cc.updated_at as "updatedAt",
-            (
-              SELECT json_agg(json_build_object(
-                'id', cp.id,
-                'userId', cp.user_id,
-                'role', COALESCE(cp.role, 'member'),
-                'lastReadAt', cp.last_read_at,
-                'lastSeen', (
-                  SELECT us.last_activity_at
-                  FROM user_sessions us
-                  WHERE us.user_id = cp.user_id
-                  ORDER BY us.last_activity_at DESC
-                  LIMIT 1
-                ),
-                'presenceStatus', COALESCE(u.presence_status, 'offline'),
-                'lastSeenAt', u.last_seen_at,
-                'name', u.name,
-                'email', u.email,
-                'avatarUrl', u.avatar_url
-              ))
-              FROM chat_participants cp
-              LEFT JOIN users u ON cp.user_id = u.id
-              WHERE cp.conversation_id = cc.id
-            ) as participants,
-            (SELECT CASE
-               WHEN cm.deleted_for_everyone THEN 'This message was deleted'
-               WHEN cm.content IS NOT NULL AND btrim(cm.content) <> '' THEN cm.content
-               WHEN cm.attachment_type = 'image' THEN '📷 Photo'
-               WHEN cm.attachment_type = 'video' THEN '🎬 Video'
-               WHEN cm.attachment_type = 'audio' THEN '🎤 Voice note'
-               WHEN cm.attachment_type = 'gif' THEN 'GIF'
-               WHEN cm.attachment_type = 'sticker' THEN 'Sticker'
-               WHEN cm.attachment_name IS NOT NULL AND btrim(cm.attachment_name) <> ''
-                 THEN ('📎 ' || cm.attachment_name)
-               WHEN cm.attachment_url IS NOT NULL THEN '📎 Attachment'
-               ELSE 'Message'
-             END
-             FROM chat_messages cm
-             WHERE cm.conversation_id = cc.id
-             ORDER BY cm.created_at DESC LIMIT 1) as "lastMessage",
-            (SELECT cm.created_at FROM chat_messages cm
-             WHERE cm.conversation_id = cc.id
-             ORDER BY cm.created_at DESC LIMIT 1) as "lastMessageAt",
-            0 as "unreadCount"
-          FROM chat_conversations cc
-          WHERE cc.id = $1
-          LIMIT 1`,
-          [existingResult.rows[0].id],
-        );
-
+        const row: any = (await getHydratedConversationRow(existingResult.rows[0].id)) || {
+          id: existingResult.rows[0].id,
+        };
+        const pretty = formatCallLogPreview(row?.lastMessage);
+        if (pretty) row.lastMessage = pretty;
         const response: ApiResponse<any> = {
           success: true,
-          data: (() => {
-            const row: any = hydrated.rows[0] || { id: existingResult.rows[0].id };
-            const pretty = formatCallLogPreview(row?.lastMessage);
-            if (pretty) row.lastMessage = pretty;
-            return row;
-          })(),
+          data: row,
         };
         return res.json(response);
       }
@@ -1038,9 +1050,35 @@ export const createConversation: RequestHandler = async (
       }
     }
 
+    // RESPONSE SHAPE PARITY: hydrate the fresh row exactly like the
+    // existing-conversation path above (participants carry name/email/avatar +
+    // presence) and derive the same display helpers the GET list emits. The
+    // mobile "Message seller" flow feeds this object straight into
+    // Conversation.fromJson → ChatDetailScreen, so a bare insert row used to
+    // open a nameless "Direct chat" room with no avatar. Best-effort: if the
+    // hydration read fails the create response still goes out with the
+    // participant rows we already have.
+    let payload: any = conversation;
+    try {
+      const hydrated = await getHydratedConversationRow(conversation.id);
+      if (hydrated) {
+        const parts = Array.isArray(hydrated.participants) ? hydrated.participants : [];
+        const other = parts.find((p: any) => p && p.userId && String(p.userId) !== String(userId));
+        const isGroup = (hydrated.type || "direct") !== "direct" || parts.length > 2;
+        payload = {
+          ...hydrated,
+          isGroup,
+          displayName: isGroup ? (hydrated.name || "Group chat") : (other?.name || hydrated.name || "Direct chat"),
+          displayAvatarUrl: isGroup ? null : (other?.avatarUrl || null),
+        };
+      }
+    } catch (hydrateError) {
+      console.error("Conversation hydration error:", hydrateError);
+    }
+
     const response: ApiResponse<any> = {
       success: true,
-      data: conversation,
+      data: payload,
     };
     res.status(201).json(response);
   } catch (error) {
@@ -1264,10 +1302,16 @@ export const sendMessage: RequestHandler = async (
 
         // FCM push for OTHER participants (WhatsApp-style): without this,
         // chat messages only ever reached devices through the socket — a
-        // killed app never saw any chat notification. Fire-and-forget;
-        // carries the recipient's TOTAL unread count so the mobile launcher
-        // badge stays exact.
-        try {
+        // killed app never saw any chat notification.
+        // NOT AWAITED: this block used to run before the 201 response — the
+        // per-recipient unread COUNT queries plus the FCM OAuth/HTTP round
+        // trips (up to ~15s each when Firebase is degraded) delayed the
+        // sender's own message ack until the mobile client's 30s timeout gave
+        // up, so "send" appeared to hang/fail even though the message was
+        // stored. The sender's response now goes out immediately and delivery
+        // fans out in the background; carries the recipient's TOTAL unread
+        // count so the mobile launcher badge stays exact.
+        void (async () => {
           const { sendPushToUsers } = await import("../services/push");
           const recipientIds = participantsResult.rows
             .map((row: any) => row.userId)
@@ -1353,9 +1397,9 @@ export const sendMessage: RequestHandler = async (
               console.error("Chat web-push error:", webPushError);
             }
           }
-        } catch (chatPushError) {
+        })().catch((chatPushError) => {
           console.error("Chat FCM push error:", chatPushError);
-        }
+        });
       } catch (notifyError) {
         console.error("Chat notification push error:", notifyError);
       }

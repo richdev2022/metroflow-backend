@@ -747,6 +747,10 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_buyer ON market_orders(buyer_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_market_orders_seller ON market_orders(seller_id)`);
+  // Delivery ETA (idempotent ladder) — sellers can stamp an estimated delivery
+  // date on an order; the orders/sales DTOs surface it (plus the weekday name)
+  // whenever it is present and stay null otherwise.
+  await query(`ALTER TABLE market_orders ADD COLUMN IF NOT EXISTS delivery_eta TIMESTAMP`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS market_saves (

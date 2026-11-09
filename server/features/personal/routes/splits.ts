@@ -31,7 +31,11 @@ const router = express.Router();
 function num(v: any): number { return Number(v) || 0; }
 function money(v: number): number { return Math.round(v * 100) / 100; }
 
-const CONTEXTS = new Set(["direct", "group", "page"]);
+// Contexts: the API's own direct/group/page PLUS the labels the web
+// SplitPots composer sends (dinner/trip/gift/rent/other). Unknown values
+// still fall back to "direct" — but a web-created "dinner" split no longer
+// comes back mangled, so its context chip renders correctly.
+const CONTEXTS = new Set(["direct", "group", "page", "dinner", "trip", "gift", "rent", "other"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const SPLIT_BASE = `
@@ -289,6 +293,8 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
       participating: participating.rows.map((r: any) => ({
         ...serializeSplit(r),
         my_share_amount: num(r.share_amount),
+        // `my_share` — the key the web SplitPots page renders for "your share".
+        my_share: num(r.share_amount),
         my_status: r.my_status,
         paid_at: r.paid_at,
       })),
@@ -305,6 +311,10 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
     const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
 
@@ -333,6 +343,10 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
 router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
     const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
     if (split.status !== "pending") {
@@ -471,6 +485,10 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
 router.post("/:id/decline", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
     const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
 
@@ -531,6 +549,10 @@ router.post("/:id/decline", authenticateToken, checkSubscriptionStatus, async (r
 router.post("/:id/remind", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
     const split = await loadSplit(String(req.params.id));
     if (!split) return res.status(404).json({ success: false, error: "Split not found" });
     if (split.creator_id !== userId) {

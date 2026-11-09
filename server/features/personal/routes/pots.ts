@@ -27,7 +27,10 @@ const router = express.Router();
 function num(v: any): number { return Number(v) || 0; }
 function money(v: number): number { return Math.round(v * 100) / 100; }
 
-const CONTEXTS = new Set(["direct", "group", "page"]);
+// Contexts mirror the splits router — the API's direct/group/page PLUS the
+// web composer's dinner/trip/gift/rent/other labels (unknown → "direct").
+const CONTEXTS = new Set(["direct", "group", "page", "dinner", "trip", "gift", "rent", "other"]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const POT_BASE = `
   SELECT p.*, u.name AS creator_name, u.avatar_url AS creator_avatar,
@@ -37,10 +40,19 @@ const POT_BASE = `
 
 function serializePot(p: any) {
   if (!p) return p;
+  const target = p.target_amount === null || p.target_amount === undefined ? null : num(p.target_amount);
+  const balance = num(p.balance);
+  // Web contract (SplitPots PotRow): `total_contributed` drives the raised
+  // figure, `percent`/`remaining` drive the progress bar. The API row only
+  // carries `balance`, so every pot response previously rendered ₦0 raised
+  // and no progress until the detail sheet was opened.
   return {
     ...p,
-    target_amount: p.target_amount === null || p.target_amount === undefined ? null : num(p.target_amount),
-    balance: num(p.balance),
+    target_amount: target,
+    balance,
+    total_contributed: balance,
+    percent: target !== null && target > 0 ? Math.min(100, Math.round((balance / target) * 100)) : 0,
+    remaining: target !== null ? Math.max(0, money(target - balance)) : null,
   };
 }
 
@@ -153,6 +165,10 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 // ---------------------------------------------------------------------------
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
     const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
 
@@ -190,6 +206,10 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
       return res.status(400).json({ success: false, error: "amount must be greater than 0" });
     }
 
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
     const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
     if (pot.status !== "open") {
@@ -314,6 +334,10 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
 router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
+    // Guard the ::uuid cast — a malformed id must 404, not 500 (22P02).
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
     const pot = await loadPot(String(req.params.id));
     if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
     if (pot.creator_id !== userId) {
@@ -358,7 +382,10 @@ router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req
         });
       }
       const freshPot = await loadPot(pot.id);
-      return res.json({ success: true, pot: serializePot(freshPot) });
+      // `payout` — the web SplitPots close toast reads it
+      // (r.data?.payout ?? r.data?.data?.payout ?? ...); without it the toast
+      // always showed ₦0.00 even when the wallet credit succeeded.
+      return res.json({ success: true, pot: serializePot(freshPot), payout });
     } catch (payoutErr: any) {
       // Revert the close — money must never be stranded in a closed pot.
       await query(

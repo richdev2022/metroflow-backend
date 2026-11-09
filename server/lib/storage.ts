@@ -53,6 +53,18 @@ class R2Storage {
           accessKeyId: this.config.accessKeyId,
           secretAccessKey: this.config.secretAccessKey,
         },
+        // BOUND THE STORAGE WRITE: without a request timeout a stalled R2
+        // connection hung `uploadFile` forever, which kept POST handlers that
+        // await their media upload (feed video posts, marketplace images,
+        // chat attachments) from EVER responding — the client sat at 100%
+        // upload progress until its own timeout. A bounded timeout converts
+        // the stall into an error, and the shared uploadMediaBuffer pipeline
+        // then degrades to local /uploads so the request still completes.
+        requestHandler: {
+          connectionTimeout: 10_000,
+          requestTimeout: 120_000,
+          throwOnRequestTimeout: true,
+        },
       });
       logger.info("✅ Cloudflare R2 storage initialized");
     } catch (error) {
@@ -315,7 +327,14 @@ class CloudinaryStorage {
     if (folder) form.append("folder", folder);
 
     const endpoint = `https://api.cloudinary.com/v1_1/${this.cloudName}/${resourceType}/upload`;
-    const response = await fetch(endpoint, { method: "POST", body: form });
+    // Bounded like the R2 path — a stalled Cloudinary connection must surface
+    // as an error (media-upload falls back to local) instead of hanging the
+    // awaiting POST handler forever.
+    const response = await fetch(endpoint, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(120_000),
+    });
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => response.statusText);

@@ -1164,15 +1164,44 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
     );
     if (!p.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
     // Ordered media carousel (falls back to the legacy columns when empty).
+    // Sound columns ride the rows (same shape as the feed) so the TikTok-style
+    // "Use sound" affordance survives the post-detail refresh too.
     const m = await query(
-      `SELECT media_type, url, poster_url FROM social_post_media WHERE post_id = $1 ORDER BY position, created_at`,
+      `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
+              COALESCE(s.title, m.sound_title) AS sound_title,
+              s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
+              m.sound_url, m.music_volume, m.video_volume
+       FROM social_post_media m
+       LEFT JOIN social_sounds s ON s.id = m.sound_id
+       WHERE m.post_id = $1 ORDER BY m.position, m.created_at`,
       [req.params.id],
     );
     const post = p.rows[0];
-    post.media = m.rows.length
-      ? m.rows
-      : [post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
-         post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean);
+    const mediaRows = m.rows.length
+      ? m.rows.map((row: any) => ({
+          media_type: row.media_type,
+          url: row.url,
+          poster_url: row.poster_url,
+          sound_id: row.sound_id || null,
+          sound_title: row.sound_title || null,
+          sound_audio_url: row.sound_audio_url || null,
+          sound_owner_id: row.sound_owner_id || null,
+          sound_url: row.sound_url || null,
+          music_volume: row.music_volume === null || row.music_volume === undefined ? null : Number(row.music_volume),
+          video_volume: row.video_volume === null || row.video_volume === undefined ? null : Number(row.video_volume),
+        }))
+      : ([post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
+          post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean) as any[]);
+    post.media = mediaRows;
+    // TikTok-style sound attribution — same shape the feed emits: server
+    // sounds keep {id,title,audio_url,owner_id}; a catalog pick (no
+    // social_sounds row) mirrors {id:null,title,audio_url,source:"catalog"}.
+    const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
+    post.sound = soundMedia
+      ? soundMedia.sound_id
+        ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id }
+        : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog" }
+      : null;
     if (post.repost_of_id) {
       const embed = await loadRepostOfs([post.repost_of_id]);
       post.repost_of = embed.get(String(post.repost_of_id)) || null;
@@ -1878,6 +1907,11 @@ router.post("/posts/:id/comments", authenticateToken, uploadAudio.single("audio"
       }).catch(() => {});
       // FCM push so a backgrounded/closed app still alerts; tapping it lands
       // straight on the post's comment section (type=comment + openComments).
+      // The data also carries the comment id (and the parent comment id when
+      // this is a threaded reply) so the app's push QUICK-REPLY action can
+      // POST /social/posts/:id/comments { body, parent_id } without opening
+      // the thread first — a payload without those ids left the quick-reply
+      // with nothing to send to.
       const postOwnerId = post.rows[0].user_id;
       query(`SELECT name FROM users WHERE id = $1`, [userId])
         .then((n) =>
@@ -1889,6 +1923,10 @@ router.post("/posts/:id/comments", authenticateToken, uploadAudio.single("audio"
               data: {
                 type: "comment",
                 postId: String(req.params.id),
+                commentId: String(r.rows[0].id),
+                ...(parentId
+                  ? { parentId: String(parentId), threadId: String(parentId) }
+                  : {}),
                 openComments: "true",
               },
             },

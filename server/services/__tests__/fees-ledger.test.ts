@@ -41,10 +41,13 @@ describe('creditRevenueWallet', () => {
     // Owner invariant: revenue movements must NEVER touch the platform pool.
     expect(inserts.length).toBe(1);
     expect(inserts[0].sql).not.toContain("'platform'");
-    expect(inserts[0].sql).toContain("'subscription'");
+    // production parameterises transaction_type ($6) and direction ($4)
+    // instead of inlining SQL literals — assert on the bound params.
+    expect(inserts[0].params[5]).toBe('subscription'); // revenueType
+    expect(inserts[0].params[3]).toBe('credit'); // direction (credit for revenue credit)
     expect(inserts[0].params[0]).toBe(500); // amount
     expect(inserts[0].params[2]).toBe('SUB-REF-1-REVENUE-CREDIT'); // deterministic ref
-    expect(inserts[0].params[3]).toBe('Subscription Payment'); // description
+    expect(inserts[0].params[4]).toBe('Subscription Payment'); // description
   });
 
   it('defaults to transaction_type fee with a -REVENUE-CREDIT reference', async () => {
@@ -52,7 +55,7 @@ describe('creditRevenueWallet', () => {
 
     const inserts = insertedTransactionRows();
     expect(inserts.length).toBe(1);
-    expect(inserts[0].sql).toContain("'fee'");
+    expect(inserts[0].params[5]).toBe('fee'); // revenueType defaults to 'fee'
     expect(inserts[0].params[2]).toBe('FEE-REF-1-REVENUE-CREDIT');
   });
 
@@ -61,7 +64,7 @@ describe('creditRevenueWallet', () => {
 
     const inserts = insertedTransactionRows();
     expect(inserts.length).toBe(1);
-    expect(inserts[0].sql).toContain("'debit'");
+    expect(inserts[0].params[3]).toBe('debit'); // direction flips to 'debit' for reversals
     expect(inserts[0].params[0]).toBe(25); // amount stored positive
     expect(inserts[0].params[2]).toBe('FEE-REF-2-REVENUE-DEBIT');
   });

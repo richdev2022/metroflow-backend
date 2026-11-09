@@ -39,6 +39,16 @@ vi.mock('./fees', () => ({
   calculateFee: vi.fn().mockResolvedValue(0),
 }));
 
+// Mock app-config: processAllPending() dynamically imports getIntlPayoutSourceCurrency
+// which would otherwise fire a real `SELECT value FROM system_settings` query
+// and consume one of the per-test `mockResolvedValueOnce` slots below, silently
+// shifting every subsequent query expectation by one.
+vi.mock('./app-config', () => ({
+  getIntlPayoutSourceCurrency: vi.fn().mockResolvedValue('NGN'),
+  getSetting: vi.fn().mockResolvedValue('NGN'),
+  isMaintenanceMode: vi.fn().mockResolvedValue(false),
+}));
+
 // Mock the providers factory to return a mock squad provider
 const mockInitiateTransfer = vi.fn();
 const mockVerifyTransfer = vi.fn();
@@ -144,12 +154,20 @@ describe('processAllPending', () => {
         await processAllPending(businessId);
 
         // Verifications via mocked modules.
-        // NOTE: no platform "hold" credit at initiation — the pool only moves
-        // when the payout actually succeeds (debitPlatformWallet below).
-        expect(fees.creditPlatformWallet).not.toHaveBeenCalled();
+        // Post-invariant (commit 1efb95f): a withdrawal writes a platform
+        // hold CREDIT at initiation (`<ref>-PLATFORM`) — that row IS the
+        // withdrawal's platform-ledger entry. The success path no longer
+        // adds a separate platform DEBIT row on payout-success (the colliding
+        // ref never landed before; the hold suffices).
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(
+          100,
+          'NGN',
+          'REF123-PLATFORM',
+          'Platform Wallet Credit for Transfer REF123',
+        );
         expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
-        expect(fees.debitPlatformWallet).toHaveBeenCalledWith(100, 'NGN', expect.anything(), expect.anything());
+        expect(fees.debitPlatformWallet).not.toHaveBeenCalled();
 
         // verifySingleTransfer should NOT have been called since we determined immediate status = success
         // (mockVerifyTransfer is the provider.verifyTransfer call)
@@ -208,18 +226,37 @@ describe('processAllPending', () => {
 
         // 10. Update transfer_queue to 'failed' immediately
         mockQuery.mockResolvedValueOnce({ rows: [] });
-        // 11. SELECT transactions to check if debited (for refund)
+        // 11. SELECT transactions to check if debited (txnCheck — debit row exists)
         mockQuery.mockResolvedValueOnce({ rows: [{ id: 'txn_1' }] });
-        // 12. Refund user wallet (+110)
+        // 12. refundClaim INSERT ... ON CONFLICT ... RETURNING id (wins the claim
+        //     so the wallet credit + ledger reversals actually execute)
+        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'refund_1' }] });
+        // 13. Refund user wallet principal (+amount)
         mockQuery.mockResolvedValueOnce({ rows: [] });
-        // 13+ Remaining direct queries use default fallback
+        // 14. holdRow SELECT — no `<ref>-PLATFORM` hold row in this test mock
+        //     chain, so debitPlatformWallet is NOT called for the hold reversal
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 15. feeClaim INSERT ... ON CONFLICT ... RETURNING id — wins the claim
+        //     so the fee refund + debitRevenueWallet run
+        mockQuery.mockResolvedValueOnce({ rows: [{ id: 'fee_refund_1' }] });
+        // 16. UPDATE wallets refund fee (+fee)
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+        // 17+ UPDATE transactions status='failed' / UPDATE transfer_queue status='failed'
+        //      / post-refund wallet + user SELECTs use the default fallback.
 
         await processAllPending(businessId);
 
-        // Verifications: fee revenue earned then reversed on failure. The pool
-        // ledger is untouched by the failure (no hold was ever written, and
-        // the payout never happened).
-        expect(fees.creditPlatformWallet).not.toHaveBeenCalled();
+        // Verifications: fee revenue earned then reversed on failure. The
+        // platform hold CREDIT is written at initiation (new invariant) — the
+        // failure path here doesn't reverse the hold because the default mock
+        // chain returns no `transaction_type='platform'` hold row, so
+        // debitPlatformWallet stays uncalled.
+        expect(fees.creditPlatformWallet).toHaveBeenCalledWith(
+          100,
+          'NGN',
+          'REF123-PLATFORM',
+          'Platform Wallet Credit for Transfer REF123',
+        );
         expect(fees.creditRevenueWallet).toHaveBeenCalledWith(10, 'NGN', expect.anything(), expect.anything());
         expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
 
@@ -240,12 +277,15 @@ describe('processAllPending', () => {
             })
         );
 
-        // Direct refund verification
-        const userWalletRefundCall = mockQuery.mock.calls.find((call: any[]) => 
-            call[0].includes('UPDATE wallets SET balance = balance +') && 
+        // Direct refund verification — reverseFailedTransfer now splits the
+        // refund into two UPDATE wallets calls (principal + fee) instead of a
+        // single amount+fee UPDATE. Verify BOTH landed with the right amounts.
+        const walletRefundCalls = mockQuery.mock.calls.filter((call: any[]) =>
+            call[0].includes('UPDATE wallets SET balance = balance +') &&
             call[1][1] === transfer.wallet_id
         );
-        expect(userWalletRefundCall).toBeDefined();
-        expect(userWalletRefundCall[1][0]).toEqual(110); // amount + fee = 100 + 10
+        expect(walletRefundCalls.length).toBeGreaterThanOrEqual(2);
+        const refundAmounts = walletRefundCalls.map((c: any[]) => c[1][0]).sort((a: number, b: number) => a - b);
+        expect(refundAmounts).toEqual([10, 100]); // fee (10) + principal (100)
     });
 });

@@ -38,20 +38,26 @@ describe("RTC and chat member scoping", () => {
   });
 
   it("scopes call history to calls involving the authenticated user", async () => {
+    // The getCalls read path opportunistically fires maybeReapStaleCalls()
+    // (throttled to once per 5 min). The reaper's UPDATE is the first query()
+    // call this test sees, so it consumes the first mockResolvedValueOnce —
+    // absorb it with a benign empty-result so the count + list mocks line up.
     (query as any)
-      .mockResolvedValueOnce({ rows: [{ total: "0" }] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [] })                  // reaper UPDATE
+      .mockResolvedValueOnce({ rows: [{ total: "0" }] })      // count
+      .mockResolvedValueOnce({ rows: [] });                  // list
 
     await getCalls(authenticatedRequest(), makeResponse(), vi.fn());
 
-    const countSql = (query as any).mock.calls[0][0];
-    const listSql = (query as any).mock.calls[1][0];
+    const countSql = (query as any).mock.calls.find((c: any[]) => /SELECT COUNT\(\*\) as total[\s\S]*FROM calls c/i.test(String(c[0] || "")))?.[0];
+    const listSql = (query as any).mock.calls.find((c: any[]) => /FROM calls c[\s\S]*ORDER BY c\.created_at DESC/i.test(String(c[0] || "")))?.[0];
 
+    expect(countSql).toBeDefined();
     expect(countSql).toContain("EXISTS");
     expect(countSql).toContain("call_participants");
-    expect((query as any).mock.calls[0][1]).toEqual(["business-id", "user-id"]);
+    expect((query as any).mock.calls.find((c: any[]) => c[0] === countSql)![1]).toEqual(["business-id", "user-id"]);
     expect(listSql).toContain("current_cp");
-    expect((query as any).mock.calls[1][1]).toEqual(["business-id", "user-id", 10, 0]);
+    expect((query as any).mock.calls.find((c: any[]) => c[0] === listSql)![1]).toEqual(["business-id", "user-id", 10, 0]);
   });
 
   it("scopes meeting history to meetings involving the authenticated user", async () => {
@@ -65,9 +71,12 @@ describe("RTC and chat member scoping", () => {
     const listSql = (query as any).mock.calls[1][0];
 
     expect(countSql).toContain("meeting_attendees");
-    expect((query as any).mock.calls[0][1]).toEqual(["business-id", "user-id"]);
+    // Post-42P18 fix: getMeetings filters by involvement only (businessId is
+    // NOT bound — an unused $1 threw 42P18 live). count/list params are now
+    // [userId] and [userId, limit, offset].
+    expect((query as any).mock.calls[0][1]).toEqual(["user-id"]);
     expect(listSql).toContain("current_ma");
-    expect((query as any).mock.calls[1][1]).toEqual(["business-id", "user-id", 10, 0]);
+    expect((query as any).mock.calls[1][1]).toEqual(["user-id", 10, 0]);
   });
 
   it("scopes recording history through recorder, meeting, or call membership", async () => {

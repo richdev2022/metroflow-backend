@@ -8,14 +8,32 @@ vi.mock('../../db', () => ({
   query: vi.fn().mockResolvedValue({ rows: [] }),
 }));
 
-vi.mock('../../lib/storage', () => ({
-  r2Storage: {
+// Mock the storage surface used by recordings.ts. `resolveRecordingMediaUrl`
+// is the wrapper recordings.ts actually calls — expose it as a vi.fn that
+// delegates into the mocked `r2Storage.getPresignedUrl` so the test's
+// assertion on the presigned-URL call still holds end-to-end.
+vi.mock('../../lib/storage', () => {
+  const r2 = {
     isAvailable: vi.fn().mockReturnValue(false),
     uploadFile: vi.fn(),
     deleteFile: vi.fn(),
     getPresignedUrl: vi.fn(),
-  },
-}));
+  };
+  return {
+    r2Storage: r2,
+    resolveRecordingMediaUrl: vi.fn().mockImplementation(async (storageUrl?: string | null) => {
+      const raw = String(storageUrl || '').trim();
+      if (!raw) return raw;
+      if (/^(https?:|data:|blob:)/i.test(raw)) return raw;
+      if (raw.startsWith('/uploads/') || raw.startsWith('/files/')) return raw;
+      // Mirror production: presign bare R2 keys when R2 is available.
+      if (r2.isAvailable()) {
+        return await r2.getPresignedUrl(raw.replace(/^\/+/, ''), 86400);
+      }
+      return `/files/${raw.replace(/^\/+/, '')}`;
+    }),
+  };
+});
 
 vi.mock('../../services/activity', () => ({
   logActivity: vi.fn(),

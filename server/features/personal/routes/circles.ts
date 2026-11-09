@@ -3,12 +3,13 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import { insertTransaction, creditWallet } from "../personal-utils";
 import { createNotification } from "../../../services/notifications";
+import { sendEmail } from "../../../services/email";
 
 /**
  * SAVINGS CIRCLES — rotating group savings, the digital ajo/esusu
  * (mounted at /circles, personal users only).
  *
- * A fixed membership (2–15) rotates a pot: every cycle every ACTIVE member
+ * A fixed membership (2–50) rotates a pot: every cycle every ACTIVE member
  * auto-pays their slot (contribution_amount) from their NGN wallet and one
  * member — by transparent rotation order — takes the full pot. Starting the
  * circle generates the whole payment calendar up front (one round per
@@ -27,7 +28,9 @@ import { createNotification } from "../../../services/notifications";
  *   GET  /circles                          → my circles + pending invites
  *   POST /circles                          → create a circle (creator = admin)
  *   GET  /circles/:id                      → detail: members, calendar, my slot
- *   POST /circles/:id/invite               → admin adds friends (user_ids)
+ *   POST /circles/:id/invite               → admin adds friends (user_ids / emails)
+ *   GET  /circles/:id/invite-candidates    → admin's searchable invite list
+ *   POST /circles/join-by-code             → join with the circle's invite code
  *   POST /circles/:id/join                 → invited member accepts
  *   POST /circles/:id/decline              → invited member declines
  *   POST /circles/:id/start                → admin locks roster + builds calendar
@@ -46,8 +49,19 @@ function money(v: number): number { return Math.round(v * 100) / 100; }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FREQUENCIES = new Set(["weekly", "biweekly", "monthly"]);
 const MIN_MEMBERS = 2;
-const MAX_MEMBERS = 15;
+// Raised from 15 → 50 (clients cap their pickers at 50). Kept as a single
+// constant so admin tuning stays a one-line change.
+const MAX_MEMBERS = 50;
 const TRUST_MAX = 100;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Shareable invite code — uppercase alphanumeric, unique per circle. */
+function newInviteCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I look-alikes
+  let code = "";
+  for (let i = 0; i < 10; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return code;
+}
 
 const MEMBER_BASE = `
   SELECT m.id, m.circle_id, m.user_id, m.role, m.position, m.status, m.trust_score,
@@ -120,15 +134,51 @@ function serializeCircle(c: any) {
   return {
     ...c,
     contribution_amount: money(num(c.contribution_amount)),
+    // Client-facing aliases — web + mobile render `member_limit`,
+    // `current_cycle` and `invite_code`; the DB columns are max_members /
+    // current_round. Safe defaults (never undefined) so list rows render.
+    member_limit: c.member_limit ?? (c.max_members != null ? Math.round(num(c.max_members)) : null),
+    current_cycle: c.current_cycle ?? (c.current_round != null ? Math.round(num(c.current_round)) : null),
+    invite_code: c.invite_code ?? null,
   };
 }
 
-async function loadCircle(id: string) {
+/** Client payment status — the calendar renders paid|late|missed|skipped|pending. */
+function clientPayStatus(status: string, timing: string | null): string {
+  if (status === "paid") return timing === "late" ? "late" : "paid";
+  if (status === "failed") return "missed";
+  return status; // pending | skipped
+}
+
+/** Client cycle (payout calendar row) derived from a round row. */
+function clientCycle(r: any) {
+  if (!r) return r;
+  return {
+    id: r.id,
+    cycle_number: Math.round(num(r.round_number)) || 1,
+    round_number: Math.round(num(r.round_number)) || 1,
+    payout_user_id: r.recipient_id,
+    payout_name: r.recipient_name ?? null,
+    recipient_id: r.recipient_id,
+    recipient_name: r.recipient_name ?? null,
+    due_at: r.due_at,
+    status: r.status === "paid_out" ? "paid" : r.status === "cancelled" ? "closed" : "scheduled",
+    collected: money(num(r.collected_amount)),
+    paid_at: r.paid_out_at ?? null,
+  };
+}
+
+/** Accepts req.params.id as-is (Express 5 types it string | string[]) and
+ *  coerces safely, so every `loadCircle(req.params.id)` call site stays
+ *  typecheck-clean without per-call casts. */
+async function loadCircle(id: string | string[] | undefined) {
+  const key = String((Array.isArray(id) ? id[0] : id) || "").trim();
+  if (!key) return null;
   const r = await query(
     `SELECT c.*, u.name AS creator_name, u.avatar_url AS creator_avatar
        FROM savings_circles c JOIN users u ON u.id = c.creator_id
       WHERE c.id = $1 LIMIT 1`,
-    [id],
+    [key],
   );
   return r.rows[0] || null;
 }
@@ -620,11 +670,18 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
       if (p.rows[0] && p.rows[0].status === "pending") myPending = { payment_id: p.rows[0].id, amount: money(num(p.rows[0].amount)), round_id: open.id };
     }
 
+    const emailInvites = await query(
+      `SELECT id, email, status, created_at FROM savings_circle_invites
+        WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [circle.id],
+    );
+
     res.json({
       success: true,
       circle: { ...serializeCircle(circle), active_count: activeCount, pot_per_round: pot },
       members,
       rounds,
+      email_invites: emailInvites.rows,
       my: {
         membership_id: me.id,
         role: me.role,
@@ -648,7 +705,117 @@ function amount(activeCount: number, contribution: any): number {
   return activeCount * num(contribution);
 }
 
-// Invite friends — admin only, respects max_members
+// People the admin can invite — Metricorex users matching a name/username/email
+// search, excluding anyone already on the roster (active or invited).
+router.get("/:id/invite-candidates", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const circle = await loadCircle(req.params.id);
+    if (!circle) return res.status(404).json({ success: false, error: "Circle not found" });
+    const me = await myMembership(circle.id, userId);
+    if (!me || me.role !== "admin") {
+      return res.status(403).json({ success: false, error: "Only the circle admin can add members" });
+    }
+
+    const q = String(req.query?.q || "").trim();
+    const params: any[] = [circle.id, userId];
+    let searchSql = "";
+    if (q) {
+      params.push(`%${q}%`);
+      searchSql = ` AND (u.name ILIKE $3 OR COALESCE(u.username, '') ILIKE $3 OR u.email ILIKE $3)`;
+    }
+    const rows = await query(
+      `SELECT u.id, u.name, u.avatar_url, u.email,
+              LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS username
+         FROM users u
+        WHERE u.id <> $2
+          AND NOT EXISTS (
+                SELECT 1 FROM savings_circle_members m
+                 WHERE m.circle_id = $1 AND m.user_id = u.id AND m.status IN ('active','invited'))
+         ${searchSql}
+        ORDER BY u.name ASC LIMIT 20`,
+      params,
+    );
+
+    const current = await query(
+      `SELECT COUNT(*)::int AS n FROM savings_circle_members WHERE circle_id = $1 AND status IN ('active','invited')`,
+      [circle.id],
+    );
+    const room = Math.max(0, Math.round(num(circle.max_members)) - (current.rows[0]?.n || 0));
+    res.json({ success: true, candidates: rows.rows, room });
+  } catch (e: any) {
+    console.error("[circles/candidates]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load invite suggestions" });
+  }
+});
+
+// Join with the circle's shareable invite code (the "Join with code" entry).
+router.post("/join-by-code", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    if (!code) return res.status(400).json({ success: false, error: "Enter the invite code you were given" });
+
+    const found = await query(`SELECT * FROM savings_circles WHERE UPPER(invite_code) = $1 LIMIT 1`, [code]);
+    const circle = found.rows[0];
+    if (!circle) return res.status(404).json({ success: false, error: "That invite code doesn't match any circle" });
+    if (circle.status !== "forming") {
+      return res.status(400).json({ success: false, error: "This circle has already started rotating" });
+    }
+
+    const existing = await myMembership(circle.id, userId);
+    if (existing && existing.status === "active") {
+      return res.json({ success: true, circle: serializeCircle(circle), already_member: true, message: "You're already in this circle" });
+    }
+
+    const active = await activeMemberCount(circle.id);
+    const invitedCnt = await query(
+      `SELECT COUNT(*)::int AS n FROM savings_circle_members WHERE circle_id = $1 AND status = 'invited'`,
+      [circle.id],
+    );
+    const used = active + (invitedCnt.rows[0]?.n || 0);
+    if (used >= Math.round(num(circle.max_members))) {
+      return res.status(400).json({ success: false, error: "This circle is full" });
+    }
+
+    if (existing && existing.status === "invited") {
+      await query(
+        `UPDATE savings_circle_members SET status = 'active', joined_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [existing.id],
+      );
+    } else {
+      await query(
+        `INSERT INTO savings_circle_members (circle_id, user_id, role, status, joined_at)
+         VALUES ($1,$2,'member','active',CURRENT_TIMESTAMP)`,
+        [circle.id, userId],
+      );
+    }
+    // A pending email invite addressed to this user's email is now fulfilled.
+    const meUser = (await query(`SELECT LOWER(email) AS email, name FROM users WHERE id = $1`, [userId])).rows[0];
+    if (meUser?.email) {
+      await query(
+        `UPDATE savings_circle_invites SET status = 'accepted' WHERE circle_id = $1 AND LOWER(email) = $2`,
+        [circle.id, meUser.email],
+      );
+    }
+    await notify({
+      userId: String(circle.creator_id),
+      type: "circle_joined",
+      title: "New circle member",
+      message: `${meUser?.name || "Someone"} joined "${String(circle.name).slice(0, 60)}" with your invite code.`,
+      actionUrl: "/savings?tab=circles",
+      actionType: "view_circle",
+      metadata: { circleId: circle.id },
+    });
+    res.json({ success: true, circle: serializeCircle(circle), message: `Welcome to "${String(circle.name).slice(0, 60)}"` });
+  } catch (e: any) {
+    console.error("[circles/join-by-code]", e?.message);
+    res.status(500).json({ success: false, error: "Could not join the circle" });
+  }
+});
+
+// Invite friends — admin only, respects max_members. Accepts user_ids AND/OR
+// emails; unknown emails get a pending email invite + invite mail.
 router.post("/:id/invite", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
@@ -669,9 +836,37 @@ router.post("/:id/invite", authenticateToken, checkSubscriptionStatus, async (re
       if (!UUID_RE.test(id)) return res.status(400).json({ success: false, error: "Each invite needs a valid user_id" });
       if (id !== userId && !ids.includes(id)) ids.push(id);
     }
-    if (!ids.length) return res.status(400).json({ success: false, error: "Pick at least one person to invite" });
 
-    const found = await query(`SELECT id, name FROM users WHERE id = ANY($1::uuid[])`, [ids]);
+    // Email invites — a registered email behaves like a user pick; an unknown
+    // email gets a pending email invite (savings_circle_invites) + invite mail.
+    const rawEmails = Array.isArray(req.body?.emails) ? req.body.emails : [];
+    const emails: string[] = [];
+    for (const v of rawEmails) {
+      const email = String(v || "").trim().toLowerCase();
+      if (!email) continue;
+      if (!EMAIL_RE.test(email)) return res.status(400).json({ success: false, error: `"${email.slice(0, 60)}" is not a valid email address` });
+      if (!emails.includes(email)) emails.push(email);
+    }
+    const emailOnly: string[] = [];
+    if (emails.length) {
+      const matched = await query(
+        `SELECT id, LOWER(email) AS email FROM users WHERE LOWER(email) = ANY($1::text[])`,
+        [emails],
+      );
+      const byEmail = new Map<string, string>(matched.rows.map((r: any) => [String(r.email), String(r.id)]));
+      for (const email of emails) {
+        const uid = byEmail.get(email);
+        if (uid && uid !== userId && !ids.includes(uid)) ids.push(uid);
+        else if (!uid) emailOnly.push(email);
+      }
+    }
+    if (!ids.length && !emailOnly.length) {
+      return res.status(400).json({ success: false, error: "Pick at least one person to invite" });
+    }
+
+    const found = ids.length
+      ? await query(`SELECT id, name FROM users WHERE id = ANY($1::uuid[])`, [ids])
+      : { rows: [] as any[] };
     if (found.rows.length !== ids.length) {
       return res.status(400).json({ success: false, error: "One or more people were not found" });
     }
@@ -681,7 +876,7 @@ router.post("/:id/invite", authenticateToken, checkSubscriptionStatus, async (re
       [circle.id],
     );
     const room = Math.round(num(circle.max_members)) - (current.rows[0]?.n || 0);
-    if (ids.length > room) {
+    if (ids.length + emailOnly.length > room) {
       return res.status(400).json({ success: false, error: `Only ${Math.max(0, room)} slot(s) left in this circle` });
     }
 
@@ -712,11 +907,50 @@ router.post("/:id/invite", authenticateToken, checkSubscriptionStatus, async (re
       });
     }
 
+    // Pending email invites for people who don't have a Metricorex account yet.
+    if (emailOnly.length) {
+      await query(
+        `INSERT INTO savings_circle_invites (circle_id, email, invited_by)
+         SELECT $1, x.email, $2 FROM UNNEST($3::text[]) AS x(email)
+         ON CONFLICT (circle_id, email) DO UPDATE
+           SET invited_by = EXCLUDED.invited_by, status = 'pending', created_at = CURRENT_TIMESTAMP`,
+        [circle.id, userId, emailOnly],
+      );
+      const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL || "https://personal.metricorex.com";
+      const contribution = `₦${money(num(circle.contribution_amount)).toLocaleString()} ${String(circle.frequency)}`;
+      for (const email of emailOnly) {
+        try {
+          await sendEmail(
+            email,
+            "There",
+            `${adminName} invited you to a savings circle on MetriCorex`,
+            `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+              <h2 style="margin:0 0 12px">You're invited to "${String(circle.name).slice(0, 80)}"</h2>
+              <p style="color:#374151;line-height:1.6">
+                ${adminName} invited you to a rotating savings circle (ajo/esusu).<br/>
+                Contribution: <strong>${contribution}</strong> · Members: up to ${Math.round(num(circle.max_members))}<br/>
+                Join with this code in the MetriCorex app → <strong>${String(circle.invite_code || "—")}</strong>
+              </p>
+              <p style="margin:24px 0">
+                <a href="${baseUrl}/circles" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Open Savings Circles</a>
+              </p>
+            </div>`,
+          );
+        } catch (mailErr: any) {
+          console.error("[circles/invite-email]", mailErr?.message);
+        }
+      }
+    }
+
+    const parts: string[] = [];
+    if (invitedIds.size) parts.push(`Invitation sent to ${invitedIds.size} person${invitedIds.size === 1 ? "" : "s"}`);
+    if (emailOnly.length) parts.push(`${emailOnly.length} email invite${emailOnly.length === 1 ? "" : "s"} sent`);
     res.json({
       success: true,
       invited: invitedIds.size,
+      email_invites: emailOnly.length,
       skipped: ids.length - invitedIds.size,
-      message: invitedIds.size ? `Invitation sent to ${invitedIds.size} person${invitedIds.size === 1 ? "" : "s"}` : "Those people are already on the roster",
+      message: parts.length ? parts.join(" · ") : "Those people are already on the roster",
     });
   } catch (e: any) {
     console.error("[circles/invite]", e?.message);

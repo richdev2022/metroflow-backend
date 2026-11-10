@@ -49,31 +49,35 @@ async function sogoUsdtNgn(): Promise<number> {
  * Live NGN-per-USD unit rate (stablecoins price 1:1 against USD).
  * Throws ONLY when every enabled source fails — callers surface an honest
  * error, they never fall back to fabricated numbers.
+ *
+ * RESILIENCE (2026-11-10): the configured provider is tried FIRST, then the
+ * remaining sources as automatic fallbacks. Previously a server whose fx
+ * provider was pinned to "sogo" (production) threw "Sogo is not configured"
+ * the moment Sogo keys were absent — and that 500'd every crypto sell BEFORE
+ * the payout stage, even with a perfectly healthy Flutterwave desk. Money
+ * flows must not share a single point of failure with one optional vendor.
  */
 export async function getUsdNgnRate(): Promise<{ rate: number; provider: string }> {
   const now = Date.now();
   if (cache && now - cache.at < CACHE_TTL_MS) return { rate: cache.rate, provider: cache.provider };
 
   const provider = await getFxProvider();
-  const attempts: Array<{ id: string; run: () => Promise<number> }> = [];
-  if (provider === "flutterwave") {
-    attempts.push({ id: "flutterwave", run: flutterwaveUsdNgn });
-  } else if (provider === "sogo") {
-    attempts.push({ id: "sogo", run: sogoUsdtNgn });
-  } else {
-    attempts.push({ id: "flutterwave", run: flutterwaveUsdNgn });
-    attempts.push({ id: "sogo", run: sogoUsdtNgn });
-  }
+  const sources: Record<string, () => Promise<number>> = {
+    flutterwave: flutterwaveUsdNgn,
+    sogo: sogoUsdtNgn,
+  };
+  const first = sources[provider] ? provider : "flutterwave";
+  const order = [first, ...Object.keys(sources).filter((k) => k !== first)];
 
   let lastErr: any = null;
-  for (const attempt of attempts) {
+  for (const id of order) {
     try {
-      const rate = await attempt.run();
-      cache = { at: now, rate: Math.round(rate * 100) / 100, provider: attempt.id };
-      return { rate: cache.rate, provider: attempt.id };
+      const rate = await sources[id]();
+      cache = { at: now, rate: Math.round(rate * 100) / 100, provider: id };
+      return { rate: cache.rate, provider: id };
     } catch (e: any) {
       lastErr = e;
-      console.warn(`[fx] ${attempt.id} USD/NGN rate failed:`, e?.message);
+      console.warn(`[fx] ${id} USD/NGN rate failed:`, e?.message);
     }
   }
   throw lastErr || new Error("No FX rate source is currently available");

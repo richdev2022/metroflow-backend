@@ -28,3 +28,5 @@ dist-ssr
 googledoc.md
 .env
 uploads/
+.env.local-backup
+.env

@@ -45,6 +45,23 @@ async function sogoUsdtNgn(): Promise<number> {
   return rate;
 }
 
+/** LAST-RESORT PUBLIC FX SOURCE (2026-11-10): open.er-api.com needs no API
+ *  key, so the money math keeps working even when BOTH vendor desks are down
+ *  or unconfigured (that exact state 500'd every crypto sell on 2026-11-10:
+ *  fx provider pinned to "sogo" + absent Sogo keys + local/dummy FLW key).
+ *  It is tried after the paid desks, never before — their spread is the
+ *  business truth; this is only a floor so flows degrade, never die. */
+async function publicUsdNgn(): Promise<number> {
+  const res = await fetch("https://open.er-api.com/v6/latest/USD", {
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!res.ok) throw new Error(`open.er-api.com HTTP ${res.status}`);
+  const body: any = await res.json();
+  const rate = Number(body?.rates?.NGN);
+  if (!(rate > 1)) throw new Error("open.er-api.com returned an invalid NGN rate");
+  return rate;
+}
+
 /**
  * Live NGN-per-USD unit rate (stablecoins price 1:1 against USD).
  * Throws ONLY when every enabled source fails — callers surface an honest
@@ -65,6 +82,7 @@ export async function getUsdNgnRate(): Promise<{ rate: number; provider: string 
   const sources: Record<string, () => Promise<number>> = {
     flutterwave: flutterwaveUsdNgn,
     sogo: sogoUsdtNgn,
+    public: publicUsdNgn,
   };
   const first = sources[provider] ? provider : "flutterwave";
   const order = [first, ...Object.keys(sources).filter((k) => k !== first)];

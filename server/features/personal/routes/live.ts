@@ -496,6 +496,35 @@ router.post("/vods/:vodId/view", authenticateToken, async (req: AuthenticatedReq
   }
 });
 
+// DELETE /live/vods/:vodId — the host deletes their own replay (Replay tab
+// long-press / ⋯ menu). Admins may moderate any replay. The storage object is
+// left in place (cheap); the row disappears from every wall and the
+// /live/:id/vod reader, which is what the clients render.
+router.delete("/vods/:vodId", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const vodId = String(req.params.vodId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(vodId)) return res.status(400).json({ success: false, error: "Invalid replay" });
+    const userId = req.user!.userId;
+
+    const vod = await query(
+      `SELECT v.id, v.host_id, u.role FROM live_vods v JOIN users u ON u.id = $2 WHERE v.id = $1`,
+      [vodId, userId],
+    );
+    if (!vod.rows.length) return res.status(404).json({ success: false, error: "Replay not found" });
+    const isHost = String(vod.rows[0].host_id) === String(userId);
+    const isAdmin = ["admin", "super_admin"].includes(String(vod.rows[0].role || ""));
+    if (!isHost && !isAdmin) {
+      return res.status(403).json({ success: false, error: "Only the host can delete this replay" });
+    }
+
+    await query(`DELETE FROM live_vods WHERE id = $1`, [vodId]);
+    res.json({ success: true, data: { deleted: vodId } });
+  } catch (e: any) {
+    console.error("live replay delete error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not delete the replay" });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Gifting — TikTok-style. Catalog is static in code so the tray renders
 // instantly; the ADMIN sets per-gift price overrides + all livestream fees

@@ -384,6 +384,69 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
 // ---------------------------------------------------------------------------
 // Mine (created + participating) — declared BEFORE /:id
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Per-split analytics (creator dashboard) — total requested vs collected,
+// pending, declined, my share, email-invite funnel. Registered BEFORE /:id
+// so "stats/summary" is never captured as an id.
+// ---------------------------------------------------------------------------
+router.get("/stats/summary", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const r = await query(
+      `SELECT
+         COUNT(*)::int AS created_count,
+         COALESCE(SUM(s.total_amount), 0)::float AS total_requested,
+         COUNT(*) FILTER (WHERE s.status = 'pending')::int AS open_count,
+         COUNT(*) FILTER (WHERE s.status = 'settled')::int AS settled_count
+       FROM splits s WHERE s.creator_id = $1`,
+      [userId],
+    );
+    const collected = await query(
+      `SELECT COALESCE(SUM(p.share_amount) FILTER (WHERE p.status = 'paid'), 0)::float AS total_received,
+              COALESCE(SUM(p.share_amount) FILTER (WHERE p.status = 'pending'), 0)::float AS total_pending
+         FROM split_participants p JOIN splits s ON s.id = p.split_id
+        WHERE s.creator_id = $1`,
+      [userId],
+    );
+    const mine = await query(
+      `SELECT
+         COUNT(*)::int AS invited_count,
+         COALESCE(SUM(p.share_amount), 0)::float AS total_owed,
+         COALESCE(SUM(p.share_amount) FILTER (WHERE p.status = 'paid'), 0)::float AS total_paid,
+         COUNT(*) FILTER (WHERE p.status = 'pending')::int AS awaiting_count
+       FROM split_participants p WHERE p.user_id = $1`,
+      [userId],
+    );
+    const a = r.rows[0] || {};
+    const c = collected.rows[0] || {};
+    const m = mine.rows[0] || {};
+    res.json({
+      success: true,
+      stats: {
+        created_count: a.created_count || 0,
+        open_count: a.open_count || 0,
+        settled_count: a.settled_count || 0,
+        total_requested: num(a.total_requested),
+        total_received: num(c.total_received),
+        total_pending: num(c.total_pending),
+        // "totals" alias so clients can read one shape
+        totals: {
+          requested: num(a.total_requested),
+          received: num(c.total_received),
+          pending: num(c.total_pending),
+        },
+        my_invited_count: m.invited_count || 0,
+        my_total_owed: num(m.total_owed),
+        my_total_paid: num(m.total_paid),
+        my_awaiting_count: m.awaiting_count || 0,
+      },
+    });
+  } catch (e: any) {
+    console.error("[splits/stats/summary]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load split stats" });
+  }
+});
+
 router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
@@ -479,6 +542,84 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
   } catch (e: any) {
     console.error("[splits/detail]", e?.message);
     res.status(500).json({ success: false, error: "Could not load the split" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Per-split analytics — "total amount paid etc" (owner request). Creator or
+// participant may read. money math is kobo-exact.
+// ---------------------------------------------------------------------------
+router.get("/:id/stats", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
+    const split = await loadSplit(String(req.params.id));
+    if (!split) return res.status(404).json({ success: false, error: "Split not found" });
+    const membership = await query(
+      `SELECT 1 FROM split_participants WHERE split_id = $1 AND user_id = $2 LIMIT 1`,
+      [split.id, userId],
+    );
+    if (split.creator_id !== userId && !membership.rows.length) {
+      return res.status(403).json({ success: false, error: "You do not have access to this split" });
+    }
+
+    const agg = await query(
+      `SELECT
+         COUNT(*)::int AS participants_count,
+         COUNT(*) FILTER (WHERE status = 'paid')::int AS paid_count,
+         COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_count,
+         COUNT(*) FILTER (WHERE status = 'declined')::int AS declined_count,
+         COALESCE(SUM(share_amount), 0)::float AS total_shared,
+         COALESCE(SUM(share_amount) FILTER (WHERE status = 'paid'), 0)::float AS total_paid,
+         COALESCE(SUM(share_amount) FILTER (WHERE status = 'pending'), 0)::float AS total_pending,
+         COALESCE(SUM(share_amount) FILTER (WHERE status = 'declined'), 0)::float AS total_declined,
+         MAX(paid_at) AS last_paid_at
+       FROM split_participants WHERE split_id = $1`,
+      [split.id],
+    );
+    const invites = await query(
+      `SELECT COUNT(*)::int AS invited, COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
+         FROM split_email_invites WHERE split_id = $1`,
+      [split.id],
+    );
+    const myRow = await query(
+      `SELECT share_amount, status, paid_at FROM split_participants WHERE split_id = $1 AND user_id = $2 LIMIT 1`,
+      [split.id, userId],
+    );
+    const a = agg.rows[0] || {};
+    const total = num(split.total_amount);
+    const totalPaid = num(a.total_paid);
+    res.json({
+      success: true,
+      stats: {
+        split_id: split.id,
+        title: split.title,
+        currency: split.currency || "NGN",
+        total_amount: total,
+        // Progress = collected share of the total bill (creator's own share
+        // counts as settled the moment the split is created).
+        total_paid: totalPaid,
+        total_pending: num(a.total_pending),
+        total_declined: num(a.total_declined),
+        total_shared: num(a.total_shared),
+        participants_count: a.participants_count || 0,
+        paid_count: a.paid_count || 0,
+        pending_count: a.pending_count || 0,
+        declined_count: a.declined_count || 0,
+        email_invites_count: invites.rows[0]?.invited || 0,
+        email_invites_accepted: invites.rows[0]?.accepted || 0,
+        last_paid_at: a.last_paid_at || null,
+        percent_paid: total > 0 ? Math.min(100, Math.round((totalPaid / total) * 100)) : 0,
+        is_creator: split.creator_id === userId,
+        my_share: myRow.rows[0] ? num(myRow.rows[0].share_amount) : null,
+        my_status: myRow.rows[0]?.status || null,
+      },
+    });
+  } catch (e: any) {
+    console.error("[splits/stats]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load split stats" });
   }
 });
 
@@ -584,6 +725,46 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
 
     // The payment is committed from here on — failures below answer 500 but
     // never touch the claim again.
+
+    // CREDIT THE CREATOR (money safety): the participant's NGN left their
+    // wallet, so it MUST land in the creator's NGN wallet in the same flow.
+    // Previously the debit was ledger-only and the creator never received
+    // the money. Best-effort ledger on a hard failure — the money movement
+    // itself must succeed (the payer's money may not vanish either way).
+    if (share > 0 && split.creator_id !== userId) {
+      const cw = await query(
+        `SELECT id FROM wallets
+          WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
+          ORDER BY created_at ASC LIMIT 1`,
+        [split.creator_id],
+      );
+      const creatorWallet = cw.rows[0];
+      if (creatorWallet) {
+        const creditRef = `${paidReference}-TO-CREATOR`;
+        const credited = await query(
+          `UPDATE wallets SET balance = balance + $2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1 RETURNING id`,
+          [creatorWallet.id, share],
+        );
+        if (credited.rows.length) {
+          await insertTransaction({
+            userId: split.creator_id,
+            walletId: creatorWallet.id,
+            reference: creditRef,
+            type: "credit",
+            transactionType: "split_receipt",
+            amount: share,
+            currency: "NGN",
+            description: `Split received — ${String(split.title).slice(0, 60)}`,
+          }).catch((cErr: any) =>
+            console.error("[splits/pay] creator credit ledger failed (money moved):", cErr?.message));
+        } else {
+          console.error("[splits/pay] CRITICAL: creator wallet credit failed", { splitId: split.id, creatorWallet: creatorWallet.id });
+        }
+      } else {
+        console.error("[splits/pay] creator has no active NGN wallet — credit pending manual reconciliation", { splitId: split.id, creator: split.creator_id });
+      }
+    }
 
     // Settle the split when every non-declined participant has paid.
     const settled = await evaluateSettled(split.id);

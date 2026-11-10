@@ -17,6 +17,58 @@ import { checkFundingLimit, rejectOverLimitFunding } from "../services/funding-l
 const router = express.Router();
 
 /**
+ * CRYPTO SALE SELF-REFUND — a crypto_sale payout transfer FAILED after the
+ * sale had already answered 'processing'. Refund the seller's stablecoin
+ * wallet (the debit that the sell route took up front), flip the sale row to
+ * 'failed' with the provider reason, and credit a visible refund transaction.
+ *
+ * Idempotency: the sale row is only refunded while still 'processing'/'pending'
+ * (the WHERE guard), so a webhook replay after a manual or inline refund can
+ * never double-credit.
+ */
+async function refundCryptoSalePayout(transfer: any, reason: string): Promise<void> {
+    const saleId = String(transfer.source_id || "");
+    if (!saleId) return;
+
+    const saleRes = await query(`SELECT * FROM crypto_sales WHERE id = $1`, [saleId]);
+    const sale = saleRes.rows[0];
+    if (!sale || !["processing", "pending"].includes(String(sale.status))) return;
+
+    const walletRes = await query(
+        `SELECT id FROM wallets WHERE id = $1 AND UPPER(currency) IN ('USDT','USDC')`,
+        [sale.wallet_id],
+    );
+    const walletId = walletRes.rows[0]?.id;
+
+    await query(
+        `UPDATE crypto_sales SET status = 'failed', failure_reason = $2, refunded_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [saleId, reason],
+    );
+
+    if (walletId) {
+        const usdDebit = Number(sale.usd_debit || 0);
+        if (usdDebit > 0) {
+            await query(`UPDATE wallets SET balance = balance + $1 WHERE id = $2`, [usdDebit, walletId]);
+            await query(
+                `INSERT INTO transactions
+                   (user_id, wallet_id, reference, type, transaction_type, amount, currency, status, description)
+                 VALUES ($1, $2, $3, 'credit', 'crypto_sale_refund', $4, $5, 'success', $6)
+                 ON CONFLICT (reference) DO NOTHING`,
+                [sale.user_id, walletId, `${sale.reference}-REFUND`, usdDebit, sale.from_asset || "USDT",
+                 "Refund — crypto sale payout failed"],
+            );
+        }
+    }
+
+    try {
+        await createNotification({
+            businessId: "", userId: sale.user_id, type: "alert", title: "Crypto sale failed — refunded",
+            message: `Your ${sale.from_asset || "stablecoin"} sale could not be settled. The wallet has been refunded.`,
+        });
+    } catch { /* best-effort */ }
+}
+
+/**
  * Flutterwave BILL PAYMENT webhooks — settle pending bill_payments rows.
  *
  * Bills arrive on the generic webhook as either a dedicated bill event
@@ -1487,6 +1539,31 @@ const handleFlutterwaveWebhook = async (event: any) => {
                 await reverseFailedTransfer(transfer, failureReason || 'Flutterwave reported transfer failed/reverted');
             } catch (reversalError) {
                 console.error(`Auto-reversal failed for Flutterwave transfer ${reference}:`, reversalError);
+            }
+        }
+
+        // CRYPTO SALE SYNC: transfers queued by the personal crypto-sell route
+        // (source_type='crypto_sale', wallet_id NULL — the stablecoin wallet
+        // was already debited) must finalise the linked crypto_sales row: the
+        // sale completes when the payout lands and self-refunds the USDT
+        // wallet when the payout fails. Without this, a sale that went out
+        // 'processing' stays 'processing' forever even after the provider
+        // reports a final state.
+        if (transfer.source_type === 'crypto_sale' && transfer.source_id) {
+            try {
+                if (newStatus === 'success') {
+                    await query(
+                        `UPDATE crypto_sales
+                            SET status = 'completed', provider_reference = $2,
+                                failure_reason = NULL, completed_at = CURRENT_TIMESTAMP
+                          WHERE id = $1 AND status IN ('processing','pending')`,
+                        [transfer.source_id, reference],
+                    );
+                } else if (newStatus === 'failed') {
+                    await refundCryptoSalePayout(transfer, failureReason || 'Payout failed at the provider');
+                }
+            } catch (saleSyncErr) {
+                console.error(`Crypto sale sync failed for ${reference}:`, saleSyncErr);
             }
         }
     }

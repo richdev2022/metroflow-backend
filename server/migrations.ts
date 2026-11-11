@@ -1,4 +1,5 @@
 import { query } from "./db";
+import { getSetting, setSetting } from "./services/app-config";
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
 import { ensureBillsSchema } from "./features/personal/bills-schema";
@@ -175,6 +176,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureBusinessRevenueLadder", ensureBusinessRevenueLadder);
   await step("ensureBusinessRevenueLadderV2", ensureBusinessRevenueLadderV2);
   await step("ensurePlanPricingLadder", ensurePlanPricingLadder);
+  await step("migrateLegacyApkToPersonalSlot", migrateLegacyApkToPersonalSlot);
 
   if (failures.length > 0) {
     console.error(`[migrations] ⚠ ${failures.length} migration step(s) failed (non-fatal):`);
@@ -2611,4 +2613,89 @@ async function ensureVaptHardeningSchema(): Promise<void> {
 
   await query(`ALTER TABLE users ALTER COLUMN otp_code TYPE VARCHAR(255)`);
   await query(`ALTER TABLE businesses ALTER COLUMN otp_code TYPE VARCHAR(255)`);
+}
+
+/**
+ * LEGACY SINGLE-APK SLOT -> PER-APP SLOTS (one-time boot migration, idempotent).
+ *
+ * History: the admin App Releases page originally had a single direct-APK
+ * upload flow (POST /admin/app-versions/:id/apk) which stored the binary URL +
+ * sha256 + size on the app_versions row (apk_url / apk_sha256 /
+ * apk_size_bytes columns) and fed the site's single legacy "Download APK"
+ * alias (GET /public/app-links -> apk_url). The owner uploaded the PERSONAL
+ * mobile APK through that legacy slot. Commit 7044650 introduced per-app
+ * slots (system_settings keys personal_apk_url/personal_apk_version and
+ * business_apk_url/business_apk_version) rendered as two separate download
+ * buttons; the site shows the legacy apk_url alias only while BOTH new slots
+ * are unset.
+ *
+ * This migration moves that legacy upload into its real home:
+ *   IF a legacy APK value exists on app_versions (android, newest active)
+ *   AND personal_apk_url is not configured yet
+ *   -> copy url + version label into the personal slot,
+ *   THEN clear the legacy apk_url/apk_size_bytes/apk_sha256 keys so the old
+ *   card can never conflict with the per-app slots again.
+ * If the personal slot was already configured (owner re-uploaded after a
+ * previous copy), the slot wins and the legacy keys are still cleared.
+ * Fail-safe: wrapped in try/catch (plus the fault-isolated step() runner), so
+ * a failure logs loudly and NEVER blocks boot.
+ */
+async function migrateLegacyApkToPersonalSlot(): Promise<void> {
+  try {
+    // Newest active android release carrying a legacy APK — same ordering the
+    // public app-links endpoint uses for the legacy alias.
+    const legacy = await query(
+      `SELECT id, apk_url, version_name FROM app_versions
+        WHERE platform = 'android' AND is_active = TRUE AND apk_url IS NOT NULL
+        ORDER BY version_code DESC LIMIT 1`,
+    );
+    if (legacy.rows.length === 0) {
+      return; // nothing to migrate (fresh install or already migrated)
+    }
+
+    const legacyUrl = String(legacy.rows[0].apk_url || "").trim();
+    if (!legacyUrl) return;
+    const legacyVersionName = String(legacy.rows[0].version_name || "").trim();
+
+    const personalUrl = (await getSetting("personal_apk_url")).trim();
+    if (!personalUrl) {
+      // Copy the legacy APK into the personal slot (url + version label).
+      await setSetting(
+        "personal_apk_url",
+        legacyUrl,
+        "Direct APK download URL for the personal mobile app (marketing site)",
+      );
+      await setSetting(
+        "personal_apk_version",
+        legacyVersionName,
+        "Version label for the personal mobile app APK",
+      );
+      console.log(
+        `[migration] Legacy single-slot APK migrated into the Personal Mobile slot: url=${legacyUrl} version=${legacyVersionName || "(none)"}`,
+      );
+    } else {
+      console.log(
+        "[migration] Legacy APK found but the Personal Mobile slot is already configured — leaving the slot untouched",
+      );
+    }
+
+    // Remove the legacy keys either way so the old single-slot card can never
+    // conflict with the per-app slots (GET /public/app-links apk_url becomes
+    // NULL and the site relies purely on the per-slot settings).
+    const cleared = await query(
+      `UPDATE app_versions
+         SET apk_url = NULL, apk_size_bytes = NULL, apk_sha256 = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE apk_url IS NOT NULL
+       RETURNING id`,
+    );
+    console.log(
+      `[migration] Cleared legacy single-slot APK keys from ${cleared.rowCount} app_versions row(s)`,
+    );
+  } catch (error: any) {
+    // Never block boot — the step() runner also isolates this, but keep an
+    // explicit guard so a partial failure can never propagate upward.
+    console.error(
+      `[migrations] ⚠ migrateLegacyApkToPersonalSlot failed (non-fatal, continuing): ${error?.message || error}`,
+    );
+  }
 }

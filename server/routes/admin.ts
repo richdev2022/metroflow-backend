@@ -435,8 +435,27 @@ protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), asy
   try {
     const businessesCount = await query(`SELECT COUNT(*) FROM businesses`);
     const usersCount = await query(`SELECT COUNT(*) FROM users`);
-    const activeBusinesses = await query(`SELECT COUNT(*) FROM businesses WHERE subscription_status = 'active'`);
-    
+
+    // ACTIVE SUBSCRIPTIONS — OWNER DEFINITION (fixed 2026-11): a subscriber is
+    // a USER (business owner) who has ACTIVATED A PLAN. The old query counted
+    // every business with subscription_status='active', but that column
+    // DEFAULTS to 'active' (db.ts), so brand-new accounts that never picked a
+    // plan inflated the metric. The real activation contract is:
+    //   plan_id IS NOT NULL              -> a plan was actually chosen/set
+    //   subscription_status = 'active'   -> not cancelled / past_due / inactive
+    //   trial_ends_at IS NULL OR past    -> an in-flight unpaid trial is NOT an
+    //                                       activation (activation NULLs it)
+    // Counted as DISTINCT owners (COALESCE falls back to the business id for
+    // legacy rows whose owner was deleted) so one owner running two subscribed
+    // accounts still counts the paid subscriptions they activated.
+    const activeSubscribers = await query(`
+      SELECT COUNT(DISTINCT COALESCE(b.owner_id::text, b.id)) AS count
+      FROM businesses b
+      WHERE b.plan_id IS NOT NULL
+        AND b.subscription_status = 'active'
+        AND (b.trial_ends_at IS NULL OR b.trial_ends_at <= NOW())
+    `);
+
     // Real revenue: ONLY platform earnings — the wallet_id-NULL fee/subscription
     // credit rows written by creditRevenueWallet()/subscription settlement (the
     // same aggregation the /revenue endpoint uses). Previously this summed
@@ -456,7 +475,9 @@ protectedRouter.get("/dashboard/stats", requirePermission('view_dashboard'), asy
       stats: {
         totalBusinesses: parseInt(businessesCount.rows[0].count),
         totalUsers: parseInt(usersCount.rows[0].count),
-        activeBusinesses: parseInt(activeBusinesses.rows[0].count),
+        // "activeBusinesses" kept as the response key for backward compat with
+        // the dashboard card — the VALUE now means activated-plan subscribers.
+        activeBusinesses: parseInt(activeSubscribers.rows[0].count),
         totalRevenue: parseInt(revenue.rows[0].sum || '0')
       }
     });
@@ -537,6 +558,439 @@ protectedRouter.get("/dashboard/charts", requirePermission('view_dashboard'), as
   } catch (error) {
     console.error("Failed to fetch charts data:", error);
     res.status(500).json({ success: false, error: "Failed to fetch charts data" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /admin/overview — ONE aggregate cross-product analytics endpoint for the
+// admin Dashboard (KPI row + product grid). Neighboring deep-dive endpoints
+// (/transfers, /bills, /crypto/..., /dashboard/stats, ...) stay untouched.
+//
+// Contract:
+//  - Gated exactly like the neighboring dashboard routes (view_dashboard).
+//  - Every section is computed by a small isolated query; ALL sections run in
+//    ONE Promise.allSettled so a missing table / bad row on one product can
+//    never fail the whole payload (fail-open per section — the section comes
+//    back { available: false, error } and the UI renders "—").
+//  - Raw parameterized SQL, COUNT(...)/SUM(...) with WHERE created_at >
+//    NOW() - INTERVAL — never SELECT *.
+//
+// ACTIVE-SUBSCRIPTION DEFINITION (owner-fixed): a subscriber is a user who
+// ACTIVATED A PLAN — businesses (the subscription holder) with
+// plan_id IS NOT NULL AND subscription_status='active', excluding in-flight
+// unpaid trials (trial_ends_at in the future — activation NULLs it). Counted
+// as DISTINCT owners (COALESCE falls back to the business id for legacy rows
+// without an owner). Same definition as /admin/dashboard/stats.
+// ---------------------------------------------------------------------------
+protectedRouter.get("/overview", requirePermission('view_dashboard'), async (req: AuthenticatedAdminRequest, res) => {
+  // pg returns COUNT/SUM(NUMERIC) as strings — coerce once here.
+  const num = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  const usersSection = async () => {
+    // users: email_verified / last_login / created_at all exist on the base
+    // table (db.ts ensureBaseSchemaTables + ALTERs). "active7d" = seen in the
+    // last 7 days via users.last_login (the session/last-seen field).
+    const r = await query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS new_7d,
+        COUNT(*) FILTER (WHERE last_login > NOW() - INTERVAL '7 days')::int AS active_7d,
+        COUNT(*) FILTER (WHERE email_verified = TRUE)::int AS verified,
+        COUNT(*) FILTER (WHERE email_verified IS DISTINCT FROM TRUE)::int AS unverified
+      FROM users
+    `);
+    const row = r.rows[0];
+    return {
+      available: true,
+      total: num(row.total),
+      new7d: num(row.new_7d),
+      active7d: num(row.active_7d),
+      verified: num(row.verified),
+      unverified: num(row.unverified),
+    };
+  };
+
+  const kycSection = async () => {
+    // users.kyc_status values in the wild: 'none' | 'pending' | 'pending_otp' |
+    // 'pending_review' | 'verified' | 'rejected' (db.ts + routes/kyc.ts).
+    const r = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE kyc_status IN ('pending', 'pending_otp', 'pending_review'))::int AS pending,
+        COUNT(*) FILTER (WHERE kyc_status = 'verified')::int AS approved,
+        COUNT(*) FILTER (WHERE kyc_status = 'rejected')::int AS rejected
+      FROM users
+    `);
+    // Business KYC upgrade submissions (business_kyc_submissions.status:
+    // pending -> approved | rejected, routes/admin.ts business-kyc section).
+    let businessSubmissions = { pending: 0, approved: 0, rejected: 0 };
+    try {
+      const b = await query(`
+        SELECT
+          COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+          COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+          COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+        FROM business_kyc_submissions
+      `);
+      businessSubmissions = {
+        pending: num(b.rows[0].pending),
+        approved: num(b.rows[0].approved),
+        rejected: num(b.rows[0].rejected),
+      };
+    } catch { /* business KYC table may not exist on old installs */ }
+    const row = r.rows[0];
+    return {
+      available: true,
+      pending: num(row.pending),
+      approved: num(row.approved),
+      rejected: num(row.rejected),
+      businessSubmissions,
+    };
+  };
+
+  const subscriptionsSection = async () => {
+    const active = await query(`
+      SELECT COUNT(DISTINCT COALESCE(b.owner_id::text, b.id))::int AS count
+      FROM businesses b
+      WHERE b.plan_id IS NOT NULL
+        AND b.subscription_status = 'active'
+        AND (b.trial_ends_at IS NULL OR b.trial_ends_at <= NOW())
+    `);
+    // Revenue THIS MONTH — platform earnings only (wallet_id-NULL fee /
+    // subscription / referral_bonus credit rows), grouped by currency.
+    const revenue = await query(`
+      SELECT currency, COALESCE(SUM(amount), 0) AS amount
+      FROM transactions
+      WHERE status = 'success'
+        AND transaction_type IN ('fee', 'subscription', 'referral_bonus')
+        AND wallet_id IS NULL
+        AND type = 'credit'
+        AND created_at >= date_trunc('month', NOW())
+      GROUP BY currency
+      ORDER BY amount DESC
+    `);
+    return {
+      available: true,
+      // Definition documented for the UI tooltip.
+      definition: "users who activated a plan (plan_id set, subscription active, not an in-flight trial)",
+      active: num(active.rows[0].count),
+      revenueThisMonth: revenue.rows.map((row: any) => ({
+        currency: row.currency || "NGN",
+        amount: num(row.amount),
+      })),
+    };
+  };
+
+  const transfersSection = async () => {
+    // transfer_queue: amount / currency / status / created_at (db.ts).
+    const byCurrency = await query(`
+      SELECT currency, COUNT(*)::int AS count, COALESCE(SUM(amount), 0) AS volume
+      FROM transfer_queue
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'success'
+      GROUP BY currency
+      ORDER BY volume DESC
+    `);
+    const counts = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days')::int AS total_30d,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days' AND status = 'failed')::int AS failed_30d
+      FROM transfer_queue
+    `);
+    // 30-day daily SUCCESS volume series (KPI chart) — generate_series keeps
+    // zero-volume days so the chart has a continuous axis.
+    const series = await query(`
+      SELECT to_char(d, 'YYYY-MM-DD') AS date,
+             COALESCE(SUM(t.amount), 0) AS volume,
+             COUNT(t.id)::int AS count
+      FROM generate_series(
+        (CURRENT_DATE - INTERVAL '29 days')::date,
+        CURRENT_DATE,
+        '1 day'::interval
+      ) d
+      LEFT JOIN transfer_queue t
+        ON t.created_at >= d
+       AND t.created_at < d + INTERVAL '1 day'
+       AND t.status = 'success'
+      GROUP BY d
+      ORDER BY d ASC
+    `);
+    return {
+      available: true,
+      count30d: num(counts.rows[0].total_30d),
+      failed30d: num(counts.rows[0].failed_30d),
+      volume30d: byCurrency.rows.map((row: any) => ({
+        currency: row.currency || "NGN",
+        count: num(row.count),
+        volume: num(row.volume),
+      })),
+      series30d: series.rows.map((row: any) => ({
+        date: row.date,
+        volume: num(row.volume),
+        count: num(row.count),
+      })),
+    };
+  };
+
+  const cryptoSection = async () => {
+    // crypto_sales: settlement_amount / settlement_currency / status
+    // (features/personal/schema.ts). Volume = completed sales only.
+    const sales = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(settlement_amount), 0) AS volume
+      FROM crypto_sales
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+    `);
+    // crypto_deposit_sales: ngn_net (Sogo deposits, routes/crypto.ts).
+    const deposits = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(ngn_net), 0) AS volume
+      FROM crypto_deposit_sales
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+    `);
+    // Pending claims = sales/deposits still awaiting settlement.
+    const pending = await query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM crypto_sales WHERE status IN ('pending', 'processing')) AS sales,
+        (SELECT COUNT(*)::int FROM crypto_deposit_sales WHERE status IN ('pending', 'processing')) AS deposits
+    `);
+    return {
+      available: true,
+      sales30d: { count: num(sales.rows[0].count), volume: num(sales.rows[0].volume) },
+      deposits30d: { count: num(deposits.rows[0].count), volume: num(deposits.rows[0].volume) },
+      pending: { sales: num(pending.rows[0].sales), deposits: num(pending.rows[0].deposits) },
+    };
+  };
+
+  const giftCardsSection = async () => {
+    // giftcard_sell_trades.status: pending|processing|approved|rejected|settled|failed
+    // volume = payout_amount on approved/settled sells (schema.ts).
+    const sells = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(payout_amount), 0) AS volume
+      FROM giftcard_sell_trades
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status IN ('approved', 'settled')
+    `);
+    // giftcard_buy_orders.status: pending|completed|failed|refunded
+    const buys = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(total_charged), 0) AS volume
+      FROM giftcard_buy_orders
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+    `);
+    const pending = await query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM giftcard_sell_trades WHERE status IN ('pending', 'processing')) AS sells,
+        (SELECT COUNT(*)::int FROM giftcard_buy_orders WHERE status = 'pending') AS buys
+    `);
+    return {
+      available: true,
+      sells30d: { count: num(sells.rows[0].count), volume: num(sells.rows[0].volume) },
+      buys30d: { count: num(buys.rows[0].count), volume: num(buys.rows[0].volume) },
+      pending: { sells: num(pending.rows[0].sells), buys: num(pending.rows[0].buys) },
+    };
+  };
+
+  const billsSection = async () => {
+    // Unified bills hub (bill_transactions): total / category / status
+    // ('completed' = successful, features/personal/routes/bills.ts).
+    const totals = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(total), 0) AS volume
+      FROM bill_transactions
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+    `);
+    const byCategory = await query(`
+      SELECT category, COUNT(*)::int AS count, COALESCE(SUM(total), 0) AS volume
+      FROM bill_transactions
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+      GROUP BY category
+      ORDER BY volume DESC
+    `);
+    const pending = await query(
+      `SELECT COUNT(*)::int AS count FROM bill_transactions WHERE status = 'processing'`,
+    );
+    return {
+      available: true,
+      count30d: num(totals.rows[0].count),
+      volume30d: num(totals.rows[0].volume),
+      byCategory: byCategory.rows.map((row: any) => ({
+        category: row.category,
+        count: num(row.count),
+        volume: num(row.volume),
+      })),
+      pending: num(pending.rows[0].count),
+    };
+  };
+
+  const virtualCardsSection = async () => {
+    // virtual_cards.status: pending|active|frozen|terminated|failed;
+    // balance is the funded USD balance (features/personal/virtualcards.ts).
+    const r = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+        COALESCE(SUM(balance) FILTER (WHERE status = 'active'), 0) AS funded_volume
+      FROM virtual_cards
+    `);
+    return {
+      available: true,
+      active: num(r.rows[0].active),
+      fundedVolume: num(r.rows[0].funded_volume),
+    };
+  };
+
+  const circlesSection = async () => {
+    // savings_circles.status: forming|active|completed|cancelled;
+    // savings_circle_members.status: invited|active|left|removed (schema.ts).
+    const circles = await query(
+      `SELECT COUNT(*)::int AS count FROM savings_circles WHERE status = 'active'`,
+    );
+    const members = await query(
+      `SELECT COUNT(*)::int AS count FROM savings_circle_members WHERE status = 'active'`,
+    );
+    return {
+      available: true,
+      activeCircles: num(circles.rows[0].count),
+      activeMembers: num(members.rows[0].count),
+    };
+  };
+
+  const potsSection = async () => {
+    // Splits: status pending|settled|cancelled; Pots: status open|closed.
+    // "Total contributed" for pots = SUM(balance) of open pots (the net of
+    // contributions) + pending splits' full split amount.
+    const splits = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount), 0) AS amount
+      FROM splits
+      WHERE status = 'pending'
+    `);
+    const pots = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(balance), 0) AS balance
+      FROM pots
+      WHERE status = 'open'
+    `);
+    const contributed = await query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM pot_contributions`,
+    );
+    return {
+      available: true,
+      openSplits: num(splits.rows[0].count),
+      openSplitsAmount: num(splits.rows[0].amount),
+      openPots: num(pots.rows[0].count),
+      openPotsBalance: num(pots.rows[0].balance),
+      totalContributed: num(contributed.rows[0].total),
+    };
+  };
+
+  const liveSection = async () => {
+    // live_sessions.created_at / live_gifts.total_amount (schema.ts + live.ts).
+    const sessions = await query(`
+      SELECT COUNT(*)::int AS count
+      FROM live_sessions
+      WHERE created_at > NOW() - INTERVAL '30 days'
+    `);
+    const gifts = await query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount), 0) AS value
+      FROM live_gifts
+      WHERE created_at > NOW() - INTERVAL '30 days'
+        AND status = 'completed'
+    `);
+    return {
+      available: true,
+      sessions30d: num(sessions.rows[0].count),
+      gifts30d: { count: num(gifts.rows[0].count), value: num(gifts.rows[0].value) },
+    };
+  };
+
+  const referralsSection = async () => {
+    // referral_bonuses (migrations.ts): one row per converted referral.
+    const bonuses = await query(`
+      SELECT
+        COUNT(DISTINCT referrer_user_id)::int AS referrers,
+        COUNT(*) FILTER (WHERE status = 'paid')::int AS completed,
+        COALESCE(SUM(amount) FILTER (WHERE status = 'paid'), 0) AS total
+      FROM referral_bonuses
+    `);
+    // Users who signed up through a referral link (users.referred_by).
+    const invited = await query(
+      `SELECT COUNT(*)::int AS count FROM users WHERE referred_by IS NOT NULL`,
+    );
+    return {
+      available: true,
+      referrers: num(bonuses.rows[0].referrers),
+      completedBonuses: num(bonuses.rows[0].completed),
+      bonusTotal: num(bonuses.rows[0].total),
+      referredUsers: num(invited.rows[0].count),
+    };
+  };
+
+  const disputesSection = async () => {
+    // transaction_disputes.status: open|under_review|resolved|closed|rejected.
+    const r = await query(`
+      SELECT COUNT(*)::int AS count
+      FROM transaction_disputes
+      WHERE status IN ('open', 'under_review')
+    `);
+    return { available: true, open: num(r.rows[0].count) };
+  };
+
+  try {
+    const settled = await Promise.allSettled([
+      usersSection(),
+      kycSection(),
+      subscriptionsSection(),
+      transfersSection(),
+      cryptoSection(),
+      giftCardsSection(),
+      billsSection(),
+      virtualCardsSection(),
+      circlesSection(),
+      potsSection(),
+      liveSection(),
+      referralsSection(),
+      disputesSection(),
+    ]);
+    const keys = [
+      "users",
+      "kyc",
+      "subscriptions",
+      "transfers",
+      "crypto",
+      "giftCards",
+      "bills",
+      "virtualCards",
+      "savingsCircles",
+      "pots",
+      "live",
+      "referrals",
+      "disputes",
+    ] as const;
+    const sections: Record<string, unknown> = {};
+    settled.forEach((outcome, i) => {
+      const key = keys[i];
+      if (outcome.status === "fulfilled") {
+        sections[key] = outcome.value;
+      } else {
+        // Fail-open: log loudly, expose an explicit unavailable marker so the
+        // dashboard renders "—" for this section instead of lying with zeros.
+        const reason: string =
+          (outcome.reason as any)?.message || String(outcome.reason || "unknown error");
+        console.error(`[admin/overview] section "${key}" failed (fail-open): ${reason}`);
+        sections[key] = { available: false, error: reason };
+      }
+    });
+
+    res.json({
+      success: true,
+      generatedAt: new Date().toISOString(),
+      sections,
+    });
+  } catch (error: any) {
+    console.error("Admin overview error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to build overview" });
   }
 });
 

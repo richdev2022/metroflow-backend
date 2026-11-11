@@ -173,9 +173,23 @@ export const checkSubscriptionStatus = async (
   next: NextFunction
 ) => {
   try {
+    const userId = req.user?.userId;
     const businessId = req.user?.businessId;
     // Skip if no businessId (e.g. platform admin or pre-auth)
     if (!businessId) return next();
+
+    // PERSONAL APP — no subscription gate for non-owner members. Invited team
+    // members carry the INVITER's business_id in their session; gating their
+    // Personal-app usage on the inviter's subscription status made one
+    // business's lapsed plan lock ANOTHER person out of free personal
+    // features ("all features accessible, no restriction based on plan").
+    // Only the business's own owner (businesses.owner_id = caller) is gated,
+    // and only on routes that legitimately price off their plan.
+    const ownerCheck = await query(
+      `SELECT 1 FROM businesses WHERE id = $1 AND owner_id = $2 LIMIT 1`,
+      [businessId, userId]
+    );
+    if (!ownerCheck.rows.length) return next();
 
     // Skip checks for subscription related endpoints to allow upgrade
     if (req.originalUrl.startsWith('/api/subscription')) {

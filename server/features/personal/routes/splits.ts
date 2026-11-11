@@ -191,31 +191,41 @@ async function loadEmailInvites(splitId: string) {
 // username / email) so the split composer can find anyone on the platform,
 // not just saved contacts. Mirrors the savings-circles invite picker.
 //   GET /splits/candidates?q=alice  → empty q returns the most recent users
+//   &includeSelf=1                  → the CALLER is included too, flagged
+//                                     is_self:true. The withdrawal-approver
+//                                     picker needs this — the creator must be
+//                                     selectable (and removable) as an
+//                                     approver of their own split/pot wallet.
+//                                     Participant pickers stay self-excluded.
 // ---------------------------------------------------------------------------
 router.get("/candidates", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.userId;
     const q = String(req.query.q || "").trim().slice(0, 80);
     const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 20));
+    const includeSelf = ["1", "true", "yes"].includes(String(req.query.includeSelf || "").toLowerCase());
+    const selfFilter = includeSelf ? "" : "AND id <> $1";
     const rows = q
       ? await query(
           `SELECT id, name, avatar_url,
                   LOWER(COALESCE(username, SPLIT_PART(email, '@', 1))) AS username,
-                  email
+                  email,
+                  id = $1 AS is_self
              FROM users
-            WHERE id <> $1
+            WHERE TRUE ${selfFilter}
               AND (name ILIKE $2 OR username ILIKE $2 OR email ILIKE $2)
-            ORDER BY name ASC
+            ORDER BY is_self DESC, name ASC
             LIMIT $3`,
           [userId, `%${q}%`, limit],
         )
       : await query(
           `SELECT id, name, avatar_url,
                   LOWER(COALESCE(username, SPLIT_PART(email, '@', 1))) AS username,
-                  email
+                  email,
+                  id = $1 AS is_self
              FROM users
-            WHERE id <> $1
-            ORDER BY created_at DESC
+            WHERE TRUE ${selfFilter}
+            ORDER BY is_self DESC, created_at DESC
             LIMIT $2`,
           [userId, limit],
         );
@@ -224,6 +234,7 @@ router.get("/candidates", authenticateToken, checkSubscriptionStatus, async (req
       name: u.name,
       avatar_url: u.avatar_url || null,
       username: u.username || null,
+      is_self: !!u.is_self,
       // Masked for privacy — enough to disambiguate without leaking the full
       // address into client state and logs.
       email_masked: u.email

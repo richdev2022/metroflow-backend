@@ -68,11 +68,24 @@ function randomReference(prefix: string): string {
     return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 }
 
-/** Resolve an owned wallet (business wallet of this business, or personal wallet of this user). */
-async function getOwnedWallet(walletId: string, businessId: string, userId: string) {
+/**
+ * Resolve a wallet the CALLER may spend from — strictly per-user on the
+ * Personal app: their own personal wallet (user_id, business_id NULL) or the
+ * business wallet of a business THEY OWN (businesses.owner_id = caller).
+ * Invited team members carry the inviter's business_id in their session, so
+ * the old (business_id = $2 OR ...) check let them attach the INVITER's
+ * business wallet to their private vaults — business money leaking into
+ * personal features. Owner-only from now on.
+ */
+async function getOwnedWallet(walletId: string, businessId: string | null, userId: string) {
     const res = await query(
-        `SELECT * FROM wallets WHERE id = $1 AND (business_id = $2 OR (user_id = $3 AND business_id IS NULL))`,
-        [walletId, businessId, userId]
+        `SELECT * FROM wallets WHERE id = $1 AND (
+            (user_id = $2 AND business_id IS NULL)
+            OR (business_id = $3 AND EXISTS (
+                SELECT 1 FROM businesses b WHERE b.id = $3 AND b.owner_id = $2
+            ))
+         )`,
+        [walletId, userId, businessId]
     );
     return res.rows[0] || null;
 }
@@ -119,23 +132,29 @@ async function recordTransaction(opts: {
  */
 router.get("/vaults", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
-        const { userId, businessId } = req.user!;
+        const { userId } = req.user!;
+        // STRICTLY PER-USER: savings vaults are a Personal feature — never
+        // scope by session business_id. Invited team members carry the
+        // inviter's business_id in their token; the old
+        // `OR v.business_id = $2` clause showed them every vault the business
+        // had created. The owner keeps full visibility of their own vaults
+        // (every insert stamps user_id), nobody else ever does.
         const vaults = await query(
             `SELECT v.*, w.currency AS auto_save_wallet_currency,
                     COALESCE((SELECT COUNT(*)::int FROM savings_transactions t WHERE t.vault_id = v.id AND t.type IN ('deposit', 'auto_save')), 0) AS deposit_count
              FROM savings_vaults v
              LEFT JOIN wallets w ON w.id = v.auto_save_wallet_id
-             WHERE v.user_id = $1 OR v.business_id = $2
+             WHERE v.user_id = $1
              ORDER BY v.created_at DESC
              LIMIT 100`,
-            [userId, businessId]
+            [userId]
         );
         const stats = await query(
             `SELECT COUNT(*)::int AS total_vaults,
                     COALESCE(SUM(balance), 0) AS total_saved,
                     COALESCE(SUM(CASE WHEN auto_save_enabled AND status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_auto_saves
-             FROM savings_vaults WHERE user_id = $1 OR business_id = $2`,
-            [userId, businessId]
+             FROM savings_vaults WHERE user_id = $1`,
+            [userId]
         );
         res.json({ success: true, vaults: vaults.rows, stats: stats.rows[0] });
     } catch (error) {
@@ -148,7 +167,7 @@ router.get("/vaults", authenticateToken, checkSubscriptionStatus, async (req: Au
  * @openapi
  * /savings/vaults:
  *   post:
- *     summary: Create a savings vault (plan-gated)
+ *     summary: Create a savings vault (Personal app — no plan gating)
  *     tags: [Savings]
  *     security:
  *       - bearerAuth: []
@@ -182,8 +201,6 @@ router.get("/vaults", authenticateToken, checkSubscriptionStatus, async (req: Au
  *     responses:
  *       200:
  *         description: Vault created
- *       403:
- *         description: Savings disabled or vault limit reached on the current plan (PLAN_UPGRADE_REQUIRED)
  */
 router.post("/vaults", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
@@ -197,29 +214,11 @@ router.post("/vaults", authenticateToken, checkSubscriptionStatus, async (req: A
         if (!vaultName) return res.status(400).json({ success: false, error: "Give your vault a name" });
         if (vaultName.length > 120) return res.status(400).json({ success: false, error: "Vault name is too long" });
 
-        // ---- Plan gating ----
-        const plan = await getPlanConfig(businessId);
-        if (plan && !plan.is_personal && plan.savings_enabled === false) {
-            return res.status(403).json({
-                success: false,
-                error: "Savings vaults are not available on your current plan. Kindly upgrade your plan.",
-                code: "PLAN_UPGRADE_REQUIRED",
-            });
-        }
-        if (plan && !plan.is_personal && plan?.max_savings_vaults != null && plan.max_savings_vaults < 999999) {
-            const countRes = await query(
-                `SELECT COUNT(*)::int AS c FROM savings_vaults
-                 WHERE business_id = $1 AND status IN ('active', 'paused')`,
-                [businessId]
-            );
-            if (countRes.rows[0].c >= plan.max_savings_vaults) {
-                return res.status(403).json({
-                    success: false,
-                    error: `Your plan allows up to ${plan.max_savings_vaults} savings vault(s). Kindly upgrade your plan for more vaults.`,
-                    code: "PLAN_UPGRADE_REQUIRED",
-                });
-            }
-        }
+        // NO PLAN GATING — owner directive: the Personal app is free to use
+        // and every feature is accessible with NO restriction based on plan.
+        // The old max_savings_vaults check hit invited members too (their
+        // session businessId points at the inviter's plan) and produced the
+        // "can't create more than one savings vault — upgrade plan" report.
 
         // ---- Optional auto-save config ----
         const autoSave = auto_save_enabled === true;
@@ -283,12 +282,12 @@ router.post("/vaults", authenticateToken, checkSubscriptionStatus, async (req: A
 router.get("/vaults/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
     try {
         const { id } = req.params;
-        const { userId, businessId } = req.user!;
+        const { userId } = req.user!;
         const vaultRes = await query(
             `SELECT v.*, w.currency AS auto_save_wallet_currency
              FROM savings_vaults v LEFT JOIN wallets w ON w.id = v.auto_save_wallet_id
-             WHERE v.id = $1 AND (v.user_id = $2 OR v.business_id = $3)`,
-            [id, userId, businessId]
+             WHERE v.id = $1 AND v.user_id = $2`,
+            [id, userId]
         );
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
@@ -343,8 +342,8 @@ router.get("/vaults/:id/transactions", authenticateToken, checkSubscriptionStatu
         const { id } = req.params;
         const { userId, businessId } = req.user!;
         const vaultRes = await query(
-            `SELECT id FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
-            [id, userId, businessId]
+            `SELECT id FROM savings_vaults WHERE id = $1 AND user_id = $2`,
+            [id, userId]
         );
         if (!vaultRes.rows[0]) return res.status(404).json({ success: false, error: "Vault not found" });
 
@@ -411,8 +410,8 @@ router.put("/vaults/:id", authenticateToken, checkSubscriptionStatus, async (req
         const { id } = req.params;
         const { userId, businessId } = req.user!;
         const vaultRes = await query(
-            `SELECT * FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
-            [id, userId, businessId]
+            `SELECT * FROM savings_vaults WHERE id = $1 AND user_id = $2`,
+            [id, userId]
         );
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
@@ -503,8 +502,8 @@ router.delete("/vaults/:id", authenticateToken, checkSubscriptionStatus, async (
         const { id } = req.params;
         const { userId, businessId } = req.user!;
         const vaultRes = await query(
-            `SELECT balance FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
-            [id, userId, businessId]
+            `SELECT balance FROM savings_vaults WHERE id = $1 AND user_id = $2`,
+            [id, userId]
         );
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
@@ -561,8 +560,8 @@ router.post("/vaults/:id/deposit", authenticateToken, requirePersonalKyc(), chec
         }
 
         const vaultRes = await query(
-            `SELECT * FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
-            [id, userId, businessId]
+            `SELECT * FROM savings_vaults WHERE id = $1 AND user_id = $2`,
+            [id, userId]
         );
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });
@@ -673,8 +672,8 @@ router.post("/vaults/:id/withdraw", authenticateToken, requirePersonalKyc(), che
         }
 
         const vaultRes = await query(
-            `SELECT * FROM savings_vaults WHERE id = $1 AND (user_id = $2 OR business_id = $3)`,
-            [id, userId, businessId]
+            `SELECT * FROM savings_vaults WHERE id = $1 AND user_id = $2`,
+            [id, userId]
         );
         const vault = vaultRes.rows[0];
         if (!vault) return res.status(404).json({ success: false, error: "Vault not found" });

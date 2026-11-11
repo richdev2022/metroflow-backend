@@ -12,6 +12,7 @@ import crypto from "crypto";
 import { sendTransactionAlert } from "../services/email";
 import { createNotification } from "../services/notifications";
 import { reverseFailedTransfer } from "../services/transfer";
+import { reconcileWithdrawalByTransferReference } from "../features/personal/split-pot-wallets";
 import { checkFundingLimit, rejectOverLimitFunding } from "../services/funding-limits";
 
 const router = express.Router();
@@ -558,6 +559,12 @@ const handleSquadWebhook = async (event: any) => {
                     console.error(`Auto-reversal failed for Squad transfer ${reference}:`, reversalError);
                 }
             }
+
+            // SPLIT/POT WITHDRAWAL SYNC: finalize a withdrawal request riding
+            // this transfer (multi-approval withdrawals use the same rails).
+            try { await reconcileWithdrawalByTransferReference(reference); } catch (wdErr: any) {
+                console.error(`Split/pot withdrawal reconcile failed for ${reference}:`, wdErr?.message);
+            }
         }
     }
 };
@@ -874,6 +881,12 @@ const handleMonnifyWebhook = async (event: any) => {
                  WHERE id = $5`,
                 [newStatus, failureReason, JSON.stringify(transferData), JSON.stringify(transferData), transfer.id]
             );
+
+            // SPLIT/POT WITHDRAWAL SYNC — finalize the withdrawal request on
+            // this transfer reference (see split-pot-wallets.ts).
+            try { await reconcileWithdrawalByTransferReference(String(reference || "")); } catch (wdErr: any) {
+                console.error(`Split/pot withdrawal reconcile failed for ${reference}:`, wdErr?.message);
+            }
         }
     }
 
@@ -924,6 +937,11 @@ const handleMonnifyWebhook = async (event: any) => {
                             console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
                         }
                     }
+
+                    // SPLIT/POT WITHDRAWAL SYNC (bulk disbursement loop).
+                    try { await reconcileWithdrawalByTransferReference(String(reference || "")); } catch (wdErr: any) {
+                        console.error(`Split/pot withdrawal reconcile failed for ${reference}:`, wdErr?.message);
+                    }
                 }
             }
         } else {
@@ -964,6 +982,11 @@ const handleMonnifyWebhook = async (event: any) => {
                     } catch (reversalError) {
                         console.error(`Auto-reversal failed for Monnify transfer ${reference}:`, reversalError);
                     }
+                }
+
+                // SPLIT/POT WITHDRAWAL SYNC (single disbursement).
+                try { await reconcileWithdrawalByTransferReference(String(reference || "")); } catch (wdErr: any) {
+                    console.error(`Split/pot withdrawal reconcile failed for ${reference}:`, wdErr?.message);
                 }
             }
         }
@@ -1565,6 +1588,13 @@ const handleFlutterwaveWebhook = async (event: any) => {
             } catch (saleSyncErr) {
                 console.error(`Crypto sale sync failed for ${reference}:`, saleSyncErr);
             }
+        }
+
+        // SPLIT/POT WITHDRAWAL SYNC — finalize a multi-approval withdrawal
+        // riding this Flutterwave transfer (after the auto-reversal above so
+        // the refund evidence is already on disk when it checks).
+        try { await reconcileWithdrawalByTransferReference(String(reference || "")); } catch (wdErr: any) {
+            console.error(`Split/pot withdrawal reconcile failed for ${reference}:`, wdErr?.message);
         }
     }
 };

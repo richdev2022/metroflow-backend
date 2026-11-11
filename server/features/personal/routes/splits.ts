@@ -2,9 +2,25 @@ import express from "express";
 import { randomBytes } from "crypto";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
-import { insertTransaction, creditWallet } from "../personal-utils";
+import { insertTransaction, creditWallet, requirePersonalKyc } from "../personal-utils";
 import { createNotification } from "../../../services/notifications";
 import { sendEmail } from "../../../services/email";
+import {
+  approversOf,
+  computeDueForWithdrawal,
+  creditSplitPotWallet,
+  ensureSplitPotWallet,
+  executeSplitWalletTransfer,
+  loadApproverProfiles,
+  loadWalletLedger,
+  loadWithdrawalHistory,
+  normalizeWithdrawalApprovers,
+  notifyWithdrawalApprovers,
+  openWithdrawalRequest,
+  readWithdrawalDestination,
+  reconcileWithdrawalRequest,
+  serializeWithdrawalRequest,
+} from "../split-pot-wallets";
 
 /**
  * SPLIT BILLS — divide an expense across contacts (mounted at /splits,
@@ -23,18 +39,34 @@ import { sendEmail } from "../../../services/email";
  *                                   user (name/username/email) for the picker
  *   POST /splits                  → create a split + invite participants
  *                                   (user_ids AND/OR emails[] — unknown emails
- *                                   get a pending email invite + invite mail)
+ *                                   get a pending email invite + invite mail;
+ *                                   optional withdrawalApprovers + withdrawalDueAt)
+ *   PATCH /splits/:id             → creator edit (title/description +
+ *                                   withdrawalApprovers/withdrawalDueAt)
  *   GET  /splits/mine             → created by me (+ status counts) + participating
- *   GET  /splits/:id              → detail (creator or participant only)
- *   POST /splits/:id/pay          → pay my share (participant, pending)
+ *   GET  /splits/:id              → detail (creator or participant only) + the
+ *                                   split's OWN wallet (balance + ledger) +
+ *                                   approvers + open withdrawal request
+ *   POST /splits/:id/pay          → pay my share (participant, pending) — lands
+ *                                   in the SPLIT'S wallet, not the creator's
  *   POST /splits/:id/decline      → decline my share (participant, pending)
  *   POST /splits/:id/remind       → creator nudges pending participants (1 per 6h)
+ *   POST /splits/:id/withdrawals  → creator bank withdrawal (multi-approval when
+ *                                   approvers are set; else immediate execution)
+ *   GET  /splits/:id/withdrawals  → withdrawal history (creator or participant)
  */
 
 const router = express.Router();
 
 function num(v: any): number { return Number(v) || 0; }
 function money(v: number): number { return Math.round(v * 100) / 100; }
+
+/** Parse a client date that must be a real date when provided. */
+function parseDate(v: any): Date | null | "invalid" {
+  if (v === undefined || v === null || v === "") return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? "invalid" : d;
+}
 
 // Contexts: the API's own direct/group/page PLUS the labels the web
 // SplitPots composer sends (dinner/trip/gift/rent/other). Unknown values
@@ -292,13 +324,29 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     const { shares, error } = computeShares(total, participants);
     if (error) return res.status(400).json({ success: false, error });
 
+    // Withdrawal approvers (multi-approval) + due date — settable at create
+    // AND edit. Creator may be included; any distinct existing user ids.
+    const approverCheck = await normalizeWithdrawalApprovers(req.body?.withdrawalApprovers);
+    if (!approverCheck.ok) {
+      return res.status(400).json({ success: false, error: approverCheck.error });
+    }
+    const withdrawalDueAt = parseDate(req.body?.withdrawalDueAt);
+    if (withdrawalDueAt === "invalid") {
+      return res.status(400).json({ success: false, error: "withdrawalDueAt must be a valid date" });
+    }
+
     const shareToken = randomBytes(24).toString("hex"); // 48 chars ≤ VARCHAR(64)
     const created = await query(
-      `INSERT INTO splits (creator_id, title, description, total_amount, currency, status, context, context_id, share_token)
-       VALUES ($1,$2,$3,$4,'NGN','pending',$5,$6,$7) RETURNING *`,
-      [userId, title, description, total, context, contextId, shareToken],
+      `INSERT INTO splits (creator_id, title, description, total_amount, currency, status, context, context_id, share_token, withdrawal_approvers, withdrawal_due_at)
+       VALUES ($1,$2,$3,$4,'NGN','pending',$5,$6,$7,$8::jsonb,$9) RETURNING *`,
+      [userId, title, description, total, context, contextId, shareToken, JSON.stringify(approverCheck.approvers || []), withdrawalDueAt],
     );
     const split = created.rows[0];
+
+    // Every split owns its OWN NGN wallet — participant payments land HERE
+    // (not the creator's account). Lazily backfilled for older splits too.
+    await ensureSplitPotWallet("split", split.id).catch((wErr: any) =>
+      console.error("[splits/create] split wallet creation failed (will retry lazily):", wErr?.message));
 
     const inserted = await query(
       `INSERT INTO split_participants (split_id, user_id, share_amount, status)
@@ -513,7 +561,9 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 });
 
 // ---------------------------------------------------------------------------
-// Detail (creator or participant only)
+// Detail (creator or participant only) — includes the split's OWN wallet
+// (balance + ledger), the approver config, any open withdrawal request and
+// the "due for withdrawal" CTA hint.
 // ---------------------------------------------------------------------------
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
@@ -533,15 +583,101 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
       return res.status(403).json({ success: false, error: "You do not have access to this split" });
     }
 
+    // Wallet bundle (balance + last-50 ledger live on the split's OWN wallet;
+    // idempotent creation covers splits made before wallets existed).
+    let wallet: { id: string; balanceNgn: number; currency: string; ledger: any[] } | null = null;
+    let openRequest: any | null = null;
+    try {
+      const w = await ensureSplitPotWallet("split", split.id);
+      const [bal, ledger] = await Promise.all([
+        query(`SELECT balance FROM wallets WHERE id = $1`, [w.walletId]),
+        loadWalletLedger(w.walletId, 50),
+      ]);
+      wallet = { id: w.walletId, balanceNgn: money(num(bal.rows[0]?.balance)), currency: "NGN", ledger };
+      openRequest = await openWithdrawalRequest("split", split.id);
+      // Finalize an async withdrawal whose provider outcome has landed.
+      if (openRequest?.status === "executing") {
+        openRequest = (await reconcileWithdrawalRequest(openRequest)) || openRequest;
+      }
+    } catch (wErr: any) {
+      console.error("[splits/detail] wallet bundle failed:", wErr?.message);
+    }
+    const approverIds = approversOf(split);
+
     res.json({
       success: true,
       split: serializeSplit(split),
       participants: await loadParticipants(split.id),
       email_invites: await loadEmailInvites(split.id),
+      wallet,
+      withdrawal_approvers: approverIds,
+      withdrawalApprovers: await loadApproverProfiles(approverIds).catch(() =>
+        approverIds.map((id) => ({ id, name: null, avatarUrl: null, username: null }))),
+      pendingWithdrawal: openRequest ? serializeWithdrawalRequest(openRequest) : null,
+      dueForWithdrawal: computeDueForWithdrawal(split.withdrawal_due_at, wallet?.balanceNgn || 0, !!openRequest),
     });
   } catch (e: any) {
     console.error("[splits/detail]", e?.message);
     res.status(500).json({ success: false, error: "Could not load the split" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Edit (creator only) — replica of creation for the editable fields, most
+// importantly the withdrawal approvers (multi-approval config) + due date.
+// ---------------------------------------------------------------------------
+router.patch("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
+    const split = await loadSplit(String(req.params.id));
+    if (!split) return res.status(404).json({ success: false, error: "Split not found" });
+    if (split.creator_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the creator can edit this split" });
+    }
+
+    const sets: string[] = [];
+    const params: any[] = [];
+
+    if (req.body?.title !== undefined) {
+      const title = String(req.body.title || "").trim();
+      if (title.length < 3 || title.length > 140) {
+        return res.status(400).json({ success: false, error: "Title must be between 3 and 140 characters" });
+      }
+      params.push(title); sets.push(`title = $${params.length}`);
+    }
+    if (req.body?.description !== undefined) {
+      params.push(String(req.body.description || "").trim().slice(0, 500) || null);
+      sets.push(`description = $${params.length}`);
+    }
+    if (req.body?.withdrawalApprovers !== undefined) {
+      const check = await normalizeWithdrawalApprovers(req.body.withdrawalApprovers);
+      if (!check.ok) return res.status(400).json({ success: false, error: check.error });
+      params.push(JSON.stringify(check.approvers || [])); sets.push(`withdrawal_approvers = $${params.length}::jsonb`);
+    }
+    if (req.body?.withdrawalDueAt !== undefined) {
+      const due = parseDate(req.body.withdrawalDueAt);
+      if (due === "invalid") return res.status(400).json({ success: false, error: "withdrawalDueAt must be a valid date" });
+      params.push(due); sets.push(`withdrawal_due_at = $${params.length}`);
+    }
+
+    if (!sets.length) {
+      return res.status(400).json({ success: false, error: "Nothing to update — send title, description, withdrawalApprovers and/or withdrawalDueAt" });
+    }
+    params.push(split.id);
+    await query(`UPDATE splits SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+
+    const fresh = await loadSplit(split.id);
+    res.json({
+      success: true,
+      split: serializeSplit(fresh),
+      withdrawal_approvers: approversOf(fresh),
+    });
+  } catch (e: any) {
+    console.error("[splits/edit]", e?.message);
+    res.status(500).json({ success: false, error: "Could not update the split" });
   }
 });
 
@@ -726,43 +862,42 @@ router.post("/:id/pay", authenticateToken, checkSubscriptionStatus, async (req: 
     // The payment is committed from here on — failures below answer 500 but
     // never touch the claim again.
 
-    // CREDIT THE CREATOR (money safety): the participant's NGN left their
-    // wallet, so it MUST land in the creator's NGN wallet in the same flow.
-    // Previously the debit was ledger-only and the creator never received
-    // the money. Best-effort ledger on a hard failure — the money movement
-    // itself must succeed (the payer's money may not vanish either way).
-    if (share > 0 && split.creator_id !== userId) {
-      const cw = await query(
-        `SELECT id FROM wallets
-          WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) = 'NGN' AND status = 'active'
-          ORDER BY created_at ASC LIMIT 1`,
-        [split.creator_id],
-      );
-      const creatorWallet = cw.rows[0];
-      if (creatorWallet) {
-        const creditRef = `${paidReference}-TO-CREATOR`;
-        const credited = await query(
-          `UPDATE wallets SET balance = balance + $2, updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1 RETURNING id`,
-          [creatorWallet.id, share],
-        );
-        if (credited.rows.length) {
-          await insertTransaction({
-            userId: split.creator_id,
-            walletId: creatorWallet.id,
-            reference: creditRef,
-            type: "credit",
-            transactionType: "split_receipt",
-            amount: share,
-            currency: "NGN",
-            description: `Split received — ${String(split.title).slice(0, 60)}`,
-          }).catch((cErr: any) =>
-            console.error("[splits/pay] creator credit ledger failed (money moved):", cErr?.message));
-        } else {
-          console.error("[splits/pay] CRITICAL: creator wallet credit failed", { splitId: split.id, creatorWallet: creatorWallet.id });
+    // CREDIT THE SPLIT'S OWN WALLET (owner directive): the participant's NGN
+    // left their wallet, so it MUST land in THIS split's own NGN wallet in the
+    // same flow — NOT the creator's account (the old direct-to-creator flow is
+    // replaced; the creator stays the organizer and moves the money out via
+    // the multi-approval withdrawal flow). Every payment credits the wallet —
+    // including the creator paying their own share.
+    if (share > 0) {
+      try {
+        const splitWallet = await ensureSplitPotWallet("split", split.id);
+        const creditRef = `${paidReference}-TO-SPLIT-WALLET`.slice(0, 255);
+        const credit = await creditSplitPotWallet({
+          walletId: splitWallet.walletId,
+          ownerType: "split",
+          ownerId: split.id,
+          amount: share,
+          reason: "contribution",
+          reference: creditRef,
+          metadata: { splitId: split.id, payerId: userId, payerReference: paidReference, creatorId: split.creator_id },
+        });
+        if (!credit.applied) {
+          console.error("[splits/pay] split wallet credit was deduped (reference already applied)", { splitId: split.id, creditRef });
         }
-      } else {
-        console.error("[splits/pay] creator has no active NGN wallet — credit pending manual reconciliation", { splitId: split.id, creator: split.creator_id });
+      } catch (walletErr: any) {
+        // Never take money without landing it — refund the payer's debit and
+        // release the claim so they can retry.
+        console.error("[splits/pay] split wallet credit failed — refunding payer:", walletErr?.message);
+        if (debited > 0 && walletId) {
+          await creditWallet(walletId, debited).catch((rErr: any) =>
+            console.error("[splits/pay] CRITICAL: wallet refund failed:", rErr?.message));
+        }
+        await query(
+          `UPDATE split_participants SET status = 'pending', paid_at = NULL, paid_reference = NULL
+            WHERE id = $1 AND paid_reference = $2`,
+          [participant.id, paidReference],
+        ).catch(() => {});
+        return res.status(500).json({ success: false, error: "Could not record the payment — nothing was charged. Please retry." });
       }
     }
 
@@ -935,6 +1070,182 @@ router.post("/:id/remind", authenticateToken, checkSubscriptionStatus, async (re
   } catch (e: any) {
     console.error("[splits/remind]", e?.message);
     res.status(500).json({ success: false, error: "Could not send reminders" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WITHDRAWALS — money leaves THIS split's own wallet (NGN), never the
+// creator's account.
+//   POST /:id/withdrawals   → creator requests a bank payout. Approvers set →
+//                             withdrawal REQUEST (multi-approval); none set →
+//                             executes immediately on the single-transfer rails.
+//   GET  /:id/withdrawals   → history (creator or participant).
+// Approve/decline/pending-inbox live on the shared /withdrawals router.
+// ---------------------------------------------------------------------------
+
+/** Destination validation lives in split-pot-wallets.ts (shared with /pots). */
+
+router.post("/:id/withdrawals", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
+    const split = await loadSplit(String(req.params.id));
+    if (!split) return res.status(404).json({ success: false, error: "Split not found" });
+    if (split.creator_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the creator can withdraw from this split" });
+    }
+
+    const wallet = await ensureSplitPotWallet("split", split.id);
+
+    // One open request at a time per split — but an APPROVED request whose
+    // execution died between approval and dispatch is RESUMED here instead of
+    // deadlocking the split behind it.
+    const open = await openWithdrawalRequest("split", split.id);
+    if (open && open.status !== "approved") {
+      return res.status(409).json({
+        success: false,
+        code: "WITHDRAWAL_IN_PROGRESS",
+        error: `A withdrawal for this split is already ${open.status} — it must finish before another can start`,
+        data: { request: serializeWithdrawalRequest(open) },
+      });
+    }
+
+    let request = open;
+    if (!open) {
+      const amount = money(num(req.body?.amount));
+      if (!(amount > 0)) {
+        return res.status(400).json({ success: false, error: "amount must be greater than 0" });
+      }
+      const dest = readWithdrawalDestination(req.body);
+      if (!dest.ok) return res.status(400).json({ success: false, error: dest.error });
+      if (amount > wallet.balance) {
+        return res.status(400).json({
+          success: false,
+          code: "INSUFFICIENT_BALANCE",
+          error: `The split wallet holds ₦${wallet.balance.toLocaleString()} — you cannot withdraw ₦${amount.toLocaleString()}`,
+        });
+      }
+
+      const approvers = approversOf(split);
+      const requester = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const requesterName = requester.rows[0]?.name || "Someone";
+      const d = dest.value;
+
+      const ins = await query(
+        `INSERT INTO withdrawal_requests
+           (owner_type, owner_id, wallet_id, requested_by, amount, currency, note,
+            bank_code, bank_name, account_number, account_name, recipient_code,
+            status, approvers, approvals)
+         VALUES ('split',$1,$2,$3,$4,'NGN',$5,$6,$7,$8,$9,$10,$11,$12::jsonb,'[]'::jsonb)
+         RETURNING *`,
+        [
+          split.id, wallet.walletId, userId, amount, d.note,
+          d.bank_code, d.bank_name, d.account_number, d.account_name, d.recipient_code,
+          approvers.length ? "pending" : "approved",
+          JSON.stringify(approvers),
+        ],
+      );
+      request = ins.rows[0];
+
+      if (approvers.length) {
+        // MULTI-APPROVAL: park as a REQUEST and notify every approver.
+        await notifyWithdrawalApprovers(request, { ownerName: split.title, requesterName });
+        return res.status(201).json({
+          success: true,
+          data: {
+            request: serializeWithdrawalRequest(request),
+            wallet: { id: wallet.walletId, balanceNgn: wallet.balance, currency: "NGN" },
+            approvalsRequired: approvers.length,
+            message: `Withdrawal request sent to ${approvers.length} approver${approvers.length === 1 ? "" : "s"} — it executes when everyone approves`,
+          },
+        });
+      }
+    } else {
+      // Resuming a stuck APPROVED request — the stored amount must still fit.
+      const resumeAmount = money(num(open.amount));
+      if (resumeAmount > wallet.balance) {
+        return res.status(400).json({
+          success: false,
+          code: "INSUFFICIENT_BALANCE",
+          error: `The split wallet now holds ₦${wallet.balance.toLocaleString()} — the pending ₦${resumeAmount.toLocaleString()} withdrawal can no longer be funded`,
+        });
+      }
+    }
+
+    // NO approvers configured (or resuming an approved request) → execute via
+    // the single-transfer clone with THIS split's wallet as the source of funds.
+    const executed = await executeSplitWalletTransfer(request, userId, { ownerName: split.title });
+    const freshWallet = await getFreshWalletBalance(wallet.walletId);
+    return res.status(201).json({
+      success: executed.request.status !== "failed",
+      data: {
+        request: serializeWithdrawalRequest(executed.request),
+        wallet: { id: wallet.walletId, balanceNgn: freshWallet, currency: "NGN" },
+        transfer: executed.payout
+          ? {
+              reference: executed.payout.reference,
+              status: executed.payout.status,
+              failureReason: executed.payout.failure_reason || null,
+            }
+          : null,
+        message: executed.request.status === "completed"
+          ? "Withdrawal completed"
+          : executed.request.status === "executing"
+            ? "Withdrawal is processing — you'll be notified when it settles"
+            : executed.request.failure_reason || "Withdrawal failed — the money is back in the split wallet",
+      },
+    });
+  } catch (e: any) {
+    if (e?.code === "NOT_EXECUTABLE") {
+      return res.status(409).json({ success: false, code: e.code, error: e.message });
+    }
+    console.error("[splits/withdrawals]", e?.message);
+    res.status(500).json({ success: false, error: "Could not create the withdrawal" });
+  }
+});
+
+async function getFreshWalletBalance(walletId: string): Promise<number> {
+  const r = await query(`SELECT balance FROM wallets WHERE id = $1`, [walletId]);
+  return money(num(r.rows[0]?.balance));
+}
+
+router.get("/:id/withdrawals", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Split not found" });
+    }
+    const split = await loadSplit(String(req.params.id));
+    if (!split) return res.status(404).json({ success: false, error: "Split not found" });
+
+    const membership = await query(
+      `SELECT 1 FROM split_participants WHERE split_id = $1 AND user_id = $2 LIMIT 1`,
+      [split.id, userId],
+    );
+    if (split.creator_id !== userId && !membership.rows.length) {
+      return res.status(403).json({ success: false, error: "You do not have access to this split" });
+    }
+
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const history = await loadWithdrawalHistory("split", split.id, limit);
+    const wallet = await ensureSplitPotWallet("split", split.id);
+    const approverIds = approversOf(split);
+
+    res.json({
+      success: true,
+      data: {
+        withdrawals: history,
+        wallet: { id: wallet.walletId, balanceNgn: wallet.balance, currency: "NGN" },
+        withdrawal_approvers: approverIds,
+        withdrawalApprovers: await loadApproverProfiles(approverIds).catch(() =>
+          approverIds.map((id) => ({ id, name: null, avatarUrl: null, username: null }))),
+      },
+    });
+  } catch (e: any) {
+    console.error("[splits/withdrawals/history]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load withdrawal history" });
   }
 });
 

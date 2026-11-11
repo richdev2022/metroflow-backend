@@ -39,6 +39,7 @@ let sentryInitialized = !!process.env.SENTRY_DSN;
   import personalRoundupRouter from "./features/personal/routes/roundup";
   import personalSplitsRouter from "./features/personal/routes/splits";
   import personalPotsRouter from "./features/personal/routes/pots";
+  import personalWithdrawalsRouter from "./features/personal/routes/withdrawals";
   import personalCirclesRouter from "./features/personal/routes/circles";
   import personalInsightsRouter from "./features/personal/routes/insights";
   import personalLiveShopRouter from "./features/personal/routes/live-shop";
@@ -1303,9 +1304,12 @@ export async function createServer() {
   mainRouter.use("/savings", savingsPersonalRouter);
   // Round-Up Auto-Save — spare-change saving into goal vaults.
   mainRouter.use("/roundup", personalRoundupRouter);
-  // Split Bills + Group Pots — shared expenses & money pots.
+  // Split Bills + Group Pots — shared expenses & money pots. Every split/pot
+  // owns its OWN NGN wallet; withdrawals go through multi-approval requests.
   mainRouter.use("/splits", personalSplitsRouter);
   mainRouter.use("/pots", personalPotsRouter);
+  // Shared approver surface for split/pot withdrawals (approve/decline/inbox).
+  mainRouter.use("/withdrawals", personalWithdrawalsRouter);
   // Savings Circles — community rotating savings (ajo / esusu) with a
   // transparent payment calendar, grace + skip logic and trust scores.
   mainRouter.use("/circles", personalCirclesRouter);

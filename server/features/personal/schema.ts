@@ -1737,5 +1737,86 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_budget_envelopes_user ON budget_envelopes(user_id, active)`);
 
+  // ---------------------------------------------------------------------
+  // SPLIT/POT WALLETS + MULTI-APPROVAL WITHDRAWALS
+  //
+  // Every bill split and group pot owns its OWN NGN wallet: payments to a
+  // split/pot land in THAT split/pot's wallet (NOT the creator's account).
+  // The balance itself lives in the shared `wallets` table as a row with
+  // user_id = NULL / business_id = NULL (NULLs never conflict in the unique
+  // keys, and the single-transfer pipeline debits `wallets` by id, so a
+  // withdrawal from a split/pot rides the EXACT proven transfer rails).
+  // split_pot_wallets maps owner → wallet row; split_pot_wallet_ledger is
+  // the feature-level money trail (contributions, withdrawal debits,
+  // refunds); withdrawal_requests carries the multi-approval flow.
+  // ---------------------------------------------------------------------
+  // Approvers + due date are settable at create AND edit on both owners.
+  await query(`ALTER TABLE splits ADD COLUMN IF NOT EXISTS withdrawal_approvers JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await query(`ALTER TABLE splits ADD COLUMN IF NOT EXISTS withdrawal_due_at TIMESTAMP`);
+  await query(`ALTER TABLE pots ADD COLUMN IF NOT EXISTS withdrawal_approvers JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await query(`ALTER TABLE pots ADD COLUMN IF NOT EXISTS withdrawal_due_at TIMESTAMP`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS split_pot_wallets (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_type VARCHAR(10) NOT NULL,                -- split | pot
+      owner_id UUID NOT NULL,
+      wallet_id UUID NOT NULL UNIQUE,                 -- the wallets row holding the balance
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (owner_type, owner_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_split_pot_wallets_owner ON split_pot_wallets(owner_type, owner_id)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS split_pot_wallet_ledger (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      wallet_id UUID NOT NULL,
+      owner_type VARCHAR(10) NOT NULL,                -- split | pot
+      owner_id UUID NOT NULL,
+      direction VARCHAR(6) NOT NULL,                  -- credit | debit
+      amount DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      reason VARCHAR(40) NOT NULL,                    -- contribution | withdrawal | withdrawal_refund | pot_close
+      reference VARCHAR(255) NOT NULL UNIQUE,         -- idempotency key (one row per money movement)
+      balance_after DECIMAL(15,2),
+      metadata JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sp_wallet_ledger_wallet ON split_pot_wallet_ledger(wallet_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_sp_wallet_ledger_owner ON split_pot_wallet_ledger(owner_type, owner_id, created_at DESC)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS withdrawal_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_type VARCHAR(10) NOT NULL,                -- split | pot
+      owner_id UUID NOT NULL,
+      wallet_id UUID NOT NULL,                        -- split/pot wallet the money leaves from
+      requested_by UUID NOT NULL,                     -- creator (organizer)
+      amount DECIMAL(15,2) NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+      note VARCHAR(255),
+      bank_code VARCHAR(20),                          -- exactly what the single transfer needs
+      bank_name VARCHAR(100),
+      account_number VARCHAR(20),
+      account_name VARCHAR(100),
+      recipient_code VARCHAR(100),                    -- pre-created provider recipient (optional)
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | approved | declined | executing | completed | failed
+      approvals JSONB NOT NULL DEFAULT '[]'::jsonb,   -- [{approverId, decision, reason, at}]
+      approvers JSONB NOT NULL DEFAULT '[]'::jsonb,   -- snapshot of approver user ids at request time
+      failure_reason TEXT,
+      transfer_reference VARCHAR(255) UNIQUE,         -- transfer_queue.reference once executing
+      transfer_queue_id UUID,
+      completed_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_owner ON withdrawal_requests(owner_type, owner_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status, updated_at DESC)`);
+
   console.log("[Migrations] Personal (identity + bills + savings + social + live + marketplace + boosts + commerce + donations + groups/pages + stories + sounds + tags + circles + insights) schema applied");
 }

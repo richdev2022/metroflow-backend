@@ -96,6 +96,15 @@ if (connection && scheduledQueue) {
 
         case 'check-processing-transfers':
           await checkProcessingTransfers();
+          // SPLIT/POT WITHDRAWALS: finalize executing withdrawal requests
+          // whose underlying transfer reached a terminal state since the last
+          // pass (belt-and-braces on top of the inline poll + webhook hooks).
+          try {
+            const { syncExecutingWithdrawals } = await import('../features/personal/split-pot-wallets');
+            await syncExecutingWithdrawals(25);
+          } catch (wdErr: any) {
+            logger.error(`Split/pot withdrawal reconcile failed: ${wdErr?.message}`);
+          }
           return { success: true, message: 'Processing transfers checked' };
 
         default:

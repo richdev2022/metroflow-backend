@@ -2,24 +2,51 @@ import express from "express";
 import { randomBytes } from "crypto";
 import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
-import { insertTransaction, creditWallet } from "../personal-utils";
+import { insertTransaction, creditWallet, requirePersonalKyc } from "../personal-utils";
 import { createNotification } from "../../../services/notifications";
+import {
+  approversOf,
+  computeDueForWithdrawal,
+  creditSplitPotWallet,
+  debitSplitPotWallet,
+  ensureSplitPotWallet,
+  executeSplitWalletTransfer,
+  loadApproverProfiles,
+  loadWalletLedger,
+  loadWithdrawalHistory,
+  normalizeWithdrawalApprovers,
+  notifyWithdrawalApprovers,
+  openWithdrawalRequest,
+  readWithdrawalDestination,
+  reconcileWithdrawalRequest,
+  serializeWithdrawalRequest,
+} from "../split-pot-wallets";
 
 /**
  * GROUP POTS — shared money pots for events, gifts and launches (mounted at
  * /pots, personal users only).
  *
  * Anyone with the link/context contributes ANY amount from their NGN wallet
- * (NO transaction PIN for v1 — social micro-payments). The creator closes the
- * pot and the collected balance pays out to their NGN wallet. Everything is
- * NGN; contributions are idempotent by unique reference.
+ * (NO transaction PIN for v1 — social micro-payments). Contributions land in
+ * THE POT'S OWN NGN wallet (NOT the creator's account) — the creator moves
+ * the money out via the multi-approval withdrawal flow (or the legacy close
+ * sweep when no approvers are configured). Everything is NGN; contributions
+ * are idempotent by unique reference.
  *
  * Endpoints:
- *   POST /pots                 → open a pot (+ share token)
- *   GET  /pots/mine            → pots I created + pots I contributed to
- *   GET  /pots/:id             → detail + contributions + progress
- *   POST /pots/:id/contribute  → { amount, note? } wallet-funded contribution
- *   POST /pots/:id/close       → creator-only payout to their NGN wallet
+ *   POST /pots                    → open a pot (+ share token, approvers, due date)
+ *   PATCH /pots/:id               → creator edits (title/purpose/target/deadline/
+ *                                    withdrawalApprovers/withdrawalDueAt)
+ *   GET  /pots/mine               → pots I created + pots I contributed to
+ *   GET  /pots/:id                → detail + contributions + progress + wallet
+ *   POST /pots/:id/contribute     → { amount, note? } wallet-funded contribution
+ *                                    (lands in the POT's wallet)
+ *   POST /pots/:id/withdrawals    → creator bank withdrawal (multi-approval when
+ *                                    approvers are set; else immediate)
+ *   GET  /pots/:id/withdrawals    → withdrawal history (creator)
+ *   POST /pots/:id/close          → creator-only sweep of the collected balance
+ *                                    to their NGN wallet (blocked when approvers
+ *                                    are set — use the approval flow instead)
  */
 
 const router = express.Router();
@@ -102,14 +129,34 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
       }
     }
 
+    // Withdrawal approvers (multi-approval) + due date — settable at create
+    // AND edit. Creator may be included; any distinct existing user ids.
+    const approverCheck = await normalizeWithdrawalApprovers(req.body?.withdrawalApprovers);
+    if (!approverCheck.ok) {
+      return res.status(400).json({ success: false, error: approverCheck.error });
+    }
+    let withdrawalDueAt: Date | null = null;
+    if (req.body?.withdrawalDueAt) {
+      withdrawalDueAt = new Date(req.body.withdrawalDueAt);
+      if (isNaN(withdrawalDueAt.getTime())) {
+        return res.status(400).json({ success: false, error: "withdrawalDueAt must be a valid date" });
+      }
+    }
+
     const shareToken = randomBytes(24).toString("hex");
     const created = await query(
-      `INSERT INTO pots (creator_id, title, purpose, currency, target_amount, balance, status, context, context_id, share_token, deadline)
-       VALUES ($1,$2,$3,'NGN',$4,0,'open',$5,$6,$7,$8) RETURNING *`,
-      [userId, title, purpose, targetAmount, context, contextId, shareToken, deadline],
+      `INSERT INTO pots (creator_id, title, purpose, currency, target_amount, balance, status, context, context_id, share_token, deadline, withdrawal_approvers, withdrawal_due_at)
+       VALUES ($1,$2,$3,'NGN',$4,0,'open',$5,$6,$7,$8,$9::jsonb,$10) RETURNING *`,
+      [userId, title, purpose, targetAmount, context, contextId, shareToken, deadline, JSON.stringify(approverCheck.approvers || []), withdrawalDueAt],
     );
+    const pot = created.rows[0];
 
-    res.status(201).json({ success: true, pot: serializePot(created.rows[0]) });
+    // Every pot owns its OWN NGN wallet — contributions land HERE (not the
+    // creator's account). Lazily backfilled for older pots too.
+    await ensureSplitPotWallet("pot", pot.id).catch((wErr: any) =>
+      console.error("[pots/create] pot wallet creation failed (will retry lazily):", wErr?.message));
+
+    res.status(201).json({ success: true, pot: serializePot(pot), withdrawal_approvers: approversOf(pot) });
   } catch (e: any) {
     console.error("[pots/create]", e?.message);
     res.status(500).json({ success: false, error: "Could not create the pot" });
@@ -161,7 +208,8 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
 });
 
 // ---------------------------------------------------------------------------
-// Detail + contributions + progress (auth required; open viewing for v1)
+// Detail + contributions + progress + the pot's OWN wallet (auth required;
+// open viewing for v1)
 // ---------------------------------------------------------------------------
 router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
   try {
@@ -181,15 +229,123 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
       [pot.id],
     );
 
+    // The pot's OWN wallet (balance + last-50 ledger) + open withdrawal request
+    // + approver profiles + dueForWithdrawal CTA hint (due = withdrawal_due_at,
+    // falling back to the pot deadline).
+    let wallet: { id: string; balanceNgn: number; currency: string; ledger: any[] } | null = null;
+    let openRequest: any | null = null;
+    try {
+      const w = await ensureSplitPotWallet("pot", pot.id);
+      const [bal, ledger] = await Promise.all([
+        query(`SELECT balance FROM wallets WHERE id = $1`, [w.walletId]),
+        loadWalletLedger(w.walletId, 50),
+      ]);
+      wallet = { id: w.walletId, balanceNgn: money(num(bal.rows[0]?.balance)), currency: "NGN", ledger };
+      openRequest = await openWithdrawalRequest("pot", pot.id);
+      if (openRequest?.status === "executing") {
+        openRequest = (await reconcileWithdrawalRequest(openRequest)) || openRequest;
+      }
+    } catch (wErr: any) {
+      console.error("[pots/detail] wallet bundle failed:", wErr?.message);
+    }
+    const dueAt = pot.withdrawal_due_at || pot.deadline || null;
+    const approverIds = approversOf(pot);
+
     res.json({
       success: true,
       pot: serializePot(pot),
       contributions: contributions.rows.map((r: any) => ({ ...r, amount: num(r.amount) })),
       progress: buildProgress(pot),
+      wallet,
+      withdrawal_approvers: approverIds,
+      withdrawalApprovers: await loadApproverProfiles(approverIds).catch(() =>
+        approverIds.map((id) => ({ id, name: null, avatarUrl: null, username: null }))),
+      pendingWithdrawal: openRequest ? serializeWithdrawalRequest(openRequest) : null,
+      dueForWithdrawal: computeDueForWithdrawal(dueAt, wallet?.balanceNgn || 0, !!openRequest),
     });
   } catch (e: any) {
     console.error("[pots/detail]", e?.message);
     res.status(500).json({ success: false, error: "Could not load the pot" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Edit (creator only) — replica of creation for the editable fields, most
+// importantly the withdrawal approvers (multi-approval config) + due date.
+// ---------------------------------------------------------------------------
+router.patch("/:id", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
+    const pot = await loadPot(String(req.params.id));
+    if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
+    if (pot.creator_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the creator can edit this pot" });
+    }
+
+    const sets: string[] = [];
+    const params: any[] = [];
+
+    if (req.body?.title !== undefined) {
+      const title = String(req.body.title || "").trim();
+      if (title.length < 3 || title.length > 140) {
+        return res.status(400).json({ success: false, error: "Title must be between 3 and 140 characters" });
+      }
+      params.push(title); sets.push(`title = $${params.length}`);
+    }
+    if (req.body?.purpose !== undefined) {
+      params.push(String(req.body.purpose || "").trim().slice(0, 500) || null);
+      sets.push(`purpose = $${params.length}`);
+    }
+    if (req.body?.target_amount !== undefined) {
+      const raw = String(req.body.target_amount).trim();
+      const target = raw === "" ? null : money(num(req.body.target_amount));
+      if (target !== null && !(target > 0)) {
+        return res.status(400).json({ success: false, error: "target_amount must be greater than 0" });
+      }
+      params.push(target); sets.push(`target_amount = $${params.length}`);
+    }
+    if (req.body?.deadline !== undefined) {
+      if (req.body.deadline === null || req.body.deadline === "") {
+        params.push(null); sets.push(`deadline = $${params.length}`);
+      } else {
+        const d = new Date(req.body.deadline);
+        if (isNaN(d.getTime())) return res.status(400).json({ success: false, error: "deadline must be a valid date" });
+        params.push(d); sets.push(`deadline = $${params.length}`);
+      }
+    }
+    if (req.body?.withdrawalApprovers !== undefined) {
+      const check = await normalizeWithdrawalApprovers(req.body.withdrawalApprovers);
+      if (!check.ok) return res.status(400).json({ success: false, error: check.error });
+      params.push(JSON.stringify(check.approvers || [])); sets.push(`withdrawal_approvers = $${params.length}::jsonb`);
+    }
+    if (req.body?.withdrawalDueAt !== undefined) {
+      if (req.body.withdrawalDueAt === null || req.body.withdrawalDueAt === "") {
+        params.push(null); sets.push(`withdrawal_due_at = $${params.length}`);
+      } else {
+        const d = new Date(req.body.withdrawalDueAt);
+        if (isNaN(d.getTime())) return res.status(400).json({ success: false, error: "withdrawalDueAt must be a valid date" });
+        params.push(d); sets.push(`withdrawal_due_at = $${params.length}`);
+      }
+    }
+
+    if (!sets.length) {
+      return res.status(400).json({ success: false, error: "Nothing to update — send title, purpose, target_amount, deadline, withdrawalApprovers and/or withdrawalDueAt" });
+    }
+    params.push(pot.id);
+    await query(`UPDATE pots SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+
+    const fresh = await loadPot(pot.id);
+    res.json({
+      success: true,
+      pot: serializePot(fresh),
+      withdrawal_approvers: approversOf(fresh),
+    });
+  } catch (e: any) {
+    console.error("[pots/edit]", e?.message);
+    res.status(500).json({ success: false, error: "Could not update the pot" });
   }
 });
 
@@ -269,6 +425,19 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
         currency: "NGN",
         description: `Group pot contribution — ${String(pot.title).slice(0, 60)}`,
       });
+      // CREDIT THE POT'S OWN WALLET (owner directive): the contribution lands
+      // in THIS pot's NGN wallet — NOT the creator's account. Inside the same
+      // guard: a failure here refunds the contributor and rolls everything back.
+      const potWallet = await ensureSplitPotWallet("pot", pot.id);
+      await creditSplitPotWallet({
+        walletId: potWallet.walletId,
+        ownerType: "pot",
+        ownerId: pot.id,
+        amount,
+        reason: "contribution",
+        reference: `${reference}-TO-POT-WALLET`.slice(0, 255),
+        metadata: { potId: pot.id, contributorId: userId, contributionReference: reference, creatorId: pot.creator_id },
+      });
     } catch (cErr: any) {
       // Never take money without recording the contribution.
       if (cErr?.potClosed) {
@@ -347,6 +516,18 @@ router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req
       return res.status(400).json({ success: false, error: "This pot is already closed" });
     }
 
+    // MULTI-APPROVAL: a pot with withdrawal approvers must move its money out
+    // through the approval flow — closing must not bypass the approvers.
+    const approvers = approversOf(pot);
+    if (approvers.length) {
+      return res.status(409).json({
+        success: false,
+        code: "APPROVAL_REQUIRED",
+        error: "This pot has withdrawal approvers — request a withdrawal instead so they can approve it",
+        data: { withdrawal_approvers: approvers },
+      });
+    }
+
     // Claim the pot first (guarded) — a concurrent close loses here.
     const claim = await query(
       `UPDATE pots SET status = 'closed', closed_at = CURRENT_TIMESTAMP
@@ -369,11 +550,74 @@ router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req
         const wallet = w.rows[0];
         if (!wallet) throw new Error("NO_NGN_WALLET");
 
-        await creditWallet(wallet.id, payout);
+        // Fund the payout from the pot's OWN wallet first (contributions land
+        // there since the wallet model); the remainder continues the legacy
+        // settlement for contributions made before the pot had a wallet.
+        const potWallet = await ensureSplitPotWallet("pot", pot.id);
+        const walletBalRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [potWallet.walletId]);
+        const walletBalance = money(num(walletBalRes.rows[0]?.balance));
+        const fromWallet = Math.min(walletBalance, payout);
+        const remainder = money(Math.max(0, payout - fromWallet));
+        const closeAttempt = Date.now().toString(36);
+
+        // Track exactly how much reached the creator's wallet so a mid-flight
+        // failure can pull every naira back before the close is reverted.
+        let credited = 0;
+        if (fromWallet > 0) {
+          // Per-attempt reference: a retried close (after a compensated failure)
+          // is a DISTINCT sweep that must get its own ledger row — a shared
+          // deterministic reference would swallow the retry's bookkeeping.
+          const sweptRef = `POT-CLOSE-${pot.id}-${closeAttempt}`.slice(0, 255);
+          const swept = await debitSplitPotWallet({
+            walletId: potWallet.walletId,
+            ownerType: "pot",
+            ownerId: pot.id,
+            amount: fromWallet,
+            reason: "pot_close",
+            reference: sweptRef,
+            metadata: { potId: pot.id, creatorId: userId, payout, fromWallet, remainder },
+          });
+          if (!swept.ok) throw new Error("Could not debit the pot wallet for the payout");
+          try {
+            if (remainder > 0) {
+              await creditWallet(wallet.id, remainder);
+              credited = money(credited + remainder);
+            }
+            await creditWallet(wallet.id, fromWallet);
+            credited = money(credited + fromWallet);
+          } catch (creditErr: any) {
+            // Compensate BOTH sides before failing — money must never vanish
+            // (or double-land) mid-sweep.
+            await creditSplitPotWallet({
+              walletId: potWallet.walletId,
+              ownerType: "pot",
+              ownerId: pot.id,
+              amount: fromWallet,
+              reason: "pot_close",
+              reference: `${sweptRef}-REFUND`.slice(0, 255),
+              metadata: { potId: pot.id, note: "Payout credit failed — swept back" },
+            }).catch((rbErr: any) => console.error("[pots/close] CRITICAL: sweep-back failed:", rbErr?.message));
+            if (credited > 0) {
+              await query(
+                `UPDATE wallets SET balance = GREATEST(0, balance - $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [credited, wallet.id],
+              ).catch((pbErr: any) => console.error("[pots/close] CRITICAL: creator pull-back failed:", pbErr?.message));
+            }
+            throw creditErr;
+          }
+        } else if (remainder > 0) {
+          // Legacy pot (contributions predate the wallet model — the money only
+          // ever existed as the pots.balance counter): pay the creator straight
+          // from the platform float, exactly like the pre-wallet close did.
+          await creditWallet(wallet.id, remainder);
+          credited = remainder;
+        }
         await insertTransaction({
           userId,
           walletId: wallet.id,
-          reference: `POT-PAYOUT-${pot.id}`.slice(0, 255),
+          // Per-attempt reference — a retried close must never collide with the
+          // previous attempt's (globally unique) transaction row.
+          reference: `POT-PAYOUT-${pot.id}-${closeAttempt}`.slice(0, 255),
           type: "credit",
           transactionType: "pot_payout",
           amount: payout,
@@ -398,6 +642,169 @@ router.post("/:id/close", authenticateToken, checkSubscriptionStatus, async (req
   } catch (e: any) {
     console.error("[pots/close]", e?.message);
     res.status(500).json({ success: false, error: "Could not close the pot" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WITHDRAWALS — money leaves THIS pot's own wallet (NGN), never the creator's
+// account.
+//   POST /:id/withdrawals   → creator requests a bank payout. Approvers set →
+//                             withdrawal REQUEST (multi-approval); none set →
+//                             executes immediately on the single-transfer rails.
+//   GET  /:id/withdrawals   → withdrawal history (creator only — bank details).
+// Approve/decline/pending-inbox live on the shared /withdrawals router.
+// ---------------------------------------------------------------------------
+router.post("/:id/withdrawals", authenticateToken, requirePersonalKyc(), checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
+    const pot = await loadPot(String(req.params.id));
+    if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
+    if (pot.creator_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the creator can withdraw from this pot" });
+    }
+
+    const wallet = await ensureSplitPotWallet("pot", pot.id);
+
+    // One open request at a time per pot — but an APPROVED request whose
+    // execution died between approval and dispatch is RESUMED here instead of
+    // deadlocking the pot behind it.
+    const open = await openWithdrawalRequest("pot", pot.id);
+    if (open && open.status !== "approved") {
+      return res.status(409).json({
+        success: false,
+        code: "WITHDRAWAL_IN_PROGRESS",
+        error: `A withdrawal for this pot is already ${open.status} — it must finish before another can start`,
+        data: { request: serializeWithdrawalRequest(open) },
+      });
+    }
+
+    let request = open;
+    if (!open) {
+      const amount = money(num(req.body?.amount));
+      if (!(amount > 0)) {
+        return res.status(400).json({ success: false, error: "amount must be greater than 0" });
+      }
+      const dest = readWithdrawalDestination(req.body);
+      if (!dest.ok) return res.status(400).json({ success: false, error: dest.error });
+      if (amount > wallet.balance) {
+        return res.status(400).json({
+          success: false,
+          code: "INSUFFICIENT_BALANCE",
+          error: `The pot wallet holds ₦${wallet.balance.toLocaleString()} — you cannot withdraw ₦${amount.toLocaleString()}`,
+        });
+      }
+
+      const approvers = approversOf(pot);
+      const requester = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const requesterName = requester.rows[0]?.name || "Someone";
+      const d = dest.value;
+
+      const ins = await query(
+        `INSERT INTO withdrawal_requests
+           (owner_type, owner_id, wallet_id, requested_by, amount, currency, note,
+            bank_code, bank_name, account_number, account_name, recipient_code,
+            status, approvers, approvals)
+         VALUES ('pot',$1,$2,$3,$4,'NGN',$5,$6,$7,$8,$9,$10,$11,$12::jsonb,'[]'::jsonb)
+         RETURNING *`,
+        [
+          pot.id, wallet.walletId, userId, amount, d.note,
+          d.bank_code, d.bank_name, d.account_number, d.account_name, d.recipient_code,
+          approvers.length ? "pending" : "approved",
+          JSON.stringify(approvers),
+        ],
+      );
+      request = ins.rows[0];
+
+      if (approvers.length) {
+        // MULTI-APPROVAL: park as a REQUEST and notify every approver.
+        await notifyWithdrawalApprovers(request, { ownerName: pot.title, requesterName });
+        return res.status(201).json({
+          success: true,
+          data: {
+            request: serializeWithdrawalRequest(request),
+            wallet: { id: wallet.walletId, balanceNgn: wallet.balance, currency: "NGN" },
+            approvalsRequired: approvers.length,
+            message: `Withdrawal request sent to ${approvers.length} approver${approvers.length === 1 ? "" : "s"} — it executes when everyone approves`,
+          },
+        });
+      }
+    } else {
+      // Resuming a stuck APPROVED request — the stored amount must still fit.
+      const resumeAmount = money(num(open.amount));
+      if (resumeAmount > wallet.balance) {
+        return res.status(400).json({
+          success: false,
+          code: "INSUFFICIENT_BALANCE",
+          error: `The pot wallet now holds ₦${wallet.balance.toLocaleString()} — the pending ₦${resumeAmount.toLocaleString()} withdrawal can no longer be funded`,
+        });
+      }
+    }
+
+    // NO approvers configured (or resuming an approved request) → execute via
+    // the single-transfer clone with THIS pot's wallet as the source of funds.
+    const executed = await executeSplitWalletTransfer(request, userId, { ownerName: pot.title });
+    const balRes = await query(`SELECT balance FROM wallets WHERE id = $1`, [wallet.walletId]);
+    return res.status(201).json({
+      success: executed.request.status !== "failed",
+      data: {
+        request: serializeWithdrawalRequest(executed.request),
+        wallet: { id: wallet.walletId, balanceNgn: money(num(balRes.rows[0]?.balance)), currency: "NGN" },
+        transfer: executed.payout
+          ? {
+              reference: executed.payout.reference,
+              status: executed.payout.status,
+              failureReason: executed.payout.failure_reason || null,
+            }
+          : null,
+        message: executed.request.status === "completed"
+          ? "Withdrawal completed"
+          : executed.request.status === "executing"
+            ? "Withdrawal is processing — you'll be notified when it settles"
+            : executed.request.failure_reason || "Withdrawal failed — the money is back in the pot wallet",
+      },
+    });
+  } catch (e: any) {
+    if (e?.code === "NOT_EXECUTABLE") {
+      return res.status(409).json({ success: false, code: e.code, error: e.message });
+    }
+    console.error("[pots/withdrawals]", e?.message);
+    res.status(500).json({ success: false, error: "Could not create the withdrawal" });
+  }
+});
+
+router.get("/:id/withdrawals", authenticateToken, checkSubscriptionStatus, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    if (!UUID_RE.test(String(req.params.id))) {
+      return res.status(404).json({ success: false, error: "Pot not found" });
+    }
+    const pot = await loadPot(String(req.params.id));
+    if (!pot) return res.status(404).json({ success: false, error: "Pot not found" });
+    if (pot.creator_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the creator can view this pot's withdrawals" });
+    }
+
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const history = await loadWithdrawalHistory("pot", pot.id, limit);
+    const wallet = await ensureSplitPotWallet("pot", pot.id);
+    const approverIds = approversOf(pot);
+
+    res.json({
+      success: true,
+      data: {
+        withdrawals: history,
+        wallet: { id: wallet.walletId, balanceNgn: wallet.balance, currency: "NGN" },
+        withdrawal_approvers: approverIds,
+        withdrawalApprovers: await loadApproverProfiles(approverIds).catch(() =>
+          approverIds.map((id) => ({ id, name: null, avatarUrl: null, username: null }))),
+      },
+    });
+  } catch (e: any) {
+    console.error("[pots/withdrawals/history]", e?.message);
+    res.status(500).json({ success: false, error: "Could not load withdrawal history" });
   }
 });
 

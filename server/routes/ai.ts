@@ -1201,8 +1201,7 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
  * @swagger
  * /ai/chat/stream:
  *   post:
- *     summary: Chat with MetricAi over SSE — reply tokens stream as they are
- *       generated (first words within ~1-2s instead of the full-reply wait)
+ *     summary: Chat with MetricAi over SSE (reply tokens stream as they are generated, first words within ~1-2s instead of the full-reply wait)
  *     tags: [MetricAi]
  *     security:
  *       - bearerAuth: []
@@ -1220,18 +1219,20 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
  *               attachmentType: { type: string }
  *     responses:
  *       200:
- *         description: text/event-stream with `delta` (text chunk), `meta`
- *           (final row: reply/imageUrl/videoJob/model/...) and `done` events;
- *           `error` on failure. Short-circuits (400/usage cap) answer as
- *           normal JSON BEFORE the stream opens.
+ *         description: >
+ *           text/event-stream with delta (text chunk), meta (final row with
+ *           reply, imageUrl, videoJob, model and more) and done events; error
+ *           on failure. Short-circuits (400 / usage cap) answer as normal JSON
+ *           before the stream opens.
  *       403:
  *         description: MetricAi not enabled on the caller's plan
- *
+ */
+/*
  * TRANSPORT NOTE — deliberately OUTSIDE the payload-encryption envelope:
- * the client does not send `x-mfv-enc` on this endpoint, so responses are
- * plaintext SSE. Streaming bytes cannot fit the whole-body envelope model,
- * `res.write` is never wrapped by payloadEncryptionMiddleware, and HTTPS
- * protects the transport. The JSON /ai/chat route stays fully enveloped.
+ * the client does not send the x-mfv-enc header on this endpoint, so responses
+ * are plaintext SSE. Streaming bytes cannot fit the whole-body envelope model,
+ * res.write is never wrapped by payloadEncryptionMiddleware, and HTTPS protects
+ * the transport. The JSON /ai/chat route stays fully enveloped.
  */
 export const postAiChatStream: RequestHandler = async (req: MetricAiRequest, res) => {
   // Prelude first — short-circuits (400 / usage cap) go out as normal JSON

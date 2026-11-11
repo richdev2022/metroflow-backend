@@ -1081,8 +1081,16 @@ router.post("/transaction-biometric/send-otp", authenticateToken, checkSubscript
 /**
  * @swagger
  * /settings/transaction-biometric:
- *   get:  read the caller's transaction-biometric flag
- *   put:  flip it (requires the OTP from send-otp — otp_type txn_biometric_toggle)
+ *   get:
+ *     summary: Read the caller's transaction-biometric flag
+ *     tags: [Settings]
+ *     security:
+ *       - bearerAuth: []
+ *   put:
+ *     summary: Flip the transaction-biometric flag (requires the OTP from send-otp, otp_type txn_biometric_toggle)
+ *     tags: [Settings]
+ *     security:
+ *       - bearerAuth: []
  */
 router.get("/transaction-biometric", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {

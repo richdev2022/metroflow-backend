@@ -16,6 +16,7 @@ import {
 } from "./disputes";
 import { getSetting, setSetting, getIntlTransferConfig, getIntlPayoutLimits, getIntlPayoutSourceCurrency, DEFAULT_PAYOUT_LIMITS } from "../services/app-config";
 import { sendPushToAll } from "../services/push";
+import { sendWebPushToUsers } from "../services/webPush";
 import adminDisputesRouter from "./admin_disputes";
 import adminFraudRouter from "./admin_fraud";
 import personalAdminRouter from "../features/personal/admin";
@@ -4528,7 +4529,7 @@ protectedRouter.put("/maintenance-mode", requirePermission('manage_settings'), a
                         body: enabled
                             ? 'Metricorex is undergoing maintenance. Some features may be unavailable.'
                             : 'Maintenance complete - Metricorex is fully back up. Thank you for your patience!',
-                        androidChannelId: 'general-v2',
+                        androidChannelId: 'general-v3',
                     }, 'maintenance');
                 } catch (pushErr: any) {
                     console.warn('Maintenance push fan-out failed:', pushErr?.message);
@@ -5220,12 +5221,36 @@ protectedRouter.post("/broadcast", requirePermission('manage_settings'), async (
         })();
 
         let pushesSent = 0;
+        let webPushesSent = 0;
+        let pushError: string | null = null;
         if (wantsPush) {
             try {
-                const pushResult = await sendPushToAll({ title: subject, body: message, androidChannelId: 'general-v2' }, 'broadcast');
+                // general-v3 is the notification channel the app actually
+                // registers; general-v2 was dropped from the app builds.
+                const pushResult = await sendPushToAll({ title: subject, body: message, androidChannelId: 'general-v3' }, 'broadcast');
                 pushesSent = pushResult.sent;
             } catch (pushErr: any) {
+                pushError = pushErr?.message || String(pushErr);
                 console.warn('Broadcast push failed:', pushErr?.message);
+            }
+            try {
+                // WEB PUSH LEG (2026-11-11): web browsers register VAPID
+                // subscriptions in web_push_subscriptions — a SEPARATE
+                // registry from FCM device tokens. Broadcasts used to target
+                // only FCM, so web users never received admin notifications
+                // even when FCM was healthy.
+                const webTargets = (await query(`SELECT DISTINCT user_id FROM web_push_subscriptions`)).rows
+                    .map((r: any) => String(r.user_id));
+                if (webTargets.length > 0) {
+                    const webRes = await sendWebPushToUsers(
+                        webTargets,
+                        { type: 'broadcast', title: subject, body: message },
+                        { TTL: 3600, urgency: 'high' },
+                    );
+                    webPushesSent = webRes?.sent ?? 0;
+                }
+            } catch (webErr: any) {
+                console.warn('Broadcast web-push failed:', webErr?.message);
             }
         }
 
@@ -5233,7 +5258,7 @@ protectedRouter.post("/broadcast", requirePermission('manage_settings'), async (
 
         res.json({
             success: true,
-            data: { recipients: users.length, emails_sent: emailsSent, pushes_sent: pushesSent, channels },
+            data: { recipients: users.length, emails_sent: emailsSent, pushes_sent: pushesSent, web_pushes_sent: webPushesSent, push_error: pushError, channels },
             message: `Broadcast queued to ${users.length} users`,
         });
     } catch (error: any) {

@@ -600,6 +600,12 @@ async function sendToTokens(
     }
   }
   // Neither mode configured — nothing went out.
+  // LOUD failure (2026-11-11): admin broadcasts reported success while every
+  // token was silently dropped when FCM creds were missing/unparseable. This
+  // must be visible in the server logs every time it happens.
+  console.error(
+    `[push] Push NOT configured (FIREBASE_SERVICE_ACCOUNT_JSON / FCM_SERVER_KEY missing) — dropped ${tokens.length} token(s) for '${String(payload.title || '').slice(0, 60)}'`,
+  );
   diagnostics?.push(
     ...tokens.map((t) => ({
       tokenPreview: t.slice(0, 18),
@@ -650,10 +656,18 @@ export async function sendPushToUsers(
       const tokensRes = await query(`SELECT fcm_token FROM user_devices WHERE user_id = $1`, [target.userId]);
       const tokens = tokensRes.rows.map((r: any) => r.fcm_token).filter(Boolean);
       if (tokens.length > 0) {
-        const result = await sendToTokens(tokens, payload);
+        const diags: PushSendDiagnostic[] = [];
+        const result = await sendToTokens(tokens, payload, diags);
         sent += result.sent;
         failed += result.failed;
         if (result.sent > 0) reachedUsers++;
+        const bad = diags.filter((d) => !d.ok);
+        if (bad.length > 0) {
+          // NEVER silent: FCM refusals (unconfigured creds, project mismatch,
+          // 404-pruned tokens) used to report broadcast success while nothing
+          // shipped. Log every failure with token preview + reason.
+          console.error(`[push] FCM failures for user ${target.userId}: ${JSON.stringify(bad.slice(0, 5))}`);
+        }
       } else if (!isPushUnconfiguredLogged) {
         // Silent zero-token skips made "no notifications" undiagnosable. Log
         // ONCE (rate-limited) with the reason so a missing device registration

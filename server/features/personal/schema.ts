@@ -1625,6 +1625,12 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_members_user ON savings_circle_members(user_id, status)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_savings_circle_members_circle ON savings_circle_members(circle_id, status)`);
+  // CIRCLES INVITE 500 FIX (2026-11-11): the invite upsert (and charge/leave
+  // flows) write `updated_at` on savings_circle_members, but the CREATE TABLE
+  // above never had that column — every POST /circles/:id/invite died with
+  // SQLSTATE 42703 at plan time ("column does not exist"), surfacing to the
+  // apps as "Could not send invites". Heal the table in place.
+  await query(`ALTER TABLE savings_circle_members ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
   await query(`
     CREATE TABLE IF NOT EXISTS savings_circle_rounds (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

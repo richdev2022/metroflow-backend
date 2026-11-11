@@ -1020,8 +1020,13 @@ router.post("/:id/join", authenticateToken, checkSubscriptionStatus, async (req:
     const userId = req.user!.userId;
     const circle = await loadCircle(req.params.id);
     if (!circle) return res.status(404).json({ success: false, error: "Circle not found" });
-    if (circle.status !== "forming") {
-      return res.status(400).json({ success: false, error: "This circle has already started" });
+    // Late-invite parity: invites may be issued to 'active' circles too (the
+    // invite route allows it), so the join gate must accept them — otherwise
+    // an invite into an active circle is a row the recipient can NEVER accept.
+    // A mid-cycle joiner joins the roster without a payout round slot (the
+    // creator can reorder positions from the circle sheet).
+    if (circle.status !== "forming" && circle.status !== "active") {
+      return res.status(400).json({ success: false, error: "This circle is no longer accepting members" });
     }
     const claim = await query(
       `UPDATE savings_circle_members

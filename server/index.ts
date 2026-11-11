@@ -133,7 +133,7 @@ import taskStatusesRouter from "./routes/task-statuses";
 import { getMeetings, createMeeting, updateMeeting, deleteMeeting, getMeetingByCode, getMeetingById, addMeetingParticipants, joinMeeting, leaveMeeting, validateMeetingAccess, guestValidateMeeting, generateMeetingInvite, guestJoinMeeting, getMeetingTranscript, getMeetingNotes, generateMeetingNotesEndpoint, getMeetingReport } from "./routes/meetings";
 import { getConversations, getConversationMessages, createConversation, sendMessage, markConversationAsRead, deleteConversation, uploadChatMedia, searchChatGifs, editMessage, deleteMessage, getParticipants, leaveConversation, updateParticipantRole, removeParticipant, aiTranslateMessage, aiSmartReplies, aiSummarizeConversation, lookupChatContact, inviteChatContact, getChatGuestContacts, deleteChatGuestContact, addChatParticipants, getChatInvite, rotateChatInvite, joinChatByInvite } from "./routes/chat";
 import { blockUser, unblockUser, listBlocked } from "./routes/blocks";
-import { getAiStatus, postAiChat, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
+import { getAiStatus, postAiChat, postAiChatStream, getAiHistory, deleteAiHistory, getAiVideoJob, getAiUsage, postAiAttachment, aiAttachmentUpload, requireMetricAiAccess } from "./routes/ai";
 import { getCalls, createCall, updateCall, joinCall, leaveCall, getCallByCode, getCallDetail, getCallTranscript, deleteCall, addCallParticipants, generateCallInvite, validateCallAccess, guestJoinCall, guestValidateCall, pushAckCall, rejectCallRest, reapStaleCalls } from "./routes/calls";
 import { getRecordings, createRecording, updateRecording, deleteRecording, uploadRecording, getRecordingById } from "./routes/recordings";
 import { getNotifications, getUnreadCount, markNotificationAsRead, markAllNotificationsAsRead, takeNotificationAction, registerDevice, unregisterDevice } from "./routes/notifications";
@@ -1213,6 +1213,8 @@ export async function createServer() {
   // MetricAi — GLM-powered in-app assistant (plan-gated)
   mainRouter.get("/ai/status", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiStatus);
   mainRouter.post("/ai/chat", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, postAiChat);
+  // SSE streaming variant — same gating, tokens stream as they are generated.
+  mainRouter.post("/ai/chat/stream", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, postAiChatStream);
   mainRouter.get("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiHistory);
   mainRouter.delete("/ai/history", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, deleteAiHistory);
   mainRouter.get("/ai/video/:jobId", authenticateToken, checkSubscriptionStatus, requireMetricAiAccess, getAiVideoJob);

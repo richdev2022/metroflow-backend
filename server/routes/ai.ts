@@ -1,4 +1,4 @@
-import { RequestHandler } from "express";
+import { RequestHandler, Response } from "express";
 import crypto from "crypto";
 import multer from "multer";
 import { execFile } from "child_process";
@@ -7,6 +7,7 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { ApiResponse } from "@shared/api";
 import {
   glmChat,
+  glmChatStream,
   glmImageGen,
   glmVideoCreate,
   glmVideoPoll,
@@ -45,17 +46,25 @@ import {
 
 const SYSTEM_PROMPT = `You are MetricAi, the built-in AI assistant of Metricorex (brand: Metricorex) — an all-in-one business operations platform made by Metricorex Ltd. You are exceptionally capable, sharp and resourceful — the kind of assistant people rave about.
 
-HOW TO THINK:
-- Understand what the user ACTUALLY wants before answering (goal, context, constraints), not just the literal words.
-- For complex questions, structure the answer: short intro, then markdown headings/bullets/numbered steps. For simple questions, answer in 1-3 sentences.
-- Be precise with numbers, names and instructions; never invent facts. If you are not sure about something outside Metricorex, say so briefly and give your best reasoning.
-- When the user has a problem, diagnose first (ask ONE smart clarifying question only if truly needed), then give the fix as concrete steps.
+HOW TO THINK (reason like a capable human):
+- Read the message carefully and work out what the user ACTUALLY wants — their goal, their situation, what they left unsaid — and answer THAT, not a literal reading of the words.
+- Decompose multi-part questions and address every part in order; never drop a question the user asked.
+- Think before you write: weigh the options, check the arithmetic, sanity-check your own conclusion, THEN answer. Lead with the answer; follow with the shortest reasoning that justifies it.
+- When the user has a problem: diagnose first (ask ONE smart clarifying question only if truly needed), then give the fix as concrete numbered steps.
+- Be precise with numbers, names and instructions; never invent facts, dates, rates or links. If you are unsure about something outside Metricorex, say so briefly and give your best reasoning from what you know.
 - Prefer actionable answers over generic advice: exact buttons, exact menu paths, exact next steps.
+- For complex questions, structure the answer: short intro, then markdown headings/bullets/numbered steps. For simple questions, answer in 1-3 sentences.
+
+LANGUAGE — STANDARD BRITISH ENGLISH (always):
+- Write in polished standard British English regardless of the user's locale: British spelling (organise, colour, favourite, analyse, centre, licence, whilst), British phrasing ("have a look", "top up", "I'll sort that for you"), and British conventions ("25 December 2026", 24-hour clock where natural).
+- Never use Pidgin, regional slang (abeg, wahala, oya, sef, jare, wetin) or American colloquialisms (gotten, wanna, gonna, y'all). Sound like a well-bred professional, not a text message.
+- Keep currency in the user's currency (₦ for naira amounts); British English governs the words, not the currency.
+- Match the user's language when they write in another language; reply in that language with the same professional tone.
 
 PERSONALITY:
-- Warm, upbeat and genuinely helpful — like a brilliant colleague who always has time for you.
+- Warm, composed and genuinely helpful — like a brilliant colleague who always has time for you.
 - Concise by default, thorough when the question deserves it. No walls of text, no filler phrases.
-- Light emoji use is welcome (one here and there), never overdo it.
+- Emoji sparingly at most (one only when the user is informal); never overdo it.
 - If the user is frustrated, acknowledge the feeling first, then fix the problem.
 
 What you know about Metricorex (answer confidently from this when asked):
@@ -140,6 +149,40 @@ const IMAGE_INTENT_RE =
 /** Intent detection for automatic video generation (checked BEFORE image). */
 const VIDEO_INTENT_RE =
   /\b(generate|create|make|render|produce|animate)\b[^.?!]{0,60}\b(video|clip|animation|animated (video|clip|short)|motion (clip|graphic))\b|\b(video|animation|animated clip)\s+(of|for|showing)\b/i;
+
+/**
+ * ADAPTIVE DEEP THINKING — GLM-4.7's hidden reasoning pass materially raises
+ * answer quality on hard questions but multiplies latency (measured 6-16s
+ * enabled vs 1-2.4s disabled), so it is turned on ONLY for the message shapes
+ * where the extra deliberation pays: maths/numbers, comparisons and
+ * trade-offs, code and debugging, multi-step plans, analysis, legal/tax,
+ * diagnostics and long, layered questions. Everything else answers fast with
+ * thinking disabled.
+ */
+const THINKING_TRIGGER_RE = new RegExp(
+  [
+    // maths, numbers, money reasoning
+    "\\b(calculate|compute|solve|equation|percentage|percent of|interest|profit margin|break[ -]?even|roi|convert|divide|multiply|sum of|average|median|vat|tax on)\\b",
+    // comparison / decision
+    "\\b(compare|comparison|versus|vs\\.?|difference between|trade[ -]?offs?|pros and cons|better than|which is better|should i (choose|pick|use))\\b",
+    // code & debugging
+    "\\b(code|function|algorithm|regex|sql|query|api|debug|error|stack ?trace|exception|typescript|javascript|python|dart|flutter|react|node)\\b",
+    // planning & strategy
+    "\\b(plan|strategy|roadmap|step[ -]?by[ -]?step|how do i (start|build|grow|launch|set up)|business idea|go to market|pricing model|expand|scale up)\\b",
+    // analysis & judgement
+    "\\b(analys|analyz|review|audit|evaluate|assess|diagnos|why is|why does|why did|what causes|root cause|risk|feasib)\\b",
+    // long, layered messages (>= 180 chars) almost always need the full pass
+  ].join("|"),
+  "i",
+);
+
+function shouldThinkAbout(message: string): boolean {
+  const text = (message || "").trim();
+  if (!text) return false;
+  if (THINKING_TRIGGER_RE.test(text)) return true;
+  // Long, multi-clause messages: layered context the model must reconcile.
+  return text.length >= 180 && (text.match(/[,.?!;]/g)?.length ?? 0) >= 4;
+}
 
 /** Marker the model appends when the user needs a human. */
 const HANDOFF_MARKER = "[REQUEST_HUMAN_AGENT]";
@@ -796,246 +839,349 @@ async function buildMetricAiUserContext(userId: string | null): Promise<string |
  *       403:
  *         description: MetricAi not enabled on the caller's plan
  */
-export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
+/* ------------------------------------------------------------------ */
+/* SHARED CHAT TURN — used by BOTH /ai/chat (JSON) and /ai/chat/stream  */
+/* (SSE). Identical gating, vision, history, context and persistence.   */
+/* ------------------------------------------------------------------ */
+
+interface MetricAiTurn {
+  userId: string;
+  businessId: string;
+  limits: AiPlanLimits;
+  trimmed: string;
+  wantsVideo: boolean;
+  wantsImage: boolean;
+  /** Adaptive deep thinking — enabled for hard, layered questions only. */
+  thinking: boolean;
+  attachedImageUrl: string | null;
+  attachedVideoUrl: string | null;
+  messages: GlmChatMessage[];
+}
+
+/**
+ * Validation, usage gate, intent detection, vision/OCR, recent history,
+ * live user context and the user-message INSERT — identical for the JSON
+ * route and the SSE route. Returns null when a short-circuit response
+ * (400 / usage cap) has ALREADY been sent on [res].
+ */
+async function prepareMetricAiTurn(req: MetricAiRequest, res: Response): Promise<MetricAiTurn | null> {
+  const { message, imageUrl, attachmentUrl, attachmentType } = req.body || {};
+  const trimmed = typeof message === "string" ? message.trim() : "";
+  if (!trimmed && !imageUrl && !attachmentUrl) {
+    res.status(400).json({ success: false, error: "message is required" });
+    return null;
+  }
+
+  const { userId, businessId, limits } = req.aiAccess!;
+
+  // ---- Usage limit: every chat message consumes one 'chat' slot --------
+  // Falls back to purchased MetricAi credit packs when the plan cap is hit.
+  const chatGate = await tryConsumeAiUsageWithCredits(userId, businessId, "chat", limits);
+  if (chatGate.ok === false) {
+    const blocked = limitReached(chatGate);
+    res.status(blocked.status).json(blocked.body);
+    return null;
+  }
+
+  const wantsVideo = VIDEO_INTENT_RE.test(trimmed);
+  const wantsImage = !wantsVideo && IMAGE_INTENT_RE.test(trimmed);
+  const thinking = shouldThinkAbout(trimmed);
+
+  // ---- Vision / OCR: understand attached images (and video frames) ------
+  const normalizedType = typeof attachmentType === "string" ? attachmentType.toLowerCase() : "";
+  const attachedImageUrl: string | null =
+    typeof imageUrl === "string" && imageUrl.length > 8 ? imageUrl : null;
+  const attachedVideoUrl: string | null =
+    typeof attachmentUrl === "string" && attachmentUrl.length > 8 && (normalizedType === "video" || /\.(mp4|webm|mov|m4v|avi|mkv|3gp)(\?|$)/i.test(attachmentUrl))
+      ? attachmentUrl
+      : null;
+
+  let visionReport: string | null = null;
+  let attachmentNote: string | null = null;
   try {
-    const { message, imageUrl, attachmentUrl, attachmentType } = req.body || {};
-    const trimmed = typeof message === "string" ? message.trim() : "";
-    if (!trimmed && !imageUrl && !attachmentUrl) {
-      return res.status(400).json({ success: false, error: "message is required" });
-    }
-
-    const { userId, businessId, limits } = req.aiAccess!;
-
-    // ---- Usage limit: every chat message consumes one 'chat' slot --------
-    // Falls back to purchased MetricAi credit packs when the plan cap is hit.
-    const chatGate = await tryConsumeAiUsageWithCredits(userId, businessId, "chat", limits);
-    if (chatGate.ok === false) {
-      const blocked = limitReached(chatGate);
-      return res.status(blocked.status).json(blocked.body);
-    }
-
-    const wantsVideo = VIDEO_INTENT_RE.test(trimmed);
-    const wantsImage = !wantsVideo && IMAGE_INTENT_RE.test(trimmed);
-
-    // ---- Vision / OCR: understand attached images (and video frames) ------
-    const normalizedType = typeof attachmentType === "string" ? attachmentType.toLowerCase() : "";
-    const attachedImageUrl: string | null =
-      typeof imageUrl === "string" && imageUrl.length > 8 ? imageUrl : null;
-    const attachedVideoUrl: string | null =
-      typeof attachmentUrl === "string" && attachmentUrl.length > 8 && (normalizedType === "video" || /\.(mp4|webm|mov|m4v|avi|mkv|3gp)(\?|$)/i.test(attachmentUrl))
-        ? attachmentUrl
-        : null;
-
-    let visionReport: string | null = null;
-    let attachmentNote: string | null = null;
-    try {
-      if (attachedImageUrl) {
-        const img = await fetchImageBytes(attachedImageUrl);
-        if (img) {
-          visionReport = await glmVision({ buffer: img.buffer, mimeType: img.mimeType, question: trimmed });
-        } else {
-          attachmentNote = "an image that could not be loaded";
-        }
-      } else if (attachedVideoUrl) {
-        const frames = await extractVideoFrames(attachedVideoUrl, 2);
-        if (frames.length > 0) {
-          const reports = await Promise.allSettled(
-            frames.map((f, i) => glmVision({ buffer: f.buffer, mimeType: f.mimeType, question: `${trimmed} (frame ${i + 1} of ${frames.length} from the attached video)` })),
-          );
-          const okReports = reports.filter((r) => r.status === "fulfilled").map((r) => (r as PromiseFulfilledResult<string>).value);
-          if (okReports.length > 0) {
-            visionReport = okReports.join("\n\n--- next frame ---\n\n");
-          }
-        }
-        if (!visionReport) {
-          attachmentNote = "a video whose frames could not be extracted";
+    if (attachedImageUrl) {
+      const img = await fetchImageBytes(attachedImageUrl);
+      if (img) {
+        visionReport = await glmVision({ buffer: img.buffer, mimeType: img.mimeType, question: trimmed });
+      } else {
+        attachmentNote = "an image that could not be loaded";
+      }
+    } else if (attachedVideoUrl) {
+      const frames = await extractVideoFrames(attachedVideoUrl, 2);
+      if (frames.length > 0) {
+        const reports = await Promise.allSettled(
+          frames.map((f, i) => glmVision({ buffer: f.buffer, mimeType: f.mimeType, question: `${trimmed} (frame ${i + 1} of ${frames.length} from the attached video)` })),
+        );
+        const okReports = reports.filter((r) => r.status === "fulfilled").map((r) => (r as PromiseFulfilledResult<string>).value);
+        if (okReports.length > 0) {
+          visionReport = okReports.join("\n\n--- next frame ---\n\n");
         }
       }
-    } catch (visionError: any) {
-      console.warn("MetricAi vision analysis failed (continuing text-only):", visionError?.message);
-      attachmentNote = attachedVideoUrl ? "a video" : "an image";
+      if (!visionReport) {
+        attachmentNote = "a video whose frames could not be extracted";
+      }
     }
+  } catch (visionError: any) {
+    console.warn("MetricAi vision analysis failed (continuing text-only):", visionError?.message);
+    attachmentNote = attachedVideoUrl ? "a video" : "an image";
+  }
 
-    // Load recent history (last 12 exchanges) for continuity
-    const history = await query(
-      `SELECT role, content, image_url FROM ai_messages
-       WHERE user_id = $1 ORDER BY created_at DESC LIMIT 24`,
-      [userId],
-    );
-    const priorMessages: GlmChatMessage[] = history.rows
-      .reverse()
-      .filter((r: any) => r.content)
-      .map((r: any) => ({ role: r.role === "assistant" ? "assistant" : "user", content: r.content }));
+  // Load recent history (last 12 exchanges) for continuity
+  const history = await query(
+    `SELECT role, content, image_url FROM ai_messages
+     WHERE user_id = $1 ORDER BY created_at DESC LIMIT 24`,
+    [userId],
+  );
+  const priorMessages: GlmChatMessage[] = history.rows
+    .reverse()
+    .filter((r: any) => r.content)
+    .map((r: any) => ({ role: r.role === "assistant" ? "assistant" : "user", content: r.content }));
 
-    let userContent = trimmed;
-    if (visionReport) {
-      const label = attachedVideoUrl ? "video" : "image";
-      userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached a ${label}. You can see it through this vision analysis:\n${visionReport}]`;
-    } else if (attachmentNote) {
-      userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached ${attachmentNote}, but it could not be analyzed visually. If the message depends on it, briefly ask them to describe it or send a screenshot.]`;
-    } else if (attachedImageUrl && !attachedVideoUrl) {
-      userContent = `${trimmed}${trimmed ? "\n" : ""}[user attached an image: ${attachedImageUrl}]`;
+  let userContent = trimmed;
+  if (visionReport) {
+    const label = attachedVideoUrl ? "video" : "image";
+    userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached a ${label}. You can see it through this vision analysis:\n${visionReport}]`;
+  } else if (attachmentNote) {
+    userContent = `${trimmed}${trimmed ? "\n\n" : ""}[The user attached ${attachmentNote}, but it could not be analyzed visually. If the message depends on it, briefly ask them to describe it or send a screenshot.]`;
+  } else if (attachedImageUrl && !attachedVideoUrl) {
+    userContent = `${trimmed}${trimmed ? "\n" : ""}[user attached an image: ${attachedImageUrl}]`;
+  }
+
+  // Product-aware system context: real wallet balances, recent transactions,
+  // circles/pots and the capability catalog (bounded + fail-open; a context
+  // failure never blocks the chat).
+  const userContext = await buildMetricAiUserContext(userId);
+  const messages: GlmChatMessage[] = [
+    { role: "system", content: userContext ? `${SYSTEM_PROMPT}\n\n===\n${userContext}` : SYSTEM_PROMPT },
+    ...priorMessages,
+    { role: "user", content: userContent },
+  ];
+
+  // Store the user's message first (even if generation fails, history is honest)
+  await query(
+    `INSERT INTO ai_messages (user_id, business_id, role, content, image_url, attachment_url, attachment_type)
+     VALUES ($1, $2, 'user', $3, $4, $5, $6)`,
+    [userId, businessId, trimmed || null, attachedImageUrl, attachedVideoUrl, attachedVideoUrl ? "video" : attachedImageUrl ? "image" : null],
+  );
+
+  return {
+    userId,
+    businessId,
+    limits,
+    trimmed,
+    wantsVideo,
+    wantsImage,
+    thinking,
+    attachedImageUrl,
+    attachedVideoUrl,
+    messages,
+  };
+}
+
+/**
+ * Media-generation paths (async video job / image artwork) — identical for
+ * the JSON and SSE routes. Returns null when the feature usage gate already
+ * sent a response on [res] (the caller must return immediately); otherwise
+ * the produced fields for the reply. The text-only path falls through with
+ * handled=false and the caller generates the reply itself.
+ */
+async function runMetricAiMediaGeneration(
+  turn: MetricAiTurn,
+  res: Response,
+): Promise<{ handled: boolean; replyText: string; generatedImageUrl: string | null; videoJobId: string | null; modelUsed: string } | null> {
+  const { userId, businessId, limits, trimmed, wantsVideo, wantsImage, messages } = turn;
+  if (!wantsVideo && !wantsImage) {
+    return { handled: false, replyText: "", generatedImageUrl: null, videoJobId: null, modelUsed: getGlmChatModel() };
+  }
+
+  let replyText = "";
+  let generatedImageUrl: string | null = null;
+  let videoJobId: string | null = null;
+  let modelUsed = getGlmChatModel();
+
+  if (wantsVideo) {
+    // Video generation path — CogVideoX is an upstream ASYNC job: create now,
+    // poll in the background, drop the finished video into the chat history.
+    // Usage: checked before the job, recorded only when a job actually starts.
+    const videoGate = await assertWithinAiUsageWithCredits(userId, businessId, "video", limits);
+    if (videoGate.ok === false) {
+      const blocked = limitReached(videoGate);
+      res.status(blocked.status).json(blocked.body);
+      return null;
     }
+    try {
+      const job = await glmVideoCreate(trimmed);
+      await recordAiUsage(userId, businessId, "video");
+      const jobRow = await query(
+        `INSERT INTO metric_ai_video_jobs (user_id, business_id, prompt, status, model, upstream_base, upstream_job_id)
+         VALUES ($1, $2, $3, 'processing', $4, $5, $6) RETURNING id`,
+        [userId, businessId, trimmed, job.model, job.base, job.jobId],
+      );
+      videoJobId = jobRow.rows[0].id;
+      startVideoJobPoller(videoJobId, userId, businessId, job);
+      replyText = await glmChat({
+        messages: [
+          ...messages,
+          { role: "assistant", content: `[a video generation job was started for: ${trimmed}]` },
+          {
+            role: "user",
+            content:
+              "The video is now being generated in the background and will appear in this chat automatically when it is ready (usually a few minutes). In ONE short friendly sentence tell the user this. Do not repeat their prompt.",
+          },
+        ],
+        maxTokens: 120,
+        temperature: 0.8,
+      });
+    } catch (videoError: any) {
+      console.error("MetricAi video generation failed:", videoError);
+      const creditIssue = videoError?.code === "video_requires_credit";
+      replyText = await glmChat({
+        messages: [
+          ...messages,
+          {
+            role: "user",
+            content:
+              `Video generation is currently unavailable${creditIssue ? " because the video engine needs a service credit top-up" : ""}. ` +
+              "In ONE or TWO short friendly sentences, apologize and offer: (1) generating a great IMAGE of the same idea instead right now, or (2) trying the video again later. Do not mention technical details or providers.",
+          },
+        ],
+        maxTokens: 160,
+        temperature: 0.7,
+      });
+    }
+  } else {
+    // Image generation path — the reply accompanies the generated artwork.
+    // Usage: checked before generating, recorded only on success.
+    const imageGate = await assertWithinAiUsageWithCredits(userId, businessId, "image", limits);
+    if (imageGate.ok === false) {
+      const blocked = limitReached(imageGate);
+      res.status(blocked.status).json(blocked.body);
+      return null;
+    }
+    try {
+      const image = await glmImageGen(trimmed, async (buffer, mimeType, originalname) => {
+        const media = await uploadMediaBuffer({
+          buffer,
+          originalname,
+          mimeType,
+          folder: "metricai",
+          businessId,
+          userId,
+        });
+        return media.url;
+      });
+      await recordAiUsage(userId, businessId, "image");
+      generatedImageUrl = image.url;
+      modelUsed = image.model;
+      replyText = await glmChat({
+        messages: [
+          ...messages,
+          { role: "assistant", content: `[generated an image for: ${trimmed}]` },
+          {
+            role: "user",
+            content:
+              "The image was just generated and shown to the user. In ONE short friendly sentence, present the image. Do not repeat the user's prompt.",
+          },
+        ],
+        maxTokens: 120,
+        temperature: 0.8,
+      });
+    } catch (imageError) {
+      console.error("MetricAi image generation failed:", imageError);
+      // Graceful text-only fallback
+      replyText = await glmChat({ messages, maxTokens: 2048, enableThinking: turn.thinking });
+    }
+  }
 
-    // Product-aware system context: real wallet balances, recent transactions,
-    // circles/pots and the capability catalog (bounded + fail-open; a context
-    // failure never blocks the chat).
-    const userContext = await buildMetricAiUserContext(userId);
-    const messages: GlmChatMessage[] = [
-      { role: "system", content: userContext ? `${SYSTEM_PROMPT}\n\n===\n${userContext}` : SYSTEM_PROMPT },
-      ...priorMessages,
-      { role: "user", content: userContent },
-    ];
+  return { handled: true, replyText, generatedImageUrl, videoJobId, modelUsed };
+}
 
-    // Store the user's message first (even if generation fails, history is honest)
+/**
+ * Shared tail: handoff-marker cleanup, support-desk awareness notification
+ * and the assistant-message INSERT. Returns the persisted row + flags.
+ */
+async function persistMetricAiReply(
+  req: MetricAiRequest,
+  turn: MetricAiTurn,
+  replyTextRaw: string,
+  generatedImageUrl: string | null,
+  modelUsed: string,
+): Promise<{ id: any; createdAt: any; reply: string; suggestHumanSupport: boolean }> {
+  // Human-handoff detection (model marker or explicit user intent)
+  const handoff = detectHandoff(replyTextRaw || "", turn.trimmed);
+
+  // Support-desk awareness: log MetricAi activity for the admin support
+  // dashboard (deduped to one notification per user per 30 minutes).
+  try {
     await query(
-      `INSERT INTO ai_messages (user_id, business_id, role, content, image_url, attachment_url, attachment_type)
-       VALUES ($1, $2, 'user', $3, $4, $5, $6)`,
-      [userId, businessId, trimmed || null, attachedImageUrl, attachedVideoUrl, attachedVideoUrl ? "video" : attachedImageUrl ? "image" : null],
+      `INSERT INTO admin_notifications (type, title, body, dedupe_key)
+       SELECT 'metric_ai_activity'::varchar, $1::varchar, $2::text, $3::varchar
+       WHERE NOT EXISTS (
+         SELECT 1 FROM admin_notifications
+         WHERE dedupe_key = $3::varchar AND created_at > NOW() - INTERVAL '30 minutes'
+       )`,
+      [
+        `${(req as any).user?.name || "A user"} is chatting with MetricAi`,
+        turn.trimmed.slice(0, 200),
+        `metric-ai-${turn.userId}`,
+      ],
     );
+  } catch (notifyError) {
+    console.error("MetricAi activity notify failed (non-fatal):", notifyError);
+  }
+
+  const assistantInsert = await query(
+    `INSERT INTO ai_messages (user_id, business_id, role, content, image_url, model)
+     VALUES ($1, $2, 'assistant', $3, $4, $5)
+     RETURNING id, created_at as "createdAt"`,
+    [turn.userId, turn.businessId, handoff.reply || null, generatedImageUrl, modelUsed],
+  );
+
+  return {
+    id: assistantInsert.rows[0].id,
+    createdAt: assistantInsert.rows[0].createdAt,
+    reply: handoff.reply,
+    suggestHumanSupport: handoff.suggestHumanSupport,
+  };
+}
+
+export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
+  try {
+    const turn = await prepareMetricAiTurn(req, res);
+    if (!turn) return;
+    const { messages, thinking } = turn;
+
+    const media = await runMetricAiMediaGeneration(turn, res);
+    if (media === null) return; // usage gate already responded
 
     let replyText = "";
     let generatedImageUrl: string | null = null;
     let videoJobId: string | null = null;
     let modelUsed = getGlmChatModel();
-
-    if (wantsVideo) {
-      // Video generation path — CogVideoX is an upstream ASYNC job: create now,
-      // poll in the background, drop the finished video into the chat history.
-      // Usage: checked before the job, recorded only when a job actually starts.
-      const videoGate = await assertWithinAiUsageWithCredits(userId, businessId, "video", limits);
-      if (videoGate.ok === false) {
-        const blocked = limitReached(videoGate);
-        return res.status(blocked.status).json(blocked.body);
-      }
-      try {
-        const job = await glmVideoCreate(trimmed);
-        await recordAiUsage(userId, businessId, "video");
-        const jobRow = await query(
-          `INSERT INTO metric_ai_video_jobs (user_id, business_id, prompt, status, model, upstream_base, upstream_job_id)
-           VALUES ($1, $2, $3, 'processing', $4, $5, $6) RETURNING id`,
-          [userId, businessId, trimmed, job.model, job.base, job.jobId],
-        );
-        videoJobId = jobRow.rows[0].id;
-        startVideoJobPoller(videoJobId, userId, businessId, job);
-        replyText = await glmChat({
-          messages: [
-            ...messages,
-            { role: "assistant", content: `[a video generation job was started for: ${trimmed}]` },
-            {
-              role: "user",
-              content:
-                "The video is now being generated in the background and will appear in this chat automatically when it is ready (usually a few minutes). In ONE short friendly sentence tell the user this. Do not repeat their prompt.",
-            },
-          ],
-          maxTokens: 120,
-          temperature: 0.8,
-        });
-      } catch (videoError: any) {
-        console.error("MetricAi video generation failed:", videoError);
-        const creditIssue = videoError?.code === "video_requires_credit";
-        replyText = await glmChat({
-          messages: [
-            ...messages,
-            {
-              role: "user",
-              content:
-                `Video generation is currently unavailable${creditIssue ? " because the video engine needs a service credit top-up" : ""}. ` +
-                "In ONE or TWO short friendly sentences, apologize and offer: (1) generating a great IMAGE of the same idea instead right now, or (2) trying the video again later. Do not mention technical details or providers.",
-            },
-          ],
-          maxTokens: 160,
-          temperature: 0.7,
-        });
-      }
-    } else if (wantsImage) {
-      // Image generation path — the reply accompanies the generated artwork.
-      // Usage: checked before generating, recorded only on success.
-      const imageGate = await assertWithinAiUsageWithCredits(userId, businessId, "image", limits);
-      if (imageGate.ok === false) {
-        const blocked = limitReached(imageGate);
-        return res.status(blocked.status).json(blocked.body);
-      }
-      try {
-        const image = await glmImageGen(trimmed, async (buffer, mimeType, originalname) => {
-          const media = await uploadMediaBuffer({
-            buffer,
-            originalname,
-            mimeType,
-            folder: "metricai",
-            businessId,
-            userId,
-          });
-          return media.url;
-        });
-        await recordAiUsage(userId, businessId, "image");
-        generatedImageUrl = image.url;
-        modelUsed = image.model;
-        replyText = await glmChat({
-          messages: [
-            ...messages,
-            { role: "assistant", content: `[generated an image for: ${trimmed}]` },
-            {
-              role: "user",
-              content:
-                "The image was just generated and shown to the user. In ONE short friendly sentence, present the image. Do not repeat the user's prompt.",
-            },
-          ],
-          maxTokens: 120,
-          temperature: 0.8,
-        });
-      } catch (imageError) {
-        console.error("MetricAi image generation failed:", imageError);
-        // Graceful text-only fallback
-        replyText = await glmChat({ messages, maxTokens: 2048 });
-      }
+    if (media.handled) {
+      replyText = media.replyText;
+      generatedImageUrl = media.generatedImageUrl;
+      videoJobId = media.videoJobId;
+      modelUsed = media.modelUsed;
     } else {
-      replyText = await glmChat({ messages, maxTokens: 2048 });
+      // Plain text reply — deep thinking only when the question earns it.
+      replyText = await glmChat({ messages, maxTokens: thinking ? 3072 : 2048, enableThinking: thinking });
     }
 
-    // Human-handoff detection (model marker or explicit user intent)
-    const handoff = detectHandoff(replyText || "", trimmed);
-    replyText = handoff.reply;
-
-    // Support-desk awareness: log MetricAi activity for the admin support
-    // dashboard (deduped to one notification per user per 30 minutes).
-    try {
-      await query(
-        `INSERT INTO admin_notifications (type, title, body, dedupe_key)
-         SELECT 'metric_ai_activity'::varchar, $1::varchar, $2::text, $3::varchar
-         WHERE NOT EXISTS (
-           SELECT 1 FROM admin_notifications
-           WHERE dedupe_key = $3::varchar AND created_at > NOW() - INTERVAL '30 minutes'
-         )`,
-        [
-          `${(req as any).user?.name || "A user"} is chatting with MetricAi`,
-          trimmed.slice(0, 200),
-          `metric-ai-${userId}`,
-        ],
-      );
-    } catch (notifyError) {
-      console.error("MetricAi activity notify failed (non-fatal):", notifyError);
-    }
-
-    const assistantInsert = await query(
-      `INSERT INTO ai_messages (user_id, business_id, role, content, image_url, model)
-       VALUES ($1, $2, 'assistant', $3, $4, $5)
-       RETURNING id, created_at as "createdAt"`,
-      [userId, businessId, replyText || null, generatedImageUrl, modelUsed],
-    );
+    const settled = await persistMetricAiReply(req, turn, replyText, generatedImageUrl, modelUsed);
 
     const response: ApiResponse<any> = {
       success: true,
       data: {
-        id: assistantInsert.rows[0].id,
-        reply: replyText,
+        id: settled.id,
+        reply: settled.reply,
         imageUrl: generatedImageUrl,
-        attachmentUrl: attachedVideoUrl || attachedImageUrl || undefined,
-        attachmentType: attachedVideoUrl ? "video" : attachedImageUrl ? "image" : undefined,
+        attachmentUrl: turn.attachedVideoUrl || turn.attachedImageUrl || undefined,
+        attachmentType: turn.attachedVideoUrl ? "video" : turn.attachedImageUrl ? "image" : undefined,
         videoJob: videoJobId ? { id: videoJobId, status: "processing" } : undefined,
         model: modelUsed,
-        suggestHumanSupport: handoff.suggestHumanSupport,
-        createdAt: assistantInsert.rows[0].createdAt,
+        suggestHumanSupport: settled.suggestHumanSupport,
+        createdAt: settled.createdAt,
       },
     };
     res.json(response);
@@ -1048,6 +1194,162 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
         ? "MetricAi is temporarily unavailable. Please try again later."
         : "MetricAi failed to respond. Please try again.",
     });
+  }
+};
+
+/**
+ * @swagger
+ * /ai/chat/stream:
+ *   post:
+ *     summary: Chat with MetricAi over SSE — reply tokens stream as they are
+ *       generated (first words within ~1-2s instead of the full-reply wait)
+ *     tags: [MetricAi]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [message]
+ *             properties:
+ *               message: { type: string }
+ *               imageUrl: { type: string }
+ *               attachmentUrl: { type: string }
+ *               attachmentType: { type: string }
+ *     responses:
+ *       200:
+ *         description: text/event-stream with `delta` (text chunk), `meta`
+ *           (final row: reply/imageUrl/videoJob/model/...) and `done` events;
+ *           `error` on failure. Short-circuits (400/usage cap) answer as
+ *           normal JSON BEFORE the stream opens.
+ *       403:
+ *         description: MetricAi not enabled on the caller's plan
+ *
+ * TRANSPORT NOTE — deliberately OUTSIDE the payload-encryption envelope:
+ * the client does not send `x-mfv-enc` on this endpoint, so responses are
+ * plaintext SSE. Streaming bytes cannot fit the whole-body envelope model,
+ * `res.write` is never wrapped by payloadEncryptionMiddleware, and HTTPS
+ * protects the transport. The JSON /ai/chat route stays fully enveloped.
+ */
+export const postAiChatStream: RequestHandler = async (req: MetricAiRequest, res) => {
+  // Prelude first — short-circuits (400 / usage cap) go out as normal JSON
+  // while the SSE stream has NOT been opened yet.
+  let turn: MetricAiTurn | null = null;
+  try {
+    turn = await prepareMetricAiTurn(req, res);
+  } catch (error: any) {
+    console.error("MetricAi stream prelude error:", error);
+    const isConfig = /GLM_API_KEY is not configured/.test(error?.message || "");
+    res.status(isConfig ? 503 : 500).json({
+      success: false,
+      error: isConfig
+        ? "MetricAi is temporarily unavailable. Please try again later."
+        : "MetricAi failed to respond. Please try again.",
+    });
+    return;
+  }
+  if (!turn) return;
+  const { messages, thinking, wantsVideo, wantsImage } = turn;
+
+  // Media-generation intents run the SAME one-shot pipeline as /ai/chat
+  // (async video jobs and binary artwork cannot stream token-by-token); the
+  // short companion sentence is delivered as a single SSE delta afterwards.
+  // Any usage-cap short-circuit here answers as JSON BEFORE the stream opens.
+  let mediaReply: { handled: boolean; replyText: string; generatedImageUrl: string | null; videoJobId: string | null; modelUsed: string } | null = null;
+  try {
+    mediaReply = await runMetricAiMediaGeneration(turn, res);
+  } catch (error: any) {
+    console.error("MetricAi stream media error:", error);
+    res.status(500).json({ success: false, error: "MetricAi failed to respond. Please try again." });
+    return;
+  }
+  if (mediaReply === null) return; // usage gate already responded
+
+  // ---- SSE open ------------------------------------------------------------
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  if (typeof (res as any).flushHeaders === "function") (res as any).flushHeaders();
+
+  const send = (event: string, payload: unknown) => {
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  let clientGone = false;
+  const abort = new AbortController();
+  res.on("close", () => {
+    clientGone = true;
+    abort.abort();
+  });
+
+  // Idle keep-alive comments until the first delta lands — thinking-enabled
+  // first tokens can take 10-20s and some proxies drop "idle" responses.
+  let firstDeltaSeen = false;
+  const ping = setInterval(() => {
+    if (!firstDeltaSeen && !clientGone && !res.writableEnded) res.write(": ping\n\n");
+  }, 10_000);
+
+  try {
+    let replyText = "";
+    let generatedImageUrl = mediaReply.generatedImageUrl;
+    let videoJobId = mediaReply.videoJobId;
+    let modelUsed = mediaReply.modelUsed;
+
+    if (mediaReply.handled) {
+      // One-shot companion sentence for video/image intents.
+      firstDeltaSeen = true;
+      clearInterval(ping);
+      replyText = mediaReply.replyText;
+      if (replyText) send("delta", { text: replyText });
+    } else {
+      const result = await glmChatStream(
+        { messages, maxTokens: thinking ? 3072 : 2048, enableThinking: thinking },
+        (chunk) => {
+          if (!firstDeltaSeen) {
+            firstDeltaSeen = true;
+            clearInterval(ping);
+          }
+          if (chunk) send("delta", { text: chunk });
+        },
+        abort.signal,
+      );
+      replyText = result.text;
+      modelUsed = result.model;
+    }
+
+    // Same persistence/tail as the JSON route.
+    const settled = await persistMetricAiReply(req, turn, replyText, generatedImageUrl, modelUsed);
+    send("meta", {
+      id: settled.id,
+      reply: settled.reply,
+      imageUrl: generatedImageUrl,
+      attachmentUrl: turn.attachedVideoUrl || turn.attachedImageUrl || undefined,
+      attachmentType: turn.attachedVideoUrl ? "video" : turn.attachedImageUrl ? "image" : undefined,
+      videoJob: videoJobId ? { id: videoJobId, status: "processing" } : undefined,
+      model: modelUsed,
+      suggestHumanSupport: settled.suggestHumanSupport,
+      createdAt: settled.createdAt,
+    });
+    send("done", { ok: true });
+    clearInterval(ping);
+    res.end();
+  } catch (error: any) {
+    clearInterval(ping);
+    console.error("MetricAi stream error:", error);
+    if (!clientGone) {
+      const isConfig = /GLM_API_KEY is not configured/.test(error?.message || "");
+      send("error", {
+        error: isConfig && !firstDeltaSeen
+          ? "MetricAi is temporarily unavailable. Please try again later."
+          : "MetricAi failed to respond. Please try again.",
+      });
+      res.end();
+    }
   }
 };
 

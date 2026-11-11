@@ -330,6 +330,212 @@ export async function glmChat(opts: GlmChatOptions): Promise<string> {
   throw lastError || new Error("GLM chat failed: no model candidates");
 }
 
+/* ------------------------------------------------------------------ */
+/* STREAMING — token-by-token chat for MetricAi's SSE endpoint.         */
+/* ------------------------------------------------------------------ */
+
+export interface GlmChatStreamResult {
+  /** The FULL reply text (all deltas concatenated). */
+  text: string;
+  /** The model id that actually answered. */
+  model: string;
+}
+
+/**
+ * Streamed variant of glmChat: same candidate walk (endpoints x models,
+ * overload memory, quota aborts), but the winning request runs with
+ * `stream: true` and every content delta is pushed to [onDelta] AS IT
+ * ARRIVES, so the app shows words within ~1s instead of waiting for the
+ * whole completion.
+ *
+ * - reasoning_content deltas (thinking mode) are deliberately NOT forwarded —
+ *   the user sees the answer, not the deliberation.
+ * - Endpoints that ignore `stream:true` and answer with a plain JSON body
+ *   are handled too: the full text is delivered through a single onDelta call.
+ * - [signal] lets the route abort generation when the SSE client disconnects.
+ */
+export async function glmChatStream(
+  opts: GlmChatOptions,
+  onDelta: (chunk: string) => void,
+  signal?: AbortSignal,
+): Promise<GlmChatStreamResult> {
+  const apiKey = getGlmApiKey();
+  if (!apiKey) {
+    throw new Error("GLM_API_KEY is not configured on the server");
+  }
+
+  const models = opts.model
+    ? [opts.model]
+    : Array.from(new Set([getGlmChatModel(), ...FALLBACK_CHAT_MODELS]));
+  const orderedModels = opts.model
+    ? models
+    : [
+        ...models.filter((m) => !isRecentlyOverloaded(m)),
+        ...models.filter((m) => isRecentlyOverloaded(m)),
+      ];
+
+  const bases = getGlmApiBases();
+  let lastError: Error | null = null;
+  let sawAuthRejection = false;
+
+  for (const base of bases) {
+    let baseRejected = false;
+
+    for (const model of orderedModels) {
+      if (baseRejected) break;
+
+      const endpoint = `${base}/chat/completions`;
+      const postStream = (includeThinking: boolean) =>
+        fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: opts.messages,
+            temperature: opts.temperature ?? 0.7,
+            max_tokens: opts.maxTokens ?? 2048,
+            stream: true,
+            ...(includeThinking
+              ? { thinking: opts.enableThinking ? { type: "enabled" } : GLM_THINKING_OFF }
+              : {}),
+          }),
+          signal,
+        });
+
+      let response: Response;
+      try {
+        response = await postStream(true);
+        if (
+          response.status === 400 &&
+          /thinking/i.test(await response.clone().text().catch(() => ""))
+        ) {
+          console.warn(`[glm] stream endpoint rejected thinking param — retrying ${model} without it...`);
+          response = await postStream(false);
+        }
+      } catch (networkError: any) {
+        if (signal?.aborted) throw networkError; // client went away — stop quietly
+        lastError = new Error(
+          `GLM stream network error (${endpoint}): ${networkError?.message || networkError}`,
+        );
+        console.warn(`[glm] stream network error on model ${model} — trying next candidate...`);
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => response.statusText);
+        lastError = new Error(
+          `GLM stream error (${response.status}) [base=${base} model=${model}] :: ${errorText.slice(0, 300)}`,
+        );
+        if (response.status === 401 || response.status === 403) {
+          baseRejected = true;
+          sawAuthRejection = true;
+          console.warn(`[glm] key rejected by ${base} (stream) — trying next platform endpoint...`);
+          continue;
+        }
+        if (response.status === 429) {
+          if (isQuotaExhausted429(errorText)) {
+            throw new Error(
+              `${lastError.message} — GLM account balance/quota exhausted for this key.`,
+            );
+          }
+          markOverloaded(model);
+          console.warn(`[glm] stream model "${model}" overloaded on ${base} — trying next candidate...`);
+          continue;
+        }
+        console.warn(
+          `[glm] stream model "${model}" not usable on ${base} (HTTP ${response.status}) — trying next candidate...`,
+        );
+        continue;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("text/event-stream")) {
+        // Endpoint ignored stream:true — degrade to one-shot delivery.
+        const data = (await response.json().catch(() => null)) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        } | null;
+        if (!data) {
+          lastError = new Error(`GLM stream returned a non-SSE, non-JSON body (${contentType})`);
+          continue;
+        }
+        if (!opts.model) resolvedChatModel = model;
+        const text = data.choices?.[0]?.message?.content || "";
+        if (text) onDelta(text);
+        return { text, model };
+      }
+
+      // ---- SSE pump ----------------------------------------------------
+      if (!opts.model) resolvedChatModel = model;
+      let full = "";
+      const reader = response.body?.getReader();
+      if (!reader) {
+        lastError = new Error("GLM stream response has no readable body");
+        continue;
+      }
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          // SSE messages are separated by a blank line; tolerate \r\n.
+          for (;;) {
+            const match = /\r?\n\r?\n/.exec(buffer);
+            if (!match) break;
+            const rawEvent = buffer.slice(0, match.index);
+            buffer = buffer.slice(match.index + match[0].length);
+            for (const line of rawEvent.split(/\r?\n/)) {
+              if (!line.startsWith("data:")) continue; // ignore comments/other fields
+              const payload = line.slice(5).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const parsed = JSON.parse(payload) as {
+                  choices?: Array<{ delta?: { content?: string | null } }>;
+                  error?: { message?: string };
+                };
+                if (parsed.error?.message) {
+                  throw new Error(`GLM stream error event: ${parsed.error.message}`);
+                }
+                const chunk = parsed.choices?.[0]?.delta?.content;
+                if (chunk) {
+                  full += chunk;
+                  onDelta(chunk);
+                }
+              } catch (jsonError: any) {
+                if (jsonError?.message?.startsWith("GLM stream error event:")) throw jsonError;
+                // Malformed keep-alive/JSON fragment — skip it.
+              }
+            }
+          }
+        }
+      } catch (streamError: any) {
+        if (signal?.aborted) throw streamError;
+        // Mid-stream failure: keep whatever we already emitted (the route
+        // treats a partial text as a valid reply and persists it).
+        console.warn(`[glm] stream interrupted after ${full.length} chars: ${streamError?.message}`);
+        if (!full) throw streamError;
+        return { text: full, model };
+      }
+      if (!full) {
+        lastError = new Error(`GLM stream produced no content on ${base}/${model}`);
+        continue;
+      }
+      return { text: full, model };
+    }
+  }
+
+  if (lastError && sawAuthRejection) {
+    lastError = new Error(
+      `${lastError.message} — the GLM key was rejected by every known endpoint.`,
+    );
+  }
+  throw lastError || new Error("GLM stream failed: no model candidates");
+}
+
 export interface GlmImageResult {
   /** Persistent URL (uploaded through our storage chain) */
   url: string;

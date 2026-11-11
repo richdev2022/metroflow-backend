@@ -116,8 +116,11 @@ function compareVersionNames(a: string, b: string): number {
  * separately, driven by the per-slot settings uploaded from the admin panel
  * (POST /admin/settings/apk-slot, keys personal_apk_url/personal_apk_version
  * and business_apk_url/business_apk_version). The legacy single-slot apk_url
- * (newest active android app_versions row) is still returned as-is so older
- * site builds keep working — it is NOT copied into the per-slot fields.
+ * (newest active android app_versions row) is still returned as a backward-
+ * compat alias for older site builds. The one-time boot migration
+ * (migrateLegacyApkToPersonalSlot in server/migrations.ts) copied the legacy
+ * upload into the personal slot and cleared the legacy keys, so apk_url is
+ * normally NULL now and the per-slot fields are the only source of truth.
  */
 router.get("/app-links", async (req, res) => {
   try {

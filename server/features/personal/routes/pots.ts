@@ -4,6 +4,7 @@ import { query } from "../../../db";
 import { AuthenticatedRequest, authenticateToken, checkSubscriptionStatus } from "../../../middleware/auth";
 import { insertTransaction, creditWallet, requirePersonalKyc } from "../personal-utils";
 import { createNotification } from "../../../services/notifications";
+import { sendEmail } from "../../../services/email";
 import {
   approversOf,
   computeDueForWithdrawal,
@@ -34,13 +35,18 @@ import {
  * are idempotent by unique reference.
  *
  * Endpoints:
- *   POST /pots                    → open a pot (+ share token, approvers, due date)
+ *   POST /pots                    → open a pot (+ share token, approvers,
+ *                                    invited contributors: participants/emails)
  *   PATCH /pots/:id               → creator edits (title/purpose/target/deadline/
- *                                    withdrawalApprovers/withdrawalDueAt)
+ *                                    withdrawalApprovers/withdrawalDueAt + ADD
+ *                                    MORE invited contributors — add-only merge)
  *   GET  /pots/mine               → pots I created + pots I contributed to
+ *                                    + pots I'm INVITED to (invited[])
  *   GET  /pots/:id                → detail + contributions + progress + wallet
+ *                                    + invitees (the creator's invited list)
  *   POST /pots/:id/contribute     → { amount, note? } wallet-funded contribution
- *                                    (lands in the POT's wallet)
+ *                                    (lands in the POT's wallet; an invited
+ *                                    contributor flips to 'accepted')
  *   POST /pots/:id/withdrawals    → creator bank withdrawal (multi-approval when
  *                                    approvers are set; else immediate)
  *   GET  /pots/:id/withdrawals    → withdrawal history (creator)
@@ -96,6 +102,199 @@ function buildProgress(pot: any) {
     percent: target > 0 ? Math.min(100, Math.round((balance / target) * 100)) : 0,
     remaining: Math.max(0, money(target - balance)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// INVITED CONTRIBUTORS — the same invite model the splits router uses:
+// `participants` are user ids (registered accounts, notified in-app) and
+// `emails` are either registered accounts (join directly) or pending email
+// invites (mailed a join link). Sharing the pot link still lets ANYONE
+// contribute — invitees are the people the creator EXPLICITLY asked. The
+// list is ADD-ONLY: an edit can invite more people, never silently un-invite
+// someone who was asked to chip in. A contributor flips to 'accepted'.
+// ---------------------------------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_POT_INVITEES = 50;
+
+interface PotInviteeSet {
+  userIds: string[];
+  emails: string[]; // unresolved emails only (registered ones became userIds)
+}
+
+// Same non-discriminated result shape the splits router's approver check
+// uses (the server tsconfig runs strict:false).
+interface PotInviteeResult {
+  ok: boolean;
+  userIds?: string[];
+  emails?: string[];
+  error?: string;
+  usersInvited?: number;
+  emailsInvited?: number;
+}
+
+async function parsePotInvitees(
+  body: any,
+  creatorId: string,
+  existingUserIds: Set<string>,
+  existingEmails: Set<string>,
+): Promise<PotInviteeResult> {
+  const rawParticipants = Array.isArray(body?.participants) ? body.participants : [];
+  const userIds: string[] = [];
+  const seen = new Set(existingUserIds);
+  seen.add(creatorId); // never invite the creator themself
+  for (const p of rawParticipants) {
+    const pid = String(typeof p === "string" ? p : p?.user_id || p?.id || "").trim();
+    if (!pid) continue;
+    if (!UUID_RE.test(pid)) return { ok: false, error: "Each invited contributor needs a valid user id" };
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    userIds.push(pid);
+  }
+  const rawEmails = Array.isArray(body?.emails) ? body.emails : [];
+  const emails: string[] = [];
+  for (const v of rawEmails) {
+    const email = String(v || "").trim().toLowerCase();
+    if (!email) continue;
+    if (!EMAIL_RE.test(email)) {
+      return { ok: false, error: `"${email.slice(0, 60)}" is not a valid email address` };
+    }
+    if (existingEmails.has(email) || emails.includes(email)) continue;
+    emails.push(email);
+  }
+  if (userIds.length + emails.length > MAX_POT_INVITEES) {
+    return { ok: false, error: `A pot can have at most ${MAX_POT_INVITEES} invited contributors` };
+  }
+  return { ok: true, userIds, emails };
+}
+
+/** Registered emails become user invites; unknown ones stay email invites. */
+async function resolveInviteEmails(
+  emails: string[],
+  creatorId: string,
+  userIds: string[],
+): Promise<PotInviteeSet> {
+  if (!emails.length) return { userIds, emails: [] };
+  const matched = await query(
+    `SELECT id, LOWER(email) AS email FROM users WHERE LOWER(email) = ANY($1::text[])`,
+    [emails],
+  );
+  const byEmail = new Map<string, string>(matched.rows.map((r: any) => [String(r.email), String(r.id)]));
+  const emailOnly: string[] = [];
+  for (const email of emails) {
+    const uid = byEmail.get(email);
+    if (uid && uid !== creatorId && !userIds.includes(uid)) userIds.push(uid);
+    else if (!uid) emailOnly.push(email);
+  }
+  return { userIds, emails: emailOnly };
+}
+
+async function insertPotInvitees(potId: string, invitedBy: string, userIds: string[], emails: string[]) {
+  if (userIds.length) {
+    await query(
+      `INSERT INTO pot_invitees (pot_id, user_id, invited_by, status)
+       SELECT $1, x.uid, $2, 'pending' FROM UNNEST($3::uuid[]) AS x(uid)
+       ON CONFLICT (pot_id, user_id) DO NOTHING`,
+      [potId, invitedBy, userIds],
+    );
+  }
+  if (emails.length) {
+    await query(
+      `INSERT INTO pot_invitees (pot_id, email, invited_by, status)
+       SELECT $1, x.email, $2, 'pending' FROM UNNEST($3::text[]) AS x(email)
+       ON CONFLICT (pot_id, email) DO UPDATE
+         SET invited_by = EXCLUDED.invited_by, status = 'pending', created_at = CURRENT_TIMESTAMP`,
+      [potId, invitedBy, emails],
+    );
+  }
+}
+
+/** In-app + socket invite for the picked users (the email invites get mail). */
+async function notifyPotInvitees(pot: any, creatorName: string, userIds: string[]) {
+  for (const uid of userIds) {
+    createNotification({
+      businessId: null,
+      userId: uid,
+      type: "pot_invite",
+      title: "Pot invite",
+      message: `${creatorName} invited you to contribute to "${String(pot.title).slice(0, 60)}"`,
+      actionUrl: "/splits?tab=pots",
+      actionType: "view_pot",
+      isActionable: true,
+      metadata: { potId: pot.id },
+    }).catch(() => {});
+  }
+}
+
+async function mailPotInvite(pot: any, creatorName: string, email: string) {
+  const baseUrl = process.env.APP_BASE_URL || process.env.APP_URL || "https://personal.metricorex.com";
+  await sendEmail(
+    email,
+    "There",
+    `${creatorName} invited you to a group pot on MetriCorex`,
+    `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+      <h2 style="margin:0 0 12px">"${String(pot.title).slice(0, 80)}"</h2>
+      <p style="color:#374151;line-height:1.6">
+        ${creatorName} invited you to chip in to the group pot
+        ${pot.purpose ? `for <strong>"${String(pot.purpose).slice(0, 80)}"</strong> ` : ""}on MetriCorex.<br/>
+        Sign up or sign in with this email to contribute any amount.
+      </p>
+      <p style="margin:24px 0">
+        <a href="${baseUrl}/splits?tab=pots" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Open the pot</a>
+      </p>
+    </div>`,
+  );
+}
+
+async function loadPotInvitees(potId: string) {
+  const r = await query(
+    `SELECT i.id, i.user_id, i.email, i.status, i.created_at,
+            u.name AS name, u.avatar_url AS avatar_url,
+            LOWER(COALESCE(u.username, SPLIT_PART(u.email, '@', 1))) AS username
+       FROM pot_invitees i
+       LEFT JOIN users u ON u.id = i.user_id
+      WHERE i.pot_id = $1
+      ORDER BY i.created_at ASC LIMIT 100`,
+    [potId],
+  );
+  return r.rows.map((row: any) => ({
+    id: row.id,
+    userId: row.user_id || null,
+    email: row.user_id ? null : String(row.email || ""),
+    status: row.status,
+    name: row.name || null,
+    avatarUrl: row.avatar_url || null,
+    username: row.username || null,
+    invitedAt: row.created_at,
+  }));
+}
+
+async function existingPotInvitees(potId: string) {
+  const r = await query(`SELECT user_id, email FROM pot_invitees WHERE pot_id = $1`, [potId]);
+  const userIds = new Set<string>(r.rows.filter((x: any) => x.user_id).map((x: any) => String(x.user_id)));
+  const emails = new Set<string>(r.rows.filter((x: any) => x.email).map((x: any) => String(x.email).toLowerCase()));
+  return { userIds, emails };
+}
+
+/** Parse + resolve + persist + notify one invite batch (create AND edit). */
+async function processPotInvitees(
+  pot: any,
+  creatorId: string,
+  creatorName: string,
+  body: any,
+  existingUserIds: Set<string>,
+  existingEmails: Set<string>,
+): Promise<PotInviteeResult> {
+  const parsed = await parsePotInvitees(body, creatorId, existingUserIds, existingEmails);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const resolved = await resolveInviteEmails(parsed.emails || [], creatorId, parsed.userIds || []);
+  if (!resolved.userIds.length && !resolved.emails.length) return { ok: true, usersInvited: 0, emailsInvited: 0 };
+  await insertPotInvitees(pot.id, creatorId, resolved.userIds, resolved.emails);
+  await notifyPotInvitees(pot, creatorName, resolved.userIds);
+  for (const email of resolved.emails) {
+    await mailPotInvite(pot, creatorName, email).catch((mailErr: any) =>
+      console.error("[pots/invite-email]", mailErr?.message));
+  }
+  return { ok: true, usersInvited: resolved.userIds.length, emailsInvited: resolved.emails.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +355,33 @@ router.post("/", authenticateToken, checkSubscriptionStatus, async (req: Authent
     await ensureSplitPotWallet("pot", pot.id).catch((wErr: any) =>
       console.error("[pots/create] pot wallet creation failed (will retry lazily):", wErr?.message));
 
-    res.status(201).json({ success: true, pot: serializePot(pot), withdrawal_approvers: approversOf(pot) });
+    // Invited contributors (owner request): create AND edit both accept
+    // participants + emails. Unknown emails become pending invites that
+    // receive the join mail; registered users are notified in-app.
+    let invitedUsers = 0;
+    let invitedEmails = 0;
+    if (req.body?.participants !== undefined || req.body?.emails !== undefined) {
+      const creatorRow = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const creatorName = creatorRow.rows[0]?.name || "Someone";
+      const invited = await processPotInvitees(pot, userId, creatorName, req.body, new Set(), new Set());
+      if (!invited.ok) {
+        // The pot exists but the invite list was rejected — surface the
+        // validation error instead of leaving the creator guessing.
+        return res.status(400).json({ success: false, error: invited.error, potId: pot.id });
+      }
+      invitedUsers = invited.usersInvited || 0;
+      invitedEmails = invited.emailsInvited || 0;
+    }
+
+    res.status(201).json({
+      success: true,
+      pot: serializePot(pot),
+      withdrawal_approvers: approversOf(pot),
+      invitees: await loadPotInvitees(pot.id).catch(() => []),
+      ...(invitedUsers + invitedEmails
+        ? { message: `${invitedUsers} contributor${invitedUsers === 1 ? "" : "s"} invited${invitedEmails ? ` · ${invitedEmails} email invite${invitedEmails === 1 ? "" : "s"} sent` : ""}` }
+        : {}),
+    });
   } catch (e: any) {
     console.error("[pots/create]", e?.message);
     res.status(500).json({ success: false, error: "Could not create the pot" });
@@ -192,6 +417,19 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
       [userId],
     );
 
+    // Pots I was INVITED to contribute to (pending + already chipped in) —
+    // the invite landing surface, mirroring the splits "invited" list.
+    const invitedPots = await query(
+      `SELECT p.*, pu.name AS creator_name, pu.avatar_url AS creator_avatar,
+              i.status AS invite_status, i.created_at AS invited_at
+         FROM pot_invitees i
+         JOIN pots p ON p.id = i.pot_id
+         JOIN users pu ON pu.id = p.creator_id
+        WHERE i.user_id = $1 AND p.creator_id <> $1
+        ORDER BY i.created_at DESC LIMIT 100`,
+      [userId],
+    );
+
     res.json({
       success: true,
       pots: created.rows.map(serializePot),
@@ -199,6 +437,11 @@ router.get("/mine", authenticateToken, checkSubscriptionStatus, async (req: Auth
         ...serializePot(r),
         my_amount: num(r.my_amount),
         my_contributions: r.my_contributions,
+      })),
+      invited: invitedPots.rows.map((r: any) => ({
+        ...serializePot(r),
+        invite_status: r.invite_status || "pending",
+        invited_at: r.invited_at,
       })),
     });
   } catch (e: any) {
@@ -262,6 +505,7 @@ router.get("/:id", authenticateToken, checkSubscriptionStatus, async (req: Authe
         approverIds.map((id) => ({ id, name: null, avatarUrl: null, username: null }))),
       pendingWithdrawal: openRequest ? serializeWithdrawalRequest(openRequest) : null,
       dueForWithdrawal: computeDueForWithdrawal(dueAt, wallet?.balanceNgn || 0, !!openRequest),
+      invitees: await loadPotInvitees(pot.id).catch(() => []),
     });
   } catch (e: any) {
     console.error("[pots/detail]", e?.message);
@@ -331,17 +575,38 @@ router.patch("/:id", authenticateToken, checkSubscriptionStatus, async (req: Aut
       }
     }
 
-    if (!sets.length) {
-      return res.status(400).json({ success: false, error: "Nothing to update — send title, purpose, target_amount, deadline, withdrawalApprovers and/or withdrawalDueAt" });
+    // Invite MORE contributors (add-only merge): the same participants +
+    // emails payload the create endpoint takes — nobody already invited is
+    // re-notified, and the list never silently drops people.
+    let invitedUsers = 0;
+    let invitedEmails = 0;
+    if (req.body?.participants !== undefined || req.body?.emails !== undefined) {
+      const existing = await existingPotInvitees(pot.id);
+      const creatorRow = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const creatorName = creatorRow.rows[0]?.name || "Someone";
+      const invited = await processPotInvitees(pot, userId, creatorName, req.body, existing.userIds, existing.emails);
+      if (!invited.ok) return res.status(400).json({ success: false, error: invited.error });
+      invitedUsers = invited.usersInvited || 0;
+      invitedEmails = invited.emailsInvited || 0;
     }
-    params.push(pot.id);
-    await query(`UPDATE pots SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+
+    if (!sets.length && !invitedUsers && !invitedEmails) {
+      return res.status(400).json({ success: false, error: "Nothing to update — send title, purpose, target_amount, deadline, withdrawalApprovers, withdrawalDueAt, participants and/or emails" });
+    }
+    if (sets.length) {
+      params.push(pot.id);
+      await query(`UPDATE pots SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+    }
 
     const fresh = await loadPot(pot.id);
     res.json({
       success: true,
       pot: serializePot(fresh),
       withdrawal_approvers: approversOf(fresh),
+      invitees: await loadPotInvitees(pot.id).catch(() => []),
+      ...(invitedUsers + invitedEmails
+        ? { message: `${invitedUsers} contributor${invitedUsers === 1 ? "" : "s"} invited${invitedEmails ? ` · ${invitedEmails} email invite${invitedEmails === 1 ? "" : "s"} sent` : ""}` }
+        : {}),
     });
   } catch (e: any) {
     console.error("[pots/edit]", e?.message);
@@ -453,6 +718,14 @@ router.post("/:id/contribute", authenticateToken, checkSubscriptionStatus, async
     }
 
     const balanceAfter = num((await query(`SELECT balance FROM pots WHERE id = $1`, [pot.id])).rows[0]?.balance);
+
+    // An invited contributor who chips in flips to 'accepted' (best-effort —
+    // a missed flip never blocks the money).
+    await query(
+      `UPDATE pot_invitees SET status = 'accepted'
+        WHERE pot_id = $1 AND user_id = $2 AND status <> 'accepted'`,
+      [pot.id, userId],
+    ).catch(() => {});
 
     // Notify the creator (contributor ≠ creator) + target-crossed celebration.
     if (pot.creator_id !== userId) {

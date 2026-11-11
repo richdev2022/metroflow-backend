@@ -1562,6 +1562,27 @@ export async function ensurePersonalSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_pot_contributions_pot ON pot_contributions(pot_id, created_at DESC)`);
 
+  // Invited contributors for group pots — mirrors the splits invite model:
+  // picked users become pot_invitees rows (notified in-app), and unknown
+  // emails are recorded as pending email invites (mailed). Anyone with the
+  // share link can still contribute — invitees are the people the creator
+  // EXPLICITLY asked to chip in. A user who contributes flips to 'accepted'.
+  await query(`
+    CREATE TABLE IF NOT EXISTS pot_invitees (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pot_id UUID NOT NULL REFERENCES pots(id) ON DELETE CASCADE,
+      user_id UUID,
+      email TEXT,
+      invited_by UUID,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | accepted | declined
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (pot_id, user_id),
+      UNIQUE (pot_id, email)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_pot_invitees_pot ON pot_invitees(pot_id, created_at)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_pot_invitees_user ON pot_invitees(user_id, status)`);
+
   // ---------------------------------------------------------------------
   // GOAL CHEERS — friends cheer a goal vault (shareable goal pages).
   // ---------------------------------------------------------------------

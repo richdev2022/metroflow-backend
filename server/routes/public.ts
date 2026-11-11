@@ -111,12 +111,27 @@ function compareVersionNames(a: string, b: string): number {
  * fallback to the latest active release store_url per platform. Consumed by
  * the marketing site "Download our mobile app" sections and the web meeting
  * interstitial. No sensitive data is exposed.
+ *
+ * APK slots: the site renders a Personal and a Business Android APK download
+ * separately, driven by the per-slot settings uploaded from the admin panel
+ * (POST /admin/settings/apk-slot, keys personal_apk_url/personal_apk_version
+ * and business_apk_url/business_apk_version). The legacy single-slot apk_url
+ * (newest active android app_versions row) is still returned as-is so older
+ * site builds keep working — it is NOT copied into the per-slot fields.
  */
 router.get("/app-links", async (req, res) => {
   try {
     let [appStoreUrl, playStoreUrl] = await Promise.all([
       getSetting("app_store_url"),
       getSetting("play_store_url"),
+    ]);
+
+    // Business / Personal APK slots (admin-uploaded, system_settings-backed).
+    const [personalApkUrl, personalApkVersion, businessApkUrl, businessApkVersion] = await Promise.all([
+      getSetting("personal_apk_url"),
+      getSetting("personal_apk_version"),
+      getSetting("business_apk_url"),
+      getSetting("business_apk_version"),
     ]);
 
     // Fallback: per-platform store_url from the newest active app release.
@@ -167,6 +182,12 @@ router.get("/app-links", async (req, res) => {
         apk_version_name: apkVersionName,
         apk_version_code: apkVersionCode,
         apk_size_bytes: apkSizeBytes,
+        // Per-app APK slots — each null slot is hidden by the site (no dead
+        // download buttons). apk_url above remains the legacy alias.
+        personal_apk_url: personalApkUrl || null,
+        personal_apk_version: personalApkVersion || null,
+        business_apk_url: businessApkUrl || null,
+        business_apk_version: businessApkVersion || null,
         // Web-app origins — centrally configurable so the marketing site and
         // any embed can deep-link to the right product without redeploying.
         business_web_url: (process.env.BUSINESS_APP_URL || "https://app.metricorex.com").replace(/\/+$/, ""),
@@ -175,7 +196,18 @@ router.get("/app-links", async (req, res) => {
     });
   } catch (error: any) {
     console.error("Public app-links error:", error.message);
-    res.json({ success: true, data: { app_store_url: null, play_store_url: null, apk_url: null } });
+    res.json({
+      success: true,
+      data: {
+        app_store_url: null,
+        play_store_url: null,
+        apk_url: null,
+        personal_apk_url: null,
+        personal_apk_version: null,
+        business_apk_url: null,
+        business_apk_version: null,
+      },
+    });
   }
 });
 

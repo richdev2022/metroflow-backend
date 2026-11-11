@@ -5185,6 +5185,142 @@ protectedRouter.delete("/app-versions/:id/apk", requirePermission('manage_settin
 });
 
 // ============================================================================
+// Direct APK slots — Personal / Business (system_settings-backed)
+// ============================================================================
+// The marketing site renders TWO separate Android APK downloads ("Personal
+// app — Android APK" and "Business app — Android APK"), each driven by its
+// own settings keys (personal_apk_url/personal_apk_version,
+// business_apk_url/business_apk_version). This mirrors the single-slot
+// /app-versions/:id/apk flow (memory multer → uploadMediaBuffer on R2 →
+// sha256 recorded) but stores the resulting URL in system_settings per slot.
+// The legacy single slot (app_versions.apk_url) is untouched and keeps
+// feeding GET /public/app-links apk_url as a backward-compat alias.
+
+const APK_SLOTS = ["personal", "business"] as const;
+type ApkSlot = (typeof APK_SLOTS)[number];
+
+const isValidApkSlot = (v: unknown): v is ApkSlot =>
+    APK_SLOTS.includes(String(v || "").trim().toLowerCase() as ApkSlot);
+
+/**
+ * GET /admin/settings/apk-slots
+ * Current per-slot APK state for the admin console cards (empty string =
+ * slot not configured). Includes the legacy app_versions apk_url for context.
+ */
+protectedRouter.get("/settings/apk-slots", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const [personalUrl, personalVersion, businessUrl, businessVersion] = await Promise.all([
+            getSetting("personal_apk_url"),
+            getSetting("personal_apk_version"),
+            getSetting("business_apk_url"),
+            getSetting("business_apk_version"),
+        ]);
+        res.json({
+            success: true,
+            data: {
+                personal_apk_url: personalUrl || "",
+                personal_apk_version: personalVersion || "",
+                business_apk_url: businessUrl || "",
+                business_apk_version: businessVersion || "",
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "Failed to load APK slots" });
+    }
+});
+
+/**
+ * POST /admin/settings/apk-slot  (multipart field: "apk"; fields: slot, version?)
+ * Upload the signed release APK for one slot (personal|business). Stored via
+ * the media service (R2 first) with size + SHA-256 recorded; the URL and the
+ * optional version label land in system_settings under {slot}_apk_url /
+ * {slot}_apk_version. Re-uploading replaces the previous APK for that slot.
+ */
+protectedRouter.post("/settings/apk-slot", requirePermission('manage_settings'), uploadSingleApk, async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const slot = String(req.body?.slot || "").trim().toLowerCase();
+        if (!isValidApkSlot(slot)) {
+            return res.status(400).json({ success: false, error: "slot must be 'personal' or 'business'" });
+        }
+        const file = (req as any).file as any | undefined;
+        if (!file) return res.status(400).json({ success: false, error: "apk file is required (multipart field 'apk')" });
+        const version = String(req.body?.version || "").trim().slice(0, 32);
+
+        const up = await uploadMediaBuffer({
+            buffer: file.buffer,
+            originalname: file.originalname,
+            mimeType: file.mimetype || 'application/vnd.android.package-archive',
+            folder: 'app-releases',
+        });
+        const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+        await setSetting(`${slot}_apk_url`, up.url, `Direct APK download URL for the ${slot} mobile app (marketing site)`);
+        await setSetting(`${slot}_apk_version`, version, `Version label for the ${slot} mobile app APK`);
+        try {
+            logAuditEvent({
+                userId: (req.admin as any)?.adminId,
+                action: 'apk_upload',
+                entityType: 'apk_slot',
+                entityId: slot,
+                newValues: { slot, size: file.size, sha256, url: up.url, version },
+            }).catch(() => {});
+        } catch { /* */ }
+        res.json({
+            success: true,
+            message: "APK uploaded",
+            data: { slot, apk_url: up.url, apk_version: version, apk_size_bytes: file.size, apk_sha256: sha256 },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "APK upload failed" });
+    }
+});
+
+/**
+ * PUT /admin/settings/apk-slot/:slot/version
+ * Body: { version: string } — update the version label WITHOUT re-uploading
+ * the binary (≤32 chars; empty string clears the label).
+ */
+protectedRouter.put("/settings/apk-slot/:slot/version", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const slot = String(req.params.slot || "").trim().toLowerCase();
+        if (!isValidApkSlot(slot)) {
+            return res.status(400).json({ success: false, error: "slot must be 'personal' or 'business'" });
+        }
+        const version = String(req.body?.version ?? "").trim().slice(0, 32);
+        await setSetting(`${slot}_apk_version`, version, `Version label for the ${slot} mobile app APK`);
+        res.json({ success: true, message: "APK version updated", data: { slot, apk_version: version } });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "APK version update failed" });
+    }
+});
+
+/**
+ * DELETE /admin/settings/apk-slot/:slot — clear a slot (URL + version label);
+ * the site hides that APK button when the URL is empty.
+ */
+protectedRouter.delete("/settings/apk-slot/:slot", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
+    try {
+        const slot = String(req.params.slot || "").trim().toLowerCase();
+        if (!isValidApkSlot(slot)) {
+            return res.status(400).json({ success: false, error: "slot must be 'personal' or 'business'" });
+        }
+        await setSetting(`${slot}_apk_url`, "", `Direct APK download URL for the ${slot} mobile app (marketing site)`);
+        await setSetting(`${slot}_apk_version`, "", `Version label for the ${slot} mobile app APK`);
+        try {
+            logAuditEvent({
+                userId: (req.admin as any)?.adminId,
+                action: 'apk_slot_clear',
+                entityType: 'apk_slot',
+                entityId: slot,
+                newValues: { slot },
+            }).catch(() => {});
+        } catch { /* */ }
+        res.json({ success: true, message: "APK removed" });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message || "APK removal failed" });
+    }
+});
+
+// ============================================================================
 // Broadcast push / email notifications
 // ============================================================================
 

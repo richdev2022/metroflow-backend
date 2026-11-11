@@ -663,6 +663,113 @@ export const getAiUsage: RequestHandler = async (req: MetricAiRequest, res) => {
 };
 
 /**
+ * Per-user product context for MetricAi — REAL wallet balances, the last few
+ * transactions, savings circles and group pots, so answers speak about the
+ * caller's actual money instead of generic copy. Deliberately BOUNDED (row
+ * caps + a compact capability catalog) and FAIL-OPEN: every section loads
+ * independently (Promise.allSettled) and any failure just shrinks the block —
+ * the chat itself never breaks, and the HTTP response shape is untouched
+ * (this only enriches the system message).
+ */
+async function buildMetricAiUserContext(userId: string | null): Promise<string | null> {
+  if (!userId) return null;
+  try {
+    const [walletsRes, txRes, circlesRes, potsRes] = await Promise.allSettled([
+      query(
+        `SELECT currency, balance FROM wallets
+          WHERE user_id = $1 AND status = 'active'
+          ORDER BY currency LIMIT 6`,
+        [userId],
+      ),
+      query(
+        `SELECT type, transaction_type, amount, currency, status, description, created_at
+           FROM transactions WHERE user_id = $1
+          ORDER BY created_at DESC LIMIT 5`,
+        [userId],
+      ),
+      query(
+        `SELECT c.name, c.contribution_amount, c.currency, c.frequency, c.status, m.role
+           FROM savings_circle_members m JOIN savings_circles c ON c.id = m.circle_id
+          WHERE m.user_id = $1 AND m.status = 'active'
+          ORDER BY m.joined_at DESC LIMIT 5`,
+        [userId],
+      ),
+      query(
+        `SELECT p.title, p.currency, p.target_amount, p.balance, p.status
+           FROM pots p
+           LEFT JOIN pot_contributions pc ON pc.pot_id = p.id AND pc.user_id = $1
+          WHERE p.status = 'open' AND (p.creator_id = $1 OR pc.user_id IS NOT NULL)
+          GROUP BY p.id
+          ORDER BY p.created_at DESC LIMIT 5`,
+        [userId],
+      ),
+    ]);
+    const ok = <T,>(r: PromiseSettledResult<T>): T | null => (r.status === "fulfilled" ? r.value : null);
+
+    const lines: string[] = [];
+
+    const wallets = ok(walletsRes);
+    if (wallets?.rows?.length) {
+      const balances = (wallets.rows as any[])
+        .map((w) => `${w.currency} ${Number(w.balance).toLocaleString()}`)
+        .join(" · ");
+      lines.push(`- Wallet balances: ${balances}`);
+    }
+
+    const txs = ok(txRes);
+    if (txs?.rows?.length) {
+      const items = (txs.rows as any[]).map((t) => {
+        const sign = t.type === "debit" ? "-" : "+";
+        const kind = t.transaction_type ? ` (${String(t.transaction_type).slice(0, 30)})` : "";
+        const desc = t.description ? ` — ${String(t.description).slice(0, 60)}` : "";
+        const day = t.created_at ? new Date(t.created_at).toISOString().slice(0, 10) : "";
+        return `  · ${sign}${Number(t.amount).toLocaleString()} ${t.currency}${kind}${desc} [${t.status}, ${day}]`;
+      });
+      lines.push(`- Recent transactions (newest first):\n${items.join("\n")}`);
+    }
+
+    const circles = ok(circlesRes);
+    if (circles?.rows?.length) {
+      const items = (circles.rows as any[]).map(
+        (c) =>
+          `  · "${String(c.name).slice(0, 50)}" — ${c.frequency} ${Number(c.contribution_amount).toLocaleString()} ${c.currency} (you: ${c.role || "member"}, circle: ${c.status})`,
+      );
+      lines.push(`- Savings circles memberships:\n${items.join("\n")}`);
+    }
+
+    const pots = ok(potsRes);
+    if (pots?.rows?.length) {
+      const items = (pots.rows as any[]).map(
+        (p) =>
+          `  · "${String(p.title).slice(0, 50)}" — ${Number(p.balance).toLocaleString()} ${p.currency}${p.target_amount !== null && p.target_amount !== undefined ? ` of ${Number(p.target_amount).toLocaleString()} target` : ""} (${p.status})`,
+      );
+      lines.push(`- Group pots (created or contributed to):\n${items.join("\n")}`);
+    }
+
+    const contextLines = lines.join("\n");
+    if (!contextLines) return null;
+
+    return [
+      "LIVE USER CONTEXT (real, current data for the person you are chatting with — use it to give concrete, personal answers; never invent or amend these numbers; do not quote them back unless relevant):",
+      contextLines,
+      "",
+      "PRODUCT CAPABILITIES (personal-app side — mention confidently and concretely when relevant):",
+      "- Crypto off-ramp: sell crypto (BTC/USDT/USDC and more) for NGN straight to the wallet.",
+      "- Gift cards: buy and sell gift cards across brands with quoted rates.",
+      "- Bill payments: airtime, data, electricity and TV/cable bills paid from the wallet.",
+      "- Savings circles: rotating group savings (ajo-style) with rounds, invites and payouts.",
+      "- Bill split: split any bill by link and track who has paid their share.",
+      "- Group pots: shared money pots for events, gifts or goals that anyone can fund by link.",
+      "- Live streaming: one-tap go-live with viewers, gifts, PK battles between hosts, live shopping and replays.",
+      "These personal features live alongside the business workspace suite; navigation differs per app.",
+    ].join("\n");
+  } catch (e: any) {
+    console.warn("MetricAi user context unavailable (fail-open):", e?.message);
+    return null;
+  }
+}
+
+/**
  * @swagger
  * /ai/chat:
  *   post:
@@ -770,8 +877,12 @@ export const postAiChat: RequestHandler = async (req: MetricAiRequest, res) => {
       userContent = `${trimmed}${trimmed ? "\n" : ""}[user attached an image: ${attachedImageUrl}]`;
     }
 
+    // Product-aware system context: real wallet balances, recent transactions,
+    // circles/pots and the capability catalog (bounded + fail-open; a context
+    // failure never blocks the chat).
+    const userContext = await buildMetricAiUserContext(userId);
     const messages: GlmChatMessage[] = [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: userContext ? `${SYSTEM_PROMPT}\n\n===\n${userContext}` : SYSTEM_PROMPT },
       ...priorMessages,
       { role: "user", content: userContent },
     ];

@@ -44,6 +44,12 @@ import { getSocketServer } from "../../../lib/socket";
  *   POST /live/vods/:vodId/view     → count a replay view
  *   POST /live/:id/invite           { user_ids } → push-invite Metricorex users to
  *                                   the stream (deep-links straight into the room)
+ *   GET  /live/battles/online-hosts → hosts currently live (challenge picker)
+ *   POST /live/battles/challenge    { liveId, toUserId } → host-vs-host invite
+ *   POST /live/battles/:id/accept   { liveId? } → opponent accepts (link streams)
+ *   POST /live/battles/:id/decline  { reason? } → opponent declines
+ *   POST /live/battles/:id/cancel   → challenger withdraws a pending invite
+ *   GET  /live/battles/pending      → invites addressed to me (newest first)
  *
  * Categories mirror TikTok: general, chat, talent, music, dance, food,
  * fashion, gaming, sports, education, business, faith, comedy.
@@ -1951,6 +1957,436 @@ const BATTLE_SELECT = `
     FROM live_battles b
     JOIN users u_a ON u_a.id = b.host_a_id
     LEFT JOIN users u_b ON u_b.id = b.host_b_id`;
+
+// ---------------------------------------------------------------------------
+// HOST-vs-HOST BATTLE INVITES — the matchmaking lobby for live challenges.
+//
+//   GET  /live/battles/online-hosts   → other hosts currently live (challenge picker)
+//   POST /live/battles/challenge      { liveId, toUserId } → send an invite
+//   POST /live/battles/:id/accept     { liveId? } → opponent links their stream
+//   POST /live/battles/:id/decline    { reason? } → opponent says no
+//   POST /live/battles/:id/cancel     → challenger withdraws a pending invite
+//   GET  /live/battles/pending        → invites addressed to me (newest first)
+//
+// Invites persist in `live_battle_invites` (schema.ts) — deliberately SEPARATE
+// from the gift-scored PK matches in `live_battles`, whose shape/lifecycle
+// (session_a_id NOT NULL, status pending|active|ended) does not fit a lobby.
+// Pending invites older than 10 minutes flip to 'expired' whenever the lists
+// below are fetched (expire-on-read; no cron needed).
+//
+// The accept/decline/cancel paths collide with the legacy PK-battle handlers
+// further down, so these routes run FIRST and call next() when the id is not
+// an invite — the legacy PK handlers keep serving their own battle ids.
+// ---------------------------------------------------------------------------
+const BATTLE_INVITE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BATTLE_INVITE_TTL_MINUTES = 10;
+
+async function expireStaleBattleInvites() {
+  try {
+    await query(
+      `UPDATE live_battle_invites
+          SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'pending'
+          AND created_at < NOW() - INTERVAL '10 minutes'`,
+    );
+  } catch (e: any) {
+    console.error("[live:battle-invites] expire error:", e?.message);
+  }
+}
+
+const BATTLE_INVITE_SELECT = `
+  SELECT bi.*, u_c.name AS challenger_name, u_c.avatar_url AS challenger_avatar,
+         u_o.name AS opponent_name, u_o.avatar_url AS opponent_avatar,
+         l_c.call_code AS challenger_code, l_c.title AS challenger_title,
+         l_o.call_code AS opponent_code, l_o.title AS opponent_title
+    FROM live_battle_invites bi
+    JOIN users u_c ON u_c.id = bi.challenger_id
+    JOIN users u_o ON u_o.id = bi.opponent_id
+    LEFT JOIN live_sessions l_c ON l_c.id = bi.challenger_live_id
+    LEFT JOIN live_sessions l_o ON l_o.id = bi.opponent_live_id`;
+
+function decorateBattleInvite(b: any) {
+  const expiresInSeconds =
+    b.status === "pending" && b.created_at
+      ? Math.max(
+          0,
+          BATTLE_INVITE_TTL_MINUTES * 60 -
+            Math.round((Date.now() - new Date(b.created_at).getTime()) / 1000),
+        )
+      : 0;
+  return {
+    id: b.id,
+    status: b.status,
+    reason: b.reason ?? null,
+    challenger: { id: b.challenger_id, name: b.challenger_name, avatar: b.challenger_avatar },
+    opponent: { id: b.opponent_id, name: b.opponent_name, avatar: b.opponent_avatar },
+    liveId: b.challenger_live_id,          // challenger's stream
+    code: b.challenger_code,               // challenger's watch code
+    title: b.challenger_title,
+    opponentLiveId: b.opponent_live_id,    // set when the opponent accepted
+    opponentCode: b.opponent_code,
+    createdAt: b.created_at,
+    updatedAt: b.updated_at,
+    expiresInSeconds,
+  };
+}
+
+/** The caller's CURRENT live session (host + status='live'), newest first. */
+async function myActiveLive(userId: string) {
+  const r = await query(
+    `SELECT * FROM live_sessions WHERE host_id = $1 AND status = 'live' ORDER BY started_at DESC LIMIT 1`,
+    [userId],
+  );
+  return r.rows[0] ?? null;
+}
+
+/** Fan a battle event out to per-user socket rooms (`user:<id>`). */
+function emitBattleEvent(event: string, userIds: string[], payload: Record<string, unknown>) {
+  try {
+    const io = getSocketServer();
+    if (!io) return;
+    for (const uid of userIds) {
+      if (uid) io.to(`user:${uid}`).emit(event, payload);
+    }
+  } catch (e: any) {
+    console.error(`[live:battle-invites] ${event} socket emit skipped:`, e?.message);
+  }
+}
+
+/** Challengeable opponents — other hosts currently live (excludes the caller). */
+router.get("/battles/online-hosts", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await expireStaleBattleInvites();
+    const r = await query(
+      `SELECT l.id AS live_id, l.call_code, l.title, l.current_viewers, l.started_at,
+              u.id AS user_id, u.name AS host_name, u.avatar_url AS host_photo
+         FROM live_sessions l JOIN users u ON u.id = l.host_id
+        WHERE l.status = 'live' AND l.host_id <> $1
+        ORDER BY l.current_viewers DESC, l.started_at DESC
+        LIMIT 50`,
+      [req.user!.userId],
+    );
+    const hosts = r.rows.map((row: any) => ({
+      userId: row.user_id,
+      name: row.host_name,
+      avatar: row.host_photo,
+      liveId: row.live_id,
+      code: row.call_code,
+      title: row.title,
+      viewerCount: Number(row.current_viewers) || 0,
+    }));
+    res.json({ success: true, data: { hosts } });
+  } catch (e: any) {
+    console.error("battle online-hosts error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load online hosts" });
+  }
+});
+
+/** Send a battle challenge to another host (caller must be live). */
+router.post("/battles/challenge", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const liveId = String(req.body?.liveId || "").trim();
+    const toUserId = String(req.body?.toUserId || "").trim();
+    if (!liveId) return res.status(400).json({ success: false, error: "liveId is required (your own live session)" });
+    if (!toUserId) return res.status(400).json({ success: false, error: "toUserId is required" });
+    if (!BATTLE_INVITE_ID_RE.test(liveId) || !BATTLE_INVITE_ID_RE.test(toUserId)) {
+      return res.status(400).json({ success: false, error: "liveId and toUserId must be valid ids" });
+    }
+    if (toUserId === userId) return res.status(400).json({ success: false, error: "You cannot challenge yourself" });
+
+    const mine = await query(
+      `SELECT id, call_code FROM live_sessions WHERE id = $1::uuid AND host_id = $2 AND status = 'live' LIMIT 1`,
+      [liveId, userId],
+    );
+    if (!mine.rows[0]) return res.status(400).json({ success: false, error: "Your stream was not found or is not live" });
+
+    const opp = await query(`SELECT id, name FROM users WHERE id = $1::uuid LIMIT 1`, [toUserId]);
+    if (!opp.rows[0]) return res.status(404).json({ success: false, error: "Opponent not found" });
+
+    // One outstanding invite per challenger→opponent pair (anti-spam).
+    const dupe = await query(
+      `SELECT id FROM live_battle_invites WHERE challenger_id = $1 AND opponent_id = $2 AND status = 'pending' LIMIT 1`,
+      [userId, toUserId],
+    );
+    if (dupe.rows[0]) {
+      return res.status(409).json({ success: false, error: "You already have a pending battle invite with this host", code: "INVITE_ALREADY_PENDING" });
+    }
+
+    const ins = await query(
+      `INSERT INTO live_battle_invites (challenger_id, opponent_id, challenger_live_id)
+       VALUES ($1,$2,$3) RETURNING *`,
+      [userId, toUserId, mine.rows[0].id],
+    );
+    const full = await query(`${BATTLE_INVITE_SELECT} WHERE bi.id = $1`, [ins.rows[0].id]);
+    const battle = decorateBattleInvite(full.rows[0]);
+
+    const challengerName = String(req.user!.name || "A streamer");
+    const inviteData = {
+      battleId: String(ins.rows[0].id),
+      fromUserId: String(userId),
+      fromName: challengerName,
+      liveId: String(mine.rows[0].id),
+      code: String(mine.rows[0].call_code || ""),
+    };
+
+    createNotification({
+      userId: toUserId,
+      type: "social",
+      title: "⚔️ Battle invite",
+      message: `${challengerName} challenged you to a LIVE battle — open the app to accept.`,
+      metadata: { kind: "battle_invite", battleId: inviteData.battleId, liveCode: inviteData.code },
+    }).catch(() => {});
+
+    // Deep-link push: `data` drives the web service worker + mobile router.
+    sendPushToUsers(
+      [{ userId: toUserId }],
+      {
+        title: "⚔️ Battle invite",
+        body: `${challengerName} challenged you to a LIVE battle — tap to respond.`,
+        data: { type: "battle_invite", ...inviteData },
+      },
+      { inApp: false, type: "battle_invite" },
+    ).catch(() => {});
+
+    emitBattleEvent("battle:invite", [toUserId], { ...inviteData, battle });
+
+    res.status(201).json({ success: true, data: { battle } });
+  } catch (e: any) {
+    console.error("battle challenge error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not send the battle challenge" });
+  }
+});
+
+/**
+ * Opponent accepts an invite. Dispatch: when the id is not a battle invite
+ * we fall through (next) to the legacy PK-battle accept below, so the legacy
+ * gift-scored battles keep working unchanged on the same path.
+ */
+router.post("/battles/:id/accept", authenticateToken, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const userId = req.user!.userId;
+    const inviteId = String(req.params.id || "");
+    if (!BATTLE_INVITE_ID_RE.test(inviteId)) return next();
+    const found = await query(`SELECT * FROM live_battle_invites WHERE id = $1 LIMIT 1`, [inviteId]);
+    if (!found.rows[0]) return next();
+    const invite = found.rows[0];
+
+    if (invite.opponent_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the invited host can accept this battle" });
+    }
+    if (invite.status !== "pending") {
+      return res.status(409).json({ success: false, error: `This battle was already ${invite.status}` });
+    }
+
+    // Bind the opponent's stream: { liveId } must be the caller's own live;
+    // without a body we fall back to their current live (if any).
+    let opponentLiveId: string | null = null;
+    const bodyLiveId = String(req.body?.liveId || "").trim();
+    if (bodyLiveId) {
+      if (!BATTLE_INVITE_ID_RE.test(bodyLiveId)) {
+        return res.status(400).json({ success: false, error: "liveId must be a valid live session id" });
+      }
+      const mine = await query(
+        `SELECT id, call_code FROM live_sessions WHERE id = $1::uuid AND host_id = $2 AND status = 'live' LIMIT 1`,
+        [bodyLiveId, userId],
+      );
+      if (!mine.rows[0]) return res.status(400).json({ success: false, error: "liveId is not one of your live streams" });
+      opponentLiveId = mine.rows[0].id;
+    } else {
+      const mine = await myActiveLive(userId);
+      opponentLiveId = mine?.id ?? null;
+    }
+
+    const upd = await query(
+      `UPDATE live_battle_invites
+          SET opponent_live_id = COALESCE($2::uuid, opponent_live_id), status = 'accepted', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND status = 'pending'
+        RETURNING *`,
+      [invite.id, opponentLiveId],
+    );
+    if (!upd.rows[0]) return res.status(409).json({ success: false, error: "This battle is no longer pending" });
+
+    const oppLive = opponentLiveId
+      ? (await query(`SELECT id, call_code FROM live_sessions WHERE id = $1 LIMIT 1`, [opponentLiveId])).rows[0]
+      : null;
+    const opponentName = String(req.user!.name || "Your opponent");
+    const acceptedData = {
+      battleId: String(invite.id),
+      opponentUserId: String(userId),
+      opponentName,
+      liveId: String(oppLive?.id || opponentLiveId || ""),
+      code: String(oppLive?.call_code || ""),
+    };
+
+    createNotification({
+      userId: invite.challenger_id,
+      type: "social",
+      title: "⚔️ Battle accepted",
+      message: `${opponentName} accepted your battle invite — the stage is set!`,
+      metadata: { kind: "battle_accepted", battleId: acceptedData.battleId, liveCode: acceptedData.code },
+    }).catch(() => {});
+
+    sendPushToUsers(
+      [{ userId: invite.challenger_id }],
+      {
+        title: "⚔️ Battle accepted",
+        body: `${opponentName} accepted your battle invite — get ready!`,
+        data: { type: "battle_accepted", ...acceptedData },
+      },
+      { inApp: false, type: "battle_accepted" },
+    ).catch(() => {});
+
+    const full = await query(`${BATTLE_INVITE_SELECT} WHERE bi.id = $1`, [invite.id]);
+    const battle = decorateBattleInvite(full.rows[0]);
+    emitBattleEvent("battle:accepted", [invite.challenger_id], { ...acceptedData, battle });
+
+    res.json({ success: true, data: { battle } });
+  } catch (e: any) {
+    console.error("battle invite accept error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not accept the battle" });
+  }
+});
+
+/** Opponent declines an invite (same dispatch as accept). */
+router.post("/battles/:id/decline", authenticateToken, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const userId = req.user!.userId;
+    const inviteId = String(req.params.id || "");
+    if (!BATTLE_INVITE_ID_RE.test(inviteId)) return next();
+    const found = await query(`SELECT * FROM live_battle_invites WHERE id = $1 LIMIT 1`, [inviteId]);
+    if (!found.rows[0]) return next();
+    const invite = found.rows[0];
+
+    if (invite.opponent_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the invited host can decline this battle" });
+    }
+    if (invite.status !== "pending") {
+      return res.status(409).json({ success: false, error: `This battle was already ${invite.status}` });
+    }
+
+    const reason = req.body?.reason ? String(req.body.reason).slice(0, 300) : null;
+    const upd = await query(
+      `UPDATE live_battle_invites SET status = 'declined', reason = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [invite.id, reason],
+    );
+    if (!upd.rows[0]) return res.status(409).json({ success: false, error: "This battle is no longer pending" });
+
+    const opponentName = String(req.user!.name || "Your opponent");
+    const declinedData = {
+      battleId: String(invite.id),
+      opponentUserId: String(userId),
+      opponentName,
+      reason: reason || "",
+    };
+
+    createNotification({
+      userId: invite.challenger_id,
+      type: "social",
+      title: "Battle declined",
+      message: `${opponentName} declined your battle invite.${reason ? ` “${reason}”` : ""}`,
+      metadata: { kind: "battle_declined", battleId: declinedData.battleId },
+    }).catch(() => {});
+
+    sendPushToUsers(
+      [{ userId: invite.challenger_id }],
+      {
+        title: "Battle declined",
+        body: `${opponentName} declined your battle invite.`,
+        data: { type: "battle_declined", ...declinedData },
+      },
+      { inApp: false, type: "battle_declined" },
+    ).catch(() => {});
+
+    const full = await query(`${BATTLE_INVITE_SELECT} WHERE bi.id = $1`, [invite.id]);
+    const battle = decorateBattleInvite(full.rows[0]);
+    emitBattleEvent("battle:declined", [invite.challenger_id], { ...declinedData, battle });
+
+    res.json({ success: true, data: { battle } });
+  } catch (e: any) {
+    console.error("battle invite decline error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not decline the battle" });
+  }
+});
+
+/** Challenger withdraws a still-pending invite. */
+router.post("/battles/:id/cancel", authenticateToken, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const userId = req.user!.userId;
+    const inviteId = String(req.params.id || "");
+    if (!BATTLE_INVITE_ID_RE.test(inviteId)) return next();
+    const found = await query(`SELECT * FROM live_battle_invites WHERE id = $1 LIMIT 1`, [inviteId]);
+    if (!found.rows[0]) return next();
+    const invite = found.rows[0];
+
+    if (invite.challenger_id !== userId) {
+      return res.status(403).json({ success: false, error: "Only the challenger can cancel this battle" });
+    }
+    if (invite.status !== "pending") {
+      return res.status(409).json({ success: false, error: `This battle was already ${invite.status}` });
+    }
+
+    const upd = await query(
+      `UPDATE live_battle_invites SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [invite.id],
+    );
+    if (!upd.rows[0]) return res.status(409).json({ success: false, error: "This battle is no longer pending" });
+
+    const challengerName = String(req.user!.name || "A streamer");
+    const cancelledData = {
+      battleId: String(invite.id),
+      challengerUserId: String(userId),
+      challengerName,
+    };
+
+    createNotification({
+      userId: invite.opponent_id,
+      type: "social",
+      title: "Battle cancelled",
+      message: `${challengerName} withdrew their battle invite.`,
+      metadata: { kind: "battle_cancelled", battleId: cancelledData.battleId },
+    }).catch(() => {});
+
+    sendPushToUsers(
+      [{ userId: invite.opponent_id }],
+      {
+        title: "Battle cancelled",
+        body: `${challengerName} withdrew their battle invite.`,
+        data: { type: "battle_cancelled", ...cancelledData },
+      },
+      { inApp: false, type: "battle_cancelled" },
+    ).catch(() => {});
+
+    const full = await query(`${BATTLE_INVITE_SELECT} WHERE bi.id = $1`, [invite.id]);
+    const battle = decorateBattleInvite(full.rows[0]);
+    emitBattleEvent("battle:cancelled", [invite.opponent_id], { ...cancelledData, battle });
+
+    res.json({ success: true, data: { battle } });
+  } catch (e: any) {
+    console.error("battle invite cancel error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not cancel the battle" });
+  }
+});
+
+/** Invites addressed to the caller that are still pending (newest first). */
+router.get("/battles/pending", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  try {
+    await expireStaleBattleInvites();
+    const r = await query(
+      `${BATTLE_INVITE_SELECT}
+        WHERE bi.opponent_id = $1 AND bi.status = 'pending'
+        ORDER BY bi.created_at DESC
+        LIMIT 50`,
+      [req.user!.userId],
+    );
+    res.json({ success: true, data: { battles: r.rows.map(decorateBattleInvite) } });
+  } catch (e: any) {
+    console.error("battle pending error:", e?.message);
+    res.status(500).json({ success: false, error: "Could not load pending battles" });
+  }
+});
 
 /** Invite another live streamer to a PK battle (host only). */
 router.post("/:id/battle", authenticateToken, async (req: AuthenticatedRequest, res) => {

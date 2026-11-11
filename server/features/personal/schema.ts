@@ -1059,6 +1059,33 @@ export async function ensurePersonalSchema(): Promise<void> {
   // battle starts; the HUD shows it and gift scoring multiplies by it.
   await query(`ALTER TABLE live_battles ADD COLUMN IF NOT EXISTS multiplier NUMERIC(4,1) NOT NULL DEFAULT 2`);
 
+  // HOST-vs-HOST BATTLE INVITES — the matchmaking lobby that runs BEFORE a PK
+  // battle starts. A live host challenges another user; the invite sits in
+  // `pending` until the opponent accepts (both live ids get linked),
+  // declines, or the challenger cancels. Pending invites older than 10
+  // minutes are expired by the routes that list them.
+  // NOTE: this is deliberately a SEPARATE table from `live_battles` above —
+  // that one stores the gift-scored PK match itself (session_a_id NOT NULL,
+  // status pending|active|ended) and its lifecycle/shape does not fit the
+  // invite lobby.
+  await query(`
+    CREATE TABLE IF NOT EXISTS live_battle_invites (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      challenger_id UUID NOT NULL,
+      opponent_id UUID NOT NULL,
+      challenger_live_id UUID NOT NULL,               -- live_sessions.id of the challenger
+      opponent_live_id UUID,                          -- live_sessions.id of the opponent (set on accept)
+      status VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending | accepted | declined | cancelled | expired
+      reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT live_battle_invites_not_self CHECK (challenger_id <> opponent_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battle_invites_opponent ON live_battle_invites(opponent_id, status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battle_invites_challenger ON live_battle_invites(challenger_id, status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_live_battle_invites_challenger_live ON live_battle_invites(challenger_live_id)`);
+
   // Per-streamer earnings pocket. available = total_earned − total_withdrawn.
   await query(`
     CREATE TABLE IF NOT EXISTS live_gift_pockets (

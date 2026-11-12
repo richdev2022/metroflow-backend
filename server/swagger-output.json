@@ -4790,8 +4790,28 @@
       }
     },
     "/api/settings/transaction-biometric": {
-      "get": "read the caller's transaction-biometric flag",
-      "put": "flip it (requires the OTP from send-otp — otp_type txn_biometric_toggle)"
+      "get": {
+        "summary": "Read the caller's transaction-biometric flag",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "put": {
+        "summary": "Flip the transaction-biometric flag (requires the OTP from send-otp, otp_type txn_biometric_toggle)",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     },
     "/api/settings/otp-enabled/send-otp": {
       "post": {
@@ -10699,6 +10719,54 @@
         "responses": {
           "200": {
             "description": "Assistant reply (may include a generated image)"
+          },
+          "403": {
+            "description": "MetricAi not enabled on the caller's plan"
+          }
+        }
+      }
+    },
+    "/api/ai/chat/stream": {
+      "post": {
+        "summary": "Chat with MetricAi over SSE (reply tokens stream as they are generated, first words within ~1-2s instead of the full-reply wait)",
+        "tags": [
+          "MetricAi"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "message"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "imageUrl": {
+                    "type": "string"
+                  },
+                  "attachmentUrl": {
+                    "type": "string"
+                  },
+                  "attachmentType": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "text/event-stream with delta (text chunk), meta (final row with reply, imageUrl, videoJob, model and more) and done events; error on failure. Short-circuits (400 / usage cap) answer as normal JSON before the stream opens.\n"
           },
           "403": {
             "description": "MetricAi not enabled on the caller's plan"

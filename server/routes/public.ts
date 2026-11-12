@@ -64,9 +64,18 @@ router.get("/app-config", async (req, res) => {
 router.post("/metric-ai/ask", postPublicMetricAiAsk as any);
 
 // ---------------------------------------------------------------------------
-// Mobile app update check (public — called by the Flutter app on login and
-// app start, with or without a session). Compares the caller's version code
-// (build number) against the newest ACTIVE release row for the platform.
+// Mobile app update check (public — called by the Flutter app on login, app
+// start, foreground-resume and a periodic poll so admins flipping the
+// "new release available" toggle reaches users within a minute).
+//
+// Simplified flow (2026-11): the prompt is driven by the release row's
+// update_available TOGGLE (not version numbers). force_update makes the
+// modal non-dismissable. url_type marks the passed URL 'store' (site may
+// render the CTA) or 'custom' (mobile-only — never shown on the site).
+//
+// Back-compat: old builds compare their version_code against the newest
+// active row, so that comparison is still evaluated and returned. The
+// response carries prompt_source so new builds know which signal fired.
 // NEVER returns 5xx to the client on data problems: the mobile side treats
 // any failure as "no update" and stays silent, so a soft success response
 // keeps old app builds fully functional even before the table exists.
@@ -88,13 +97,16 @@ function compareVersionNames(a: string, b: string): number {
  * @swagger
  * /public/app-updates/check:
  *   get:
- *     summary: Check whether a newer mobile app release is available
+ *     summary: Check whether a mobile app update is available
  *     tags: [Public]
  *     security: []
  *     parameters:
  *       - in: query
  *         name: platform
  *         schema: { type: string, enum: [ios, android] }
+ *       - in: query
+ *         name: app
+ *         schema: { type: string, enum: [personal, business] }
  *       - in: query
  *         name: current_version_code
  *         schema: { type: integer }
@@ -107,29 +119,84 @@ function compareVersionNames(a: string, b: string): number {
  */
 /**
  * GET /public/app-links
- * Mobile app download links configured by admins (system_settings), with a
- * fallback to the latest active release store_url per platform. Consumed by
- * the marketing site "Download our mobile app" sections and the web meeting
- * interstitial. No sensitive data is exposed.
- *
- * APK slots: the site renders a Personal and a Business Android APK download
- * separately, driven by the per-slot settings uploaded from the admin panel
- * (POST /admin/settings/apk-slot, keys personal_apk_url/personal_apk_version
- * and business_apk_url/business_apk_version). The legacy single-slot apk_url
- * (newest active android app_versions row) is still returned as a backward-
- * compat alias for older site builds. The one-time boot migration
- * (migrateLegacyApkToPersonalSlot in server/migrations.ts) copied the legacy
- * upload into the personal slot and cleared the legacy keys, so apk_url is
- * normally NULL now and the per-slot fields are the only source of truth.
+ * Mobile app download links per app (business/personal), consumed by the
+ * marketing site "Download our mobile app" sections and the web meeting
+ * interstitial. Sources:
+ *   - STORE CTAs: the newest CURRENT (is_active) release row per app+platform,
+ *     but ONLY when its url_type is 'store' — a custom URL is mobile-only and
+ *     must never surface on the website. The admin system_settings store URLs
+ *     remain the Business-app fallback.
+ *   - APK SLOTS: the Personal and Business Android APK downloads are driven by
+ *     the per-slot settings uploaded from the admin panel
+ *     (POST /admin/settings/apk-slot, keys personal_apk_url/personal_apk_version
+ *     and business_apk_url/business_apk_version). The legacy single-slot
+ *     apk_url (newest active android app_versions row) is still returned as a
+ *     backward-compat alias for older site builds. The one-time boot migration
+ *     (migrateLegacyApkToPersonalSlot in server/migrations.ts) copied the
+ *     legacy upload into the personal slot, so the per-slot fields are the
+ *     primary source; a release-attached apk (app_type-aware) is the fallback.
+ * No sensitive data is exposed.
  */
-router.get("/app-links", async (req, res) => {
+router.get("/app-links", async (_req, res) => {
   try {
-    let [appStoreUrl, playStoreUrl] = await Promise.all([
+    // Per-app store URLs from the current release rows — 'store' type only.
+    let releaseStoreUrls: { app_type: string; platform: string; store_url: string }[] = [];
+    try {
+      const relRes = await query(
+        `SELECT app_type, platform, store_url FROM app_versions
+         WHERE is_active = TRUE AND url_type = 'store'
+           AND store_url IS NOT NULL AND store_url <> ''
+         ORDER BY version_code DESC`,
+      );
+      releaseStoreUrls = relRes.rows;
+    } catch { /* app_versions may not exist yet — settings only is fine */ }
+
+    // Per-app direct-APK slots (site fallback when the Play Store misbehaves).
+    let releaseApks: { app_type: string; apk_url: string; apk_size_bytes: any; version_name: string; version_code: any }[] = [];
+    try {
+      const apkRes = await query(
+        `SELECT DISTINCT ON (app_type) app_type, apk_url, apk_size_bytes, version_name, version_code
+         FROM app_versions
+         WHERE platform = 'android' AND is_active = TRUE AND apk_url IS NOT NULL
+         ORDER BY app_type, version_code DESC`,
+      );
+      releaseApks = apkRes.rows;
+    } catch { /* apk columns may not exist yet */ }
+
+    const storeLinksFor = (appType: "business" | "personal") => {
+      let appStoreUrl: string | null = null;
+      let playStoreUrl: string | null = null;
+      for (const row of releaseStoreUrls) {
+        if (row.app_type !== appType) continue;
+        if (!appStoreUrl && row.platform === "ios" && /^https?:\/\//i.test(row.store_url)) {
+          appStoreUrl = row.store_url;
+        }
+        if (!playStoreUrl && row.platform === "android" && /^(https?:\/\/|market:\/\/)/i.test(row.store_url)) {
+          playStoreUrl = row.store_url;
+        }
+      }
+      return { appStoreUrl, playStoreUrl };
+    };
+
+    const apkSlotFor = (appType: "business" | "personal") => {
+      const apk = releaseApks.find((r) => r.app_type === appType);
+      return {
+        apk_url: apk ? apk.apk_url : null,
+        apk_version_name: apk ? apk.version_name || null : null,
+        apk_version_code: apk ? (apk.version_code != null ? Number(apk.version_code) : null) : null,
+        apk_size_bytes: apk && apk.apk_size_bytes ? parseInt(String(apk.apk_size_bytes), 10) : null,
+      };
+    };
+
+    // Business links start from release rows, then the legacy settings fill
+    // whatever the releases do not provide.
+    const [settingAppStore, settingPlayStore] = await Promise.all([
       getSetting("app_store_url"),
       getSetting("play_store_url"),
     ]);
 
-    // Business / Personal APK slots (admin-uploaded, system_settings-backed).
+    // Business / Personal APK slots (admin-uploaded, system_settings-backed)
+    // — the primary APK source for the site's per-app download buttons.
     const [personalApkUrl, personalApkVersion, businessApkUrl, businessApkVersion] = await Promise.all([
       getSetting("personal_apk_url"),
       getSetting("personal_apk_version"),
@@ -137,31 +204,12 @@ router.get("/app-links", async (req, res) => {
       getSetting("business_apk_version"),
     ]);
 
-    // Fallback: per-platform store_url from the newest active app release.
-    if (!appStoreUrl || !playStoreUrl) {
-      try {
-        const relRes = await query(
-          `SELECT platform, store_url FROM app_versions
-           WHERE is_active = TRUE AND store_url IS NOT NULL AND store_url <> ''
-           ORDER BY version_code DESC`,
-        );
-        for (const row of relRes.rows) {
-          if (!appStoreUrl && row.platform === "ios" && /^https?:\/\//i.test(row.store_url)) {
-            appStoreUrl = row.store_url;
-          }
-          if (!playStoreUrl && row.platform === "android" && /^(https?:\/\/|market:\/\/)/i.test(row.store_url)) {
-            playStoreUrl = row.store_url;
-          }
-        }
-      } catch { /* app_versions may not exist yet — settings only is fine */ }
-    }
-
-    // Direct-APK download (site fallback when the Play Store is unavailable).
-    // Exposed from the newest active android release that carries an APK.
-    let apkUrl: string | null = null;
-    let apkVersionName: string | null = null;
-    let apkVersionCode: number | null = null;
-    let apkSizeBytes: number | null = null;
+    // Legacy single-slot alias: newest active android release carrying an APK
+    // (kept for older site builds; normally NULL since the slot migration).
+    let legacyApkUrl: string | null = null;
+    let legacyApkVersionName: string | null = null;
+    let legacyApkVersionCode: number | null = null;
+    let legacyApkSizeBytes: number | null = null;
     try {
       const apkRes = await query(
         `SELECT apk_url, apk_size_bytes, version_name, version_code FROM app_versions
@@ -169,28 +217,46 @@ router.get("/app-links", async (req, res) => {
           ORDER BY version_code DESC LIMIT 1`,
       );
       if (apkRes.rows.length > 0) {
-        apkUrl = apkRes.rows[0].apk_url;
-        apkSizeBytes = apkRes.rows[0].apk_size_bytes ? parseInt(apkRes.rows[0].apk_size_bytes, 10) : null;
-        apkVersionName = apkRes.rows[0].version_name || null;
-        apkVersionCode = apkRes.rows[0].version_code || null;
+        legacyApkUrl = apkRes.rows[0].apk_url;
+        legacyApkSizeBytes = apkRes.rows[0].apk_size_bytes ? parseInt(apkRes.rows[0].apk_size_bytes, 10) : null;
+        legacyApkVersionName = apkRes.rows[0].version_name || null;
+        legacyApkVersionCode = apkRes.rows[0].version_code || null;
       }
     } catch { /* apk columns may not exist yet */ }
+
+    const businessStore = storeLinksFor("business");
+    const businessPayload = {
+      app_store_url: businessStore.appStoreUrl || settingAppStore || null,
+      play_store_url: businessStore.playStoreUrl || settingPlayStore || null,
+      // Settings slot first, release-attached APK as the fallback.
+      apk_url: businessApkUrl || apkSlotFor("business").apk_url || legacyApkUrl,
+      apk_version_name: businessApkVersion || apkSlotFor("business").apk_version_name || legacyApkVersionName,
+      apk_size_bytes: apkSlotFor("business").apk_size_bytes ?? legacyApkSizeBytes,
+    };
+    const personalStore = storeLinksFor("personal");
+    const personalPayload = {
+      app_store_url: personalStore.appStoreUrl || null,
+      play_store_url: personalStore.playStoreUrl || null,
+      apk_url: personalApkUrl || apkSlotFor("personal").apk_url || null,
+      apk_version_name: personalApkVersion || apkSlotFor("personal").apk_version_name || null,
+      apk_size_bytes: apkSlotFor("personal").apk_size_bytes,
+    };
 
     res.json({
       success: true,
       data: {
-        app_store_url: appStoreUrl || null,
-        play_store_url: playStoreUrl || null,
-        apk_url: apkUrl,
-        apk_version_name: apkVersionName,
-        apk_version_code: apkVersionCode,
-        apk_size_bytes: apkSizeBytes,
+        // Legacy top-level fields keep pre-existing consumers (old site build,
+        // web meeting interstitial) working — they mirror the Business app.
+        ...businessPayload,
         // Per-app APK slots — each null slot is hidden by the site (no dead
-        // download buttons). apk_url above remains the legacy alias.
+        // download buttons). Deployed site sections read these directly.
         personal_apk_url: personalApkUrl || null,
         personal_apk_version: personalApkVersion || null,
         business_apk_url: businessApkUrl || null,
         business_apk_version: businessApkVersion || null,
+        // Per-app links for the redesigned download sections.
+        business: businessPayload,
+        personal: personalPayload,
         // Web-app origins — centrally configurable so the marketing site and
         // any embed can deep-link to the right product without redeploying.
         business_web_url: (process.env.BUSINESS_APP_URL || "https://app.metricorex.com").replace(/\/+$/, ""),
@@ -251,6 +317,7 @@ router.get("/app-flags", async (_req, res) => {
 
 router.get("/app-updates/check", async (req, res) => {
   const platform = String(req.query.platform || "android").toLowerCase().trim();
+  const appType = String(req.query.app || "business").toLowerCase().trim() === "personal" ? "personal" : "business";
   const currentVersionName = String(req.query.current_version_name || "").trim();
   const currentVersionCodeRaw = parseInt(String(req.query.current_version_code || ""), 10);
   const hasCode = Number.isFinite(currentVersionCodeRaw) && currentVersionCodeRaw > 0;
@@ -260,8 +327,11 @@ router.get("/app-updates/check", async (req, res) => {
     update_required: false,
     force_update: false,
     platform,
+    app: appType,
+    prompt_source: null as string | null,
     current: { version_name: currentVersionName || null, version_code: hasCode ? currentVersionCodeRaw : null },
     latest: null as Record<string, unknown> | null,
+    release: null as Record<string, unknown> | null,
     min_supported_version_code: null as number | null,
   };
 
@@ -274,20 +344,21 @@ router.get("/app-updates/check", async (req, res) => {
     let minSupported: number | null = null;
     try {
       const latestRes = await query(
-        `SELECT id, platform, version_name, version_code, force_update,
-                min_supported_version_code, release_notes, store_url, created_at, updated_at
+        `SELECT id, platform, app_type, url_type, version_name, version_code, force_update,
+                min_supported_version_code, release_notes, store_url, update_available,
+                created_at, updated_at
          FROM app_versions
-         WHERE platform = $1 AND is_active = TRUE
+         WHERE platform = $1 AND app_type = $2 AND is_active = TRUE
          ORDER BY version_code DESC
          LIMIT 1`,
-        [platform],
+        [platform, appType],
       );
       latest = latestRes.rows[0] || null;
       const minRes = await query(
         `SELECT MAX(min_supported_version_code) AS min_code
          FROM app_versions
-         WHERE platform = $1 AND is_active = TRUE AND min_supported_version_code IS NOT NULL`,
-        [platform],
+         WHERE platform = $1 AND app_type = $2 AND is_active = TRUE AND min_supported_version_code IS NOT NULL`,
+        [platform, appType],
       );
       minSupported = minRes.rows[0]?.min_code != null ? Number(minRes.rows[0].min_code) : null;
     } catch (tableErr: any) {
@@ -300,17 +371,36 @@ router.get("/app-updates/check", async (req, res) => {
       return res.json({ success: true, data: noUpdate });
     }
 
-    // Primary comparison: monotonic integer version code (build number).
-    // Fallback: semver-ish compare of the names when the caller has no code.
-    let updateAvailable = false;
+    // Legacy signal (old builds): monotonic build-number comparison.
+    let versionNewer = false;
     if (hasCode) {
-      updateAvailable = Number(latest.version_code) > currentVersionCodeRaw;
+      versionNewer = Number(latest.version_code) > currentVersionCodeRaw;
     } else if (currentVersionName) {
-      updateAvailable = compareVersionNames(latest.version_name, currentVersionName) > 0;
+      versionNewer = compareVersionNames(latest.version_name, currentVersionName) > 0;
     }
 
+    // New signal (2026-11 flow): the admin's "new release available" toggle.
+    const toggleOn = latest.update_available === true;
+
+    // Both signals can fire; the toggle wins (it is the admin's explicit
+    // intent) and the modal/prompt_source tells the app which one applied.
+    const promptSource = toggleOn ? "toggle" : versionNewer ? "version" : null;
+    const updateAvailable = toggleOn || versionNewer;
     const belowFloor = hasCode && minSupported != null && currentVersionCodeRaw < minSupported;
     const updateRequired = updateAvailable && (latest.force_update === true || belowFloor === true);
+
+    const releasePayload = {
+      id: latest.id,
+      app_type: latest.app_type,
+      platform: latest.platform,
+      url: latest.store_url || null,
+      url_type: latest.url_type || "store",
+      force_update: latest.force_update === true,
+      version_name: latest.version_name,
+      version_code: Number(latest.version_code),
+      release_notes: latest.release_notes || null,
+      updated_at: latest.updated_at,
+    };
 
     return res.json({
       success: true,
@@ -319,10 +409,14 @@ router.get("/app-updates/check", async (req, res) => {
         update_required: updateRequired,
         force_update: updateRequired,
         platform,
+        app: appType,
+        prompt_source: promptSource,
         current: {
           version_name: currentVersionName || null,
           version_code: hasCode ? currentVersionCodeRaw : null,
         },
+        // Legacy shape (old builds read latest.store_url to open the store —
+        // it carries whatever URL the admin passed, store or custom).
         latest: {
           id: latest.id,
           version_name: latest.version_name,
@@ -330,8 +424,12 @@ router.get("/app-updates/check", async (req, res) => {
           force_update: latest.force_update === true,
           release_notes: latest.release_notes || null,
           store_url: latest.store_url || null,
+          url_type: latest.url_type || "store",
+          app_type: latest.app_type,
           updated_at: latest.updated_at,
         },
+        // Simplified-flow shape consumed by the redesigned update modal.
+        release: releasePayload,
         min_supported_version_code: minSupported,
       },
     });

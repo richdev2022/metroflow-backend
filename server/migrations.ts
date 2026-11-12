@@ -2137,6 +2137,31 @@ async function ensureAppVersionsSchema(): Promise<void> {
   await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_url TEXT`);
   await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_size_bytes BIGINT`);
   await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS apk_sha256 VARCHAR(64)`);
+
+  // Simplified release flow (2026-11): one row per app (personal/business) +
+  // platform, no admin-facing version numbers.
+  //   app_type          — which app the release belongs to (the mobile pop
+  //                       and the matching site section key off this).
+  //   url_type          — 'store' (site may render the store CTA) or 'custom'
+  //                       (mobile-only download link, NEVER shown on the site).
+  //   update_available  — the admin "new release available" toggle. ON = every
+  //                       user of that app/platform gets the in-app update
+  //                       modal instantly (forced when force_update is ON).
+  //                       Version numbers no longer drive the prompt; legacy
+  //                       builds still get the old comparison behaviour.
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS app_type VARCHAR(16) NOT NULL DEFAULT 'business'`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS url_type VARCHAR(16) NOT NULL DEFAULT 'store'`);
+  await query(`ALTER TABLE app_versions ADD COLUMN IF NOT EXISTS update_available BOOLEAN NOT NULL DEFAULT FALSE`);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_app_versions_app_platform_active
+     ON app_versions (app_type, platform, is_active, version_code DESC)`,
+  );
+  // The seeded baseline rows were tracking placeholders, not announcements —
+  // under the new toggle semantics they must not prompt anyone on deploy.
+  await query(
+    `UPDATE app_versions SET update_available = FALSE
+     WHERE release_notes = 'Initial tracked release.'`,
+  );
 }
 
 /**

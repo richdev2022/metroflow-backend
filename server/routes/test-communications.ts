@@ -191,7 +191,7 @@ router.post("/push-send", authenticateToken, async (req: AuthenticatedRequest, r
       };
     } else {
       payload = {
-        title: "Metroflow push test",
+        title: "Metricorex push test",
         body: `Push pipeline test (${kind}) — if you can read this on the device, FCM delivery works`,
         data: { type: "test", kind, stamp },
       };
@@ -256,7 +256,7 @@ router.post("/push-send", authenticateToken, async (req: AuthenticatedRequest, r
 const SMS_CATEGORIES = {
   'otp': (otp: string) => `Your verification code is: ${otp}. Valid for 10 minutes.`,
   'transfer_otp': (otp: string) => `Your Transfer OTP is: ${otp}`,
-  'bvn_nin_otp': (otp: string) => `Your Metroflow verification code is: ${otp}. Valid for 10 minutes.`
+  'bvn_nin_otp': (otp: string) => `Your Metricorex verification code is: ${otp}. Valid for 10 minutes.`
 };
 
 // Email Categories

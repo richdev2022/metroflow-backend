@@ -5089,12 +5089,12 @@ protectedRouter.put("/settings/app-store-urls", requirePermission('manage_settin
         if (app_store_url !== undefined) {
             const app = validUrl(app_store_url);
             if (app === null) return res.status(400).json({ success: false, error: "app_store_url must be a valid https:// (or market://) URL" });
-            await setSetting("app_store_url", app, "Apple App Store download link for the Metroflow mobile app");
+            await setSetting("app_store_url", app, "Apple App Store download link for the Metricorex mobile app");
         }
         if (play_store_url !== undefined) {
             const play = validUrl(play_store_url);
             if (play === null) return res.status(400).json({ success: false, error: "play_store_url must be a valid https:// (or market://) URL" });
-            await setSetting("play_store_url", play, "Google Play Store download link for the Metroflow mobile app");
+            await setSetting("play_store_url", play, "Google Play Store download link for the Metricorex mobile app");
         }
         const [appStore, playStore] = await Promise.all([getSetting("app_store_url"), getSetting("play_store_url")]);
         console.log(`[admin] app store URLs updated by admin ${req.admin?.adminId}`);
@@ -5384,6 +5384,8 @@ protectedRouter.delete("/announcements/:id", requirePermission('manage_settings'
 // ============================================================================
 
 const APP_VERSION_PLATFORMS = ["ios", "android"];
+const APP_VERSION_APP_TYPES = ["personal", "business"];
+const APP_VERSION_URL_TYPES = ["store", "custom"];
 
 // APK uploads: memory storage, 500 MB ceiling (matches the global multer cap),
 // .apk extension + APK mime (or generic octet-stream) only.
@@ -5404,6 +5406,12 @@ const uploadSingleApk = multer({
   },
 }).single('apk');
 
+/**
+ * Simplified release payload (2026-11). The admin console no longer asks for
+ * version numbers — it publishes: app (personal/business) + platform + a
+ * download URL (store or custom) + force update + the "new release available"
+ * toggle. Version columns are auto-assigned server-side for legacy clients.
+ */
 const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }) => {
   const errors: string[] = [];
   const out: Record<string, any> = {};
@@ -5417,17 +5425,59 @@ const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }
     }
   }
 
-  if (body.version_name !== undefined || forCreate) {
-    const versionName = String(body.version_name ?? "").trim();
-    if (!versionName) errors.push("version_name is required");
-    else if (versionName.length > 32) errors.push("version_name must be 32 characters or fewer");
-    else out.version_name = versionName;
+  // App the release belongs to — drives the in-app pop (Personal or Business)
+  // and which marketing-site section may show its store CTA.
+  if (body.app_type !== undefined) {
+    const appType = String(body.app_type || "").toLowerCase().trim();
+    if (!APP_VERSION_APP_TYPES.includes(appType)) {
+      errors.push("app_type must be 'personal' or 'business'");
+    } else {
+      out.app_type = appType;
+    }
+  } else if (forCreate) {
+    out.app_type = "business";
   }
 
-  if (body.version_code !== undefined || forCreate) {
-    const code = parseInt(String(body.version_code), 10);
-    if (!Number.isFinite(code) || code <= 0) errors.push("version_code must be a positive integer (the build number)");
-    else out.version_code = code;
+  // Whether the passed URL is a store listing (site shows the CTA) or a
+  // custom link (mobile-only — never rendered on the marketing site).
+  if (body.url_type !== undefined) {
+    const urlType = String(body.url_type || "").toLowerCase().trim();
+    if (!APP_VERSION_URL_TYPES.includes(urlType)) {
+      errors.push("url_type must be 'store' or 'custom'");
+    } else {
+      out.url_type = urlType;
+    }
+  } else if (forCreate) {
+    out.url_type = "store";
+  }
+
+  // Version columns are now OPTIONAL — auto-assigned when omitted so legacy
+  // app builds keep their comparison-based flow working.
+  if (body.version_name !== undefined) {
+    const versionName = String(body.version_name ?? "").trim();
+    if (!versionName) {
+      if (!forCreate) out.version_name = null; // COALESCE keeps the old value
+      // On create an absent/blank name falls through to auto-assignment.
+    } else if (versionName.length > 32) {
+      errors.push("version_name must be 32 characters or fewer");
+    } else {
+      out.version_name = versionName;
+    }
+  }
+
+  if (body.version_code !== undefined) {
+    const raw = String(body.version_code ?? "").trim();
+    if (raw === "") {
+      if (!forCreate) out.version_code = null;
+      // On create an absent code falls through to auto-assignment.
+    } else {
+      const code = parseInt(raw, 10);
+      if (!Number.isFinite(code) || code <= 0) {
+        errors.push("version_code must be a positive integer (the build number)");
+      } else {
+        out.version_code = code;
+      }
+    }
   }
 
   if (body.min_supported_version_code !== undefined) {
@@ -5441,7 +5491,14 @@ const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }
   }
 
   if (body.force_update !== undefined) out.force_update = body.force_update === true || body.force_update === "true";
+
+  // is_active marks the CURRENT release row for its app+platform (drives the
+  // site store CTA + APK slot). update_available is the admin's "new release
+  // available" switch — ON means every user gets the in-app update modal.
   if (body.is_active !== undefined) out.is_active = body.is_active === true || body.is_active === "true";
+  if (body.update_available !== undefined) {
+    out.update_available = body.update_available === true || body.update_available === "true";
+  }
 
   if (body.release_notes !== undefined) {
     // Empty string means "clear" (COALESCE on the server keeps '' as the new value).
@@ -5461,14 +5518,33 @@ const parseAppVersionPayload = (body: any, { forCreate }: { forCreate: boolean }
   return { out, errors };
 };
 
+/** One CURRENT release per app+platform: everything else stands down. */
+async function demoteSiblingReleases(appType: string, platform: string, keepId: string) {
+  await query(
+    `UPDATE app_versions
+     SET is_active = FALSE, update_available = FALSE, updated_at = CURRENT_TIMESTAMP
+     WHERE app_type = $1 AND platform = $2 AND id <> $3 AND (is_active = TRUE OR update_available = TRUE)`,
+    [appType, platform, keepId],
+  );
+}
+
+/** Next free version_code for a platform (UNIQUE constraint is platform-wide). */
+async function nextVersionCode(platform: string): Promise<number> {
+  const res = await query(
+    `SELECT COALESCE(MAX(version_code), 12) + 1 AS next_code FROM app_versions WHERE platform = $1`,
+    [platform],
+  );
+  return Number(res.rows[0]?.next_code || 13);
+}
+
 /**
  * GET /admin/app-versions
- * List every tracked mobile release (both platforms), newest first.
+ * List every tracked mobile release (both apps, both platforms), newest first.
  */
 protectedRouter.get("/app-versions", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
     try {
         const result = await query(
-            `SELECT * FROM app_versions ORDER BY platform ASC, version_code DESC, created_at DESC`,
+            `SELECT * FROM app_versions ORDER BY app_type ASC, platform ASC, version_code DESC, created_at DESC`,
         );
         res.json({ success: true, data: result.rows });
     } catch (error: any) {
@@ -5478,9 +5554,11 @@ protectedRouter.get("/app-versions", requirePermission('manage_settings'), async
 
 /**
  * POST /admin/app-versions
- * Publish a new mobile release. Once active, app builds with a lower
- * version_code are prompted to update (forced when force_update is set or
- * they are below min_supported_version_code).
+ * Publish a release the SIMPLE way: { app_type, platform, url_type, store_url,
+ * force_update, update_available }. Version columns are auto-assigned, the
+ * previous release for the same app+platform is stood down automatically, and
+ * once update_available is ON every user of that app gets the in-app update
+ * modal instantly (forced when force_update is also ON).
  */
 protectedRouter.post("/app-versions", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
     try {
@@ -5489,24 +5567,32 @@ protectedRouter.post("/app-versions", requirePermission('manage_settings'), asyn
             return res.status(400).json({ success: false, error: errors.join("; ") });
         }
 
+        const versionCode = out.version_code ?? (await nextVersionCode(out.platform));
+        const versionName = out.version_name ?? `1.0.${versionCode}`;
+
         const result = await query(
             `INSERT INTO app_versions
                 (platform, version_name, version_code, force_update, min_supported_version_code,
-                 release_notes, store_url, is_active, created_by)
-             VALUES ($1, $2, $3, COALESCE($4, FALSE), $5, $6, $7, COALESCE($8, TRUE), $9)
+                 release_notes, store_url, is_active, app_type, url_type, update_available, created_by)
+             VALUES ($1, $2, $3, COALESCE($4, FALSE), $5, $6, $7, COALESCE($8, TRUE), $9, $10, COALESCE($11, FALSE), $12)
              RETURNING *`,
             [
                 out.platform,
-                out.version_name,
-                out.version_code,
+                versionName,
+                versionCode,
                 out.force_update ?? false,
                 out.min_supported_version_code ?? null,
                 out.release_notes ?? null,
                 out.store_url ?? null,
                 out.is_active ?? true,
+                out.app_type ?? "business",
+                out.url_type ?? "store",
+                out.update_available ?? false,
                 req.admin?.adminId || null,
             ],
         );
+        // Publishing a release makes it THE current one for its app+platform.
+        await demoteSiblingReleases(out.app_type ?? "business", out.platform, result.rows[0].id);
         res.json({ success: true, data: result.rows[0] });
     } catch (error: any) {
         if (error?.code === "23505") {
@@ -5521,8 +5607,8 @@ protectedRouter.post("/app-versions", requirePermission('manage_settings'), asyn
 
 /**
  * PUT /admin/app-versions/:id
- * Partial update — toggle force_update / is_active, raise the support floor,
- * edit notes or the store link.
+ * Partial update — flip the "new release available" toggle, force update,
+ * swap the URL (store/custom) or restyle the row.
  */
 protectedRouter.put("/app-versions/:id", requirePermission('manage_settings'), async (req: AuthenticatedAdminRequest, res) => {
     try {
@@ -5541,8 +5627,11 @@ protectedRouter.put("/app-versions/:id", requirePermission('manage_settings'), a
                 release_notes = COALESCE($6, release_notes),
                 store_url = COALESCE($7, store_url),
                 is_active = COALESCE($8, is_active),
+                app_type = COALESCE($9, app_type),
+                url_type = COALESCE($10, url_type),
+                update_available = COALESCE($11, update_available),
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $9
+             WHERE id = $12
              RETURNING *`,
             [
                 out.platform ?? null,
@@ -5553,13 +5642,22 @@ protectedRouter.put("/app-versions/:id", requirePermission('manage_settings'), a
                 out.release_notes ?? null,
                 out.store_url ?? null,
                 out.is_active ?? null,
+                out.app_type ?? null,
+                out.url_type ?? null,
+                out.update_available ?? null,
                 req.params.id,
             ],
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ success: false, error: "App release not found" });
         }
-        res.json({ success: true, data: result.rows[0] });
+        const row = result.rows[0];
+        // Turning a release ON (current or "new release available") stands its
+        // siblings down so only ONE release per app+platform ever prompts.
+        if (row.is_active === true || row.update_available === true) {
+            await demoteSiblingReleases(row.app_type, row.platform, row.id);
+        }
+        res.json({ success: true, data: row });
     } catch (error: any) {
         if (error?.code === "23505") {
             return res.status(409).json({

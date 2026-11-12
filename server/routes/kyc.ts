@@ -204,7 +204,7 @@ router.post("/initiate", authenticateToken, async (req: AuthenticatedRequest, re
 
         // Send OTP based on Environment and chosen method
         const kycEnv = process.env.KYC || 'live';
-        const message = `Your Metroflow verification code is: ${otp}. Valid for 10 minutes.`;
+        const message = `Your Metricorex verification code is: ${otp}. Valid for 10 minutes.`;
         const chosenMethod = otp_method || 'sms'; // default to sms
 
         let messageResponse = "";

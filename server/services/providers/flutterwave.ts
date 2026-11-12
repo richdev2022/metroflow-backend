@@ -190,14 +190,14 @@ export const flutterwaveProvider: Provider = {
    */
   async createVirtualAccount(data: VirtualAccountRequest) {
     try {
-      const nameParts = `${data.firstName || "Metroflow"} ${data.lastName || "User"}`.split(" ");
+      const nameParts = `${data.firstName || "Metricorex"} ${data.lastName || "User"}`.split(" ");
       const payload: Record<string, any> = {
         email: data.email,
         is_permanent: true,
-        firstname: (data.firstName || nameParts[0] || "Metroflow").trim(),
+        firstname: (data.firstName || nameParts[0] || "Metricorex").trim(),
         lastname: (data.lastName || nameParts.slice(1).join(" ") || nameParts[0] || "User").trim(),
         phonenumber: data.phoneNumber,
-        narration: `${data.firstName || "Metroflow"} ${data.lastName || "User"}`.trim(),
+        narration: `${data.firstName || "Metricorex"} ${data.lastName || "User"}`.trim(),
         tx_ref: `VA-${data.customerIdentifier}-${Date.now()}`,
         bvn: data.bvn,
       };
@@ -234,7 +234,7 @@ export const flutterwaveProvider: Provider = {
       const payload: Record<string, any> = {
         email: `va+${slug || Date.now()}@metroflow-virtual-accounts.local`,
         is_permanent: true,
-        firstname: (data.businessName || "Metroflow").split(" ")[0] || "Metroflow",
+        firstname: (data.businessName || "Metricorex").split(" ")[0] || "Metricorex",
         lastname: (data.businessName || "Business").split(" ").slice(1).join(" ") || "Business",
         phonenumber: data.phoneNumber,
         narration: data.businessName,
@@ -278,7 +278,7 @@ export const flutterwaveProvider: Provider = {
           email: request.email,
         },
         customizations: {
-          title: "Metroflow Wallet Funding",
+          title: "Metricorex Wallet Funding",
           description: "Wallet funding payment",
         },
       };
@@ -421,7 +421,7 @@ export const flutterwaveProvider: Provider = {
         account_bank: data.bankCode,
         account_number: data.accountNumber,
         amount: roundAmount(toMajorUnit(data.amount)),
-        narration: data.remark || "Metroflow transfer",
+        narration: data.remark || "Metricorex transfer",
         currency: data.currencyId || "NGN",
         reference: data.transactionReference,
         beneficiary_name: data.accountName,

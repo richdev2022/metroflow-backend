@@ -941,7 +941,7 @@ async function createSubscriberAndFirstCharge(opts: {
         if (outcome.ok) {
             return {
                 success: true,
-                message: `Subscription active — first charge of ₦${Number(plan.amount).toLocaleString()} succeeded from your Metroflow wallet.`,
+                message: `Subscription active — first charge of ₦${Number(plan.amount).toLocaleString()} succeeded from your Metricorex wallet.`,
                 subscriber_id: subscriberId,
             };
         }

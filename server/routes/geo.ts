@@ -20,7 +20,7 @@ const NOMINATIM_BASE = (
 ).replace(/\/+$/, "");
 const NOMINATIM_UA =
   process.env.NOMINATIM_USER_AGENT ||
-  "Metroflow/1.0 (support@metricorex.com)";
+  "Metricorex/1.0 (support@metricorex.com)";
 const NOMINATIM_TIMEOUT_MS = 8000;
 
 // ---- Tiny in-process TTL cache --------------------------------------------

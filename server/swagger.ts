@@ -9,7 +9,7 @@ const options: swaggerJsdoc.Options = {
       title: "Metricorex API",
       version: "2.0.0",
       description:
-        "Metricorex (Metroflow) backend — personal + business work OS with fintech rails. " +
+        "Metricorex backend — personal + business work OS with fintech rails. " +
         "Revenue features: Bills Hub (airtime/data/TV/electricity/betting), Savings Vaults " +
         "(auto-save + early-break fee), Payment Links, Smart Invoices and MetricAi Credit " +
         "Packs — all plan-configurable via /admin/pricing. Auth: JWT bearer tokens.",

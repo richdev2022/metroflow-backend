@@ -346,6 +346,12 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_volume NUMERIC DEFAULT 0.8`);
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS video_volume NUMERIC DEFAULT 1.0`);
+  // Music SEGMENT (clip) — the composer lets the author pick WHICH part of
+  // the attached track plays. Start/duration (ms) ride on the video media
+  // row next to the sound fields (this is the table the sound columns live
+  // on — NOT social_posts) so feed viewers replay the chosen part.
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`);
 
   // Saved posts — Facebook-style collections. A user files any post into one
   // or more named folders ("Videos", "Photos", or their own creations);
@@ -1361,6 +1367,11 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`);
+  // Music SEGMENT (clip) — the composer picks WHICH part of the attached
+  // track plays; stored on the story row next to the sound fields so viewers
+  // replay the chosen part.
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_story_views (

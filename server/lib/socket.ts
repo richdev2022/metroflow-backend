@@ -1873,14 +1873,18 @@ export function initSocketServer(server: http.Server): void {
       // Notify the room AND the call creator: the creator may still be waiting
       // in the ringback screen before entering the room, so `user:` is the only
       // room guaranteed to reach them. `call:` rooms are never joined anywhere.
+      // callCode rides on the payload (clients match the accept against the
+      // shareable code, same key the REST join emits).
       let creatorId: string | null = null;
+      let callCode: string | null = null;
       try {
-        const callRes = await query(`SELECT created_by FROM calls WHERE id = $1`, [resolvedCallId]);
+        const callRes = await query(`SELECT created_by, call_code FROM calls WHERE id = $1`, [resolvedCallId]);
         creatorId = callRes.rows[0]?.created_by || null;
+        callCode = callRes.rows[0]?.call_code || null;
       } catch { /* best-effort */ }
-      io.to(`room:${resolvedCallId}`).emit("call:accepted", { callId: resolvedCallId, userId: socket.data.userId });
+      io.to(`room:${resolvedCallId}`).emit("call:accepted", { callId: resolvedCallId, callCode, userId: socket.data.userId });
       if (creatorId && creatorId !== socket.data.userId) {
-        io.to(`user:${creatorId}`).emit("call:accepted", { callId: resolvedCallId, userId: socket.data.userId });
+        io.to(`user:${creatorId}`).emit("call:accepted", { callId: resolvedCallId, callCode, userId: socket.data.userId });
       }
 
       // ---------------------------------------------------------------------

@@ -9,7 +9,7 @@ import { sendEmail, generateCallInvitationEmailHtml } from "../services/email";
 import { postCallLogMessage, CALL_LOG_FINAL_STATUSES } from "../lib/call-log";
 import { resolveSpeakerNames } from "../lib/speaker-names";
 import { liveStageForCallRoom } from "../lib/live-stage";
-import { pushIncomingCall, pushMissedCall, acknowledgeCallPush } from "../lib/call-push";
+import { pushIncomingCall, pushMissedCall, pushCallCancelled, acknowledgeCallPush } from "../lib/call-push";
 import { roomManager } from "../lib/roomManager";
 import { resolveRecordingMediaUrl } from "../lib/storage";
 import crypto from "crypto";
@@ -1166,16 +1166,58 @@ export const joinCall: RequestHandler = async (
       // REST (push tap -> accept) must also stop the caller's ringback.
       // Mirror the socket call:accept broadcast to the creator's personal
       // room; the client handler is idempotent (stops ringing when the id
-      // matches the outbound call).
+      // matches the outbound call). callCode rides along so clients can
+      // match the accept to the code they dialled (same payload the socket
+      // call:accept emits).
       const creatorId = callState.created_by || callState.host_id;
       if (creatorId && creatorId !== userId) {
         io.to(`user:${creatorId}`).emit("call:accepted", {
           callId: actualId,
           call_id: actualId,
+          callCode: call.callCode || null,
           userId,
           status: effectiveStatus,
         });
       }
+
+      // -------------------------------------------------------------------
+      // STOP THE RING EVERYWHERE (REST mirror of the socket call:accept
+      // stop-ring block). One device answered -> every OTHER participant
+      // still ringing must dismiss their ringing UI + notification NOW.
+      // The creator just received call:accepted above (their ringback stops
+      // off that); everyone else gets call:ring-stopped in their personal
+      // user room plus the SILENT pushCallCancelled for backgrounded/locked
+      // devices whose socket is dead. No socket exists on this REST path, so
+      // the joiner's own user room is skipped entirely (equivalent of the
+      // socket path's socket.to exclusion).
+      // -------------------------------------------------------------------
+      try {
+        const othersRes = await query(
+          `SELECT DISTINCT user_id FROM call_participants WHERE call_id = $1 AND user_id <> $2`,
+          [actualId, userId],
+        );
+        const otherIds: string[] = othersRes.rows.map((r: any) => String(r.user_id)).filter(Boolean);
+        const stopRingEvent = { callId: actualId, callCode: call.callCode || null, acceptedBy: userId };
+        for (const pid of otherIds) {
+          if (pid !== creatorId) {
+            io.to(`user:${pid}`).emit("call:ring-stopped", stopRingEvent);
+          }
+        }
+        const pushTargets = otherIds.filter((pid) => pid !== creatorId);
+        if (pushTargets.length) {
+          pushCallCancelled(pushTargets, {
+            callId: actualId,
+            callerId: userId,
+            reason: "answered_elsewhere",
+          });
+        }
+        // The joiner's OWN backgrounded devices also dismiss silently (no
+        // callerId here so the helper's self-filter does not drop the send).
+        pushCallCancelled([userId], {
+          callId: actualId,
+          reason: "answered_elsewhere",
+        });
+      } catch { /* ring-stop is best-effort */ }
     }
 
     const response: ApiResponse<any> = {
@@ -1336,6 +1378,22 @@ export const rejectCallRest: RequestHandler = async (
       if (creatorId && creatorId !== userId) {
         io.to(`user:${creatorId}`).emit("call:rejected", { callId, userId });
       }
+      // REST mirror of the socket call:reject ring-stop: the DECLINING
+      // account's other devices (and any of its backgrounded devices) must
+      // dismiss their ring immediately instead of waiting for the 45s
+      // auto-dismiss. The background isolate that calls this endpoint has no
+      // live socket, so io.to(user:<id>) reaches every socket of the account
+      // (the socket path's socket.to exclusion is not available here) and the
+      // silent pushCallCancelled covers devices whose socket is dead.
+      io.to(`user:${userId}`).emit("call:ring-stopped", {
+        callId,
+        callCode: preReject?.call_code ?? null,
+        rejectedBy: userId,
+      });
+      pushCallCancelled([userId], {
+        callId,
+        reason: "answered_elsewhere",
+      });
     }
 
     res.json({ success: true, data: { callId, rejected: true } });

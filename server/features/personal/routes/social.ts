@@ -6,7 +6,7 @@ import {
   verifyTransactionPin, assertPersonalService, genRef, requirePersonalKyc, isPersonalKycVerified,
 } from "../personal-utils";
 import { calculateFee, creditRevenueWallet } from "../../../services/fees";
-import { uploadMediaBuffer } from "../../../services/media-upload";
+import { uploadMediaBuffer, resolveAbsoluteUrl } from "../../../services/media-upload";
 import { extractVideoPosterFrame } from "../../../services/video-thumbnail";
 import { upload, uploadAudio } from "../../../middleware/upload";
 import musicRoutes from "../social-music";
@@ -58,6 +58,24 @@ const router = express.Router();
 router.use("/music", musicRoutes);
 
 const REACTION_TYPES = new Set(["like", "love", "haha", "wow", "sad", "angry"]);
+
+// ---------------------------------------------------------------------------
+// URL absolutizer for media the API stores (voice-note comments, media_url
+// rows). Stored values may be: a full https URL, a root-relative path
+// ("/uploads/x.m4a", "/files/<r2-key>") or a bare R2 object key. Everything
+// leaves here as a FULL https URL — root-relative audio_url values are why
+// web rendered "Voice note unavailable" and mobile playback failed. Reuses
+// resolveAbsoluteUrl (services/media-upload.ts) + mirrors the /files/<key>
+// normalization uploadMediaBuffer applies to bare R2 keys.
+// ---------------------------------------------------------------------------
+const absoluteMediaUrl = (u: string | null | undefined): string | null => {
+  const s = String(u ?? "").trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^uploads\//i.test(s)) return resolveAbsoluteUrl(`/uploads/${s.slice("uploads/".length)}`);
+  if (s.startsWith("/")) return resolveAbsoluteUrl(s);
+  return resolveAbsoluteUrl(`/files/${s}`);
+};
 
 // ---------------------------------------------------------------------------
 // Boost pricing engine (system_settings-driven; admin manages everything)
@@ -496,7 +514,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Ordered media carousels for this page — one batched query, grouped per
     // post. Older posts (created before the multi-media upgrade) have no rows
     // here and fall back to their legacy image_url/video_url columns.
-    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null }>>();
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; sound_start_ms: number | null; sound_duration_ms: number | null }>>();
     if (postIds.length) {
       try {
         let mediaRes;
@@ -509,7 +527,8 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
             `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
                     COALESCE(s.title, m.sound_title) AS sound_title,
                     s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
-                    m.sound_url, m.music_volume, m.video_volume
+                    m.sound_url, m.music_volume, m.video_volume,
+                    m.sound_start_ms, m.sound_duration_ms
              FROM social_post_media m
              LEFT JOIN social_sounds s ON s.id = m.sound_id
              WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
@@ -536,6 +555,9 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
             sound_url: row.sound_url || null,
             music_volume: row.music_volume == null ? null : Number(row.music_volume),
             video_volume: row.video_volume == null ? null : Number(row.video_volume),
+            // Music clip (chosen segment) — stored on the media row.
+            sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
+            sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
           });
           mediaByPost.set(String(row.post_id), list);
         }
@@ -758,12 +780,15 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // sounds keep the {id,title,audio_url,owner_id} shape; a media row
         // with a catalog pick (sound_url + sound_title, NO social_sounds row)
         // returns the catalog shape so feed playback works for Audius tracks.
+        // clip_start_ms/clip_duration_ms carry the author's chosen segment
+        // (stored on the media row — the catalog itself has no clip data).
         sound: (() => {
           const list = mediaByPost.get(String(p.id)) || [];
           const m = list.find((x: any) => x.sound_id) || list.find((x: any) => x.sound_url && x.sound_title);
           if (!m) return null;
-          if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id };
-          return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog" };
+          const clip = { clip_start_ms: m.sound_start_ms ?? null, clip_duration_ms: m.sound_duration_ms ?? null };
+          if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id, ...clip };
+          return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog", ...clip };
         })(),
         // Hashtags extracted at compose time — clients render them as chips
         // and deep-link into the tag feed.
@@ -930,6 +955,66 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       return { media_type: "video" as const, url: await uploadOne(p.file), poster_url: poster };
     }));
 
+    // ---------------------------------------------------------------------
+    // REPLAY REPOSTING — clients may create a feed post from media that
+    // ALREADY exists on the API (the replay composer passes the original
+    // URLs/keys instead of re-uploading the bytes). Optional `media_urls`
+    // body field: an array of strings (max 4). Each entry is accepted ONLY
+    // when it is one of:
+    //   1. an https URL on THIS api host (apiOrigin)
+    //   2. a root-relative path starting with /files/ or /uploads/
+    //   3. a bare R2 object key matching the storage upload key patterns
+    //      ("<folder>/<stem>.<ext>" — e.g. "social-media/1234-abcd.mp4")
+    // Anything else is rejected with 400 (never an open fetch/proxy surface).
+    // Accepted entries become media rows in the SAME shape the upload path
+    // builds (media_type from the extension, poster_url null) and are
+    // appended to the carousel, so the persisted rows + response match the
+    // uploaded-media path exactly.
+    // ---------------------------------------------------------------------
+    const apiOrigin = String(
+      process.env.API_PUBLIC_BASE_URL || process.env.APP_BASE_URL || "https://api.metricorex.com",
+    ).replace(/\/$/, "");
+    const rawMediaUrls = req.body?.media_urls;
+    const mediaUrlEntries: string[] = Array.isArray(rawMediaUrls)
+      ? rawMediaUrls.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+      : [];
+    if (mediaUrlEntries.length > 4) {
+      return res.status(400).json({ success: false, error: "Too many media_urls entries (max 4)" });
+    }
+    const MEDIA_URL_REJECT = "Invalid media_urls entry — use an https URL on this host, a /files/… or /uploads/… path, or a bare storage key";
+    const isOwnHostUrl = (s: string) => {
+      try {
+        const u = new URL(s);
+        // Origin comparison covers protocol + host + port, so only https URLs
+        // on the API's own origin pass (apiOrigin is an https origin).
+        return u.origin === apiOrigin;
+      } catch { return false; }
+    };
+    const isUploadKeyLike = (s: string) =>
+      !s.startsWith("/") && !/^https?:\/\//i.test(s)
+      && !s.includes("..") && !s.includes("\\") && !s.includes("?") && !s.includes("#")
+      && /\.[A-Za-z0-9]{1,5}$/.test(s);
+    const mediaTypeForEntry = (s: string): "image" | "video" => {
+      const ext = s.split("?")[0].split("#")[0].split(".").pop()?.toLowerCase() || "";
+      return ["mp4", "mov", "webm"].includes(ext) ? "video" : "image";
+    };
+    for (const entry of mediaUrlEntries) {
+      let abs: string;
+      if (/^https?:\/\//i.test(entry)) {
+        if (!isOwnHostUrl(entry)) return res.status(400).json({ success: false, error: MEDIA_URL_REJECT });
+        abs = entry;
+      } else if (entry.startsWith("/")) {
+        if (!/^\/(files|uploads)\//.test(entry)) return res.status(400).json({ success: false, error: MEDIA_URL_REJECT });
+        abs = resolveAbsoluteUrl(entry);
+      } else {
+        if (!isUploadKeyLike(entry)) return res.status(400).json({ success: false, error: MEDIA_URL_REJECT });
+        // Bare R2 object key — normalize to the /files/<key> media route and
+        // absolutize (same normalization uploadMediaBuffer applies to keys).
+        abs = resolveAbsoluteUrl(`/files/${entry}`);
+      }
+      mediaRows.push({ media_type: mediaTypeForEntry(abs), url: abs, poster_url: null });
+    }
+
     // Server-side poster fill — videos that arrived WITHOUT a client-captured
     // frame used to block the response on ffmpeg (up to ~90s per video at
     // three retry offsets) — the "upload hangs at 99%" complaint. Extraction
@@ -1006,6 +1091,18 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     };
     const catalogMusicVolume = clampVolume(req.body?.music_volume, 0.8);
     const catalogVideoVolume = clampVolume(req.body?.video_volume, 1.0);
+    // Music SEGMENT (clip) — the composer sends the chosen part of the track
+    // (music_start_ms + music_duration_ms) so viewers replay THAT part, not
+    // always from 0:00. Works for both JSON and multipart bodies (multer
+    // parses multipart text fields into req.body as strings — Number() below
+    // handles both). Persisted on the video media rows (sound_start_ms /
+    // sound_duration_ms columns, see schema.ts).
+    const clampMs = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+    };
+    const catalogMusicStartMs = clampMs(req.body?.music_start_ms);
+    const catalogMusicDurationMs = clampMs(req.body?.music_duration_ms);
     const hasCatalogSound = !!(catalogSoundUrl && catalogSoundTitle);
 
     const r = await query(
@@ -1028,10 +1125,13 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       const rowSoundTitle = isVideo ? catalogSoundTitle : null;
       const rowMusicVolume = isVideo && hasCatalogSound ? catalogMusicVolume : null;
       const rowVideoVolume = isVideo && hasCatalogSound ? catalogVideoVolume : null;
+      // Chosen music segment — video rows only (same ride-along rule).
+      const rowSoundStartMs = isVideo ? catalogMusicStartMs : null;
+      const rowSoundDurationMs = isVideo ? catalogMusicDurationMs : null;
       await query(
-        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume],
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume, rowSoundStartMs, rowSoundDurationMs],
       ).catch(async () => {
         // Cold deploy without the catalog-sound columns yet — retry with the
         // legacy column set so the media row itself still lands.
@@ -1131,14 +1231,18 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
             sound_id: m.media_type === "video" && soundPayload ? soundPayload.id : null,
             sound_url: m.media_type === "video" && !soundPayload ? catalogSoundUrl : null,
             sound_title: m.media_type === "video" && !soundPayload ? catalogSoundTitle : null,
+            sound_start_ms: m.media_type === "video" ? catalogMusicStartMs : null,
+            sound_duration_ms: m.media_type === "video" ? catalogMusicDurationMs : null,
           })),
           // Server-sound shape stays {id,title,audio_url,owner_id}; a catalog
           // pick (no social_sounds row) mirrors the feed's catalog shape so
-          // the composer's post plays immediately.
+          // the composer's post plays immediately. clip_start_ms /
+          // clip_duration_ms echo the stored segment (the catalog itself has
+          // no clip data — it lives only on this post's media rows).
           sound: soundPayload
-            ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id }
+            ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id, clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
             : hasCatalogSound
-              ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog" }
+              ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog", clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
               : null,
           tags: cleanTags,
           like_count: 0, comment_count: 0,
@@ -1170,7 +1274,8 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
       `SELECT m.post_id, m.media_type, m.url, m.poster_url, m.sound_id,
               COALESCE(s.title, m.sound_title) AS sound_title,
               s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
-              m.sound_url, m.music_volume, m.video_volume
+              m.sound_url, m.music_volume, m.video_volume,
+              m.sound_start_ms, m.sound_duration_ms
        FROM social_post_media m
        LEFT JOIN social_sounds s ON s.id = m.sound_id
        WHERE m.post_id = $1 ORDER BY m.position, m.created_at`,
@@ -1189,6 +1294,8 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
           sound_url: row.sound_url || null,
           music_volume: row.music_volume === null || row.music_volume === undefined ? null : Number(row.music_volume),
           video_volume: row.video_volume === null || row.video_volume === undefined ? null : Number(row.video_volume),
+          sound_start_ms: row.sound_start_ms === null || row.sound_start_ms === undefined ? null : Number(row.sound_start_ms),
+          sound_duration_ms: row.sound_duration_ms === null || row.sound_duration_ms === undefined ? null : Number(row.sound_duration_ms),
         }))
       : ([post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
           post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean) as any[]);
@@ -1196,11 +1303,13 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
     // TikTok-style sound attribution — same shape the feed emits: server
     // sounds keep {id,title,audio_url,owner_id}; a catalog pick (no
     // social_sounds row) mirrors {id:null,title,audio_url,source:"catalog"}.
+    // clip_start_ms/clip_duration_ms carry the stored music segment (the
+    // catalog itself has no clip data — it lives on the post's media rows).
     const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
     post.sound = soundMedia
       ? soundMedia.sound_id
-        ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id }
-        : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog" }
+        ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id, clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
+        : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog", clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
       : null;
     if (post.repost_of_id) {
       const embed = await loadRepostOfs([post.repost_of_id]);
@@ -1835,8 +1944,10 @@ router.get("/posts/:id/comments", authenticateToken, async (req: AuthenticatedRe
       // only `message` made every comment render as username-only.
       message: c.body, body: c.body, content: c.body,
       like_count: c.like_count, liked_by_me: !!c.liked_by_me,
-      // Voice comment payload (null for plain text comments).
-      audio_url: c.audio_url ?? null,
+      // Voice comment payload (null for plain text comments). audio_url is
+      // ALWAYS absolutized — root-relative values broke web ("Voice note
+      // unavailable") and mobile playback.
+      audio_url: absoluteMediaUrl(c.audio_url),
       audio_duration_ms: c.audio_duration_ms ?? null,
       // Edit = your own comment. Delete = your own comment, any comment on
       // your post, or platform admin.
@@ -1940,7 +2051,7 @@ router.post("/posts/:id/comments", authenticateToken, uploadAudio.single("audio"
       id: r.rows[0].id, post_id: req.params.id, parent_id: parentId,
       author: { id: userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
       body, message: body, content: body,
-      audio_url: audioUrl, audio_duration_ms: audioDurationMs,
+      audio_url: absoluteMediaUrl(audioUrl), audio_duration_ms: audioDurationMs,
       like_count: 0, created_at: r.rows[0].created_at,
     };
     res.status(201).json({ success: true, data: { comment }, comment });
@@ -3125,6 +3236,10 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
     sound_title: row.sound_title ?? null,
     music_volume: row.music_volume == null ? 0.8 : Number(row.music_volume),
     video_volume: row.video_volume == null ? 1.0 : Number(row.video_volume),
+    // Music SEGMENT (clip) — the part of the track the author picked; viewers
+    // replay from clip_start_ms for clip_duration_ms instead of 0:00.
+    sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
+    sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
     view_count: Number(row.view_count) || 0,
     like_count: Number(row.like_count) || 0,
     viewed_by_me: !!row.viewed_by_me,
@@ -3148,6 +3263,9 @@ const STORY_MUSIC_COLUMN_DDL = [
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`,
+  // Music SEGMENT (clip) — chosen part of the attached track.
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`,
   // Defensive: sound_id ships in the CREATE TABLE, but very old deployed
   // tables predate it — include it so the retry below cannot 42703 either.
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_id UUID`,
@@ -3190,6 +3308,16 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const musicVolume = clampVolume(req.body?.music_volume, 0.8);
     const videoVolume = clampVolume(req.body?.video_volume, 1.0);
+    // Music SEGMENT (clip) — the composer sends the chosen part of the track
+    // (music_start_ms + music_duration_ms; sound_start_ms/sound_duration_ms
+    // accepted as aliases). Stored on the story row so viewers replay THAT
+    // part instead of always starting at 0:00.
+    const clampMs = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+    };
+    const storySoundStartMs = clampMs(req.body?.music_start_ms ?? req.body?.sound_start_ms);
+    const storySoundDurationMs = clampMs(req.body?.music_duration_ms ?? req.body?.sound_duration_ms);
     // Server sounds ("Use this sound" flow): persist sound_id ONLY when it
     // references a real social_sounds row — otherwise it stays null and the
     // catalog URL/title above carry the audio.
@@ -3229,9 +3357,9 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
 
     const insertStory = () =>
       query(
-        `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-        [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume],
+        `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+        [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume, storySoundStartMs, storySoundDurationMs],
       );
     let r;
     try {

@@ -235,6 +235,18 @@ async function ensureChatStatusesSchema(): Promise<void> {
   await query(
     `CREATE INDEX IF NOT EXISTS idx_chat_statuses_business_active ON chat_statuses(business_id, expires_at)`,
   );
+  // Status music — the chat-status composer attaches a track (id/title/url
+  // for catalog picks that have no social_sounds row) + the playback segment
+  // (start/duration ms) and the music/video mix volumes. Column types follow
+  // the story-music convention (social_stories: TEXT/INTEGER/DOUBLE PRECISION).
+  // ADD COLUMN IF NOT EXISTS keeps every boot idempotent.
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS sound_id TEXT`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS sound_title TEXT`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS sound_url TEXT`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_start_ms INTEGER`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_duration_ms INTEGER`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION`);
+  await query(`ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION`);
   await query(`
     CREATE TABLE IF NOT EXISTS chat_status_views (
       status_id UUID NOT NULL REFERENCES chat_statuses(id) ON DELETE CASCADE,

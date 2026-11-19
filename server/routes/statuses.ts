@@ -17,10 +17,15 @@ const router = express.Router();
  */
 
 const STATUS_TTL_HOURS = 24;
-const BG_COLORS = [
-  "#1E3A8A", "#7C2D12", "#065F46", "#4C1D95", "#9D174D",
-  "#0E7490", "#B45309", "#374151", "#B91C1C", "#1D4ED8",
-] as const;
+// Background colour — the mobile status composer ships a CUSTOM colour
+// picker (and gradients), so the old fixed-palette whitelist dropped every
+// custom colour and forced the fallback. Accept any 3-8 hex-digit colour
+// with an optional leading '#' (stored as provided, '#' normalized in).
+// Invalid input keeps the existing fallback behaviour: the classic
+// palette head. The chat_statuses.background_color column is VARCHAR(9),
+// which exactly fits "#RRGGBBAA".
+const DEFAULT_BG_COLOR = "#1E3A8A";
+const HEX_COLOR_RE = /^#?[0-9a-fA-F]{3,8}$/;
 
 function purgeExpired(): void {
   // Fire-and-forget: every read sweeps the 24h window.
@@ -65,6 +70,9 @@ export const getStatuses: RequestHandler = async (req, res) => {
       `SELECT s.id, s.user_id as "userId", u.name as "authorName", u.avatar_url as "authorAvatar",
               s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
               s.background_color as "backgroundColor",
+              s.sound_id as "soundId", s.sound_title as "soundTitle", s.sound_url as "soundUrl",
+              s.music_start_ms as "musicStartMs", s.music_duration_ms as "musicDurationMs",
+              s.music_volume as "musicVolume", s.video_volume as "videoVolume",
               s.reposted_from as "repostedFrom", s.repost_author as "repostAuthor",
               s.created_at as "createdAt", s.expires_at as "expiresAt",
               (s.user_id = $1) as "isMine",
@@ -115,7 +123,31 @@ export const createStatus: RequestHandler = async (req, res) => {
     const mediaUrl = typeof req.body?.mediaUrl === "string" ? req.body.mediaUrl.trim() : "";
     const mediaType = String(req.body?.mediaType || (mediaUrl ? "image" : "")).toLowerCase();
     let backgroundColor = String(req.body?.backgroundColor || "").trim();
-    if (!BG_COLORS.includes(backgroundColor as any)) backgroundColor = BG_COLORS[0];
+    if (HEX_COLOR_RE.test(backgroundColor)) {
+      // Store as provided; only normalize a missing leading '#'.
+      if (!backgroundColor.startsWith("#")) backgroundColor = `#${backgroundColor}`;
+    } else {
+      backgroundColor = DEFAULT_BG_COLOR;
+    }
+
+    // Status music (chat-status composer attaches a track): catalog tracks
+    // ride directly on the row — same shape as social_stories. camelCase
+    // keys match what the mobile composer sends.
+    const soundId = String(req.body?.soundId ?? "").trim().slice(0, 200) || null;
+    const soundTitle = String(req.body?.soundTitle ?? "").trim().slice(0, 200) || null;
+    const soundUrl = String(req.body?.soundUrl ?? "").trim().slice(0, 2000) || null;
+    const intOrNull = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.round(n) : null;
+    };
+    const musicStartMs = intOrNull(req.body?.musicStartMs);
+    const musicDurationMs = intOrNull(req.body?.musicDurationMs);
+    const volumeOrNull = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : null;
+    };
+    const musicVolume = volumeOrNull(req.body?.musicVolume);
+    const videoVolume = volumeOrNull(req.body?.videoVolume);
 
     if (!content && !mediaUrl) {
       return res.status(400).json({ success: false, error: "Write something or attach an image" });
@@ -139,10 +171,12 @@ export const createStatus: RequestHandler = async (req, res) => {
     }
 
     const inserted = await query(
-      `INSERT INTO chat_statuses (user_id, business_id, content, media_url, media_type, background_color, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '${STATUS_TTL_HOURS} hours')
+      `INSERT INTO chat_statuses (user_id, business_id, content, media_url, media_type, background_color,
+                                  sound_id, sound_title, sound_url, music_start_ms, music_duration_ms, music_volume, video_volume, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW() + INTERVAL '${STATUS_TTL_HOURS} hours')
        RETURNING id, created_at as "createdAt", expires_at as "expiresAt"`,
-      [userId, businessId, content || null, mediaUrl || null, mediaUrl ? (mediaType === "video" ? "video" : "image") : null, backgroundColor],
+      [userId, businessId, content || null, mediaUrl || null, mediaUrl ? (mediaType === "video" ? "video" : "image") : null, backgroundColor,
+       soundId, soundTitle, soundUrl, musicStartMs, musicDurationMs, musicVolume, videoVolume],
     );
 
     res.status(201).json({ success: true, message: "Status posted", data: inserted.rows[0] });
@@ -310,7 +344,10 @@ export const repostStatus: RequestHandler = async (req, res) => {
     // Same platform-wide visibility predicate as the list endpoint.
     const original = await query(
       `SELECT s.id, s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
-              s.background_color as "backgroundColor", s.user_id, u.name as "authorName"
+              s.background_color as "backgroundColor", s.user_id, u.name as "authorName",
+              s.sound_id as "soundId", s.sound_title as "soundTitle", s.sound_url as "soundUrl",
+              s.music_start_ms as "musicStartMs", s.music_duration_ms as "musicDurationMs",
+              s.music_volume as "musicVolume", s.video_volume as "videoVolume"
          FROM chat_statuses s JOIN users u ON u.id = s.user_id
         WHERE s.id = $1 AND s.expires_at > NOW()
           AND NOT EXISTS (
@@ -329,10 +366,13 @@ export const repostStatus: RequestHandler = async (req, res) => {
     const inserted = await query(
       `INSERT INTO chat_statuses
          (user_id, business_id, content, media_url, media_type, background_color,
+          sound_id, sound_title, sound_url, music_start_ms, music_duration_ms, music_volume, video_volume,
           reposted_from, repost_author, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '${STATUS_TTL_HOURS} hours')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW() + INTERVAL '${STATUS_TTL_HOURS} hours')
        RETURNING id, created_at as "createdAt", expires_at as "expiresAt"`,
-      [userId, req.user?.businessId || null, o.content, o.mediaUrl, o.mediaType, o.backgroundColor, o.id, o.authorName],
+      [userId, req.user?.businessId || null, o.content, o.mediaUrl, o.mediaType, o.backgroundColor,
+       o.soundId, o.soundTitle, o.soundUrl, o.musicStartMs, o.musicDurationMs, o.musicVolume, o.videoVolume,
+       o.id, o.authorName],
     );
 
     res.status(201).json({
@@ -383,6 +423,9 @@ export const getUserStatuses: RequestHandler = async (req, res) => {
       `SELECT s.id, s.user_id as "userId", u.name as "authorName", u.avatar_url as "authorAvatar",
               s.content, s.media_url as "mediaUrl", s.media_type as "mediaType",
               s.background_color as "backgroundColor",
+              s.sound_id as "soundId", s.sound_title as "soundTitle", s.sound_url as "soundUrl",
+              s.music_start_ms as "musicStartMs", s.music_duration_ms as "musicDurationMs",
+              s.music_volume as "musicVolume", s.video_volume as "videoVolume",
               s.reposted_from as "repostedFrom", s.repost_author as "repostAuthor",
               s.created_at as "createdAt", s.expires_at as "expiresAt",
               (s.user_id = $1) as "isMine",

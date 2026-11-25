@@ -1,10 +1,7 @@
 import { query } from "./db";
-<<<<<<< HEAD
 import { getSetting, setSetting } from "./services/app-config";
-=======
 import { hashPassword, verifyPassword } from "./services/auth";
 import { generateBusinessId } from "./utils/idGenerator";
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
 import { ensureBillsSchema } from "./features/personal/bills-schema";
@@ -2715,7 +2712,6 @@ async function ensureVaptHardeningSchema(): Promise<void> {
 }
 
 /**
-<<<<<<< HEAD
  * LEGACY SINGLE-APK SLOT -> PER-APP SLOTS (one-time boot migration, idempotent).
  *
  * History: the admin App Releases page originally had a single direct-APK
@@ -2798,7 +2794,9 @@ async function migrateLegacyApkToPersonalSlot(): Promise<void> {
       `[migrations] ⚠ migrateLegacyApkToPersonalSlot failed (non-fatal, continuing): ${error?.message || error}`,
     );
   }
-=======
+}
+
+/**
  * DEMO BUSINESS ACCOUNT (App Store Guideline 2.1) — the reviewer credentials
  * sunday@metricorex.com / Password@123 used to exist ONLY as a
  * platform_admins row, so POST /auth/login answered 400 "Invalid email or
@@ -2978,5 +2976,4 @@ async function seedDemoBusinessAccount(): Promise<void> {
     );
     console.log(`Seeded demo business account (reviewer login: ${DEMO_EMAIL})`);
   }
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 }

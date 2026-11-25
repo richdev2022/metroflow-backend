@@ -523,11 +523,7 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Ordered media carousels for this page — one batched query, grouped per
     // post. Older posts (created before the multi-media upgrade) have no rows
     // here and fall back to their legacy image_url/video_url columns.
-<<<<<<< HEAD
-    const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; sound_start_ms: number | null; sound_duration_ms: number | null }>>();
-=======
-    const mediaByPost = new Map<string, Array<{ media_type: string; url: string | null; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; music_start_ms: number | null; music_duration_ms: number | null; clip_start_ms: number | null; clip_duration_ms: number | null }>>();
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string | null; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; sound_start_ms: number | null; sound_duration_ms: number | null; music_start_ms: number | null; music_duration_ms: number | null; clip_start_ms: number | null; clip_duration_ms: number | null }>>();
     if (postIds.length) {
       try {
         let mediaRes;
@@ -541,11 +537,8 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
                     COALESCE(s.title, m.sound_title) AS sound_title,
                     s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
                     m.sound_url, m.music_volume, m.video_volume,
-<<<<<<< HEAD
-                    m.sound_start_ms, m.sound_duration_ms
-=======
+                    m.sound_start_ms, m.sound_duration_ms,
                     m.music_start_ms, m.music_duration_ms, m.clip_start_ms, m.clip_duration_ms
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
              FROM social_post_media m
              LEFT JOIN social_sounds s ON s.id = m.sound_id
              WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
@@ -572,16 +565,15 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
             sound_url: row.sound_url || null,
             music_volume: row.music_volume == null ? null : Number(row.music_volume),
             video_volume: row.video_volume == null ? null : Number(row.video_volume),
-<<<<<<< HEAD
-            // Music clip (chosen segment) — stored on the media row.
+            // Music clip (chosen segment) — stored on the media row. All alias
+            // spellings (sound_*_ms legacy, music_*_ms, clip_*_ms) resolve to the
+            // canonical keys so viewers replay exactly the chosen window.
             sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
             sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
-=======
-            music_start_ms: row.music_start_ms == null ? null : Number(row.music_start_ms),
-            music_duration_ms: row.music_duration_ms == null ? null : Number(row.music_duration_ms),
-            clip_start_ms: row.clip_start_ms == null ? null : Number(row.clip_start_ms),
-            clip_duration_ms: row.clip_duration_ms == null ? null : Number(row.clip_duration_ms),
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
+            music_start_ms: row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+            music_duration_ms: row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
+            clip_start_ms: row.clip_start_ms != null ? Number(row.clip_start_ms) : row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+            clip_duration_ms: row.clip_duration_ms != null ? Number(row.clip_duration_ms) : row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
           });
           mediaByPost.set(String(row.post_id), list);
         }
@@ -814,18 +806,14 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           const list = mediaByPost.get(String(p.id)) || [];
           const m = list.find((x: any) => x.sound_id) || list.find((x: any) => x.sound_url && x.sound_title);
           if (!m) return null;
-<<<<<<< HEAD
-          const clip = { clip_start_ms: m.sound_start_ms ?? null, clip_duration_ms: m.sound_duration_ms ?? null };
+          const clip = {
+            clip_start_ms: m.clip_start_ms ?? m.music_start_ms ?? m.sound_start_ms ?? null,
+            clip_duration_ms: m.clip_duration_ms ?? m.music_duration_ms ?? m.sound_duration_ms ?? null,
+            music_start_ms: m.music_start_ms ?? m.sound_start_ms ?? null,
+            music_duration_ms: m.music_duration_ms ?? m.sound_duration_ms ?? null,
+          };
           if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id, ...clip };
           return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog", ...clip };
-=======
-          // clip_* keys are what the mobile player reads for the picked
-          // segment (musicClipStartMsOf/musicClipDurationMsOf read
-          // clip_start_ms/clip_duration_ms) — ride them on BOTH shapes so
-          // viewers replay the author's chosen part of the track.
-          if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id, music_start_ms: m.music_start_ms ?? null, music_duration_ms: m.music_duration_ms ?? null, clip_start_ms: m.clip_start_ms ?? null, clip_duration_ms: m.clip_duration_ms ?? null };
-          return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog", music_start_ms: m.music_start_ms ?? null, music_duration_ms: m.music_duration_ms ?? null, clip_start_ms: m.clip_start_ms ?? null, clip_duration_ms: m.clip_duration_ms ?? null };
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
         })(),
         // Hashtags extracted at compose time — clients render them as chips
         // and deep-link into the tag feed.
@@ -1154,22 +1142,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       const n = Number(v);
       return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
     };
-<<<<<<< HEAD
-    const catalogMusicVolume = clampVolume(req.body?.music_volume, 0.8);
-    const catalogVideoVolume = clampVolume(req.body?.video_volume, 1.0);
-    // Music SEGMENT (clip) — the composer sends the chosen part of the track
-    // (music_start_ms + music_duration_ms) so viewers replay THAT part, not
-    // always from 0:00. Works for both JSON and multipart bodies (multer
-    // parses multipart text fields into req.body as strings — Number() below
-    // handles both). Persisted on the video media rows (sound_start_ms /
-    // sound_duration_ms columns, see schema.ts).
-    const clampMs = (v: any) => {
-      const n = Number(v);
-      return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
-    };
-    const catalogMusicStartMs = clampMs(req.body?.music_start_ms);
-    const catalogMusicDurationMs = clampMs(req.body?.music_duration_ms);
-=======
     // MUSIC CLIP SEGMENT (MusicClipSheet) — the part of the track the author
     // picked, persisted so viewers replay exactly that window. Clients send
     // music_start_ms/music_duration_ms; clip_start_ms/clip_duration_ms is the
@@ -1184,7 +1156,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       req.body?.music_volume != null ? clampVolume(req.body.music_volume, 0.8) : null;
     const catalogVideoVolume =
       req.body?.video_volume != null ? clampVolume(req.body.video_volume, 1.0) : null;
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     const hasCatalogSound = !!(catalogSoundUrl && catalogSoundTitle);
 
     const r = await query(
@@ -1199,23 +1170,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       const m = mediaRows[i];
       if (!m.url) continue;
       const isVideo = m.media_type === "video";
-<<<<<<< HEAD
-      const rowSoundId = isVideo ? attachedSoundId : null;
-      // Catalog-track fields ride on video rows only (images carry no audio).
-      // Volumes only accompany an actual catalog pick — never invent a mix
-      // for a plain video post.
-      const rowSoundUrl = isVideo ? catalogSoundUrl : null;
-      const rowSoundTitle = isVideo ? catalogSoundTitle : null;
-      const rowMusicVolume = isVideo && hasCatalogSound ? catalogMusicVolume : null;
-      const rowVideoVolume = isVideo && hasCatalogSound ? catalogVideoVolume : null;
-      // Chosen music segment — video rows only (same ride-along rule).
-      const rowSoundStartMs = isVideo ? catalogMusicStartMs : null;
-      const rowSoundDurationMs = isVideo ? catalogMusicDurationMs : null;
-      await query(
-        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume, rowSoundStartMs, rowSoundDurationMs],
-=======
       void isVideo;
       // Sound attribution rides EVERY media row (photo, video AND text-card):
       // both the server-sound id ("Use this sound" flow) and the catalog
@@ -1233,7 +1187,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
         `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
         [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume, rowMusicStartMs, rowMusicDurationMs, rowMusicStartMs, rowMusicDurationMs],
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       ).catch(async () => {
         // Cold deploy without the catalog-sound/clip columns yet — retry with
         // the legacy column set so the media row itself still lands.
@@ -1346,23 +1299,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
           image_url: r.rows[0].image_url, video_url: r.rows[0].video_url,
           media: savedMedia.map((m, i) => ({
             ...m,
-<<<<<<< HEAD
-            sound_id: m.media_type === "video" && soundPayload ? soundPayload.id : null,
-            sound_url: m.media_type === "video" && !soundPayload ? catalogSoundUrl : null,
-            sound_title: m.media_type === "video" && !soundPayload ? catalogSoundTitle : null,
-            sound_start_ms: m.media_type === "video" ? catalogMusicStartMs : null,
-            sound_duration_ms: m.media_type === "video" ? catalogMusicDurationMs : null,
-          })),
-          // Server-sound shape stays {id,title,audio_url,owner_id}; a catalog
-          // pick (no social_sounds row) mirrors the feed's catalog shape so
-          // the composer's post plays immediately. clip_start_ms /
-          // clip_duration_ms echo the stored segment (the catalog itself has
-          // no clip data — it lives only on this post's media rows).
-          sound: soundPayload
-            ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id, clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
-            : hasCatalogSound
-              ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog", clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
-=======
             // Server-sound id rides EVERY row (photo posts can carry a track
             // too); a minted ORIGINAL sound binds to video rows only.
             sound_id: m.sound_id || (m.media_type === "video" && soundPayload ? soundPayload.id : null),
@@ -1383,7 +1319,6 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
             ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id, music_start_ms: musicStartMs ?? null, music_duration_ms: musicDurationMs ?? null, clip_start_ms: musicStartMs ?? null, clip_duration_ms: musicDurationMs ?? null }
             : hasCatalogSound || catalogSoundUrl
               ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog", music_start_ms: musicStartMs ?? null, music_duration_ms: musicDurationMs ?? null, clip_start_ms: musicStartMs ?? null, clip_duration_ms: musicDurationMs ?? null }
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
               : null,
           tags: cleanTags,
           like_count: 0, comment_count: 0,
@@ -1420,11 +1355,8 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
               COALESCE(s.title, m.sound_title) AS sound_title,
               s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
               m.sound_url, m.music_volume, m.video_volume,
-<<<<<<< HEAD
-              m.sound_start_ms, m.sound_duration_ms
-=======
+              m.sound_start_ms, m.sound_duration_ms,
               m.music_start_ms, m.music_duration_ms, m.clip_start_ms, m.clip_duration_ms
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
        FROM social_post_media m
        LEFT JOIN social_sounds s ON s.id = m.sound_id
        WHERE m.post_id = $1 ORDER BY m.position, m.created_at`,
@@ -1443,15 +1375,15 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
           sound_url: row.sound_url || null,
           music_volume: row.music_volume === null || row.music_volume === undefined ? null : Number(row.music_volume),
           video_volume: row.video_volume === null || row.video_volume === undefined ? null : Number(row.video_volume),
-<<<<<<< HEAD
-          sound_start_ms: row.sound_start_ms === null || row.sound_start_ms === undefined ? null : Number(row.sound_start_ms),
-          sound_duration_ms: row.sound_duration_ms === null || row.sound_duration_ms === undefined ? null : Number(row.sound_duration_ms),
-=======
-          music_start_ms: row.music_start_ms === null || row.music_start_ms === undefined ? null : Number(row.music_start_ms),
-          music_duration_ms: row.music_duration_ms === null || row.music_duration_ms === undefined ? null : Number(row.music_duration_ms),
-          clip_start_ms: row.clip_start_ms === null || row.clip_start_ms === undefined ? null : Number(row.clip_start_ms),
-          clip_duration_ms: row.clip_duration_ms === null || row.clip_duration_ms === undefined ? null : Number(row.clip_duration_ms),
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
+          // Music clip (chosen segment) — stored on the media row. All alias
+          // spellings (sound_*_ms legacy, music_*_ms, clip_*_ms) resolve to the
+          // canonical keys so viewers replay exactly the chosen window.
+          sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
+          sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
+          music_start_ms: row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+          music_duration_ms: row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
+          clip_start_ms: row.clip_start_ms != null ? Number(row.clip_start_ms) : row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+          clip_duration_ms: row.clip_duration_ms != null ? Number(row.clip_duration_ms) : row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
         }))
       : ([post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
           post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean) as any[]);
@@ -1459,22 +1391,12 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
     // TikTok-style sound attribution — same shape the feed emits: server
     // sounds keep {id,title,audio_url,owner_id}; a catalog pick (no
     // social_sounds row) mirrors {id:null,title,audio_url,source:"catalog"}.
-<<<<<<< HEAD
-    // clip_start_ms/clip_duration_ms carry the stored music segment (the
-    // catalog itself has no clip data — it lives on the post's media rows).
-    const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
-    post.sound = soundMedia
-      ? soundMedia.sound_id
-        ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id, clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
-        : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog", clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
-=======
     // clip_*/music_* ride both shapes so the player can replay the segment.
     const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
     post.sound = soundMedia
       ? soundMedia.sound_id
         ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id, music_start_ms: soundMedia.music_start_ms ?? null, music_duration_ms: soundMedia.music_duration_ms ?? null, clip_start_ms: soundMedia.clip_start_ms ?? null, clip_duration_ms: soundMedia.clip_duration_ms ?? null }
         : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog", music_start_ms: soundMedia.music_start_ms ?? null, music_duration_ms: soundMedia.music_duration_ms ?? null, clip_start_ms: soundMedia.clip_start_ms ?? null, clip_duration_ms: soundMedia.clip_duration_ms ?? null }
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       : null;
     if (post.repost_of_id) {
       const embed = await loadRepostOfs([post.repost_of_id]);
@@ -3475,21 +3397,15 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
     sound_title: row.sound_title ?? null,
     music_volume: row.music_volume == null ? 0.8 : Number(row.music_volume),
     video_volume: row.video_volume == null ? 1.0 : Number(row.video_volume),
-<<<<<<< HEAD
-    // Music SEGMENT (clip) — the part of the track the author picked; viewers
-    // replay from clip_start_ms for clip_duration_ms instead of 0:00.
+    // Music clip (chosen segment) — stored on the media row. All alias
+    // spellings (sound_*_ms legacy, music_*_ms, clip_*_ms) resolve to the
+    // canonical keys so viewers replay exactly the chosen window.
     sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
     sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
-=======
-    // Music-clip segment — the viewer replays the author's chosen window.
-    // music_* and clip_* spellings carry the SAME values so every reader
-    // (mobile social_stories.dart reads sound_start_ms ?? music_start_ms ??
-    // clip_start_ms) lands on the right window.
-    music_start_ms: row.music_start_ms == null ? null : Number(row.music_start_ms),
-    music_duration_ms: row.music_duration_ms == null ? null : Number(row.music_duration_ms),
-    clip_start_ms: (row.clip_start_ms ?? row.music_start_ms) == null ? null : Number(row.clip_start_ms ?? row.music_start_ms),
-    clip_duration_ms: (row.clip_duration_ms ?? row.music_duration_ms) == null ? null : Number(row.clip_duration_ms ?? row.music_duration_ms),
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
+    music_start_ms: row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+    music_duration_ms: row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
+    clip_start_ms: row.clip_start_ms != null ? Number(row.clip_start_ms) : row.music_start_ms != null ? Number(row.music_start_ms) : row.sound_start_ms != null ? Number(row.sound_start_ms) : null,
+    clip_duration_ms: row.clip_duration_ms != null ? Number(row.clip_duration_ms) : row.music_duration_ms != null ? Number(row.music_duration_ms) : row.sound_duration_ms != null ? Number(row.sound_duration_ms) : null,
     view_count: Number(row.view_count) || 0,
     like_count: Number(row.like_count) || 0,
     viewed_by_me: !!row.viewed_by_me,
@@ -3513,17 +3429,14 @@ const STORY_MUSIC_COLUMN_DDL = [
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`,
-<<<<<<< HEAD
-  // Music SEGMENT (clip) — chosen part of the attached track.
+  // Music-clip segment — chosen part of the attached track. All
+  // alias spellings (sound_*_ms legacy, music_*_ms, clip_*_ms).
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`,
-=======
-  // Music-clip segment (the part of the track the author picked).
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_start_ms INT`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_duration_ms INT`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_start_ms INT`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_duration_ms INT`,
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
   // Defensive: sound_id ships in the CREATE TABLE, but very old deployed
   // tables predate it — include it so the retry below cannot 42703 either.
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_id UUID`,
@@ -3566,18 +3479,6 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const musicVolume = clampVolume(req.body?.music_volume, 0.8);
     const videoVolume = clampVolume(req.body?.video_volume, 1.0);
-<<<<<<< HEAD
-    // Music SEGMENT (clip) — the composer sends the chosen part of the track
-    // (music_start_ms + music_duration_ms; sound_start_ms/sound_duration_ms
-    // accepted as aliases). Stored on the story row so viewers replay THAT
-    // part instead of always starting at 0:00.
-    const clampMs = (v: any) => {
-      const n = Number(v);
-      return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
-    };
-    const storySoundStartMs = clampMs(req.body?.music_start_ms ?? req.body?.sound_start_ms);
-    const storySoundDurationMs = clampMs(req.body?.music_duration_ms ?? req.body?.sound_duration_ms);
-=======
     // MUSIC CLIP SEGMENT (MusicClipSheet) — the part of the track the author
     // picked, persisted so viewers replay exactly that window. Clients send
     // music_start_ms/music_duration_ms; clip_start_ms/clip_duration_ms is the
@@ -3589,7 +3490,6 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const storyMusicStartMs = parseStoryMs(req.body?.music_start_ms ?? req.body?.clip_start_ms ?? req.body?.sound_start_ms);
     const storyMusicDurationMs = parseStoryMs(req.body?.music_duration_ms ?? req.body?.clip_duration_ms ?? req.body?.sound_duration_ms);
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     // Server sounds ("Use this sound" flow): persist sound_id ONLY when it
     // references a real social_sounds row — otherwise it stays null and the
     // catalog URL/title above carry the audio.
@@ -3629,15 +3529,9 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
 
     const insertStory = () =>
       query(
-<<<<<<< HEAD
-        `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
-        [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume, storySoundStartMs, storySoundDurationMs],
-=======
         `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
         [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume, storyMusicStartMs, storyMusicDurationMs, storyMusicStartMs, storyMusicDurationMs],
->>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       );
     let r;
     try {

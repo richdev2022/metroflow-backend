@@ -86,9 +86,31 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 if ! git pull --ff-only; then
-  [ "$STASHED" = "1" ] && git stash pop
-  fail "git pull failed (diverged?). Resolve manually, then re-run."
-  exit 1
+  # Diverged history — the release flow rebases upstream, so a long-lived
+  # VPS checkout can sit on the old lineage forever and every ff-only pull
+  # aborts. Self-heal: preserve local-only commits on a backup branch, then
+  # hard-align to origin/main. Untracked/ignored files (`.env`!) are never
+  # touched by `git reset --hard`.
+  warn "fast-forward pull failed (diverged?) — self-healing"
+  if ! git fetch origin --prune; then
+    fail "git fetch failed — check network/remote access, then re-run."
+    [ "$STASHED" = "1" ] && git stash pop
+    exit 1
+  fi
+  LOCAL_ONLY="$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+  if [ "${LOCAL_ONLY:-0}" != "0" ]; then
+    BACKUP_BRANCH="pre-deploy-backup-$(date +%Y%m%d-%H%M%S)"
+    if git branch "$BACKUP_BRANCH" HEAD 2>/dev/null; then
+      warn "$LOCAL_ONLY local-only commit(s) preserved on branch '$BACKUP_BRANCH'"
+    fi
+  fi
+  if git reset --hard origin/main; then
+    ok "working tree aligned to origin/main ($(git rev-parse --short HEAD))"
+  else
+    fail "could not align to origin/main. Inspect with 'git status', then re-run."
+    [ "$STASHED" = "1" ] && git stash pop
+    exit 1
+  fi
 fi
 NEW_REV="$(git rev-parse HEAD)"
 if [ "$OLD_REV" = "$NEW_REV" ]; then

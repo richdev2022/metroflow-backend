@@ -1173,6 +1173,83 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_completed BOOLEAN DEFAULT FALSE`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_prompt_dismissed BOOLEAN DEFAULT FALSE`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT FALSE`);
+
+    // ------------------------------------------------------------------
+    // Seed the App Review demo BUSINESS account (App Store Guideline 2.1).
+    // Apple's reviewer logs into the business app with:
+    //   sunday@metricorex.com / Password@123
+    // The account MUST be a `users` row (that is the table /auth/login
+    // authenticates against) attached to a real `businesses` row — the
+    // platform_admins seed above does NOT satisfy app login.
+    // Idempotent + self-healing on every boot:
+    //   • account missing  -> creates the demo business + admin user
+    //   • account existing -> forces the demo password, verifies the email,
+    //     clears any OTP gate and login lockout so App Review NEVER fails.
+    // ------------------------------------------------------------------
+    try {
+      const demoEmail = "sunday@metricorex.com";
+      const demoPassword = "Password@123";
+      const demoUserRow = await query(
+        `SELECT id, business_id FROM users WHERE email = $1 LIMIT 1`,
+        [demoEmail],
+      );
+      if (demoUserRow.rows.length === 0) {
+        const bizRow = await query(
+          `SELECT id FROM businesses WHERE email = $1 LIMIT 1`,
+          [demoEmail],
+        );
+        let demoBizId: string;
+        if (bizRow.rows.length > 0) {
+          demoBizId = bizRow.rows[0].id as string;
+        } else {
+          demoBizId = "biz-demo-metricorex";
+          const demoPlan = await query(`SELECT id FROM pricing_plans LIMIT 1`);
+          await query(
+            `INSERT INTO businesses (id, name, email, industry, plan_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              demoBizId,
+              "Metricorex Demo",
+              demoEmail,
+              "Technology",
+              (demoPlan.rows[0] as { id?: string } | undefined)?.id ?? null,
+            ],
+          );
+        }
+        const demoHash = await hashPassword(demoPassword);
+        await query(
+          `INSERT INTO users
+             (business_id, email, password_hash, name, role, status,
+              email_verified, verified_at, auth_provider, profile_completed)
+           VALUES ($1, $2, $3, $4, 'admin', 'active', TRUE, CURRENT_TIMESTAMP, 'local', TRUE)
+           ON CONFLICT DO NOTHING`,
+          [demoBizId, demoEmail, demoHash, "Sunday Demo"],
+        );
+        console.log("Seeded App Review demo business account (sunday@metricorex.com)");
+      } else {
+        const demoHash = await hashPassword(demoPassword);
+        await query(
+          `UPDATE users
+             SET password_hash = $1,
+                 email_verified = TRUE,
+                 verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP),
+                 otp_code = NULL,
+                 otp_expires_at = NULL,
+                 status = 'active',
+                 failed_login_attempts = 0,
+                 locked_until = NULL
+           WHERE email = $2`,
+          [demoHash, demoEmail],
+        );
+        console.log("Demo business account healed (password/verification/lockout reset)");
+      }
+    } catch (demoSeedErr) {
+      console.warn(
+        "Demo business account seed skipped:",
+        demoSeedErr instanceof Error ? demoSeedErr.message : demoSeedErr,
+      );
+    }
     
     // Create audit logs table
     await query(`

@@ -413,7 +413,7 @@ async function loadRepostOfs(repostOfIds: string[]): Promise<Map<string, any>> {
   try {
     const rows = await query(
       `SELECT p.id, p.user_id, p.body, p.image_url, p.video_url, p.created_at,
-              u.name AS author_name, u.avatar_url AS author_photo,
+              u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
               (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
               (SELECT COUNT(*)::int FROM social_comments c WHERE c.post_id = p.id AND c.status = 'active') AS comment_count
@@ -434,8 +434,17 @@ async function loadRepostOfs(repostOfIds: string[]): Promise<Map<string, any>> {
     for (const p of rows.rows) {
       out.set(String(p.id), {
         id: p.id,
-        author: { id: p.user_id, name: p.author_name, photo: p.author_photo, is_verified: !!p.author_verified },
-        body: p.body, message: p.body,
+        // Author shape mirrors the feed card — photo + avatar_url carry the
+        // SAME avatar so every client spelling renders (mobile repost card
+        // reads author.photo, web reads author.avatar_url); username powers
+        // the "Shared from @handle" attribution.
+        author: {
+          id: p.user_id, name: p.author_name,
+          username: p.author_username ?? null,
+          photo: p.author_photo, avatarUrl: p.author_photo, avatar_url: p.author_photo,
+          is_verified: !!p.author_verified,
+        },
+        body: p.body, message: p.body, content: p.body, caption: p.body,
         image_url: p.image_url, video_url: p.video_url,
         media: mediaByPost.get(String(p.id)) || [
           p.image_url ? { media_type: "image", url: p.image_url, poster_url: null } : null,
@@ -514,7 +523,11 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
     // Ordered media carousels for this page — one batched query, grouped per
     // post. Older posts (created before the multi-media upgrade) have no rows
     // here and fall back to their legacy image_url/video_url columns.
+<<<<<<< HEAD
     const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; sound_start_ms: number | null; sound_duration_ms: number | null }>>();
+=======
+    const mediaByPost = new Map<string, Array<{ media_type: string; url: string | null; poster_url: string | null; sound_id: string | null; sound_title: string | null; sound_audio_url: string | null; sound_owner_id: string | null; sound_url: string | null; music_volume: number | null; video_volume: number | null; music_start_ms: number | null; music_duration_ms: number | null; clip_start_ms: number | null; clip_duration_ms: number | null }>>();
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     if (postIds.length) {
       try {
         let mediaRes;
@@ -528,7 +541,11 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
                     COALESCE(s.title, m.sound_title) AS sound_title,
                     s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
                     m.sound_url, m.music_volume, m.video_volume,
+<<<<<<< HEAD
                     m.sound_start_ms, m.sound_duration_ms
+=======
+                    m.music_start_ms, m.music_duration_ms, m.clip_start_ms, m.clip_duration_ms
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
              FROM social_post_media m
              LEFT JOIN social_sounds s ON s.id = m.sound_id
              WHERE m.post_id = ANY($1::uuid[]) ORDER BY m.post_id, m.position, m.created_at`,
@@ -555,9 +572,16 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
             sound_url: row.sound_url || null,
             music_volume: row.music_volume == null ? null : Number(row.music_volume),
             video_volume: row.video_volume == null ? null : Number(row.video_volume),
+<<<<<<< HEAD
             // Music clip (chosen segment) — stored on the media row.
             sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
             sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
+=======
+            music_start_ms: row.music_start_ms == null ? null : Number(row.music_start_ms),
+            music_duration_ms: row.music_duration_ms == null ? null : Number(row.music_duration_ms),
+            clip_start_ms: row.clip_start_ms == null ? null : Number(row.clip_start_ms),
+            clip_duration_ms: row.clip_duration_ms == null ? null : Number(row.clip_duration_ms),
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
           });
           mediaByPost.set(String(row.post_id), list);
         }
@@ -754,8 +778,12 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           friendship_status: fMap.get(p.user_id) || "none",
           // "none" | "following" — seeded from social_follows on load so the
           // UI shows Following (with an Unfollow action) for accounts the
-          // viewer already follows.
+          // viewer already follows. is_following / is_followed_by_me are
+          // boolean aliases — the mobile feed card reads any of the three
+          // spellings to render Follow vs Following after a refresh.
           viewer_follow_status: p.user_id === userId ? "self" : followSet.has(String(p.user_id)) ? "following" : "none",
+          is_following: p.user_id !== userId && followSet.has(String(p.user_id)),
+          is_followed_by_me: p.user_id !== userId && followSet.has(String(p.user_id)),
         },
         message: poll ? poll.question : p.body,
         // `body`/`content` aliases — clients read item.body for text posts; the
@@ -772,8 +800,8 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
         // Ordered multi-media carousel — synthesized from the legacy columns
         // for posts created before social_post_media existed.
         media: mediaByPost.get(String(p.id)) || [
-          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null } : null,
-          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null } : null,
+          p.image_url ? { media_type: "image", url: p.image_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null, music_start_ms: null, music_duration_ms: null, clip_start_ms: null, clip_duration_ms: null } : null,
+          p.video_url ? { media_type: "video", url: p.video_url, poster_url: null, sound_id: null, sound_title: null, sound_audio_url: null, sound_owner_id: null, sound_url: null, music_volume: null, video_volume: null, music_start_ms: null, music_duration_ms: null, clip_start_ms: null, clip_duration_ms: null } : null,
         ].filter(Boolean),
         // TikTok-style sound attribution — the first video's attached sound,
         // surfaced so clients can render the "Use sound" affordance. Server
@@ -786,9 +814,18 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
           const list = mediaByPost.get(String(p.id)) || [];
           const m = list.find((x: any) => x.sound_id) || list.find((x: any) => x.sound_url && x.sound_title);
           if (!m) return null;
+<<<<<<< HEAD
           const clip = { clip_start_ms: m.sound_start_ms ?? null, clip_duration_ms: m.sound_duration_ms ?? null };
           if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id, ...clip };
           return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog", ...clip };
+=======
+          // clip_* keys are what the mobile player reads for the picked
+          // segment (musicClipStartMsOf/musicClipDurationMsOf read
+          // clip_start_ms/clip_duration_ms) — ride them on BOTH shapes so
+          // viewers replay the author's chosen part of the track.
+          if (m.sound_id) return { id: m.sound_id, title: m.sound_title, audio_url: m.sound_audio_url, owner_id: m.sound_owner_id, music_start_ms: m.music_start_ms ?? null, music_duration_ms: m.music_duration_ms ?? null, clip_start_ms: m.clip_start_ms ?? null, clip_duration_ms: m.clip_duration_ms ?? null };
+          return { id: null, title: m.sound_title, audio_url: m.sound_url, source: "catalog", music_start_ms: m.music_start_ms ?? null, music_duration_ms: m.music_duration_ms ?? null, clip_start_ms: m.clip_start_ms ?? null, clip_duration_ms: m.clip_duration_ms ?? null };
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
         })(),
         // Hashtags extracted at compose time — clients render them as chips
         // and deep-link into the tag feed.
@@ -838,13 +875,16 @@ router.get("/feed", authenticateToken, checkSubscriptionStatus, async (req: Auth
       items = items.map((i) => ({ ...i, saved_collection_ids: savedMap.get(String(i.id)) || [] }));
     } catch { /* cosmetic */ }
 
-    // Embed repost originals (X-style attribution cards).
+    // Embed repost originals (X-style attribution cards). The embed rides
+    // BOTH `repost_of` (existing key) and `shared_from` (new alias — the
+    // mobile feed card reads shared_from first) so shared/reposted rows
+    // render "Shared from @handle" + the original preview everywhere.
     try {
       const repostIds = items.map((i: any) => i.repost_of_id).filter(Boolean);
       if (repostIds.length) {
         const repostMap = await loadRepostOfs(repostIds);
         items = items.map((i: any) => (i.repost_of_id && repostMap.has(String(i.repost_of_id))
-          ? { ...i, repost_of: repostMap.get(String(i.repost_of_id)) }
+          ? { ...i, repost_of: repostMap.get(String(i.repost_of_id)), shared_from: repostMap.get(String(i.repost_of_id)) }
           : i));
       }
     } catch { /* cosmetic */ }
@@ -1049,6 +1089,31 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       if (imageUrl) mediaRows.push({ media_type: "image", url: imageUrl, poster_url: null });
       if (videoUrl) mediaRows.push({ media_type: "video", url: videoUrl, poster_url: null });
     }
+    // URL-LIST SHAPE (mobile repost-to-feed, commit dad65ad): clients that
+    // already uploaded elsewhere send `media_urls` — a JSON array of strings,
+    // a JSON-encoded array string, or a newline/comma-separated list. Each
+    // entry becomes a media row (video detected from the extension) so the
+    // carousel + back-compat columns behave exactly like file uploads.
+    if (!mediaRows.length && req.body?.media_urls != null) {
+      let urls: string[] = [];
+      const rawUrls = req.body.media_urls;
+      try {
+        const parsed = typeof rawUrls === "string" ? JSON.parse(rawUrls) : rawUrls;
+        if (Array.isArray(parsed)) urls = parsed.map((x) => String(x ?? "").trim());
+        else if (typeof parsed === "string") urls = parsed.split(/[\n,]+/);
+      } catch {
+        urls = String(rawUrls).split(/[\n,]+/);
+      }
+      const VIDEO_URL_RE = /\.(mp4|mov|m4v|webm|avi|mkv|3gp)(\?|$)/i;
+      for (const u of urls) {
+        if (mediaRows.length >= MAX_MEDIA) break;
+        if (!/^https?:\/\//i.test(u)) continue;
+        mediaRows.push({ media_type: VIDEO_URL_RE.test(u) ? "video" : "image", url: u.slice(0, 2000), poster_url: null });
+      }
+      // Back-compat columns must reflect the URL rows too (OG previews).
+      if (!imageUrl) imageUrl = mediaRows.find((m) => m.media_type === "image")?.url || null;
+      if (!videoUrl) videoUrl = mediaRows.find((m) => m.media_type === "video")?.url || null;
+    }
     if (!body && !mediaRows.length) return res.status(400).json({ success: false, error: "Write something or attach a photo/video" });
     if (body.length > 5000) return res.status(400).json({ success: false, error: "Post is too long (max 5000 characters)" });
 
@@ -1081,7 +1146,7 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     }
     // Catalog (Audius) tracks — the composer also sends sound_url/sound_title
     // + mix volumes for picks that have no social_sounds row. These ride
-    // directly on the video media row (see schema.ts) so the feed can play
+    // directly on the media row (see schema.ts) so the feed can play
     // them; dropping them used to make catalog-track posts silent.
     const catalogSoundUrl = String(req.body?.sound_url ?? "").trim().slice(0, 2000) || null;
     const catalogSoundTitle = String(req.body?.sound_title ?? "").trim().slice(0, 200) || null;
@@ -1089,6 +1154,7 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
       const n = Number(v);
       return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
     };
+<<<<<<< HEAD
     const catalogMusicVolume = clampVolume(req.body?.music_volume, 0.8);
     const catalogVideoVolume = clampVolume(req.body?.video_volume, 1.0);
     // Music SEGMENT (clip) — the composer sends the chosen part of the track
@@ -1103,6 +1169,22 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     };
     const catalogMusicStartMs = clampMs(req.body?.music_start_ms);
     const catalogMusicDurationMs = clampMs(req.body?.music_duration_ms);
+=======
+    // MUSIC CLIP SEGMENT (MusicClipSheet) — the part of the track the author
+    // picked, persisted so viewers replay exactly that window. Clients send
+    // music_start_ms/music_duration_ms; clip_start_ms/clip_duration_ms is the
+    // alias spelling (some sweeps send both — prefer the explicit clip_*).
+    const parseMs = (v: any): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 && n <= 60 * 60 * 1000 ? Math.round(n) : null;
+    };
+    const musicStartMs = parseMs(req.body?.music_start_ms ?? req.body?.clip_start_ms ?? req.body?.sound_start_ms);
+    const musicDurationMs = parseMs(req.body?.music_duration_ms ?? req.body?.clip_duration_ms ?? req.body?.sound_duration_ms);
+    const catalogMusicVolume =
+      req.body?.music_volume != null ? clampVolume(req.body.music_volume, 0.8) : null;
+    const catalogVideoVolume =
+      req.body?.video_volume != null ? clampVolume(req.body.video_volume, 1.0) : null;
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     const hasCatalogSound = !!(catalogSoundUrl && catalogSoundTitle);
 
     const r = await query(
@@ -1112,11 +1194,12 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
     const postId = r.rows[0].id;
     // Persist the ordered carousel (best-effort — a media-row failure must not
     // fail the post, the back-compat columns already carry the first media).
-    const savedMedia: Array<{ media_type: string; url: string | null; poster_url: string | null }> = [];
+    const savedMedia: Array<{ media_type: string; url: string | null; poster_url: string | null; sound_id?: string | null; sound_url?: string | null; sound_title?: string | null; music_volume?: number | null; video_volume?: number | null; music_start_ms?: number | null; music_duration_ms?: number | null; clip_start_ms?: number | null; clip_duration_ms?: number | null }> = [];
     for (let i = 0; i < mediaRows.length; i++) {
       const m = mediaRows[i];
       if (!m.url) continue;
       const isVideo = m.media_type === "video";
+<<<<<<< HEAD
       const rowSoundId = isVideo ? attachedSoundId : null;
       // Catalog-track fields ride on video rows only (images carry no audio).
       // Volumes only accompany an actual catalog pick — never invent a mix
@@ -1132,15 +1215,50 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
         `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume, rowSoundStartMs, rowSoundDurationMs],
+=======
+      void isVideo;
+      // Sound attribution rides EVERY media row (photo, video AND text-card):
+      // both the server-sound id ("Use this sound" flow) and the catalog
+      // fields below used to be video-gated, so photo/text posts with an
+      // attached track played silent after a refresh. Volumes only accompany
+      // an actual catalog pick — never invent a mix for a plain media post.
+      const rowSoundId = attachedSoundId;
+      const rowSoundUrl = catalogSoundUrl;
+      const rowSoundTitle = catalogSoundTitle;
+      const rowMusicVolume = hasCatalogSound ? (catalogMusicVolume ?? 0.8) : catalogMusicVolume;
+      const rowVideoVolume = hasCatalogSound ? (catalogVideoVolume ?? 1.0) : catalogVideoVolume;
+      const rowMusicStartMs = musicStartMs;
+      const rowMusicDurationMs = musicDurationMs;
+      await query(
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        [postId, m.media_type, m.url, m.poster_url, i, rowSoundId, rowSoundUrl, rowSoundTitle, rowMusicVolume, rowVideoVolume, rowMusicStartMs, rowMusicDurationMs, rowMusicStartMs, rowMusicDurationMs],
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       ).catch(async () => {
-        // Cold deploy without the catalog-sound columns yet — retry with the
-        // legacy column set so the media row itself still lands.
+        // Cold deploy without the catalog-sound/clip columns yet — retry with
+        // the legacy column set so the media row itself still lands.
         await query(
           `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id) VALUES ($1,$2,$3,$4,$5,$6)`,
           [postId, m.media_type, m.url, m.poster_url, i, rowSoundId],
         ).catch(() => {});
       });
-      savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url });
+      savedMedia.push({ media_type: m.media_type, url: m.url, poster_url: m.poster_url, sound_id: rowSoundId, sound_url: rowSoundUrl, sound_title: rowSoundTitle, music_volume: rowMusicVolume, video_volume: rowVideoVolume, music_start_ms: rowMusicStartMs, music_duration_ms: rowMusicDurationMs, clip_start_ms: rowMusicStartMs, clip_duration_ms: rowMusicDurationMs });
+    }
+
+    // TEXT-CARD posts (no photo/video) still attach music — persist the sound
+    // on ONE synthetic media row (media_type='text', url NULL — the migration
+    // relaxed url's NOT NULL for exactly this row). Every media renderer
+    // filters empty urls out, while the feed sound map (which reads ANY media
+    // row) picks the track up so text posts play their music like photos do.
+    if (!mediaRows.length && (catalogSoundUrl || catalogSoundTitle || musicStartMs != null)) {
+      const textMusicVolume = hasCatalogSound ? (catalogMusicVolume ?? 0.8) : catalogMusicVolume;
+      const textVideoVolume = hasCatalogSound ? (catalogVideoVolume ?? 1.0) : catalogVideoVolume;
+      await query(
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_id, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
+         VALUES ($1,'text',NULL,NULL,0,NULL,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [postId, catalogSoundUrl, catalogSoundTitle, textMusicVolume, textVideoVolume, musicStartMs, musicDurationMs, musicStartMs, musicDurationMs],
+      ).catch(() => {}); // cosmetic-only row — the post itself already landed
+      savedMedia.push({ media_type: "text", url: null, poster_url: null, sound_url: catalogSoundUrl, sound_title: catalogSoundTitle, music_volume: textMusicVolume, video_volume: textVideoVolume, music_start_ms: musicStartMs, music_duration_ms: musicDurationMs, clip_start_ms: musicStartMs, clip_duration_ms: musicDurationMs });
     }
 
     // FIRE-AND-FORGET poster fill (see pendingPosters above): ffmpeg-extract
@@ -1228,6 +1346,7 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
           image_url: r.rows[0].image_url, video_url: r.rows[0].video_url,
           media: savedMedia.map((m, i) => ({
             ...m,
+<<<<<<< HEAD
             sound_id: m.media_type === "video" && soundPayload ? soundPayload.id : null,
             sound_url: m.media_type === "video" && !soundPayload ? catalogSoundUrl : null,
             sound_title: m.media_type === "video" && !soundPayload ? catalogSoundTitle : null,
@@ -1243,6 +1362,28 @@ router.post("/posts", authenticateToken, checkSubscriptionStatus, upload.fields(
             ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id, clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
             : hasCatalogSound
               ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog", clip_start_ms: catalogMusicStartMs, clip_duration_ms: catalogMusicDurationMs }
+=======
+            // Server-sound id rides EVERY row (photo posts can carry a track
+            // too); a minted ORIGINAL sound binds to video rows only.
+            sound_id: m.sound_id || (m.media_type === "video" && soundPayload ? soundPayload.id : null),
+            sound_url: m.media_type === "video" && soundPayload ? null : (m.sound_url ?? null),
+            sound_title: m.media_type === "video" && soundPayload ? null : (m.sound_title ?? null),
+            music_volume: m.music_volume ?? null,
+            video_volume: m.video_volume ?? null,
+            music_start_ms: m.music_start_ms ?? null,
+            music_duration_ms: m.music_duration_ms ?? null,
+            clip_start_ms: m.clip_start_ms ?? null,
+            clip_duration_ms: m.clip_duration_ms ?? null,
+          })),
+          // Server-sound shape stays {id,title,audio_url,owner_id}; a catalog
+          // pick (no social_sounds row) mirrors the feed's catalog shape so
+          // the composer's post plays immediately. clip_* keys carry the
+          // picked segment (the player reads them on every surface).
+          sound: soundPayload
+            ? { id: soundPayload.id, title: soundPayload.title, audio_url: soundPayload.audio_url, owner_id: soundPayload.owner_id, music_start_ms: musicStartMs ?? null, music_duration_ms: musicDurationMs ?? null, clip_start_ms: musicStartMs ?? null, clip_duration_ms: musicDurationMs ?? null }
+            : hasCatalogSound || catalogSoundUrl
+              ? { id: null, title: catalogSoundTitle, audio_url: catalogSoundUrl, source: "catalog", music_start_ms: musicStartMs ?? null, music_duration_ms: musicDurationMs ?? null, clip_start_ms: musicStartMs ?? null, clip_duration_ms: musicDurationMs ?? null }
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
               : null,
           tags: cleanTags,
           like_count: 0, comment_count: 0,
@@ -1260,7 +1401,11 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
   try {
     const userId = req.user!.userId;
     const p = await query(
-      `SELECT p.*, u.name AS author_name, u.avatar_url AS author_photo,
+      `SELECT p.*, u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username,
+              (u.verified_badge_status = 'active' AND (u.verified_until IS NULL OR u.verified_until > NOW())) AS author_verified,
+              COALESCE(u.account_privacy, 'public') AS account_privacy,
+              EXISTS (SELECT 1 FROM social_follows f
+                       WHERE f.follower_id = $2 AND f.following_id = p.user_id AND f.status = 'active') AS viewer_follows,
               (SELECT COUNT(*)::int FROM social_reactions r WHERE r.post_id = p.id) AS like_count,
               (SELECT r.type FROM social_reactions r WHERE r.post_id = p.id AND r.user_id = $2 LIMIT 1) AS my_reaction
        FROM social_posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
@@ -1275,7 +1420,11 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
               COALESCE(s.title, m.sound_title) AS sound_title,
               s.audio_url AS sound_audio_url, s.owner_id AS sound_owner_id,
               m.sound_url, m.music_volume, m.video_volume,
+<<<<<<< HEAD
               m.sound_start_ms, m.sound_duration_ms
+=======
+              m.music_start_ms, m.music_duration_ms, m.clip_start_ms, m.clip_duration_ms
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
        FROM social_post_media m
        LEFT JOIN social_sounds s ON s.id = m.sound_id
        WHERE m.post_id = $1 ORDER BY m.position, m.created_at`,
@@ -1294,8 +1443,15 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
           sound_url: row.sound_url || null,
           music_volume: row.music_volume === null || row.music_volume === undefined ? null : Number(row.music_volume),
           video_volume: row.video_volume === null || row.video_volume === undefined ? null : Number(row.video_volume),
+<<<<<<< HEAD
           sound_start_ms: row.sound_start_ms === null || row.sound_start_ms === undefined ? null : Number(row.sound_start_ms),
           sound_duration_ms: row.sound_duration_ms === null || row.sound_duration_ms === undefined ? null : Number(row.sound_duration_ms),
+=======
+          music_start_ms: row.music_start_ms === null || row.music_start_ms === undefined ? null : Number(row.music_start_ms),
+          music_duration_ms: row.music_duration_ms === null || row.music_duration_ms === undefined ? null : Number(row.music_duration_ms),
+          clip_start_ms: row.clip_start_ms === null || row.clip_start_ms === undefined ? null : Number(row.clip_start_ms),
+          clip_duration_ms: row.clip_duration_ms === null || row.clip_duration_ms === undefined ? null : Number(row.clip_duration_ms),
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
         }))
       : ([post.image_url ? { media_type: "image", url: post.image_url, poster_url: null } : null,
           post.video_url ? { media_type: "video", url: post.video_url, poster_url: null } : null].filter(Boolean) as any[]);
@@ -1303,6 +1459,7 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
     // TikTok-style sound attribution — same shape the feed emits: server
     // sounds keep {id,title,audio_url,owner_id}; a catalog pick (no
     // social_sounds row) mirrors {id:null,title,audio_url,source:"catalog"}.
+<<<<<<< HEAD
     // clip_start_ms/clip_duration_ms carry the stored music segment (the
     // catalog itself has no clip data — it lives on the post's media rows).
     const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
@@ -1310,11 +1467,37 @@ router.get("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, re
       ? soundMedia.sound_id
         ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id, clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
         : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog", clip_start_ms: soundMedia.sound_start_ms ?? null, clip_duration_ms: soundMedia.sound_duration_ms ?? null }
+=======
+    // clip_*/music_* ride both shapes so the player can replay the segment.
+    const soundMedia = mediaRows.find((x: any) => x.sound_id) || mediaRows.find((x: any) => x.sound_url && x.sound_title);
+    post.sound = soundMedia
+      ? soundMedia.sound_id
+        ? { id: soundMedia.sound_id, title: soundMedia.sound_title, audio_url: soundMedia.sound_audio_url, owner_id: soundMedia.sound_owner_id, music_start_ms: soundMedia.music_start_ms ?? null, music_duration_ms: soundMedia.music_duration_ms ?? null, clip_start_ms: soundMedia.clip_start_ms ?? null, clip_duration_ms: soundMedia.clip_duration_ms ?? null }
+        : { id: null, title: soundMedia.sound_title, audio_url: soundMedia.sound_url, source: "catalog", music_start_ms: soundMedia.music_start_ms ?? null, music_duration_ms: soundMedia.music_duration_ms ?? null, clip_start_ms: soundMedia.clip_start_ms ?? null, clip_duration_ms: soundMedia.clip_duration_ms ?? null }
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       : null;
     if (post.repost_of_id) {
       const embed = await loadRepostOfs([post.repost_of_id]);
-      post.repost_of = embed.get(String(post.repost_of_id)) || null;
+      const embedCard = embed.get(String(post.repost_of_id)) || null;
+      post.repost_of = embedCard;
+      // `shared_from` alias — mobile/web share cards read either key.
+      post.shared_from = embedCard;
     }
+    // Author object + the viewer's follow state (feed parity) — the post
+    // detail header renders Follow/Following from these keys after refresh.
+    post.author = {
+      id: post.user_id,
+      name: post.author_name,
+      photo: post.author_photo,
+      avatarUrl: post.author_photo,
+      avatar_url: post.author_photo,
+      username: (post as any).author_username ?? null,
+      is_private: post.account_privacy === "private",
+      is_verified: !!(post as any).author_verified,
+      viewer_follow_status: post.user_id === userId ? "self" : post.viewer_follows ? "following" : "none",
+      is_following: post.user_id !== userId && !!post.viewer_follows,
+      is_followed_by_me: post.user_id !== userId && !!post.viewer_follows,
+    };
     res.json({ success: true, data: { post } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: "Could not load post" });
@@ -1361,6 +1544,17 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
     [userId, postIds],
   );
   const ids = postsRes.rows.map((r) => r.id);
+
+  // Follow state per author (batched, one query) — the Saved page's
+  // Follow/Following button must reflect reality, not reset to "Follow".
+  const followSet = new Set<string>();
+  try {
+    const followRes = await query(
+      `SELECT following_id FROM social_follows WHERE follower_id = $1 AND following_id = ANY($2::uuid[])`,
+      [userId, [...new Set(postsRes.rows.map((r) => String(r.user_id)))]],
+    );
+    for (const row of followRes.rows) followSet.add(String(row.following_id));
+  } catch { /* cosmetic — follow state degrades to "none" */ }
 
   const mediaByPost = new Map<string, Array<{ media_type: string; url: string; poster_url: string | null }>>();
   if (ids.length) {
@@ -1438,7 +1632,9 @@ async function shapeSavedPosts(userId: string, postIds: string[]) {
           is_private: p.account_privacy === "private",
           is_verified: !!p.author_verified,
           friendship_status: "none",
-          viewer_follow_status: p.user_id === userId ? "self" : "none",
+          viewer_follow_status: p.user_id === userId ? "self" : followSet.has(String(p.user_id)) ? "following" : "none",
+          is_following: p.user_id !== userId && followSet.has(String(p.user_id)),
+          is_followed_by_me: p.user_id !== userId && followSet.has(String(p.user_id)),
         },
         message: poll ? poll.question : p.body,
         body: p.body,
@@ -2186,12 +2382,26 @@ router.patch("/posts/:id", authenticateToken, async (req: AuthenticatedRequest, 
 // ---------------------------------------------------------------------------
 router.post("/posts/:id/share", authenticateToken, async (req: AuthenticatedRequest, res) => {
   try {
+    const userId = req.user!.userId;
     const r = await query(
-      `UPDATE social_posts SET share_count = share_count + 1 WHERE id = $1 AND status = 'active' RETURNING share_count`,
+      `UPDATE social_posts SET share_count = share_count + 1 WHERE id = $1 AND status = 'active' RETURNING id, share_count`,
       [req.params.id],
     );
     if (!r.rows.length) return res.status(404).json({ success: false, error: "Post not found" });
-    res.json({ success: true, data: { share_count: r.rows[0].share_count } });
+    // Record WHO shared (audit + analytics): one ledger row per share event,
+    // same social_post_views table the feed ranking already aggregates —
+    // `source='share'` keeps it distinct from organic feed views.
+    await query(
+      `INSERT INTO social_post_views (post_id, author_id, viewer_id, source)
+       SELECT p.id, p.user_id, $2, 'share'
+       FROM social_posts p WHERE p.id = $1
+       ON CONFLICT DO NOTHING`,
+      [req.params.id, userId],
+    ).catch(() => {}); // ledger is advisory — never fail the share bump
+    // share_count rides BOTH flat and data-nested so every client spelling
+    // ({share_count} at the top level, or res.data.share_count) works.
+    const shareCount = Number(r.rows[0].share_count) || 0;
+    res.json({ success: true, share_count: shareCount, data: { share_count: shareCount } });
   } catch {
     res.status(500).json({ success: false, error: "Could not record share" });
   }
@@ -2283,6 +2493,27 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
       // Plain repost — allowed (X-style), commentary optional.
     }
 
+    // Sound + music-clip fields for the REPOST's own media (video reactions
+    // with an attached track): same contract as POST /posts — the sweep sends
+    // sound_url/sound_title/music_volume/video_volume + music_start_ms/
+    // music_duration_ms (clip_start_ms/clip_duration_ms alias spelling).
+    const repostSoundUrl = String(req.body?.sound_url ?? "").trim().slice(0, 2000) || null;
+    const repostSoundTitle = String(req.body?.sound_title ?? "").trim().slice(0, 200) || null;
+    const repostClampVolume = (v: any, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
+    };
+    const repostMusicVolume =
+      req.body?.music_volume != null ? repostClampVolume(req.body.music_volume, 0.8) : null;
+    const repostVideoVolume =
+      req.body?.video_volume != null ? repostClampVolume(req.body.video_volume, 1.0) : null;
+    const parseRepostMs = (v: any): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 && n <= 60 * 60 * 1000 ? Math.round(n) : null;
+    };
+    const repostMusicStartMs = parseRepostMs(req.body?.music_start_ms ?? req.body?.clip_start_ms ?? req.body?.sound_start_ms);
+    const repostMusicDurationMs = parseRepostMs(req.body?.music_duration_ms ?? req.body?.clip_duration_ms ?? req.body?.sound_duration_ms);
+
     const r = await query(
       `INSERT INTO social_posts (user_id, body, image_url, video_url, audience, repost_of_id)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
@@ -2291,10 +2522,18 @@ router.post("/posts/:id/repost", authenticateToken, checkSubscriptionStatus, upl
     const post = r.rows[0];
     if (videoUrl || imageUrl) {
       await query(
-        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position)
-         VALUES ($1, $2, $3, $4, 0)`,
-        [post.id, videoUrl ? "video" : "image", videoUrl || imageUrl, posterUrl],
-      ).catch(() => {});
+        `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
+         VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [post.id, videoUrl ? "video" : "image", videoUrl || imageUrl, posterUrl, repostSoundUrl, repostSoundTitle, repostMusicVolume, repostVideoVolume, repostMusicStartMs, repostMusicDurationMs, repostMusicStartMs, repostMusicDurationMs],
+      ).catch(async () => {
+        // Cold deploy without the sound/clip columns yet — retry with the
+        // legacy column set so the media row itself still lands.
+        await query(
+          `INSERT INTO social_post_media (post_id, media_type, url, poster_url, position)
+           VALUES ($1, $2, $3, $4, 0)`,
+          [post.id, videoUrl ? "video" : "image", videoUrl || imageUrl, posterUrl],
+        ).catch(() => {});
+      });
     }
 
     // Background poster fill for video reposts (see pendingReposter above) —
@@ -3236,10 +3475,21 @@ function shapeStory(row: any, extra: Record<string, unknown> = {}) {
     sound_title: row.sound_title ?? null,
     music_volume: row.music_volume == null ? 0.8 : Number(row.music_volume),
     video_volume: row.video_volume == null ? 1.0 : Number(row.video_volume),
+<<<<<<< HEAD
     // Music SEGMENT (clip) — the part of the track the author picked; viewers
     // replay from clip_start_ms for clip_duration_ms instead of 0:00.
     sound_start_ms: row.sound_start_ms == null ? null : Number(row.sound_start_ms),
     sound_duration_ms: row.sound_duration_ms == null ? null : Number(row.sound_duration_ms),
+=======
+    // Music-clip segment — the viewer replays the author's chosen window.
+    // music_* and clip_* spellings carry the SAME values so every reader
+    // (mobile social_stories.dart reads sound_start_ms ?? music_start_ms ??
+    // clip_start_ms) lands on the right window.
+    music_start_ms: row.music_start_ms == null ? null : Number(row.music_start_ms),
+    music_duration_ms: row.music_duration_ms == null ? null : Number(row.music_duration_ms),
+    clip_start_ms: (row.clip_start_ms ?? row.music_start_ms) == null ? null : Number(row.clip_start_ms ?? row.music_start_ms),
+    clip_duration_ms: (row.clip_duration_ms ?? row.music_duration_ms) == null ? null : Number(row.clip_duration_ms ?? row.music_duration_ms),
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     view_count: Number(row.view_count) || 0,
     like_count: Number(row.like_count) || 0,
     viewed_by_me: !!row.viewed_by_me,
@@ -3263,9 +3513,17 @@ const STORY_MUSIC_COLUMN_DDL = [
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`,
+<<<<<<< HEAD
   // Music SEGMENT (clip) — chosen part of the attached track.
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`,
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`,
+=======
+  // Music-clip segment (the part of the track the author picked).
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_start_ms INT`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_duration_ms INT`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_start_ms INT`,
+  `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_duration_ms INT`,
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
   // Defensive: sound_id ships in the CREATE TABLE, but very old deployed
   // tables predate it — include it so the retry below cannot 42703 either.
   `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_id UUID`,
@@ -3308,6 +3566,7 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const musicVolume = clampVolume(req.body?.music_volume, 0.8);
     const videoVolume = clampVolume(req.body?.video_volume, 1.0);
+<<<<<<< HEAD
     // Music SEGMENT (clip) — the composer sends the chosen part of the track
     // (music_start_ms + music_duration_ms; sound_start_ms/sound_duration_ms
     // accepted as aliases). Stored on the story row so viewers replay THAT
@@ -3318,6 +3577,19 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
     };
     const storySoundStartMs = clampMs(req.body?.music_start_ms ?? req.body?.sound_start_ms);
     const storySoundDurationMs = clampMs(req.body?.music_duration_ms ?? req.body?.sound_duration_ms);
+=======
+    // MUSIC CLIP SEGMENT (MusicClipSheet) — the part of the track the author
+    // picked, persisted so viewers replay exactly that window. Clients send
+    // music_start_ms/music_duration_ms; clip_start_ms/clip_duration_ms is the
+    // alias spelling. Both column spellings are populated identically so any
+    // reader gets the segment.
+    const parseStoryMs = (v: any): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 && n <= 60 * 60 * 1000 ? Math.round(n) : null;
+    };
+    const storyMusicStartMs = parseStoryMs(req.body?.music_start_ms ?? req.body?.clip_start_ms ?? req.body?.sound_start_ms);
+    const storyMusicDurationMs = parseStoryMs(req.body?.music_duration_ms ?? req.body?.clip_duration_ms ?? req.body?.sound_duration_ms);
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
     // Server sounds ("Use this sound" flow): persist sound_id ONLY when it
     // references a real social_sounds row — otherwise it stays null and the
     // catalog URL/title above carry the audio.
@@ -3357,9 +3629,15 @@ router.post("/stories", authenticateToken, checkSubscriptionStatus, upload.field
 
     const insertStory = () =>
       query(
+<<<<<<< HEAD
         `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume, sound_start_ms, sound_duration_ms)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
         [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume, storySoundStartMs, storySoundDurationMs],
+=======
+        `INSERT INTO social_stories (user_id, media_type, media_url, poster_url, caption, background_color, text_color, font, text_align, duration_seconds, audience, sound_id, sound_url, sound_title, music_volume, video_volume, music_start_ms, music_duration_ms, clip_start_ms, clip_duration_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
+        [userId, mediaType, mediaUrl, posterUrl, caption, backgroundColor, mediaType === "text" ? textColor : null, mediaType === "text" ? font : "default", mediaType === "text" ? textAlign : "center", mediaType === "video" ? Math.max(durationSeconds, 7) : durationSeconds, audience, storySoundId, storySoundUrl, storySoundTitle, musicVolume, videoVolume, storyMusicStartMs, storyMusicDurationMs, storyMusicStartMs, storyMusicDurationMs],
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
       );
     let r;
     try {
@@ -3772,12 +4050,24 @@ router.get("/tags/:tag/posts", authenticateToken, checkSubscriptionStatus, async
         mediaByPost.set(String(row.post_id), list);
       }
     }
+    // Follow state per author (batched, one query) — tag-feed cards must not
+    // reset the Follow button to "Follow" for accounts the viewer follows.
+    const tagFollowSet = new Set<string>();
+    try {
+      const tagFollowRes = await query(
+        `SELECT following_id FROM social_follows WHERE follower_id = $1 AND following_id = ANY($2::uuid[])`,
+        [userId, [...new Set(postsRes.rows.map((r) => String(r.user_id)))]],
+      );
+      for (const row of tagFollowRes.rows) tagFollowSet.add(String(row.following_id));
+    } catch { /* cosmetic */ }
     const items = postsRes.rows.map((p) => ({
       kind: "post", id: p.id,
       author: {
         id: p.user_id, name: p.author_name, photo: p.author_photo, username: p.author_username,
         is_verified: !!p.author_verified, is_private: p.account_privacy === "private",
-        viewer_follow_status: p.user_id === userId ? "self" : "none",
+        viewer_follow_status: p.user_id === userId ? "self" : tagFollowSet.has(String(p.user_id)) ? "following" : "none",
+        is_following: p.user_id !== userId && tagFollowSet.has(String(p.user_id)),
+        is_followed_by_me: p.user_id !== userId && tagFollowSet.has(String(p.user_id)),
       },
       body: p.body, content: p.body, message: p.body,
       image_url: p.image_url, video_url: p.video_url,

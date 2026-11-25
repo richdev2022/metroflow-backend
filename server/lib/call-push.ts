@@ -238,7 +238,12 @@ export async function pushCallCancelled(
         title: "Call cancelled",
         body: "The call was cancelled",
         data: {
-          type: "call-cancelled",
+          // Mobile apps key the silent cancel push on type 'call_cancelled'
+          // (underscore) in PushNotificationService — the old hyphenated
+          // 'call-cancelled' was silently ignored, so backgrounded devices of
+          // the SAME user (personal app vs business app) kept ringing after
+          // someone answered.
+          type: "call_cancelled",
           callId: info.callId,
           callerName: info.callerName || "",
           reason: info.reason || "caller_hung_up",

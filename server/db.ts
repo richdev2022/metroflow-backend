@@ -266,6 +266,7 @@ async function ensureBaseSchemaTables() {
       last_login TIMESTAMP,
       auth_provider VARCHAR(50) DEFAULT 'local',
       google_id VARCHAR(255),
+      apple_id VARCHAR(255),
       avatar_url TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -451,6 +452,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "otp_expires_at",
     "auth_provider",
     "google_id",
+    "apple_id",
     "avatar_url",
     "failed_login_attempts",
     "locked_until",
@@ -509,6 +511,7 @@ export async function verifySchema(): Promise<string[]> {
           const heal: Record<string, string> = {
             "users.auth_provider": `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'`,
             "users.google_id": `ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)`,
+            "users.apple_id": `ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(255)`,
             "users.avatar_url": `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
           };
           for (const col of missingColumns) {
@@ -825,6 +828,7 @@ export async function initializeDatabase() {
         last_login TIMESTAMP,
         auth_provider VARCHAR(50) DEFAULT 'local',
         google_id VARCHAR(255),
+        apple_id VARCHAR(255),
         avatar_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1161,6 +1165,10 @@ export async function initializeDatabase() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'local'`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)`);
+    // Apple Sign-In column (Guideline 4.8 — POST /auth/apple finds users by
+    // the verified Apple subject).
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(255)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_users_apple_id ON users(apple_id)`);
     // Profile completion (first-login personal profile for invited team members)
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_completed BOOLEAN DEFAULT FALSE`);
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_prompt_dismissed BOOLEAN DEFAULT FALSE`);

@@ -31,6 +31,7 @@ import {
   recordSuccessfulLogin,
 } from "../services/login-security";
 import { verifyGoogleIdToken } from "../services/googleAuth";
+import { verifyAppleIdentityToken } from "../services/appleAuth";
 import { isMaintenanceMode } from "../services/app-config";
 import { attributeReferrer, ensureUserReferralCode } from "../services/referral";
 import { isPhoneHeldByVerifiedAccount } from "../lib/phone-identity";
@@ -1784,6 +1785,438 @@ export const googleAuth: RequestHandler = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to authenticate with Google",
+    });
+  }
+};
+
+/**
+ * @swagger
+ * /auth/apple:
+ *   post:
+ *     summary: Sign up or log in with Apple (identity token from Sign in with Apple — Guideline 4.8)
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - identityToken
+ *             properties:
+ *               identityToken:
+ *                 type: string
+ *                 description: Signed Apple identity token (RS256 JWT)
+ *               authorizationCode:
+ *                 type: string
+ *                 description: One-time authorization code (available for server-side token exchange)
+ *               user:
+ *                 type: object
+ *                 description: ONLY present on the first grant
+ *                 properties:
+ *                   identifier:
+ *                     type: string
+ *                   givenName:
+ *                     type: string
+ *                   familyName:
+ *                     type: string
+ *                   email:
+ *                     type: string
+ *               referralCode:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Apple authentication successful
+ */
+export const appleAuth: RequestHandler = async (req, res) => {
+  try {
+    const { identityToken, authorizationCode, referralCode } = req.body || {};
+    const appleUser = (req.body as any)?.user || {};
+    // mode:"personal" — parity with /auth/google so the Personal apps can
+    // create PERSONAL accounts through Apple Sign-In too.
+    const signupMode = String((req.body as any)?.mode || "").toLowerCase();
+
+    // MAINTENANCE GATE: Apple SSO must not bypass the maintenance window.
+    if (await rejectIfUnderMaintenance(res)) return;
+
+    if (!identityToken || typeof identityToken !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Apple identity token is required",
+      });
+    }
+
+    // authorizationCode is accepted (and forwarded to future token-exchange /
+    // revocation flows) but is NOT required — Apple only sends it on grants
+    // from the native sheet, and identity validation rides the identityToken.
+    void authorizationCode;
+
+    const appleInfo = await verifyAppleIdentityToken(identityToken);
+    if (!appleInfo || !appleInfo.sub) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid or expired Apple identity token",
+      });
+    }
+
+    const appleSub = appleInfo.sub;
+    // Email resolution order: the VERIFIED email inside the token → the
+    // first-grant email the client forwarded (Apple only returns it once) →
+    // a deterministic placeholder keyed on the immutable Apple subject.
+    // The placeholder keeps account creation working for users who declined
+    // the email scope entirely; their identity is still Apple-verified.
+    const firstNameGrantEmail =
+      typeof appleUser?.email === "string" && appleUser.email.includes("@")
+        ? appleUser.email.toLowerCase().trim()
+        : null;
+    const email =
+      appleInfo.email ||
+      firstNameGrantEmail ||
+      `${appleSub.replace(/[^a-zA-Z0-9._-]/g, "")}@apple-ids.metricorex.com`;
+
+    const displayName =
+      [appleUser?.givenName, appleUser?.familyName]
+        .filter((n: any) => typeof n === "string" && n.trim().length > 0)
+        .map((n: any) => String(n).trim())
+        .join(" ") || email.split("@")[0];
+
+    // 1) Existing user linked by apple_id
+    const byAppleId = await query(
+      `SELECT id, business_id as "businessId", email, name, avatar_url as "avatarUrl",
+              auth_provider as "authProvider", password_hash as "passwordHash", email_verified
+       FROM users WHERE apple_id = $1 LIMIT 1`,
+      [appleSub],
+    );
+
+    let user = byAppleId.rows[0] || null;
+
+    // 2) Existing user with same email (link Apple account)
+    if (!user) {
+      const byEmail = await query(
+        `SELECT id, business_id as "businessId", email, name, avatar_url as "avatarUrl",
+                auth_provider as "authProvider", password_hash as "passwordHash", email_verified
+         FROM users WHERE email = $1 LIMIT 1`,
+        [email],
+      );
+
+      if (byEmail.rows.length > 0) {
+        user = byEmail.rows[0];
+        // Link the Apple identity to the existing account. Apple guarantees
+        // the identity (the token is Apple-signed) so email_verified rides it.
+        await query(
+          `UPDATE users
+           SET apple_id = $1,
+               auth_provider = CASE WHEN auth_provider = 'apple' THEN auth_provider ELSE auth_provider || '+apple' END,
+               email_verified = TRUE,
+               verified_at = COALESCE(verified_at, NOW()),
+               otp_code = NULL,
+               otp_expires_at = NULL,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2`,
+          [appleSub, user.id],
+        );
+      }
+    }
+
+    let isNewUser = false;
+
+    // 3) Brand-new user: create business + admin user (Apple-verified identity, no password)
+    if (!user) {
+      isNewUser = true;
+
+      // 3a) PERSONAL MODE — parity with /auth/google personal branch:
+      // account_type 'personal', business_id NULL, personal wallets, no password.
+      if (signupMode === "personal") {
+        const personalResult = await query(
+          `INSERT INTO users
+            (business_id, email, name, role, account_type, email_verified, verified_at,
+             apple_id, auth_provider, profile_completed, profile_prompt_dismissed)
+           VALUES (NULL, $1, $2, 'owner', 'personal', TRUE, CURRENT_TIMESTAMP,
+                   $3, 'apple', FALSE, FALSE)
+           RETURNING id, email, name`,
+          [email, displayName, appleSub],
+        );
+        const newPersonal = personalResult.rows[0];
+
+        // Personal wallets: NGN (primary) + stablecoin (USDT + USDC).
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'NGN', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'USDT', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+        await query(
+          `INSERT INTO wallets (user_id, business_id, balance, currency, status)
+           VALUES ($1, NULL, 0, 'USDC', 'active') ON CONFLICT (user_id, currency) DO NOTHING`,
+          [newPersonal.id],
+        );
+
+        try {
+          if (referralCode) {
+            await attributeReferrer(newPersonal.id, referralCode);
+          }
+          await ensureUserReferralCode(newPersonal.id);
+        } catch (refErr: any) {
+          console.warn("Referral attribution skipped (apple personal):", refErr?.message);
+        }
+
+        await logActivity({
+          businessId: null,
+          userId: newPersonal.id,
+          action: "register",
+          actionType: "personal",
+          description: "Personal account registered via Apple Sign-In",
+          metadata: { authProvider: "apple", mode: "personal" },
+        });
+
+        const token = await generateToken(newPersonal.id, null);
+
+        return res.json({
+          success: true,
+          token,
+          userId: newPersonal.id,
+          businessId: null,
+          accountType: "personal",
+          isNewUser,
+          // Apple users never set a password to use the app — parity with the
+          // Google personal flow (requiresPasswordSetup stays false).
+          requiresPasswordSetup: false,
+          requiresProfileCompletion: true,
+          profileCompleted: false,
+          profilePromptDismissed: false,
+          phoneVerified: false,
+          message: "Apple sign-up successful",
+          role: "owner",
+          isBusinessAdmin: false,
+          user: {
+            id: newPersonal.id,
+            name: newPersonal.name,
+            email: newPersonal.email,
+            avatarUrl: null,
+            authProvider: "apple",
+            hasPassword: false,
+            accountType: "personal",
+          },
+        });
+      }
+
+      const derivedBusinessName =
+        ((req.body as any)?.businessName && String((req.body as any).businessName).trim()) ||
+        `${displayName.split(" ")[0]}'s Workspace`;
+
+      const existingBusiness = await query(
+        "SELECT id FROM businesses WHERE email = $1",
+        [email],
+      );
+      if (existingBusiness.rows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "A business with this email already exists. Please sign in instead.",
+        });
+      }
+
+      // Get default free/trial plan (same logic as email registration)
+      const planResult = await query("SELECT * FROM pricing_plans WHERE price = 0 LIMIT 1");
+      let planId = null;
+      let trialEndsAt = null;
+      const trialDaysDefault =
+        planResult.rows.length > 0 &&
+        planResult.rows[0].trial_days &&
+        planResult.rows[0].trial_days > 0
+          ? planResult.rows[0].trial_days
+          : 7;
+      const trialDate = new Date();
+      trialDate.setDate(trialDate.getDate() + trialDaysDefault);
+      trialEndsAt = trialDate;
+      if (planResult.rows.length > 0) planId = planResult.rows[0].id;
+
+      const businessId = generateBusinessId(derivedBusinessName);
+      const businessResult = await query(
+        `INSERT INTO businesses (id, name, email, industry, plan_id, trial_ends_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, name, email`,
+        [
+          businessId,
+          derivedBusinessName,
+          email,
+          (req.body as any)?.businessIndustry || null,
+          planId,
+          trialEndsAt,
+        ],
+      );
+      const business = businessResult.rows[0];
+
+      const userResult = await query(
+        `INSERT INTO users
+          (business_id, email, name, role, email_verified, verified_at, apple_id, auth_provider)
+         VALUES ($1, $2, $3, 'admin', TRUE, CURRENT_TIMESTAMP, $4, 'apple')
+         RETURNING id, email, name, role`,
+        [business.id, email, displayName, appleSub],
+      );
+      const newUser = userResult.rows[0];
+
+      // Refer & Earn: attribute the Apple signup to a referrer (optional
+      // referralCode — also claimable later via /referrals/claim). Best effort.
+      try {
+        if (referralCode) {
+          await attributeReferrer(newUser.id, referralCode);
+        }
+        await ensureUserReferralCode(newUser.id);
+      } catch (refErr: any) {
+        console.warn("Referral attribution skipped (apple):", refErr?.message);
+      }
+
+      // Welcome email on Apple account creation (best effort)
+      try {
+        const loginLink = `${process.env.CLIENT_URL || process.env.APP_BASE_URL || 'https://metricorex.com'}/login`;
+        const welcomeEmail = generateAccountCreationEmailHtml(newUser.name || displayName, loginLink);
+        sendEmail(newUser.email, newUser.name || displayName, 'Welcome to Metricorex - Your account has been created', welcomeEmail).catch((e) =>
+          console.warn('Account creation email failed:', e?.message),
+        );
+      } catch (welcomeErr: any) {
+        console.warn('Failed to send account creation email:', welcomeErr?.message);
+      }
+
+      await query(`UPDATE businesses SET owner_id = $1 WHERE id = $2`, [
+        newUser.id,
+        business.id,
+      ]);
+
+      // Seed default task statuses (parity with email registration)
+      const defaultStatuses = [
+        { name: "pending", color: "#6b7280", is_default: true, sort_order: 0 },
+        { name: "in_progress", color: "#3b82f6", is_default: true, sort_order: 1 },
+        { name: "completed", color: "#10b981", is_default: true, sort_order: 2 },
+      ];
+      for (const status of defaultStatuses) {
+        await query(
+          `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [business.id, status.name, status.color, status.is_default, status.sort_order],
+        );
+      }
+
+      await logActivity({
+        businessId: business.id,
+        userId: newUser.id,
+        action: "register",
+        actionType: "business",
+        description: `Business registered via Apple Sign-In: ${business.name}`,
+        metadata: {
+          businessName: business.name,
+          authProvider: "apple",
+        },
+      });
+
+      const token = await generateToken(newUser.id, business.id);
+
+      return res.json({
+        success: true,
+        token,
+        userId: newUser.id,
+        businessId: business.id,
+        isNewUser,
+        requiresPasswordSetup: true,
+        // Fresh SSO sign-up: derived workspace name, no phone/industry/logo
+        // yet — clients MUST route to the profile-completion screen first.
+        // The creator is a business admin, so the screen they get is the
+        // BUSINESS completion flow (never the personal one).
+        profileCompleted: false,
+        message: "Apple sign-up successful",
+        role: "admin",
+        isBusinessAdmin: true,
+        requiresProfileCompletion: false,
+        phoneVerified: false,
+        profilePromptDismissed: true,
+        user: {
+          id: newUser.id,
+          name: newUser.name,
+          email: newUser.email,
+          avatarUrl: null,
+          authProvider: "apple",
+          hasPassword: false,
+        },
+        business: {
+          id: business.id,
+          name: business.name,
+          email: business.email,
+          industry: (req.body as any)?.businessIndustry || null,
+          phoneNumber: null,
+          logoUrl: null,
+        },
+      });
+    }
+
+    // 4) Existing user login
+    if (user.email === null || user.email === undefined) {
+      return res.status(400).json({ success: false, message: "Account error" });
+    }
+
+    // Advisory post-login bookkeeping — must never break the login response
+    // (recordSuccessfulLogin is internally best-effort; guard the call too).
+    try {
+      await recordSuccessfulLogin(user.email);
+    } catch (loginAuditErr: any) {
+      console.warn(
+        "Apple auth: post-login bookkeeping skipped:",
+        (loginAuditErr?.message || loginAuditErr).toString().substring(0, 200)
+      );
+    }
+    await logActivity({
+      businessId: user.businessId,
+      userId: user.id,
+      action: "login",
+      actionType: "authentication",
+      description: "User logged in with Apple Sign-In",
+    });
+
+    const token = await generateToken(user.id, user.businessId);
+
+    const profileStatus = await getProfileStatus(user.id);
+    let completion = profileStatus.profileCompleted;
+    if (profileStatus.isBusinessAdmin) {
+      try {
+        completion = await computeBusinessProfileCompleted(user.businessId);
+      } catch { completion = true; }
+    }
+    return res.json({
+      success: true,
+      token,
+      userId: user.id,
+      businessId: user.businessId,
+      isNewUser,
+      requiresPasswordSetup: !user.passwordHash,
+      // Existing SSO accounts: admins still owe a complete business profile
+      // (phone, industry, real name, logo); invited members owe their
+      // personal profile (see requiresProfileCompletion).
+      profileCompleted: completion,
+      message: isNewUser ? "Apple sign-up successful" : "Apple login successful",
+      role: profileStatus.role,
+      isBusinessAdmin: profileStatus.isBusinessAdmin,
+      requiresProfileCompletion: profileStatus.requiresProfileCompletion,
+      phoneVerified: profileStatus.phoneVerified,
+      profilePromptDismissed: profileStatus.profilePromptDismissed,
+      avatarUrl: profileStatus.avatarUrl,
+      phoneNumber: profileStatus.phoneNumber,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        avatarUrl: user.avatarUrl,
+        authProvider: user.authProvider,
+        hasPassword: !!user.passwordHash,
+      },
+    });
+  } catch (error) {
+    console.error("Apple auth error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to authenticate with Apple",
     });
   }
 };

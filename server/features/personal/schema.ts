@@ -346,12 +346,23 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_volume NUMERIC DEFAULT 0.8`);
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS video_volume NUMERIC DEFAULT 1.0`);
+<<<<<<< HEAD
   // Music SEGMENT (clip) — the composer lets the author pick WHICH part of
   // the attached track plays. Start/duration (ms) ride on the video media
   // row next to the sound fields (this is the table the sound columns live
   // on — NOT social_posts) so feed viewers replay the chosen part.
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`);
   await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`);
+=======
+  // Music-clip segment (the part of the track the author picked) — carried on
+  // EVERY media row (photo, video AND text-card; url is NOT NULL-relaxed in
+  // migrations.ts for the text-card sound row). Mirrors the defensive
+  // re-ensure in migrations.ts social-music-clip-columns.
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_start_ms INT`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_duration_ms INT`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS clip_start_ms INT`);
+  await query(`ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS clip_duration_ms INT`);
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 
   // Saved posts — Facebook-style collections. A user files any post into one
   // or more named folders ("Videos", "Photos", or their own creations);
@@ -1367,11 +1378,20 @@ export async function ensurePersonalSchema(): Promise<void> {
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`);
+<<<<<<< HEAD
   // Music SEGMENT (clip) — the composer picks WHICH part of the attached
   // track plays; stored on the story row next to the sound fields so viewers
   // replay the chosen part.
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_start_ms INTEGER`);
   await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS sound_duration_ms INTEGER`);
+=======
+  // Music-clip segment (the part of the track the author picked) — mirrors
+  // migrations.ts social-music-clip-columns + the route's DDL ladder.
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_start_ms INT`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_duration_ms INT`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_start_ms INT`);
+  await query(`ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_duration_ms INT`);
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_story_views (

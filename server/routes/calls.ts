@@ -528,7 +528,7 @@ export const getCallByCode: RequestHandler = async (
     const { code } = req.params;
     const businessId = req.user?.businessId;
 
-    const result = await query(
+    let result = await query(
       `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
               ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
               co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
@@ -537,6 +537,24 @@ export const getCallByCode: RequestHandler = async (
        FROM calls WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`,
       [code, businessId],
     );
+
+    // CROSS-APP PICKUP FIX (mirrors joinCall/getCallById): the callee's
+    // session may be scoped to the other side of a personal/business call.
+    if (result.rows.length === 0) {
+      result = await query(
+        `SELECT id, business_id as "businessId", type, status, started_at as "startedAt", 
+              ended_at as "endedAt", created_by as "createdById", host_id as "hostId",
+              co_host_id as "coHostId", call_code as "callCode", password, is_group_call as "isGroupCall",
+              waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
+              created_at as "createdAt", updated_at as "updatedAt"
+         FROM calls WHERE call_code = $1 AND (
+           type = 'live'
+           OR business_id IS NULL
+           OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = calls.id AND cp.user_id = $2)
+         ) LIMIT 1`,
+        [code, req.user?.userId],
+      );
+    }
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -617,6 +635,21 @@ export const getCallById: RequestHandler = async (
       : { rows: [] as any[] };
     if (result.rows.length === 0) {
       result = await query(`${baseSelect} WHERE call_code = $1 AND business_id IS NOT DISTINCT FROM $2`, [id, businessId]);
+    }
+
+    // CROSS-APP PICKUP FIX (mirrors joinCall): personal app answering a
+    // business-created call or business app answering a personal call used to
+    // hit a phantom 404 here before the room ever opened.
+    if (result.rows.length === 0) {
+      const lookupCol = UUID_RE.test(id) ? "id" : "call_code";
+      result = await query(
+        `${baseSelect} WHERE calls.${lookupCol} = $1 AND (
+           type = 'live'
+           OR business_id IS NULL
+           OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = calls.id AND cp.user_id = $2)
+         ) LIMIT 1`,
+        [id, req.user?.userId],
+      );
     }
 
     if (result.rows.length === 0) {
@@ -966,10 +999,22 @@ export const joinCall: RequestHandler = async (
     // so fall back to an unscoped lookup restricted to type='live'.
     let liveRoomFallback: { id: string } | undefined;
     if (!actualId) {
+      // CROSS-APP PICKUP FIX: personal-origin calls carry business_id NULL and
+      // business-origin calls carry a workspace id. A callee whose session is
+      // scoped to the OTHER side (personal app answering a business-created
+      // call, business app answering a personal call, web answering either)
+      // failed both scoped lookups and got a phantom 404 "Call not found" at
+      // the exact moment they tapped Accept. Fall back to an unscoped read for
+      // live rooms, personal-origin (business_id NULL) calls, or rows where
+      // the requesting user is already a participant.
       const lookupCol = isValidUUID(id) ? "id" : "call_code";
       const fb = await query(
-        `SELECT id FROM calls WHERE ${lookupCol} = $1 AND type = 'live' LIMIT 1`,
-        [id],
+        `SELECT c.id FROM calls c WHERE c.${lookupCol} = $1 AND (
+           c.type = 'live'
+           OR c.business_id IS NULL
+           OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = c.id AND cp.user_id = $2)
+         ) LIMIT 1`,
+        [id, userId],
       );
       if (fb.rows.length > 0) {
         liveRoomFallback = fb.rows[0];
@@ -991,8 +1036,8 @@ export const joinCall: RequestHandler = async (
     // rejected here with a phantom 404.
     const validationResult = await query(
       `SELECT id, password, status, started_at, ended_at, waiting_room_enabled, max_participants, host_id, co_host_id, created_by
-       FROM calls WHERE ${lookupCol} = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live')`,
-      [id, businessId],
+       FROM calls WHERE ${lookupCol} = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live' OR business_id IS NULL OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = calls.id AND cp.user_id = $3))`,
+      [id, businessId, userId],
     );
     const callState = validationResult.rows[0];
     // Race guard: the row was found by the first lookup but vanished before
@@ -1091,8 +1136,8 @@ export const joinCall: RequestHandler = async (
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               max_participants as "maxParticipants",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live')`,
-      [actualId, businessId],
+       FROM calls WHERE id = $1 AND (business_id IS NOT DISTINCT FROM $2 OR type = 'live' OR business_id IS NULL OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = calls.id AND cp.user_id = $3))`,
+      [actualId, businessId, userId],
     );
     if (callResult.rows.length === 0) {
       return res.status(404).json({
@@ -1466,6 +1511,23 @@ export const leaveCall: RequestHandler = async (
     }
 
     if (!actualId) {
+      // CROSS-APP PICKUP FIX: reject must also resolve for a callee scoped to
+      // the other side (personal↔business), otherwise declining a call fails
+      // with 404 and the other devices keep ringing until timeout.
+      const lookupCol = isValidUUID(id) ? "id" : "call_code";
+      const fb = await query(
+        `SELECT c.id FROM calls c WHERE c.${lookupCol} = $1 AND (
+           c.business_id IS NULL
+           OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = c.id AND cp.user_id = $2)
+         ) LIMIT 1`,
+        [id, userId],
+      );
+      if (fb.rows.length > 0) {
+        actualId = fb.rows[0].id;
+      }
+    }
+
+    if (!actualId) {
       return res.status(404).json({
         success: false,
         error: "Call not found",
@@ -1486,8 +1548,8 @@ export const leaveCall: RequestHandler = async (
               conversation_id as "conversationId", duration_started_at as "durationStartedAt",
               waiting_room_enabled as "waitingRoomEnabled", recording_enabled as "recordingEnabled",
               created_at as "createdAt", updated_at as "updatedAt"
-       FROM calls WHERE id = $1 AND business_id IS NOT DISTINCT FROM $2`,
-      [actualId, businessId],
+       FROM calls WHERE id = $1 AND (business_id IS NOT DISTINCT FROM $2 OR business_id IS NULL OR EXISTS (SELECT 1 FROM call_participants cp WHERE cp.call_id = calls.id AND cp.user_id = $3))`,
+      [actualId, businessId, userId],
     );
     if (callResult.rows.length === 0) {
       // Call deleted between the participant update and this lookup

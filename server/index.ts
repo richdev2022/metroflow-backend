@@ -59,6 +59,7 @@ import {
   verifyResetOTP,
   resetPassword,
   googleAuth,
+  appleAuth,
   setPassword,
   changePassword,
   getMe,
@@ -957,6 +958,7 @@ export async function createServer() {
   mainRouter.post("/auth/verify-reset-otp", verifyResetOTP);
   mainRouter.post("/auth/reset-password", resetPassword);
   mainRouter.post("/auth/google", googleAuth);
+  mainRouter.post("/auth/apple", appleAuth);
   mainRouter.post("/auth/set-password", authenticateToken, setPassword);
   mainRouter.post("/auth/change-password", authenticateToken, changePassword);
   mainRouter.get("/auth/me", authenticateToken, getMe);

@@ -1,5 +1,10 @@
 import { query } from "./db";
+<<<<<<< HEAD
 import { getSetting, setSetting } from "./services/app-config";
+=======
+import { hashPassword, verifyPassword } from "./services/auth";
+import { generateBusinessId } from "./utils/idGenerator";
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 import { ensureFraudSchema } from "./features/fraud/schema";
 import { ensurePersonalSchema } from "./features/personal/schema";
 import { ensureBillsSchema } from "./features/personal/bills-schema";
@@ -160,6 +165,62 @@ export async function runPostInitializeMigrations(): Promise<void> {
     await query(`ALTER TABLE calls ALTER COLUMN business_id DROP NOT NULL`);
   });
 
+  // Apple Sign-In (Guideline 4.8) — users.apple_id mirrors users.google_id:
+  // POST /auth/apple resolves accounts by the verified Apple subject. The
+  // base CREATE TABLE + ALTER live in db.ts too; this keeps self-hosted
+  // databases on every boot path covered. Idempotent.
+  await step("users.apple_id", async () => {
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(255)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_users_apple_id ON users(apple_id)`);
+  });
+
+  // SOCIAL MUSIC CLIP COLUMNS (web + mobile parity sweep) — the composers send
+  //   music_start_ms / music_duration_ms  (the song segment the author picked)
+  //   clip_start_ms  / clip_duration_ms   (alias spelling)
+  // for posts, stories and chat statuses, plus the sound attribution fields
+  // (sound_url / sound_title / music_volume / video_volume) for statuses.
+  // social_post_media + social_stories already carry the sound columns
+  // (features/personal/schema.ts); chat_statuses gains the full set here.
+  // All additive + idempotent — safe on every boot.
+  await step("social-music-clip-columns", async () => {
+    const clipColumnDdl = [
+      // Ordered post carousel (photo, video AND text-card rows).
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_start_ms INT`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_duration_ms INT`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS clip_start_ms INT`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS clip_duration_ms INT`,
+      // Defensive re-ensures — same statements as schema.ts, so a schema.ts
+      // regression can never make the INSERTs below 42703.
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_url TEXT`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS music_volume NUMERIC DEFAULT 0.8`,
+      `ALTER TABLE social_post_media ADD COLUMN IF NOT EXISTS video_volume NUMERIC DEFAULT 1.0`,
+      // TEXT-CARD posts attach music too: the composer sends sound fields with
+      // no photo/video, so the sound rides ONE synthetic media row
+      // (media_type='text', url NULL). social_post_media.url started NOT NULL
+      // — relax it so the row can land. Photo/video rows always carry a url;
+      // only the synthetic text rows are NULL, and every media renderer
+      // filters empty urls out.
+      `ALTER TABLE social_post_media ALTER COLUMN url DROP NOT NULL`,
+      // 24h stories.
+      `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_start_ms INT`,
+      `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS music_duration_ms INT`,
+      `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_start_ms INT`,
+      `ALTER TABLE social_stories ADD COLUMN IF NOT EXISTS clip_duration_ms INT`,
+      // Chat statuses — sound attribution mirrors social_stories' column
+      // types (TEXT / VARCHAR(200) / DOUBLE PRECISION DEFAULT 0.8 / 1.0).
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS sound_url TEXT`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS sound_title VARCHAR(200)`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_volume DOUBLE PRECISION DEFAULT 0.8`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS video_volume DOUBLE PRECISION DEFAULT 1.0`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_start_ms INT`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS music_duration_ms INT`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS clip_start_ms INT`,
+      `ALTER TABLE chat_statuses ADD COLUMN IF NOT EXISTS clip_duration_ms INT`,
+    ];
+    for (const ddl of clipColumnDdl) await query(ddl);
+  });
+
   // ---- 2. Ledger repairs (data, idempotent) ---------------------------
   await step("ensureLedgerAndVirtualAccountFixes", ensureLedgerAndVirtualAccountFixes);
   await step("reconcilePlatformLedger", reconcilePlatformLedger);
@@ -173,6 +234,7 @@ export async function runPostInitializeMigrations(): Promise<void> {
   await step("ensureLoginSecurityColumns", ensureLoginSecurityColumns);
 
   // ---- 3. Data ladders (gated UPDATEs — always LAST) ------------------
+  await step("seedDemoBusinessAccount", seedDemoBusinessAccount); // reviewer demo login (App Store Guideline 2.1) — runs before the ladders so the demo business is included
   await step("ensureBusinessRevenueLadder", ensureBusinessRevenueLadder);
   await step("ensureBusinessRevenueLadderV2", ensureBusinessRevenueLadderV2);
   await step("ensurePlanPricingLadder", ensurePlanPricingLadder);
@@ -2653,6 +2715,7 @@ async function ensureVaptHardeningSchema(): Promise<void> {
 }
 
 /**
+<<<<<<< HEAD
  * LEGACY SINGLE-APK SLOT -> PER-APP SLOTS (one-time boot migration, idempotent).
  *
  * History: the admin App Releases page originally had a single direct-APK
@@ -2735,4 +2798,185 @@ async function migrateLegacyApkToPersonalSlot(): Promise<void> {
       `[migrations] ⚠ migrateLegacyApkToPersonalSlot failed (non-fatal, continuing): ${error?.message || error}`,
     );
   }
+=======
+ * DEMO BUSINESS ACCOUNT (App Store Guideline 2.1) — the reviewer credentials
+ * sunday@metricorex.com / Password@123 used to exist ONLY as a
+ * platform_admins row, so POST /auth/login answered 400 "Invalid email or
+ * password" and every business-app review flow was blocked at sign-in.
+ *
+ * This seed (idempotent, runs on EVERY boot in dev + production) guarantees a
+ * full BUSINESS account exists for the credentials above:
+ *   · businesses row "Metricorex Demo Business" (email = the reviewer email,
+ *     owned by the demo user)
+ *   · users row — role 'admin' (isBusinessAdmin), email_verified TRUE so the
+ *     login OTP gate is skipped, bcrypt-12 password hash matching
+ *     Password@123 (the same lib/rounds as hashPassword in services/auth)
+ *   · lockout counters cleared (failed_login_attempts / locked_until /
+ *     lock_count / account_blocked) so a reviewer typo can't lock the demo
+ * If the users row already exists, its password hash is re-synced to
+ * Password@123 (only when it no longer verifies) and email_verified is forced
+ * TRUE — reviewers can always log in.
+ */
+async function seedDemoBusinessAccount(): Promise<void> {
+  const DEMO_EMAIL = "sunday@metricorex.com";
+  const DEMO_PASSWORD = "Password@123";
+  const DEMO_BUSINESS_NAME = "Metricorex Demo Business";
+  // Profile-completion gates: /auth/login reports profileCompleted for admins
+  // via computeBusinessProfileCompleted(), which requires a REAL business
+  // name (not the "'s Workspace" SSO placeholder), industry, phone_number and
+  // logo_url. Seed them so the reviewer lands in the app, not on the
+  // completion screen. Logo = the official brand asset used by email
+  // templates (APP_LOGO_URL fallback).
+  const DEMO_BUSINESS_PHONE = "+2348012345678";
+  const DEMO_BUSINESS_LOGO = "https://metricorex.com/Assets/logo.png";
+
+  // 1) Business row (exists-check by the UNIQUE email — never duplicates).
+  let businessId: string | null = null;
+  const bizRes = await query(
+    `SELECT id FROM businesses WHERE email = $1 LIMIT 1`,
+    [DEMO_EMAIL],
+  );
+  if (bizRes.rows.length > 0) {
+    businessId = bizRes.rows[0].id;
+  } else {
+    // id is generated the same way registerBusiness does; the PK is only at
+    // collision risk from another concurrent boot — retry once with a fresh id.
+    for (let attempt = 0; attempt < 2 && !businessId; attempt++) {
+      try {
+        const candidate = generateBusinessId(DEMO_BUSINESS_NAME);
+        const planRes = await query(
+          `SELECT id FROM pricing_plans WHERE price = 0 LIMIT 1`,
+        );
+        await query(
+          `INSERT INTO businesses (id, name, email, industry, plan_id, subscription_status, phone_number, logo_url)
+           VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
+           ON CONFLICT (email) DO NOTHING`,
+          [
+            candidate,
+            DEMO_BUSINESS_NAME,
+            DEMO_EMAIL,
+            "Technology",
+            planRes.rows[0]?.id ?? null,
+            DEMO_BUSINESS_PHONE,
+            DEMO_BUSINESS_LOGO,
+          ],
+        );
+        const created = await query(
+          `SELECT id FROM businesses WHERE email = $1 LIMIT 1`,
+          [DEMO_EMAIL],
+        );
+        if (created.rows.length > 0) businessId = created.rows[0].id;
+      } catch (e: any) {
+        if (attempt === 1) throw e; // let the step runner log it
+      }
+    }
+  }
+
+  // Default task statuses for the demo workspace (parity with registration).
+  if (businessId) {
+    const defaultStatuses = [
+      { name: "pending", color: "#6b7280", is_default: true, sort_order: 0 },
+      { name: "in_progress", color: "#3b82f6", is_default: true, sort_order: 1 },
+      { name: "completed", color: "#10b981", is_default: true, sort_order: 2 },
+    ];
+    for (const status of defaultStatuses) {
+      await query(
+        `INSERT INTO task_statuses (business_id, name, color, is_default, sort_order)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (business_id, name) DO NOTHING`,
+        [businessId, status.name, status.color, status.is_default, status.sort_order],
+      ).catch(() => {}); // unique constraint may not exist on very old tables — cosmetic
+    }
+  }
+
+  // 2) User row.
+  let userId: string;
+  const userRes = await query(
+    `SELECT id, business_id as "businessId", password_hash as "passwordHash", email_verified as "emailVerified"
+     FROM users WHERE email = $1 LIMIT 1`,
+    [DEMO_EMAIL],
+  );
+  // The demo workspace must ALWAYS pass the profile gates — heal an existing
+  // business row too (older boots seeded it before the phone/logo fields).
+  if (businessId) {
+    await query(
+      `UPDATE businesses
+       SET phone_number = COALESCE(phone_number, $2),
+           logo_url = COALESCE(logo_url, $3),
+           industry = COALESCE(industry, 'Technology')
+       WHERE id = $1`,
+      [businessId, DEMO_BUSINESS_PHONE, DEMO_BUSINESS_LOGO],
+    );
+  }
+  if (userRes.rows.length > 0) {
+    const u = userRes.rows[0];
+    userId = u.id;
+    // Keep the hash in sync with Password@123 — but only rewrite it when the
+    // stored hash no longer verifies (avoids a bcrypt burn on every boot).
+    const hashOk = u.passwordHash
+      ? await verifyPassword(DEMO_PASSWORD, u.passwordHash).catch(() => false)
+      : false;
+    if (!hashOk) {
+      await query(
+        `UPDATE users SET password_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [u.id, await hashPassword(DEMO_PASSWORD)],
+      );
+    }
+    // Verified email + clear lockout state + completed profile flag so
+    // reviewers are never gated (profile_completed covers the member-path
+    // completion prompt; admins pass via the business fields above).
+    await query(
+      `UPDATE users
+       SET email_verified = TRUE,
+           verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP),
+           otp_code = NULL,
+           otp_expires_at = NULL,
+           failed_login_attempts = 0,
+           locked_until = NULL,
+           lock_count = 0,
+           account_blocked = FALSE,
+           profile_completed = TRUE,
+           profile_prompt_dismissed = TRUE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [u.id],
+    );
+    // Attach the demo workspace when the account isn't a live member of
+    // another (existing) workspace — never hijack a real member's business.
+    const belongsToDemo = u.businessId === businessId;
+    if (!belongsToDemo) {
+      let workspaceMissing = true;
+      if (u.businessId) {
+        const ws = await query(`SELECT 1 FROM businesses WHERE id = $1 LIMIT 1`, [u.businessId]);
+        workspaceMissing = ws.rows.length === 0;
+      }
+      if (workspaceMissing && businessId) {
+        await query(
+          `UPDATE users SET business_id = $2, role = 'admin', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [u.id, businessId],
+        );
+      }
+    }
+  } else {
+    const inserted = await query(
+      `INSERT INTO users
+        (business_id, email, password_hash, name, role, email_verified, verified_at, auth_provider,
+         profile_completed, profile_prompt_dismissed)
+       VALUES ($1, $2, $3, $4, 'admin', TRUE, CURRENT_TIMESTAMP, 'local', TRUE, TRUE)
+       RETURNING id`,
+      [businessId, DEMO_EMAIL, await hashPassword(DEMO_PASSWORD), "Demo Admin"],
+    );
+    userId = inserted.rows[0].id;
+  }
+
+  // 3) Ownership link — the demo business is owned by the demo user.
+  if (businessId) {
+    await query(
+      `UPDATE businesses SET owner_id = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND (owner_id IS NULL OR owner_id <> $2)`,
+      [businessId, userId],
+    );
+    console.log(`Seeded demo business account (reviewer login: ${DEMO_EMAIL})`);
+  }
+>>>>>>> cfc39cb (feat(backend): Apple Sign-In, demo business seed, social music persistence, follow state, share attribution)
 }

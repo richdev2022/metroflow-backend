@@ -1269,7 +1269,7 @@ router.post("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, re
       `INSERT INTO live_messages (session_id, user_id, body) VALUES ($1,$2,$3) RETURNING *`,
       [s.id, req.user!.userId, body],
     );
-    const u = await query(`SELECT name, avatar_url FROM users WHERE id = $1`, [req.user!.userId]);
+    const u = await query(`SELECT name, avatar_url, username FROM users WHERE id = $1`, [req.user!.userId]);
     res.status(201).json({
       success: true,
       data: {
@@ -1277,6 +1277,16 @@ router.post("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, re
           id: r.rows[0].id, session_id: s.id, user_id: req.user!.userId, body,
           is_pinned: false, created_at: r.rows[0].created_at,
           author: { id: req.user!.userId, name: u.rows[0]?.name, photo: u.rows[0]?.avatar_url },
+          // `user` object — the mobile live viewer reads message.user.{id,name,
+          // photo|avatar_url} for the commenter avatar + display name; `author`
+          // stays for the web client. Same avatar under every spelling.
+          user: {
+            id: req.user!.userId,
+            name: u.rows[0]?.name ?? null,
+            username: u.rows[0]?.username ?? null,
+            photo: u.rows[0]?.avatar_url ?? null,
+            avatar_url: u.rows[0]?.avatar_url ?? null,
+          },
         },
       },
     });
@@ -1299,7 +1309,7 @@ router.get("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, res
       where += ` AND m.created_at > (SELECT created_at FROM live_messages WHERE id = $2)`;
     }
     const r = await query(
-      `SELECT m.id, m.user_id, m.body, m.is_pinned, m.created_at, u.name AS author_name, u.avatar_url AS author_photo
+      `SELECT m.id, m.user_id, m.body, m.is_pinned, m.created_at, u.name AS author_name, u.avatar_url AS author_photo, u.username AS author_username
        FROM live_messages m JOIN users u ON u.id = m.user_id
        WHERE ${where} ORDER BY m.created_at ASC LIMIT 200`,
       params,
@@ -1310,6 +1320,16 @@ router.get("/:id/chat", authenticateToken, async (req: AuthenticatedRequest, res
         messages: r.rows.map((m) => ({
           id: m.id, body: m.body, is_pinned: m.is_pinned, created_at: m.created_at,
           author: { id: m.user_id, name: m.author_name, photo: m.author_photo },
+          // `user` object — the mobile live viewer renders commenter avatar +
+          // display name from message.user.{id,name,photo|avatar_url}; the
+          // web client keeps reading `author`. Same avatar under every key.
+          user: {
+            id: m.user_id,
+            name: m.author_name ?? null,
+            username: m.author_username ?? null,
+            photo: m.author_photo ?? null,
+            avatar_url: m.author_photo ?? null,
+          },
         })),
       },
     });

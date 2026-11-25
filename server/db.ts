@@ -1221,8 +1221,10 @@ export async function initializeDatabase() {
         await query(
           `INSERT INTO users
              (business_id, email, password_hash, name, role, status,
-              email_verified, verified_at, auth_provider, profile_completed)
-           VALUES ($1, $2, $3, $4, 'admin', 'active', TRUE, CURRENT_TIMESTAMP, 'local', TRUE)
+              email_verified, verified_at, auth_provider, profile_completed,
+              kyc_status, bvn_status, nin_status, phone_verified)
+           VALUES ($1, $2, $3, $4, 'admin', 'active', TRUE, CURRENT_TIMESTAMP, 'local', TRUE,
+                   'verified', 'verified', 'verified', TRUE)
            ON CONFLICT DO NOTHING`,
           [demoBizId, demoEmail, demoHash, "Sunday Demo"],
         );
@@ -1238,7 +1240,11 @@ export async function initializeDatabase() {
                  otp_expires_at = NULL,
                  status = 'active',
                  failed_login_attempts = 0,
-                 locked_until = NULL
+                 locked_until = NULL,
+                 kyc_status = 'verified',
+                 bvn_status = 'verified',
+                 nin_status = 'verified',
+                 phone_verified = TRUE
            WHERE email = $2`,
           [demoHash, demoEmail],
         );

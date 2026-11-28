@@ -1988,6 +1988,10 @@ router.post("/posts/:id/react", authenticateToken, async (req: AuthenticatedRequ
           title: "New reaction",
           message: `Someone reacted ${type} to your post`,
           type: "social",
+          // Deep link: tapping the bell row opens THIS post (was actionless →
+          // the client fell back to Home).
+          actionUrl: `/post/${req.params.id}`,
+          metadata: { postId: req.params.id },
         }).catch(() => {});
       }
     }
@@ -2728,6 +2732,9 @@ router.post("/polls/:id/vote", authenticateToken, async (req: AuthenticatedReque
           title: "New paid vote",
           message: `Someone voted on your paid poll (+₦${price.toLocaleString()} to your Vote Pocket)`,
           type: "social",
+          // Deep link: open the poll (was actionless → Home).
+          actionUrl: `/poll/${p.id}`,
+          metadata: { pollId: p.id },
         }).catch(() => {});
       }
       const votesRes = await query(

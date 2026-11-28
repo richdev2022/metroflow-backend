@@ -220,6 +220,9 @@ router.post("/users/:id/follow", authenticateToken, async (req: AuthenticatedReq
         type: "social",
         title: "New follow request",
         message: `${req.user!.name || "Someone"} requested to follow you.`,
+        // Deep link: open the requester's profile (was actionless → Home).
+        actionUrl: `/profile/${userId}`,
+        metadata: { profileId: userId },
       }).catch(() => {});
       return res.status(201).json({ success: true, data: { status: "requested" } });
     }
@@ -237,6 +240,9 @@ router.post("/users/:id/follow", authenticateToken, async (req: AuthenticatedReq
       type: "social",
       title: "New follower",
       message: `${req.user!.name || "Someone"} started following you.`,
+      // Deep link: open the new follower's profile (was actionless → Home).
+      actionUrl: `/profile/${userId}`,
+      metadata: { profileId: userId },
     }).catch(() => {});
     res.status(201).json({ success: true, data: { status: "following" } });
   } catch (e: any) {
@@ -336,6 +342,9 @@ router.post("/follow/requests/:id/accept", authenticateToken, async (req: Authen
       type: "social",
       title: "Follow request accepted",
       message: `${req.user!.name || "Someone"} accepted your follow request.`,
+      // Deep link: open the accepter's profile (was actionless → Home).
+      actionUrl: `/profile/${userId}`,
+      metadata: { profileId: userId },
     }).catch(() => {});
     res.json({ success: true, data: { status: "accepted" } });
   } catch {

@@ -1893,7 +1893,11 @@ export function initSocketServer(server: http.Server): void {
       // ringing UI + notification immediately (was: they kept ringing until
       // the call ended, or until the 45s auto-dismiss).
       // ---------------------------------------------------------------------
-      const stopRingEvent = { callId: resolvedCallId, callCode: data.callId, acceptedBy: socket.data.userId };
+      // CROSS-APP STOP-RING FIX: carry the CANONICAL call_code (not the raw
+      // id the acceptor sent). The other app/device may know the call by its
+      // CODE while this event's callId is the resolved UUID — matching on the
+      // real code is what lets Personal<->Business dismiss each other.
+      const stopRingEvent = { callId: resolvedCallId, callCode: callCode || data.callId, acceptedBy: socket.data.userId };
       // Acceptor's other live devices (socket.to excludes the answering socket).
       socket.to(`user:${socket.data.userId}`).emit("call:ring-stopped", stopRingEvent);
       try {

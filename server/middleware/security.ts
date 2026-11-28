@@ -4,7 +4,15 @@ import crypto from "crypto";
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
-const RATE_LIMIT_MAX = 100; // 100 requests per window
+// The key is `${req.path}-${ip}`, so this is a per-PATH, per-IP budget. The
+// previous value (100) was far below what a normal polling client consumes:
+// the live room alone polls chat every 3s (~300 requests / 15 min per viewer)
+// plus stats + heartbeat, and several viewers behind ONE IP (same Wi-Fi, NAT,
+// or a localhost test run) share a single bucket — so 3+ people joining a
+// livestream instantly tripped "Too many requests. Please try again later."
+// and blocked the room. Raised to a level that comfortably supports ~10
+// concurrent pollers per path per IP while still throttling real floods.
+const RATE_LIMIT_MAX = 3000; // requests per path per IP per window
 
 export function rateLimiter(req: Request, res: Response, next: NextFunction) {
   const ip = req.ip || req.connection.remoteAddress || "unknown";

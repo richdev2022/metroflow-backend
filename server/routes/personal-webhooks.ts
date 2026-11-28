@@ -416,7 +416,14 @@ async function findCardByProviderId(cardId: unknown) {
   return r.rows[0] ?? null;
 }
 
-/** Credit the card's funding (stablecoin) wallet; returns the wallet row or null. */
+/** Credit the card's funding (stablecoin) wallet; returns the wallet row or null.
+ *
+ *  MONEY SAFETY. The ledger row and the balance update commit ATOMICALLY and
+ *  the unique `transactions.reference` guard is the FIRST write, so a replayed
+ *  refund webhook rolls back and exits without touching the balance. Previously
+ *  this only INSERTed the ledger row and NEVER moved `wallets.balance`, so a
+ *  card-creation failure or termination "refund" was audited but never actually
+ *  returned to the user. */
 async function creditCardOwnerWallet(card: any, usdAmount: number, reference: string, description: string, txnType: string) {
   const walletRes = await query(
     `SELECT id, currency FROM wallets WHERE user_id = $1 AND business_id IS NULL AND UPPER(currency) IN ('USDT','USDC') AND status = 'active'
@@ -426,13 +433,32 @@ async function creditCardOwnerWallet(card: any, usdAmount: number, reference: st
   const fw = walletRes.rows[0];
   if (!fw) return null;
   const ref = reference.slice(0, 80);
-  await query(
-    `INSERT INTO transactions
-       (user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
-     VALUES ($1, $2, $3, $4, 'success', 'credit', $5, $6, $7, 'credit')
-     ON CONFLICT (reference) DO NOTHING`,
-    [card.user_id, Math.round(usdAmount * 100) / 100, String(fw.currency || "USD").toUpperCase(), ref, description.slice(0, 240), txnType, fw.id],
-  );
+  const amount = Math.round(usdAmount * 100) / 100;
+  if (!(amount > 0)) return fw;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const ins = await client.query(
+      `INSERT INTO transactions
+         (user_id, amount, currency, reference, status, type, description, transaction_type, wallet_id, direction)
+       VALUES ($1, $2, $3, $4, 'success', 'credit', $5, $6, $7, 'credit')
+       ON CONFLICT (reference) DO NOTHING RETURNING id`,
+      [card.user_id, amount, String(fw.currency || "USD").toUpperCase(), ref, description.slice(0, 240), txnType, fw.id],
+    );
+    if (ins.rows.length > 0) {
+      await client.query(
+        `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [amount, fw.id],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (String(e?.code) === "23505") return fw; // unique violation — already credited (replay)
+    throw e;
+  } finally {
+    client.release();
+  }
   return fw;
 }
 
@@ -748,19 +774,34 @@ async function handleBitnobCardEvent(event: string, payload: any) {
 // Stablecoin deposits + withdrawals (deposit.success / transfer.*)
 // ===========================================================================
 
-/** Amount-unit policy: Bitnob balances are 6-decimal base units; deposits are
- *  documented in token units. BITNOB_DEPOSIT_AMOUNT_MODE resolves ambiguity:
- *  base (trust payload) | micro (divide by 1e6) | auto (heuristic, default). */
-function depositAmount(raw: any): number {
-  const mode = (process.env.BITNOB_DEPOSIT_AMOUNT_MODE || "auto").toLowerCase();
+/** Amount-unit policy for Bitnob deposit payloads.
+ *
+ *  MONEY SAFETY. Bitnob denominates amounts in 6-decimal base units
+ *  (1 USDT = 1_000_000) — the SAME unit this codebase sends on withdrawals
+ *  (stablecoin.ts: `Math.round(amount * 1e6)`), so deposit webhooks arrive in
+ *  base units as well. The previous default ("auto") only divided when the
+ *  integer was ≥ 1e6, so ANY sub-1-USDT deposit (e.g. 0.000062 USDT arriving
+ *  as "62") was credited verbatim as $62 — the exact over-credit this guards
+ *  against. Never infer "major units" from a small integer again.
+ *
+ *  Resolution order:
+ *    1. The provider's own human-readable token amount (`amount_formatted`)
+ *       when present — authoritative and unit-agnostic.
+ *    2. BITNOB_DEPOSIT_AMOUNT_MODE: micro (default) | base | auto.
+ *       • micro — divide by 1e6 (base units → token units). DEFAULT.
+ *       • base  — payload is already in token units (legacy providers).
+ *       • auto  — legacy heuristic, opt-in only, kept for back-compat. */
+function depositAmount(raw: any, formatted?: any): number {
+  const fmt = Number(formatted);
+  if (formatted !== undefined && formatted !== null && formatted !== "" && Number.isFinite(fmt) && fmt > 0) {
+    return fmt;
+  }
   const n = Number(raw ?? 0);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  if (mode === "micro") return n / 1e6;
+  const mode = (process.env.BITNOB_DEPOSIT_AMOUNT_MODE || "micro").toLowerCase();
   if (mode === "base") return n;
-  // auto: an integer ≥ 1e6 with no formatted companion is almost certainly
-  // 6-decimal base units (1 USDT = 1_000_000). Token-unit amounts are small or fractional.
-  if (Number.isInteger(n) && n >= 1_000_000) return n / 1e6;
-  return n;
+  if (mode === "auto") return Number.isInteger(n) && n >= 1_000_000 ? n / 1e6 : n;
+  return n / 1e6; // "micro" (default) — 6-decimal base units
 }
 
 /** Replay-proof event de-duplication. Returns false when already processed. */
@@ -805,7 +846,7 @@ async function processStablecoinDeposit(payload: any): Promise<{ ok: boolean; ac
   const chain = String(d?.chain || d?.network || "").toLowerCase().trim();
   const currency = String(d?.currency || d?.asset || d?.token || "").toUpperCase().trim();
   const hash = String(d?.hash || d?.tx_hash || d?.transaction_hash || "").trim();
-  const amount = depositAmount(d?.amount ?? d?.amount_formatted ?? d?.value);
+  const amount = depositAmount(d?.amount ?? d?.value, d?.amount_formatted);
 
   if (!address || !amount || !currency) {
     console.warn("[bitnob webhook] deposit.success with incomplete data:", JSON.stringify(payload).slice(0, 300));
@@ -874,7 +915,7 @@ async function processStablecoinDeposit(payload: any): Promise<{ ok: boolean; ac
     try {
       const t = await bitnob.getTransaction(hash);
       const tx = t?.data || {};
-      const txAmount = depositAmount(tx.amount ?? tx.amount_formatted ?? tx.value);
+      const txAmount = depositAmount(tx.amount ?? tx.value, tx.amount_formatted);
       const txCurrency = String(tx.currency || tx.asset || currency).toUpperCase();
       const txAddress = String(tx.address || tx.to_address || address);
       const txStatus = String(tx.status || tx.state || "success").toLowerCase();
